@@ -850,14 +850,17 @@ class NetworkTrainer:
         loss_recorder = train_util.LossRecorder()
         del train_dataset_group
 
-        # prepare gradient skipping if enabled
+        # prepare gradient skipping if enabled (複数 GPUではrankごとに判定がズレる恐れありらしい)
         skip_grad_norm = getattr(args, "skip_grad_norm", False)
         log_grad_norm = getattr(args, "grad_norm_log", False)
         logger.info(f"skip_grad_norm: {skip_grad_norm}, grad_norm_log: {log_grad_norm}")
         if skip_grad_norm:
+            # 勾配ノルムの履歴を保持するキュー
             moving_avg_window = deque(maxlen=200)
             log_buffer = []
             log_file_path = "gradient_logs.txt"
+
+            # ログ用のヘッダーを書き出す
             if log_grad_norm:
                 with open(log_file_path, "w") as f:
                     f.write("Epoch,Step,Gradient Norm,Threshold\n")
@@ -865,6 +868,8 @@ class NetworkTrainer:
             def check_gradients_and_skip_update(model, epoch, step):
                 device = next(model.parameters()).device
                 gradient_norm = torch.tensor(0.0, device=device)
+
+                # 各パラメータの勾配ノルムの二乗を加算
                 with torch.no_grad():
                     for param in model.parameters():
                         if param.grad is not None:
@@ -872,7 +877,10 @@ class NetworkTrainer:
                             gradient_norm += grad.norm() ** 2
                 gradient_norm = gradient_norm.sqrt().item()
 
+                # 移動平均窓に追加
                 moving_avg_window.append(gradient_norm)
+
+                # 窓がいっぱいになったら平均+2.5σを計算
                 if len(moving_avg_window) == moving_avg_window.maxlen:
                     mean_norm = np.mean(moving_avg_window)
                     std_norm = np.std(moving_avg_window)
@@ -882,6 +890,7 @@ class NetworkTrainer:
                 else:
                     dynamic_threshold = 200_000
 
+                # ログをファイルに出力
                 if log_grad_norm:
                     log_buffer.append(
                         f"{epoch},{step},{gradient_norm},{dynamic_threshold}\n"
@@ -891,6 +900,7 @@ class NetworkTrainer:
                             f.writelines(log_buffer)
                         log_buffer.clear()
 
+                # 閾値を超えた場合はこのステップをスキップ
                 return gradient_norm > dynamic_threshold
         else:
             def check_gradients_and_skip_update(model, epoch, step):
@@ -1063,7 +1073,7 @@ class NetworkTrainer:
                     skip_step = False
                     if check_gradients_and_skip_update(network, epoch, step):
                         accelerator.print(
-                            f"Skipping update at Epoch: {epoch}, Step: {step} due to large gradients."
+                            f"\nSkipping update at Epoch: {epoch}, Step: {step} due to large gradients."
                         )
                         skipped_steps += 1
                         optimizer.zero_grad(set_to_none=True)
