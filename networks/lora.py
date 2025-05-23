@@ -866,7 +866,12 @@ class LoRANetwork(torch.nn.Module):
 
     UNET_TARGET_REPLACE_MODULE = ["Transformer2DModel"]
     UNET_TARGET_REPLACE_MODULE_CONV2D_3X3 = ["ResnetBlock2D", "Downsample2D", "Upsample2D"]
-    TEXT_ENCODER_TARGET_REPLACE_MODULE = ["CLIPAttention", "CLIPSdpaAttention", "CLIPMLP"]
+    DEFAULT_TEXT_ENCODER_TARGET_REPLACE_MODULE = [
+        "CLIPAttention",
+        "CLIPSdpaAttention",
+        "CLIPMLP",
+    ]
+    TEXT_ENCODER_TARGET_REPLACE_MODULE = DEFAULT_TEXT_ENCODER_TARGET_REPLACE_MODULE.copy()
     LORA_PREFIX_UNET = "lora_unet"
     LORA_PREFIX_TEXT_ENCODER = "lora_te"
 
@@ -1033,6 +1038,8 @@ class LoRANetwork(torch.nn.Module):
             self.text_encoder_loras.extend(text_encoder_loras)
             skipped_te += skipped
         logger.info(f"create LoRA for Text Encoder: {len(self.text_encoder_loras)} modules.")
+        for lora in self.text_encoder_loras:
+            logger.info(f"\t{lora.lora_name}")
 
         # extend U-Net target modules if conv2d 3x3 is enabled, or load from weights
         target_modules = LoRANetwork.UNET_TARGET_REPLACE_MODULE

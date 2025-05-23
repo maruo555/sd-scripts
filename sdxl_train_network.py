@@ -28,6 +28,10 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                     network_module.LoRANetwork.TEXT_ENCODER_TARGET_REPLACE_MODULE = [
                         "CLIPMLP"
                     ]
+                    logger.info(
+                        "Text encoder target modules: %s",
+                        network_module.LoRANetwork.TEXT_ENCODER_TARGET_REPLACE_MODULE,
+                    )
             except Exception as e:
                 logger.warning(f"failed to set text encoder target modules: {e}")
 
