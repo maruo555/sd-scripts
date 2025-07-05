@@ -47,6 +47,7 @@ from library.avg_ckpt_util import (
     load_lora_state_dict,
 )
 from library.utils import setup_logging, add_logging_arguments
+from accelerate.utils import broadcast
 
 setup_logging()
 import logging
@@ -1323,13 +1324,13 @@ class NetworkTrainer:
                     accelerator.unwrap_model(network).load_state_dict(avg_sd, strict=False)
                     if args.avg_reset_stats:
                         for p_state in optimizer.state.values():
-                            p_state["step"] = max(p_state.get("step", 0), 1)
+                            p_state["step"] = p_state.get("step", 0)  # keep real count
                             for buf in ("exp_avg", "exp_avg_sq", "exp_avg_max"):
                                 if buf in p_state and isinstance(p_state[buf], torch.Tensor):
                                     p_state[buf].zero_()
                     if accelerator.distributed_type != DistributedType.NO:
-                        accelerator.wait_for_everyone()
-                        accelerator.broadcast_model(network)
+                        sd = broadcast(accelerator.unwrap_model(network).state_dict())
+                        accelerator.unwrap_model(network).load_state_dict(sd, strict=False)
                         accelerator.wait_for_everyone()
                     else:
                         accelerator.wait_for_everyone()
