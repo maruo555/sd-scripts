@@ -282,6 +282,15 @@ class NetworkTrainer:
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
 
+        if getattr(args, "self_mask_enable", False) and self.is_sdxl:
+            if args.mem_eff_attn or args.xformers or args.sdpa:
+                logger.warning(
+                    "self-mask disables memory efficient attention / self-mask使用時はmem_eff_attn/xformers/sdpaを無効化します"
+                )
+                args.mem_eff_attn = False
+                args.xformers = False
+                args.sdpa = False
+
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
@@ -358,6 +367,24 @@ class NetworkTrainer:
 
         if hasattr(network, "prepare_network"):
             network.prepare_network(args)
+
+        self_mask_manager = None
+        if getattr(args, "self_mask_enable", False):
+            if not self.is_sdxl:
+                logger.warning("self-mask is only supported for SDXL training; option ignored")
+            else:
+                from library.self_mask_util import SelfMaskManager
+
+                try:
+                    self_mask_manager = SelfMaskManager(args, accelerator, tokenizers, is_sdxl=self.is_sdxl)
+                    self_mask_manager.register_unet(unet)
+                    logger.info(
+                        "Self-mask manager initialized (mode=%s, layers=%s)", args.self_mask_mode, args.self_mask_layers
+                    )
+                except Exception as ex:
+                    logger.error("failed to initialize self-mask manager: %s", ex)
+                    raise
+
         if args.scale_weight_norms and not hasattr(network, "apply_max_norm_regularization"):
             logger.warning(
                 "warning: scale_weight_norms is specified but the network does not support it / scale_weight_normsが指定されていますが、ネットワークが対応していません"
@@ -1264,6 +1291,15 @@ class NetworkTrainer:
                                 args, accelerator, batch, tokenizers, text_encoders, weight_dtype
                             )
 
+                    if self_mask_manager:
+                        self_mask_manager.begin_step(
+                            batch=batch,
+                            text_conds=text_encoder_conds,
+                            latent_hw=latents.shape[-2:],
+                            global_step=global_step,
+                            max_train_steps=args.max_train_steps,
+                        )
+
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
@@ -1290,6 +1326,29 @@ class NetworkTrainer:
                             weight_dtype,
                         )
 
+                    if self_mask_manager:
+                        self_mask_manager.after_main_forward()
+                        mask_tensor = None
+                        if self_mask_manager.requires_contrast():
+                            contrast_conds = self_mask_manager.begin_contrast_pass()
+                            if contrast_conds is not None:
+                                with torch.no_grad(), accelerator.autocast():
+                                    _ = self.call_unet(
+                                        args,
+                                        accelerator,
+                                        unet,
+                                        noisy_latents.detach(),
+                                        timesteps,
+                                        contrast_conds,
+                                        batch,
+                                        weight_dtype,
+                                    )
+                                self_mask_manager.after_contrast_forward()
+                        mask_info = self_mask_manager.finalize_step()
+                        mask_tensor = mask_info.get("mask") if mask_info else None
+                    else:
+                        mask_tensor = None
+
                     if args.v_parameterization:
                         # v-parameterization training
                         target = noise_scheduler.get_velocity(latents, noise, timesteps)
@@ -1301,6 +1360,10 @@ class NetworkTrainer:
                     )
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
+
+                    if mask_tensor is not None:
+                        loss = self_mask_manager.apply_loss_weight(loss, mask_tensor)
+
                     loss = loss.mean([1, 2, 3])
 
                     loss_weights = batch["loss_weights"]  # 各sampleごとのweight
@@ -1598,6 +1661,96 @@ def setup_parser() -> argparse.ArgumentParser:
         "--skip_until_initial_step",
         action="store_true",
         help="skip training until initial_step is reached / initial_stepに到達するまで学習をスキップする",
+    )
+
+    # Self-mask options (SDXL only)
+    parser.add_argument("--self_mask_enable", action="store_true", help="Enable self-mask guided loss weighting (SDXL only)")
+    parser.add_argument(
+        "--self_mask_tokens",
+        type=str,
+        default=None,
+        help="Comma separated token patterns with optional weights (e.g. char:1.0,outfit:0.5)",
+    )
+    parser.add_argument(
+        "--self_mask_ignore_tokens",
+        type=str,
+        default=None,
+        help="Comma separated wildcard patterns for tokens to ignore when building background",
+    )
+    parser.add_argument(
+        "--self_mask_layers",
+        type=str,
+        default="mid",
+        help="Comma separated U-Net blocks to sample attention from (mid,up,down, or module names)",
+    )
+    parser.add_argument(
+        "--self_mask_mode",
+        type=str,
+        default="ratio",
+        choices=["ratio", "diff", "contrast"],
+        help="Mask blending strategy: ratio | diff | contrast",
+    )
+    parser.add_argument(
+        "--self_mask_thresh",
+        type=float,
+        default=0.5,
+        help="Threshold for binary mask (<=1: value, >1: top-percent)",
+    )
+    parser.add_argument("--self_mask_fg", type=float, default=1.0, help="Foreground loss weight multiplier")
+    parser.add_argument("--self_mask_bg", type=float, default=0.3, help="Background loss weight multiplier")
+    parser.add_argument(
+        "--self_mask_warmup",
+        type=float,
+        default=0.0,
+        help="Fraction of training steps before enabling mask (0-1)",
+    )
+    parser.add_argument(
+        "--self_mask_conf_min_sep",
+        type=float,
+        default=None,
+        help="Minimum separation score required to enable mask",
+    )
+    parser.add_argument(
+        "--self_mask_conf_cov_range",
+        type=str,
+        default=None,
+        help="Coverage range check in the form min,max",
+    )
+    parser.add_argument(
+        "--self_mask_smooth",
+        type=str,
+        default=None,
+        help="Optional smoothing pipeline, e.g. open=1,close=1,blur=1",
+    )
+    parser.add_argument(
+        "--self_mask_log",
+        type=int,
+        default=0,
+        help="Log mask metrics every N steps (0 to disable)",
+    )
+    parser.add_argument(
+        "--self_mask_log_mask_dir",
+        type=str,
+        default=None,
+        help="Directory to save debug mask images",
+    )
+    parser.add_argument(
+        "--self_mask_log_mask_interval",
+        type=int,
+        default=0,
+        help="Save mask images every N steps (requires self_mask_log_mask_dir)",
+    )
+    parser.add_argument(
+        "--self_mask_other_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for background attention in diff/ratio modes",
+    )
+    parser.add_argument(
+        "--self_mask_ema_decay",
+        type=float,
+        default=None,
+        help="Optional EMA decay (0-1) for fallback mask smoothing",
     )
     parser.add_argument(
         "--initial_epoch",
