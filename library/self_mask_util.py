@@ -113,8 +113,11 @@ class SelfMaskManager:
         global_step: int,
         max_train_steps: int,
     ) -> None:
-        self.batch_size = batch["input_ids"].shape[0]
-        self.context_length = batch["input_ids"].shape[-1]
+        input_ids = batch["input_ids"]
+        self.batch_size = input_ids.shape[0]
+        # SDXLではinput_idsが(B,N,77)のようにチャンクされる場合があるため、
+        # 有効なトークン長は _prepare_token_indices 内で算出する
+        self.context_length = 0
         self.latent_hw = latent_hw
         self.global_step = global_step
         self.max_train_steps = max_train_steps
@@ -529,9 +532,11 @@ class SelfMaskManager:
 
         char_indices: List[List[Dict]] = []
         other_indices: List[Optional[torch.Tensor]] = []
+        seq_lengths: List[int] = []
 
         for b_idx in range(self.batch_size):
-            seq = input_ids[b_idx].tolist()
+            seq = self._flatten_token_sequence(input_ids[b_idx])
+            seq_lengths.append(len(seq))
             tag_map = self._build_tag_position_map(captions[b_idx], seq)
 
             spec_entries = []
@@ -552,8 +557,8 @@ class SelfMaskManager:
 
             valid_positions = [
                 idx
-                for idx in range(self.context_length)
-                if seq[idx] not in self.special_token_ids and idx < self.context_length
+                for idx, token_id in enumerate(seq)
+                if token_id not in self.special_token_ids
             ]
 
             other = sorted(set(valid_positions) - collected_indices - ignore_indices)
@@ -564,6 +569,29 @@ class SelfMaskManager:
 
         self.char_indices = char_indices
         self.other_indices = other_indices
+        self.context_length = max(seq_lengths) if seq_lengths else 0
+
+    def _flatten_token_sequence(self, seq_tensor: torch.Tensor) -> List[int]:
+        if seq_tensor.ndim == 1:
+            return seq_tensor.tolist()
+
+        if seq_tensor.ndim == 2:
+            if seq_tensor.shape[0] == 0:
+                return []
+
+            bos_id = int(seq_tensor[0, 0].item())
+            eos_id = int(seq_tensor[-1, -1].item())
+
+            body: List[int] = []
+            for chunk in seq_tensor:
+                body.extend(int(token) for token in chunk[1:-1].tolist())
+
+            flattened = [bos_id]
+            flattened.extend(body)
+            flattened.append(eos_id)
+            return flattened
+
+        raise ValueError("input_ids tensor must be 1D or 2D for self mask processing")
 
     def _build_tag_position_map(self, caption: str, seq: List[int]) -> Dict[str, List[int]]:
         tag_map: Dict[str, List[int]] = {}
