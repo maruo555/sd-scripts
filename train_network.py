@@ -1753,6 +1753,11 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Optional EMA decay (0-1) for fallback mask smoothing",
     )
     parser.add_argument(
+        "--self_mask_cpu_offload",
+        action="store_true",
+        help="Move self-mask attention statistics to CPU between steps to reduce VRAM usage",
+    )
+    parser.add_argument(
         "--initial_epoch",
         type=int,
         default=None,

@@ -62,6 +62,7 @@ class SelfMaskManager:
         self.log_mask_dir = getattr(args, "self_mask_log_mask_dir", None)
         self.log_mask_interval = getattr(args, "self_mask_log_mask_interval", 0)
         self.ema_decay = getattr(args, "self_mask_ema_decay", None)
+        self.cpu_offload = getattr(args, "self_mask_cpu_offload", False)
 
         self.collecting = False
         self.active_variant = "main"
@@ -85,6 +86,9 @@ class SelfMaskManager:
 
         if self.background_weight <= 0:
             raise ValueError("--self_mask_bg must be > 0 to keep background gradients")
+
+        if self.cpu_offload:
+            logger.info("self-mask attention statistics will be offloaded to CPU between steps")
 
     # region public API -------------------------------------------------
     def register_unet(self, unet) -> None:
@@ -319,11 +323,18 @@ class SelfMaskManager:
         if shape is None:
             return
 
+        if self.cpu_offload:
+            char_store = char_map.detach().to("cpu", dtype=torch.float32)
+            other_store = other_map.detach().to("cpu", dtype=torch.float32)
+        else:
+            char_store = char_map.detach().to(torch.float32)
+            other_store = other_map.detach().to(torch.float32)
+
         record = {
             "module": module_name,
             "name": name,
-            "char": char_map.detach().to(torch.float32),
-            "other": other_map.detach().to(torch.float32),
+            "char": char_store,
+            "other": other_store,
             "shape": shape,
         }
         self.record_buffer.append(record)
@@ -343,8 +354,17 @@ class SelfMaskManager:
 
         for record in records:
             batch, height, width = record["shape"]
-            char_map = record["char"].view(batch, height, width)
-            other_map = record["other"].view(batch, height, width)
+
+            char_tensor = record["char"]
+            other_tensor = record["other"]
+
+            if char_tensor.device != self.device:
+                char_tensor = char_tensor.to(self.device, non_blocking=True)
+            if other_tensor.device != self.device:
+                other_tensor = other_tensor.to(self.device, non_blocking=True)
+
+            char_map = char_tensor.view(batch, height, width)
+            other_map = other_tensor.view(batch, height, width)
 
             if (height, width) != target_hw:
                 char_map = F.interpolate(char_map.unsqueeze(1), size=target_hw, mode="bilinear", align_corners=False).squeeze(1)
