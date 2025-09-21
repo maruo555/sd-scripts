@@ -273,7 +273,7 @@ class LoRAModule(torch.nn.Module):
             head_dim = hidden // num_heads
             delta = delta.view(batch, seq_len, num_heads, head_dim)
             gates = gates.view(batch, 1, num_heads, 1)
-            delta = delta * gates
+            delta.mul_(gates)
             delta = delta.view(batch, seq_len, hidden)
             return delta
         elif delta.dim() == 2:
@@ -283,7 +283,7 @@ class LoRAModule(torch.nn.Module):
             head_dim = hidden // num_heads
             delta = delta.view(batch, 1, num_heads, head_dim)
             gates = gates.view(batch, 1, num_heads, 1)
-            delta = delta * gates
+            delta.mul_(gates)
             delta = delta.view(batch, hidden)
             return delta
         else:
