@@ -5,7 +5,8 @@
 
 import math
 import os
-from typing import Dict, List, Optional, Tuple, Type, Union
+import weakref
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 from diffusers import AutoencoderKL
 from transformers import CLIPTextModel
 import numpy as np
@@ -110,7 +111,46 @@ class LoRAModule(torch.nn.Module):
         # otherwise quantize Delta directly: Delta' = Q(B(z))
         self.delta_q_on_z = bool(delta_q_on_z)
 
+        # token gate runtime / parameters
+        self._network_ref: Optional[weakref.ReferenceType] = None
+        self.token_gate_enabled = False
+        self.token_gate_num_inputs: int = 0
+        self.token_gate_num_heads: Optional[int] = None
+        self.token_gate_weight: Optional[torch.nn.Parameter] = None
+        self.token_gate_bias: Optional[torch.nn.Parameter] = None
+
     # no EMA buffers/statistics for delta quantization (ema_* removed)
+
+    def set_network(self, network):
+        self._network_ref = weakref.ref(network)
+
+    def _get_network(self) -> Optional["LoRANetwork"]:
+        return self._network_ref() if self._network_ref is not None else None
+
+    def configure_token_gate(self, num_inputs: int, num_heads: int):
+        if self.token_gate_enabled:
+            if self.token_gate_num_inputs == num_inputs and self.token_gate_num_heads == num_heads:
+                return
+            self.disable_token_gate()
+
+        gate_dtype = self.lora_up.weight.dtype
+        self.token_gate_enabled = True
+        self.token_gate_num_inputs = num_inputs
+        self.token_gate_num_heads = num_heads
+        self.token_gate_weight = torch.nn.Parameter(torch.zeros(num_heads, num_inputs, dtype=gate_dtype))
+        self.token_gate_bias = torch.nn.Parameter(torch.zeros(num_heads, dtype=gate_dtype))
+
+    def disable_token_gate(self):
+        if self.token_gate_enabled:
+            self.token_gate_enabled = False
+            self.token_gate_num_inputs = 0
+            self.token_gate_num_heads = None
+            if hasattr(self, "token_gate_weight"):
+                del self.token_gate_weight
+            if hasattr(self, "token_gate_bias"):
+                del self.token_gate_bias
+            self.register_parameter("token_gate_weight", None)
+            self.register_parameter("token_gate_bias", None)
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -197,7 +237,58 @@ class LoRAModule(torch.nn.Module):
                     step_t = self.delta_q_step
                 delta = fake_quantize(delta, step=step_t, mode=self.delta_q_mode)
 
+        if self.token_gate_enabled and self._get_network() is not None:
+            delta = self._apply_token_gate(delta)
+
         return org_forwarded + delta
+
+    def _apply_token_gate(self, delta: torch.Tensor) -> torch.Tensor:
+        network = self._get_network()
+        if network is None:
+            return delta
+        gate_inputs = network.get_token_gate_inputs()
+        if gate_inputs is None:
+            return delta
+        if gate_inputs.shape[0] != delta.shape[0]:
+            # batch size mismatch; skip gating to avoid silent shape errors
+            return delta
+
+        num_heads = self.token_gate_num_heads
+        if not num_heads or num_heads <= 0:
+            return delta
+
+        if gate_inputs.device != delta.device:
+            gate_inputs = gate_inputs.to(delta.device)
+        gate_inputs = gate_inputs.to(delta.dtype)
+
+        logits = torch.matmul(gate_inputs, self.token_gate_weight.t()) + self.token_gate_bias
+        gates = torch.sigmoid(logits)
+
+        network.accumulate_token_gate_stat(gates)
+
+        if delta.dim() == 3:
+            batch, seq_len, hidden = delta.shape
+            if hidden % num_heads != 0:
+                return delta
+            head_dim = hidden // num_heads
+            delta = delta.view(batch, seq_len, num_heads, head_dim)
+            gates = gates.view(batch, 1, num_heads, 1)
+            delta.mul_(gates)
+            delta = delta.view(batch, seq_len, hidden)
+            return delta
+        elif delta.dim() == 2:
+            batch, hidden = delta.shape
+            if hidden % num_heads != 0:
+                return delta
+            head_dim = hidden // num_heads
+            delta = delta.view(batch, 1, num_heads, head_dim)
+            gates = gates.view(batch, 1, num_heads, 1)
+            delta.mul_(gates)
+            delta = delta.view(batch, hidden)
+            return delta
+        else:
+            # unsupported rank; skip gating
+            return delta
 
 
 class LoRAInfModule(LoRAModule):
@@ -232,10 +323,13 @@ class LoRAInfModule(LoRAModule):
             self.regional = True
             self.use_sub_prompt = False
 
-        self.network: LoRANetwork = None
+        self._network_ref: Optional[weakref.ReferenceType] = None
 
     def set_network(self, network):
-        self.network = network
+        self._network_ref = weakref.ref(network)
+
+    def _get_network(self) -> Optional["LoRANetwork"]:
+        return self._network_ref() if self._network_ref is not None else None
 
     # freezeしてマージする
     def merge_to(self, sd, dtype, device):
@@ -305,10 +399,12 @@ class LoRAInfModule(LoRAModule):
         return self.org_forward(x) + self.lora_up(self.lora_down(x)) * self.multiplier * self.scale
 
     def forward(self, x):
+        network = self._get_network()
+
         if not self.enabled:
             return self.org_forward(x)
 
-        if self.network is None or self.network.sub_prompt_index is None:
+        if network is None or network.sub_prompt_index is None:
             return self.default_forward(x)
         if not self.regional and not self.use_sub_prompt:
             return self.default_forward(x)
@@ -326,13 +422,14 @@ class LoRAInfModule(LoRAModule):
         else:
             area = x.size()[1]
 
-        mask = self.network.mask_dic.get(area, None)
+        network = self._get_network()
+        mask = network.mask_dic.get(area, None)
         if mask is None or len(x.size()) == 2:
             # emb_layers in SDXL doesn't have mask
             # if "emb" not in self.lora_name:
             #     print(f"mask is None for resolution {self.lora_name}, {area}, {x.size()}")
             mask_size = (1, x.size()[1]) if len(x.size()) == 2 else (1, *x.size()[1:-1], 1)
-            return torch.ones(mask_size, dtype=x.dtype, device=x.device) / self.network.num_sub_prompts
+            return torch.ones(mask_size, dtype=x.dtype, device=x.device) / network.num_sub_prompts
         if len(x.size()) == 3:
             mask = torch.reshape(mask, (1, -1, 1))
         return mask
@@ -341,7 +438,8 @@ class LoRAInfModule(LoRAModule):
         if "attn2_to_out" in self.lora_name:
             return self.to_out_forward(x)
 
-        if self.network.mask_dic is None:  # sub_prompt_index >= 3
+        network = self._get_network()
+        if network.mask_dic is None:  # sub_prompt_index >= 3
             return self.default_forward(x)
 
         # apply mask for LoRA result
@@ -355,88 +453,90 @@ class LoRAInfModule(LoRAModule):
         x = self.org_forward(x)
         x = x + lx
 
-        if "attn2_to_q" in self.lora_name and self.network.is_last_network:
+        if "attn2_to_q" in self.lora_name and network.is_last_network:
             x = self.postp_to_q(x)
 
         return x
 
     def postp_to_q(self, x):
         # repeat x to num_sub_prompts
-        has_real_uncond = x.size()[0] // self.network.batch_size == 3
-        qc = self.network.batch_size  # uncond
-        qc += self.network.batch_size * self.network.num_sub_prompts  # cond
+        has_real_uncond = x.size()[0] // network.batch_size == 3
+        qc = network.batch_size  # uncond
+        qc += network.batch_size * network.num_sub_prompts  # cond
         if has_real_uncond:
-            qc += self.network.batch_size  # real_uncond
+            qc += network.batch_size  # real_uncond
 
         query = torch.zeros((qc, x.size()[1], x.size()[2]), device=x.device, dtype=x.dtype)
-        query[: self.network.batch_size] = x[: self.network.batch_size]
+        query[: network.batch_size] = x[: network.batch_size]
 
-        for i in range(self.network.batch_size):
-            qi = self.network.batch_size + i * self.network.num_sub_prompts
-            query[qi : qi + self.network.num_sub_prompts] = x[self.network.batch_size + i]
+        for i in range(network.batch_size):
+            qi = network.batch_size + i * network.num_sub_prompts
+            query[qi : qi + network.num_sub_prompts] = x[network.batch_size + i]
 
         if has_real_uncond:
-            query[-self.network.batch_size :] = x[-self.network.batch_size :]
+            query[-network.batch_size :] = x[-network.batch_size :]
 
         # logger.info(f"postp_to_q {self.lora_name} {x.size()} {query.size()} {self.network.num_sub_prompts}")
         return query
 
     def sub_prompt_forward(self, x):
-        if x.size()[0] == self.network.batch_size:  # if uncond in text_encoder, do not apply LoRA
+        network = self._get_network()
+        if x.size()[0] == network.batch_size:  # if uncond in text_encoder, do not apply LoRA
             return self.org_forward(x)
 
-        emb_idx = self.network.sub_prompt_index
+        emb_idx = network.sub_prompt_index
         if not self.text_encoder:
-            emb_idx += self.network.batch_size
+            emb_idx += network.batch_size
 
         # apply sub prompt of X
-        lx = x[emb_idx :: self.network.num_sub_prompts]
+        lx = x[emb_idx :: network.num_sub_prompts]
         lx = self.lora_up(self.lora_down(lx)) * self.multiplier * self.scale
 
         # logger.info(f"sub_prompt_forward {self.lora_name} {x.size()} {lx.size()} {emb_idx}")
 
         x = self.org_forward(x)
-        x[emb_idx :: self.network.num_sub_prompts] += lx
+        x[emb_idx :: network.num_sub_prompts] += lx
 
         return x
 
     def to_out_forward(self, x):
         # logger.info(f"to_out_forward {self.lora_name} {x.size()} {self.network.is_last_network}")
 
-        if self.network.is_last_network:
-            masks = [None] * self.network.num_sub_prompts
-            self.network.shared[self.lora_name] = (None, masks)
+        network = self._get_network()
+        if network.is_last_network:
+            masks = [None] * network.num_sub_prompts
+            network.shared[self.lora_name] = (None, masks)
         else:
-            lx, masks = self.network.shared[self.lora_name]
+            lx, masks = network.shared[self.lora_name]
 
         # call own LoRA
-        x1 = x[self.network.batch_size + self.network.sub_prompt_index :: self.network.num_sub_prompts]
+        x1 = x[network.batch_size + network.sub_prompt_index :: network.num_sub_prompts]
         lx1 = self.lora_up(self.lora_down(x1)) * self.multiplier * self.scale
 
-        if self.network.is_last_network:
+        if network.is_last_network:
             lx = torch.zeros(
-                (self.network.num_sub_prompts * self.network.batch_size, *lx1.size()[1:]), device=lx1.device, dtype=lx1.dtype
+                (network.num_sub_prompts * network.batch_size, *lx1.size()[1:]), device=lx1.device, dtype=lx1.dtype
             )
-            self.network.shared[self.lora_name] = (lx, masks)
+            network.shared[self.lora_name] = (lx, masks)
 
         # logger.info(f"to_out_forward {lx.size()} {lx1.size()} {self.network.sub_prompt_index} {self.network.num_sub_prompts}")
-        lx[self.network.sub_prompt_index :: self.network.num_sub_prompts] += lx1
-        masks[self.network.sub_prompt_index] = self.get_mask_for_x(lx1)
+        lx[network.sub_prompt_index :: network.num_sub_prompts] += lx1
+        masks[network.sub_prompt_index] = self.get_mask_for_x(lx1)
 
         # if not last network, return x and masks
         x = self.org_forward(x)
-        if not self.network.is_last_network:
+        if not network.is_last_network:
             return x
 
-        lx, masks = self.network.shared.pop(self.lora_name)
+        lx, masks = network.shared.pop(self.lora_name)
 
         # if last network, combine separated x with mask weighted sum
-        has_real_uncond = x.size()[0] // self.network.batch_size == self.network.num_sub_prompts + 2
+        has_real_uncond = x.size()[0] // network.batch_size == network.num_sub_prompts + 2
 
-        out = torch.zeros((self.network.batch_size * (3 if has_real_uncond else 2), *x.size()[1:]), device=x.device, dtype=x.dtype)
-        out[: self.network.batch_size] = x[: self.network.batch_size]  # uncond
+        out = torch.zeros((network.batch_size * (3 if has_real_uncond else 2), *x.size()[1:]), device=x.device, dtype=x.dtype)
+        out[: network.batch_size] = x[: network.batch_size]  # uncond
         if has_real_uncond:
-            out[-self.network.batch_size :] = x[-self.network.batch_size :]  # real_uncond
+            out[-network.batch_size :] = x[-network.batch_size :]  # real_uncond
 
         # logger.info(f"to_out_forward {self.lora_name} {self.network.sub_prompt_index} {self.network.num_sub_prompts}")
         # if num_sub_prompts > num of LoRAs, fill with zero
@@ -446,20 +546,20 @@ class LoRAInfModule(LoRAModule):
 
         mask = torch.cat(masks)
         mask_sum = torch.sum(mask, dim=0) + 1e-4
-        for i in range(self.network.batch_size):
+        for i in range(network.batch_size):
             # 1枚の画像ごとに処理する
-            lx1 = lx[i * self.network.num_sub_prompts : (i + 1) * self.network.num_sub_prompts]
+            lx1 = lx[i * network.num_sub_prompts : (i + 1) * network.num_sub_prompts]
             lx1 = lx1 * mask
             lx1 = torch.sum(lx1, dim=0)
 
-            xi = self.network.batch_size + i * self.network.num_sub_prompts
-            x1 = x[xi : xi + self.network.num_sub_prompts]
+            xi = network.batch_size + i * network.num_sub_prompts
+            x1 = x[xi : xi + network.num_sub_prompts]
             x1 = x1 * mask
             x1 = torch.sum(x1, dim=0)
             x1 = x1 / mask_sum
 
             x1 = x1 + lx1
-            out[self.network.batch_size + i] = x1
+            out[network.batch_size + i] = x1
 
         # logger.info(f"to_out_forward {x.size()} {out.size()} {has_real_uncond}")
         return out
@@ -1019,6 +1119,21 @@ class LoRANetwork(torch.nn.Module):
         self.loraplus_unet_lr_ratio = None
         self.loraplus_text_encoder_lr_ratio = None
 
+        self._lora_metadata: Dict[str, Dict[str, Any]] = {}
+        self._token_gate_modules: List[LoRAModule] = []
+        self._token_gate_enabled: bool = False
+        self._token_gate_inputs: Optional[torch.Tensor] = None
+        self._token_gate_step_sum: Optional[float] = None
+        self._token_gate_step_count: int = 0
+        self._token_gate_current_category: Optional[str] = None
+        self._token_gate_last_log: Optional[Dict[str, float]] = None
+        self.token_gate_tokens: List[str] = []
+        self.token_gate_scope: Optional[str] = None
+        self.token_gate_dim: Optional[str] = None
+        self.token_gate_l1: float = 0.0
+        self.token_gate_num_inputs: int = 0
+        self.token_gate_use_neg_bit: bool = False
+
         if modules_dim is not None:
             logger.info(f"create LoRA network from weights")
         elif block_dims is not None:
@@ -1120,6 +1235,53 @@ class LoRANetwork(torch.nn.Module):
                                 delta_q_on_z=self.delta_q_on_z,
                             )
                             loras.append(lora)
+
+                            # store metadata for token gate and other runtime features
+                            meta: Dict[str, Any] = {
+                                "is_unet": is_unet,
+                                "text_encoder_idx": text_encoder_idx,
+                                "child_name": child_name,
+                            }
+
+                            def _safe_get_submodule(mod: torch.nn.Module, path: str) -> Optional[torch.nn.Module]:
+                                if path == "":
+                                    return mod
+                                try:
+                                    return mod.get_submodule(path)
+                                except AttributeError:
+                                    return None
+                                except ValueError:
+                                    return None
+
+                            parent_name = child_name.rsplit(".", 1)[0] if "." in child_name else ""
+                            search_name = parent_name
+                            current_module = _safe_get_submodule(module, parent_name)
+
+                            # ascend until we find a module exposing `heads`
+                            num_heads = None
+                            while current_module is not None:
+                                if hasattr(current_module, "heads"):
+                                    try:
+                                        num_heads = int(getattr(current_module, "heads"))
+                                    except (TypeError, ValueError):
+                                        num_heads = None
+                                    break
+                                if not search_name:
+                                    break
+                                if "." in search_name:
+                                    search_name = search_name.rsplit(".", 1)[0]
+                                else:
+                                    search_name = ""
+                                current_module = _safe_get_submodule(module, search_name)
+
+                            if num_heads is None and hasattr(module, "heads"):
+                                try:
+                                    num_heads = int(getattr(module, "heads"))
+                                except (TypeError, ValueError):
+                                    num_heads = None
+
+                            meta["num_heads"] = num_heads
+                            self._lora_metadata[lora_name] = meta
             return loras, skipped
 
         text_encoders = text_encoder if type(text_encoder) == list else [text_encoder]
@@ -1216,6 +1378,151 @@ class LoRANetwork(torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.enabled = is_enabled
 
+    # ----- Token gate support -----
+    def configure_token_gate(
+        self,
+        tokens: List[str],
+        scope: str = "cross_attn",
+        dim: str = "head",
+        l1_weight: float = 0.0,
+        use_neg_bit: bool = False,
+    ):
+        if not tokens:
+            raise ValueError("tokens must not be empty when configuring token gate")
+        if scope != "cross_attn":
+            raise NotImplementedError(f"token gate scope '{scope}' is not supported")
+        if dim != "head":
+            raise NotImplementedError(f"token gate dimension '{dim}' is not supported")
+
+        self._token_gate_enabled = True
+        self.token_gate_tokens = list(tokens)
+        self.token_gate_scope = scope
+        self.token_gate_dim = dim
+        self.token_gate_l1 = float(l1_weight)
+        self.token_gate_use_neg_bit = bool(use_neg_bit)
+        self.token_gate_num_inputs = len(tokens) + (1 if use_neg_bit else 0)
+
+        self._token_gate_modules = []
+        applicable = 0
+
+        # up_block の末尾2つとmid_blockにしかtoken gateは適用しない
+        up_block_pattern = re.compile(r"up_blocks_(\d+)")
+        max_up_block_idx = None
+        for lora in self.unet_loras:
+            match = up_block_pattern.search(lora.lora_name)
+            if match:
+                idx = int(match.group(1))
+                if max_up_block_idx is None or idx > max_up_block_idx:
+                    max_up_block_idx = idx
+
+        for lora in self.unet_loras:
+            meta = self._lora_metadata.get(lora.lora_name)
+            if meta is None:
+                continue
+            if scope == "cross_attn":
+                child_name = meta.get("child_name", "")
+                if "attn2" not in child_name:
+                    continue
+
+            allow_gate = False
+            lora_name = lora.lora_name
+            if "mid_block" in lora_name:
+                allow_gate = True
+            else:
+                match = up_block_pattern.search(lora_name)
+                if match:
+                    idx = int(match.group(1))
+                    if max_up_block_idx is None or idx >= max(0, max_up_block_idx - 1):
+                        allow_gate = True
+
+            if not allow_gate:
+                continue
+
+            num_heads = meta.get("num_heads")
+            if num_heads is None or num_heads <= 0:
+                continue
+            lora.configure_token_gate(self.token_gate_num_inputs, num_heads)
+            self._token_gate_modules.append(lora)
+            applicable += 1
+
+        if applicable == 0:
+            logger.warning("token gate enabled but no applicable LoRA modules were found")
+
+        self.clear_token_gate_state()
+
+    def clear_token_gate_state(self):
+        self._token_gate_inputs = None
+        self._token_gate_step_sum = 0.0 if self._token_gate_enabled else None
+        self._token_gate_step_count = 0
+        self._token_gate_current_category = None
+        self._token_gate_last_log = None
+
+    def set_token_gate_state(self, gate_inputs: Optional[torch.Tensor], category: Optional[str]):
+        if not self._token_gate_enabled:
+            return
+        self._token_gate_inputs = gate_inputs
+        if gate_inputs is None:
+            self._token_gate_step_sum = None
+            self._token_gate_step_count = 0
+            self._token_gate_current_category = None
+            self._token_gate_last_log = None
+        else:
+            self._token_gate_step_sum = 0.0
+            self._token_gate_step_count = 0
+            self._token_gate_current_category = category
+            self._token_gate_last_log = None
+
+    def get_token_gate_inputs(self) -> Optional[torch.Tensor]:
+        return self._token_gate_inputs if self._token_gate_enabled else None
+
+    def accumulate_token_gate_stat(self, gate_values: torch.Tensor):
+        if not self._token_gate_enabled:
+            return
+        if self._token_gate_step_sum is None:
+            return
+        if gate_values is None:
+            return
+        gate_tensor = gate_values.detach()
+        try:
+            self._token_gate_step_sum += gate_tensor.sum().item()
+            self._token_gate_step_count += gate_tensor.numel()
+        except RuntimeError:
+            # in case tensor is on different device, bring to cpu momentarily
+            self._token_gate_step_sum += gate_tensor.to("cpu").sum().item()
+            self._token_gate_step_count += gate_tensor.numel()
+
+    def pop_token_gate_step_log(self) -> Dict[str, float]:
+        if not self._token_gate_enabled:
+            return {}
+        if self._token_gate_step_sum is None or self._token_gate_step_count == 0:
+            return {}
+        mean_val = self._token_gate_step_sum / max(self._token_gate_step_count, 1)
+        category = self._token_gate_current_category
+        key = f"g_mean_{category}" if category else None
+        self._token_gate_last_log = {key: mean_val} if key else {}
+        # reset so the same values are not reused accidentally
+        self._token_gate_step_sum = None
+        self._token_gate_step_count = 0
+        self._token_gate_inputs = None
+        self._token_gate_current_category = None
+        return self._token_gate_last_log if self._token_gate_last_log is not None else {}
+
+    def token_gate_regularization_loss(self) -> Optional[torch.Tensor]:
+        if not self._token_gate_enabled or self.token_gate_l1 <= 0.0:
+            return None
+        if not self._token_gate_modules:
+            return None
+        reg = None
+        for module in self._token_gate_modules:
+            if not module.token_gate_enabled or module.token_gate_weight is None:
+                continue
+            weight = module.token_gate_weight
+            term = weight.abs().sum()
+            reg = term if reg is None else reg + term
+        if reg is None:
+            return None
+        return reg * self.token_gate_l1
+
     def load_weights(self, file):
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import load_file
@@ -1239,6 +1546,8 @@ class LoRANetwork(torch.nn.Module):
             self.unet_loras = []
 
         for lora in self.text_encoder_loras + self.unet_loras:
+            if hasattr(lora, "set_network"):
+                lora.set_network(self)
             lora.apply_to()
             self.add_module(lora.lora_name, lora)
 
@@ -1385,7 +1694,34 @@ class LoRANetwork(torch.nn.Module):
                 all_params.extend(params)
                 lr_descriptions.extend(["unet" + (" " + d if d else "") for d in descriptions])
 
-        return all_params, lr_descriptions
+        # ensure that each parameter appears in only one optimizer group
+        deduped_params = []
+        deduped_descriptions = []
+        seen_param_ids = set()
+        duplicate_detected = False
+        for param_group, desc in zip(all_params, lr_descriptions):
+            params_iter = param_group.get("params", [])
+            params_list = list(params_iter)
+            unique_params = []
+            for p in params_list:
+                pid = id(p)
+                if pid in seen_param_ids:
+                    duplicate_detected = True
+                    continue
+                seen_param_ids.add(pid)
+                unique_params.append(p)
+
+            if not unique_params:
+                continue
+
+            new_group = {**param_group, "params": unique_params}
+            deduped_params.append(new_group)
+            deduped_descriptions.append(desc)
+
+        if duplicate_detected:
+            logger.warning("duplicate parameters found in optimizer groups; extra references were dropped")
+
+        return deduped_params, deduped_descriptions
 
     def enable_gradient_checkpointing(self):
         # not supported

@@ -6,10 +6,12 @@ import sys
 import random
 import time
 import json
+import re
 from multiprocessing import Value
 import toml
 from collections import deque
 import numpy as np
+from typing import List, Optional
 
 from tqdm import tqdm
 
@@ -282,6 +284,15 @@ class NetworkTrainer:
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
 
+        if getattr(args, "self_mask_enable", False) and self.is_sdxl:
+            if args.mem_eff_attn or args.xformers or args.sdpa:
+                logger.warning(
+                    "self-mask disables memory efficient attention / self-mask使用時はmem_eff_attn/xformers/sdpaを無効化します"
+                )
+                args.mem_eff_attn = False
+                args.xformers = False
+                args.sdpa = False
+
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
@@ -358,6 +369,24 @@ class NetworkTrainer:
 
         if hasattr(network, "prepare_network"):
             network.prepare_network(args)
+
+        self_mask_manager = None
+        if getattr(args, "self_mask_enable", False):
+            if not self.is_sdxl:
+                logger.warning("self-mask is only supported for SDXL training; option ignored")
+            else:
+                from library.self_mask_util import SelfMaskManager
+
+                try:
+                    self_mask_manager = SelfMaskManager(args, accelerator, tokenizers, is_sdxl=self.is_sdxl)
+                    self_mask_manager.register_unet(unet)
+                    logger.info(
+                        "Self-mask manager initialized (mode=%s, layers=%s)", args.self_mask_mode, args.self_mask_layers
+                    )
+                except Exception as ex:
+                    logger.error("failed to initialize self-mask manager: %s", ex)
+                    raise
+
         if args.scale_weight_norms and not hasattr(network, "apply_max_norm_regularization"):
             logger.warning(
                 "warning: scale_weight_norms is specified but the network does not support it / scale_weight_normsが指定されていますが、ネットワークが対応していません"
@@ -367,6 +396,59 @@ class NetworkTrainer:
         train_unet = not args.network_train_text_encoder_only
         train_text_encoder = self.is_train_text_encoder(args)
         network.apply_to(text_encoder, unet, train_text_encoder, train_unet)
+
+        token_gate_active = getattr(args, "token_gate", False)
+        token_gate_patterns: Optional[List[re.Pattern]] = None
+        token_gate_token_count = 0
+        token_gate_use_neg_bit = getattr(args, "neg_gate_bit", False)
+        if token_gate_active:
+            if hasattr(network, "configure_token_gate"):
+                network.configure_token_gate(
+                    args.token_gate_tokens_list,
+                    scope=getattr(args, "token_gate_scope", "cross_attn"),
+                    dim=getattr(args, "token_gate_dim", "head"),
+                    l1_weight=getattr(args, "token_gate_l1", 0.0),
+                    use_neg_bit=token_gate_use_neg_bit,
+                )
+                token_gate_patterns = [re.compile(re.escape(tok), re.IGNORECASE) for tok in args.token_gate_tokens_list]
+                token_gate_token_count = len(args.token_gate_tokens_list)
+            else:
+                logger.warning("token gate requested but network module does not support it; option ignored")
+                token_gate_active = False
+                args.token_gate = False
+
+        def _encode_captions_for_tokenizer(tokenizer, captions: List[str]) -> torch.Tensor:
+            tokenizer_max_length = tokenizer.model_max_length if args.max_token_length is None else args.max_token_length + 2
+            encoded_list = []
+            for caption in captions:
+                # ensure string input
+                text = caption if isinstance(caption, str) else str(caption)
+                input_ids = tokenizer(
+                    text,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=tokenizer_max_length,
+                    return_tensors="pt",
+                ).input_ids  # shape: [1, max_len]
+
+                if tokenizer_max_length > tokenizer.model_max_length:
+                    flat_ids = input_ids.squeeze(0)
+                    chunk_list = []
+                    step = tokenizer.model_max_length - 2
+                    for start in range(1, tokenizer_max_length - tokenizer.model_max_length + 2, step):
+                        chunk = torch.cat((flat_ids[:1], flat_ids[start : start + step], flat_ids[-1:].clone()))
+                        if tokenizer.pad_token_id != tokenizer.eos_token_id:
+                            if chunk[-2] != tokenizer.eos_token_id and chunk[-2] != tokenizer.pad_token_id:
+                                chunk[-1] = tokenizer.eos_token_id
+                            if chunk[1] == tokenizer.pad_token_id:
+                                chunk[1] = tokenizer.eos_token_id
+                        chunk_list.append(chunk)
+                    stacked = torch.stack(chunk_list)
+                    encoded_list.append(stacked)
+                else:
+                    encoded_list.append(input_ids)
+
+            return torch.stack(encoded_list)
 
         # Configure LoRA delta fake-quantization if available
         if (((getattr(args, "dq_delta_step", None) is not None and args.dq_delta_step) or (getattr(args, "dq_delta_bits", None) is not None and args.dq_delta_bits) or dq_bits_sched) and hasattr(network, "set_delta_fake_quant")):
@@ -1216,6 +1298,8 @@ class NetworkTrainer:
 
                     on_step_start(text_encoder, unet)
 
+                    network_unwrapped = accelerator.unwrap_model(network)
+
                     if "latents" in batch and batch["latents"] is not None:
                         latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
                     else:
@@ -1246,7 +1330,77 @@ class NetworkTrainer:
                         else:
                             raise NotImplementedError("multipliers for each sample is not supported yet")
                         # print(f"set multiplier: {multipliers}")
-                        accelerator.unwrap_model(network).set_multiplier(multipliers)
+                        network_unwrapped.set_multiplier(multipliers)
+
+                    gate_inputs_tensor = None
+                    gate_category = None
+                    token_gate_step_logs = {}
+                    base_noise_pred = None
+                    if token_gate_active:
+                        rand_val = random.random()
+                        if rand_val < getattr(args, "anchor_ratio", 0.0):
+                            gate_category = "anchor"
+                        elif rand_val < getattr(args, "anchor_ratio", 0.0) + getattr(args, "neg_gate_ratio", 0.0):
+                            gate_category = "negbit"
+                        else:
+                            gate_category = "pos"
+
+                        captions = batch["captions"]
+                        modified_captions: List = []
+                        token_presence: List[List[float]] = []
+                        any_caption_changed = False
+
+                        for cap in captions:
+                            if not isinstance(cap, str):
+                                modified_captions.append(cap)
+                                token_presence.append([0.0] * token_gate_token_count)
+                                continue
+
+                            working = cap
+                            if gate_category == "anchor" and token_gate_patterns:
+                                for pat in token_gate_patterns:
+                                    working = pat.sub(" ", working)
+                            elif gate_category == "pos" and token_gate_patterns and getattr(args, "token_drop_prob", 0.0) > 0.0:
+                                for pat in token_gate_patterns:
+                                    if pat.search(working) and random.random() < args.token_drop_prob:
+                                        working = pat.sub(" ", working)
+
+                            working = " ".join(working.split())
+                            if working != cap:
+                                any_caption_changed = True
+
+                            modified_captions.append(working)
+                            if token_gate_patterns:
+                                presence = [1.0 if pat.search(working) else 0.0 for pat in token_gate_patterns]
+                            else:
+                                presence = []
+                            token_presence.append(presence)
+
+                        if any_caption_changed:
+                            batch["captions"] = modified_captions
+                            if batch.get("input_ids") is not None:
+                                batch["input_ids"] = _encode_captions_for_tokenizer(tokenizers[0], modified_captions).to(
+                                    dtype=batch["input_ids"].dtype
+                                )
+                            if len(tokenizers) > 1 and batch.get("input_ids2") is not None:
+                                batch["input_ids2"] = _encode_captions_for_tokenizer(tokenizers[1], modified_captions).to(
+                                    dtype=batch["input_ids2"].dtype
+                                )
+
+                        if token_gate_token_count > 0:
+                            gate_inputs_tensor = torch.tensor(token_presence, dtype=torch.float32, device=accelerator.device)
+                        else:
+                            gate_inputs_tensor = torch.zeros((len(captions), 0), dtype=torch.float32, device=accelerator.device)
+
+                        if token_gate_use_neg_bit:
+                            neg_column = torch.ones(
+                                (gate_inputs_tensor.size(0), 1), device=accelerator.device, dtype=torch.float32
+                            ) if gate_category == "negbit" else torch.zeros(
+                                (gate_inputs_tensor.size(0), 1), device=accelerator.device, dtype=torch.float32
+                            )
+                            gate_inputs_tensor = torch.cat([gate_inputs_tensor, neg_column], dim=1)
+
+                        network_unwrapped.set_token_gate_state(gate_inputs_tensor, gate_category)
 
                     with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
                         # Get the text embedding for conditioning
@@ -1264,6 +1418,15 @@ class NetworkTrainer:
                                 args, accelerator, batch, tokenizers, text_encoders, weight_dtype
                             )
 
+                    if self_mask_manager:
+                        self_mask_manager.begin_step(
+                            batch=batch,
+                            text_conds=text_encoder_conds,
+                            latent_hw=latents.shape[-2:],
+                            global_step=global_step,
+                            max_train_steps=args.max_train_steps,
+                        )
+
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
@@ -1278,6 +1441,26 @@ class NetworkTrainer:
                             t.requires_grad_(True)
 
                     # Predict the noise residual
+                    if token_gate_active and gate_category in ("anchor", "negbit"):
+                        # evaluate base model without LoRA contributions for distillation target
+                        current_multiplier = getattr(network_unwrapped, "multiplier", 1.0)
+                        network_unwrapped.set_token_gate_state(None, None)
+                        network_unwrapped.set_multiplier(0.0)
+                        with torch.no_grad(), accelerator.autocast():
+                            base_noise_pred = self.call_unet(
+                                args,
+                                accelerator,
+                                unet,
+                                noisy_latents.detach(),
+                                timesteps,
+                                text_encoder_conds,
+                                batch,
+                                weight_dtype,
+                            )
+                        network_unwrapped.set_multiplier(current_multiplier)
+                        if gate_inputs_tensor is not None:
+                            network_unwrapped.set_token_gate_state(gate_inputs_tensor, gate_category)
+
                     with accelerator.autocast():
                         noise_pred = self.call_unet(
                             args,
@@ -1290,17 +1473,49 @@ class NetworkTrainer:
                             weight_dtype,
                         )
 
-                    if args.v_parameterization:
-                        # v-parameterization training
-                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    if self_mask_manager:
+                        self_mask_manager.after_main_forward()
+                        mask_tensor = None
+                        if self_mask_manager.requires_contrast():
+                            contrast_conds = self_mask_manager.begin_contrast_pass()
+                            if contrast_conds is not None:
+                                with torch.no_grad(), accelerator.autocast():
+                                    _ = self.call_unet(
+                                        args,
+                                        accelerator,
+                                        unet,
+                                        noisy_latents.detach(),
+                                        timesteps,
+                                        contrast_conds,
+                                        batch,
+                                        weight_dtype,
+                                    )
+                                self_mask_manager.after_contrast_forward()
+                        mask_info = self_mask_manager.finalize_step()
+                        mask_tensor = mask_info.get("mask") if mask_info else None
                     else:
-                        target = noise
+                        mask_tensor = None
+
+                    if args.v_parameterization:
+                        if token_gate_active and gate_category in ("anchor", "negbit"):
+                            target = base_noise_pred.detach()
+                        else:
+                            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        if token_gate_active and gate_category in ("anchor", "negbit"):
+                            target = base_noise_pred.detach()
+                        else:
+                            target = noise
 
                     loss = train_util.conditional_loss(
                         noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
                     )
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
+
+                    if mask_tensor is not None:
+                        loss = self_mask_manager.apply_loss_weight(loss, mask_tensor)
+
                     loss = loss.mean([1, 2, 3])
 
                     loss_weights = batch["loss_weights"]  # 各sampleごとのweight
@@ -1315,7 +1530,20 @@ class NetworkTrainer:
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
 
+                    if token_gate_active and gate_category in ("anchor", "negbit"):
+                        anchor_weight = getattr(args, "anchor_loss_weight", 1.0)
+                        if anchor_weight != 1.0:
+                            loss = loss * anchor_weight
+
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
+
+                    if token_gate_active:
+                        reg_loss = network_unwrapped.token_gate_regularization_loss()
+                        if reg_loss is not None:
+                            loss = loss + reg_loss
+                        token_gate_step_logs = network_unwrapped.pop_token_gate_step_log() or {}
+                    else:
+                        token_gate_step_logs = {}
 
                     accelerator.backward(loss)
                     skip_step = False
@@ -1354,6 +1582,9 @@ class NetworkTrainer:
                                     step=args.round_lora_step,
                                     mode=args.round_lora_mode,
                                 )
+
+                    if token_gate_active:
+                        network_unwrapped.set_token_gate_state(None, None)
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -1403,6 +1634,8 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}
+                if token_gate_step_logs:
+                    logs.update(token_gate_step_logs)
                 if skip_grad_norm:
                     logs["skipped"] = skipped_steps
                 progress_bar.set_postfix(**logs)
@@ -1416,6 +1649,9 @@ class NetworkTrainer:
                     )
                     if skip_grad_norm:
                         logs["train/skipped_steps"] = skipped_steps
+                    if token_gate_step_logs:
+                        for key, value in token_gate_step_logs.items():
+                            logs[f"train/{key}"] = value
                     accelerator.log(logs, step=global_step)
 
                 if global_step >= args.max_train_steps:
@@ -1598,6 +1834,101 @@ def setup_parser() -> argparse.ArgumentParser:
         "--skip_until_initial_step",
         action="store_true",
         help="skip training until initial_step is reached / initial_stepに到達するまで学習をスキップする",
+    )
+
+    # Self-mask options (SDXL only)
+    parser.add_argument("--self_mask_enable", action="store_true", help="Enable self-mask guided loss weighting (SDXL only)")
+    parser.add_argument(
+        "--self_mask_tokens",
+        type=str,
+        default=None,
+        help="Comma separated token patterns with optional weights (e.g. char:1.0,outfit:0.5)",
+    )
+    parser.add_argument(
+        "--self_mask_ignore_tokens",
+        type=str,
+        default=None,
+        help="Comma separated wildcard patterns for tokens to ignore when building background",
+    )
+    parser.add_argument(
+        "--self_mask_layers",
+        type=str,
+        default="mid",
+        help="Comma separated U-Net blocks to sample attention from (mid,up,down, or module names)",
+    )
+    parser.add_argument(
+        "--self_mask_mode",
+        type=str,
+        default="ratio",
+        choices=["ratio", "diff", "contrast"],
+        help="Mask blending strategy: ratio | diff | contrast",
+    )
+    parser.add_argument(
+        "--self_mask_thresh",
+        type=float,
+        default=0.5,
+        help="Threshold for binary mask (<=1: value, >1: top-percent)",
+    )
+    parser.add_argument("--self_mask_fg", type=float, default=1.0, help="Foreground loss weight multiplier")
+    parser.add_argument("--self_mask_bg", type=float, default=0.3, help="Background loss weight multiplier")
+    parser.add_argument(
+        "--self_mask_warmup",
+        type=float,
+        default=0.0,
+        help="Fraction of training steps before enabling mask (0-1)",
+    )
+    parser.add_argument(
+        "--self_mask_conf_min_sep",
+        type=float,
+        default=None,
+        help="Minimum separation score required to enable mask",
+    )
+    parser.add_argument(
+        "--self_mask_conf_cov_range",
+        type=str,
+        default=None,
+        help="Coverage range check in the form min,max",
+    )
+    parser.add_argument(
+        "--self_mask_smooth",
+        type=str,
+        default=None,
+        help="Optional smoothing pipeline, e.g. open=1,close=1,blur=1",
+    )
+    parser.add_argument(
+        "--self_mask_log",
+        type=int,
+        default=0,
+        help="Log mask metrics every N steps (0 to disable)",
+    )
+    parser.add_argument(
+        "--self_mask_log_mask_dir",
+        type=str,
+        default=None,
+        help="Directory to save debug mask images",
+    )
+    parser.add_argument(
+        "--self_mask_log_mask_interval",
+        type=int,
+        default=0,
+        help="Save mask images every N steps (requires self_mask_log_mask_dir)",
+    )
+    parser.add_argument(
+        "--self_mask_other_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for background attention in diff/ratio modes",
+    )
+    parser.add_argument(
+        "--self_mask_ema_decay",
+        type=float,
+        default=None,
+        help="Optional EMA decay (0-1) for fallback mask smoothing",
+    )
+    parser.add_argument(
+        "--self_mask_cpu_offload",
+        action="store_true",
+        help="Move self-mask attention statistics to CPU between steps to reduce VRAM usage",
     )
     parser.add_argument(
         "--initial_epoch",

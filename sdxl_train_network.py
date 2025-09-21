@@ -30,6 +30,43 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             args.network_train_unet_only or not args.cache_text_encoder_outputs
         ), "network for Text Encoder cannot be trained with caching Text Encoder outputs / Text Encoderの出力をキャッシュしながらText Encoderのネットワークを学習することはできません"
 
+        if args.token_gate:
+            assert (
+                args.token_gate_tokens and args.token_gate_tokens.strip()
+            ), "--token_gate_tokens is required when --token_gate is enabled / --token_gate使用時は--token_gate_tokensを指定してください"
+            tokens = [tok.strip() for tok in args.token_gate_tokens.split(",") if tok.strip()]
+            assert (
+                len(tokens) > 0
+            ), "token list must contain at least one entry / ゲート対象トークンが1つ以上必要です"
+            assert (
+                not args.cache_text_encoder_outputs
+            ), "token gate cannot be combined with cached text encoder outputs / トークンゲートはテキストエンコーダー出力キャッシュと併用できません"
+            assert (
+                0.0 <= args.token_drop_prob < 1.0
+            ), "token_drop_prob must be in [0,1) / token_drop_probは0以上1未満で指定してください"
+            assert 0.0 <= args.anchor_ratio <= 1.0, "anchor_ratio must be in [0,1] / anchor_ratioは0から1の範囲で指定してください"
+            assert 0.0 <= args.neg_gate_ratio <= 1.0, "neg_gate_ratio must be in [0,1] / neg_gate_ratioは0から1の範囲で指定してください"
+            assert (
+                args.anchor_ratio + args.neg_gate_ratio <= 1.0 + 1e-6
+            ), "anchor_ratio + neg_gate_ratio must not exceed 1 / anchor_ratioとneg_gate_ratioの合計は1を超えられません"
+            if args.neg_gate_ratio > 0:
+                assert (
+                    args.neg_gate_bit
+                ), "neg_gate_ratio requires --neg_gate_bit / neg_gate_ratioを使う場合は--neg_gate_bitを有効にしてください"
+            assert (
+                args.token_gate_l1 >= 0.0
+            ), "token_gate_l1 must be non-negative / token_gate_l1は0以上にしてください"
+            args.token_gate_tokens_list = tokens
+        else:
+            if args.anchor_ratio > 0 or args.neg_gate_ratio > 0 or args.token_drop_prob > 0:
+                logger.warning(
+                    "token gate is disabled; anchor_ratio, neg_gate_ratio and token_drop_prob are ignored / トークンゲート無効時はanchor_ratio, neg_gate_ratio, token_drop_probは無視されます"
+                )
+            args.anchor_ratio = 0.0
+            args.neg_gate_ratio = 0.0
+            args.token_drop_prob = 0.0
+            args.token_gate_tokens_list = []
+
         train_dataset_group.verify_bucket_reso_steps(32)
 
     def load_target_model(self, args, weight_dtype, accelerator):
@@ -185,6 +222,67 @@ def setup_parser() -> argparse.ArgumentParser:
         "--fp16_safe_norms",
         action="store_true",
         help="Compute reduction ops (LayerNorm/GroupNorm/Softmax) in fp32 while keeping weights/other ops in fp16.",
+    )
+    # presence-based token gate options
+    parser.add_argument(
+        "--token_gate",
+        action="store_true",
+        help="Enable token-based gating for LoRA (SDXL presence T-LoRA mode)",
+    )
+    parser.add_argument(
+        "--token_gate_tokens",
+        type=str,
+        default=None,
+        help="Comma separated list of character tokens used for gating",
+    )
+    parser.add_argument(
+        "--token_gate_scope",
+        type=str,
+        default="cross_attn",
+        choices=["cross_attn"],
+        help="Scope of modules affected by the gate",
+    )
+    parser.add_argument(
+        "--token_gate_dim",
+        type=str,
+        default="head",
+        choices=["head"],
+        help="Granularity of gating (currently head only)",
+    )
+    parser.add_argument(
+        "--token_gate_l1",
+        type=float,
+        default=0.0,
+        help="L1 regularization weight applied to gate parameters",
+    )
+    parser.add_argument(
+        "--token_drop_prob",
+        type=float,
+        default=0.0,
+        help="Probability to drop character tokens from captions during positive steps",
+    )
+    parser.add_argument(
+        "--anchor_ratio",
+        type=float,
+        default=0.0,
+        help="Ratio of training steps run as anchor distillation",
+    )
+    parser.add_argument(
+        "--neg_gate_bit",
+        action="store_true",
+        help="Enable the negative gate control bit",
+    )
+    parser.add_argument(
+        "--neg_gate_ratio",
+        type=float,
+        default=0.0,
+        help="Ratio of training steps where the negative gate bit is activated",
+    )
+    parser.add_argument(
+        "--anchor_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for the anchor/negative distillation loss",
     )
     return parser
 
