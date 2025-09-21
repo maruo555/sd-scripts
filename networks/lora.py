@@ -5,6 +5,7 @@
 
 import math
 import os
+import weakref
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 from diffusers import AutoencoderKL
 from transformers import CLIPTextModel
@@ -111,7 +112,7 @@ class LoRAModule(torch.nn.Module):
         self.delta_q_on_z = bool(delta_q_on_z)
 
         # token gate runtime / parameters
-        self.network = None
+        self._network_ref: Optional[weakref.ReferenceType] = None
         self.token_gate_enabled = False
         self.token_gate_num_inputs: int = 0
         self.token_gate_num_heads: Optional[int] = None
@@ -121,7 +122,10 @@ class LoRAModule(torch.nn.Module):
     # no EMA buffers/statistics for delta quantization (ema_* removed)
 
     def set_network(self, network):
-        self.network = network
+        self._network_ref = weakref.ref(network)
+
+    def _get_network(self) -> Optional["LoRANetwork"]:
+        return self._network_ref() if self._network_ref is not None else None
 
     def configure_token_gate(self, num_inputs: int, num_heads: int):
         if self.token_gate_enabled:
@@ -233,15 +237,16 @@ class LoRAModule(torch.nn.Module):
                     step_t = self.delta_q_step
                 delta = fake_quantize(delta, step=step_t, mode=self.delta_q_mode)
 
-        if self.token_gate_enabled and self.network is not None:
+        if self.token_gate_enabled and self._get_network() is not None:
             delta = self._apply_token_gate(delta)
 
         return org_forwarded + delta
 
     def _apply_token_gate(self, delta: torch.Tensor) -> torch.Tensor:
-        if self.network is None:
+        network = self._get_network()
+        if network is None:
             return delta
-        gate_inputs = self.network.get_token_gate_inputs()
+        gate_inputs = network.get_token_gate_inputs()
         if gate_inputs is None:
             return delta
         if gate_inputs.shape[0] != delta.shape[0]:
@@ -259,7 +264,7 @@ class LoRAModule(torch.nn.Module):
         logits = torch.matmul(gate_inputs, self.token_gate_weight.t()) + self.token_gate_bias
         gates = torch.sigmoid(logits)
 
-        self.network.accumulate_token_gate_stat(gates)
+        network.accumulate_token_gate_stat(gates)
 
         if delta.dim() == 3:
             batch, seq_len, hidden = delta.shape
@@ -318,10 +323,13 @@ class LoRAInfModule(LoRAModule):
             self.regional = True
             self.use_sub_prompt = False
 
-        self.network: LoRANetwork = None
+        self._network_ref: Optional[weakref.ReferenceType] = None
 
     def set_network(self, network):
-        self.network = network
+        self._network_ref = weakref.ref(network)
+
+    def _get_network(self) -> Optional["LoRANetwork"]:
+        return self._network_ref() if self._network_ref is not None else None
 
     # freezeしてマージする
     def merge_to(self, sd, dtype, device):
@@ -391,10 +399,12 @@ class LoRAInfModule(LoRAModule):
         return self.org_forward(x) + self.lora_up(self.lora_down(x)) * self.multiplier * self.scale
 
     def forward(self, x):
+        network = self._get_network()
+
         if not self.enabled:
             return self.org_forward(x)
 
-        if self.network is None or self.network.sub_prompt_index is None:
+        if network is None or network.sub_prompt_index is None:
             return self.default_forward(x)
         if not self.regional and not self.use_sub_prompt:
             return self.default_forward(x)
@@ -412,13 +422,14 @@ class LoRAInfModule(LoRAModule):
         else:
             area = x.size()[1]
 
-        mask = self.network.mask_dic.get(area, None)
+        network = self._get_network()
+        mask = network.mask_dic.get(area, None)
         if mask is None or len(x.size()) == 2:
             # emb_layers in SDXL doesn't have mask
             # if "emb" not in self.lora_name:
             #     print(f"mask is None for resolution {self.lora_name}, {area}, {x.size()}")
             mask_size = (1, x.size()[1]) if len(x.size()) == 2 else (1, *x.size()[1:-1], 1)
-            return torch.ones(mask_size, dtype=x.dtype, device=x.device) / self.network.num_sub_prompts
+            return torch.ones(mask_size, dtype=x.dtype, device=x.device) / network.num_sub_prompts
         if len(x.size()) == 3:
             mask = torch.reshape(mask, (1, -1, 1))
         return mask
@@ -427,7 +438,8 @@ class LoRAInfModule(LoRAModule):
         if "attn2_to_out" in self.lora_name:
             return self.to_out_forward(x)
 
-        if self.network.mask_dic is None:  # sub_prompt_index >= 3
+        network = self._get_network()
+        if network.mask_dic is None:  # sub_prompt_index >= 3
             return self.default_forward(x)
 
         # apply mask for LoRA result
@@ -441,88 +453,90 @@ class LoRAInfModule(LoRAModule):
         x = self.org_forward(x)
         x = x + lx
 
-        if "attn2_to_q" in self.lora_name and self.network.is_last_network:
+        if "attn2_to_q" in self.lora_name and network.is_last_network:
             x = self.postp_to_q(x)
 
         return x
 
     def postp_to_q(self, x):
         # repeat x to num_sub_prompts
-        has_real_uncond = x.size()[0] // self.network.batch_size == 3
-        qc = self.network.batch_size  # uncond
-        qc += self.network.batch_size * self.network.num_sub_prompts  # cond
+        has_real_uncond = x.size()[0] // network.batch_size == 3
+        qc = network.batch_size  # uncond
+        qc += network.batch_size * network.num_sub_prompts  # cond
         if has_real_uncond:
-            qc += self.network.batch_size  # real_uncond
+            qc += network.batch_size  # real_uncond
 
         query = torch.zeros((qc, x.size()[1], x.size()[2]), device=x.device, dtype=x.dtype)
-        query[: self.network.batch_size] = x[: self.network.batch_size]
+        query[: network.batch_size] = x[: network.batch_size]
 
-        for i in range(self.network.batch_size):
-            qi = self.network.batch_size + i * self.network.num_sub_prompts
-            query[qi : qi + self.network.num_sub_prompts] = x[self.network.batch_size + i]
+        for i in range(network.batch_size):
+            qi = network.batch_size + i * network.num_sub_prompts
+            query[qi : qi + network.num_sub_prompts] = x[network.batch_size + i]
 
         if has_real_uncond:
-            query[-self.network.batch_size :] = x[-self.network.batch_size :]
+            query[-network.batch_size :] = x[-network.batch_size :]
 
         # logger.info(f"postp_to_q {self.lora_name} {x.size()} {query.size()} {self.network.num_sub_prompts}")
         return query
 
     def sub_prompt_forward(self, x):
-        if x.size()[0] == self.network.batch_size:  # if uncond in text_encoder, do not apply LoRA
+        network = self._get_network()
+        if x.size()[0] == network.batch_size:  # if uncond in text_encoder, do not apply LoRA
             return self.org_forward(x)
 
-        emb_idx = self.network.sub_prompt_index
+        emb_idx = network.sub_prompt_index
         if not self.text_encoder:
-            emb_idx += self.network.batch_size
+            emb_idx += network.batch_size
 
         # apply sub prompt of X
-        lx = x[emb_idx :: self.network.num_sub_prompts]
+        lx = x[emb_idx :: network.num_sub_prompts]
         lx = self.lora_up(self.lora_down(lx)) * self.multiplier * self.scale
 
         # logger.info(f"sub_prompt_forward {self.lora_name} {x.size()} {lx.size()} {emb_idx}")
 
         x = self.org_forward(x)
-        x[emb_idx :: self.network.num_sub_prompts] += lx
+        x[emb_idx :: network.num_sub_prompts] += lx
 
         return x
 
     def to_out_forward(self, x):
         # logger.info(f"to_out_forward {self.lora_name} {x.size()} {self.network.is_last_network}")
 
-        if self.network.is_last_network:
-            masks = [None] * self.network.num_sub_prompts
-            self.network.shared[self.lora_name] = (None, masks)
+        network = self._get_network()
+        if network.is_last_network:
+            masks = [None] * network.num_sub_prompts
+            network.shared[self.lora_name] = (None, masks)
         else:
-            lx, masks = self.network.shared[self.lora_name]
+            lx, masks = network.shared[self.lora_name]
 
         # call own LoRA
-        x1 = x[self.network.batch_size + self.network.sub_prompt_index :: self.network.num_sub_prompts]
+        x1 = x[network.batch_size + network.sub_prompt_index :: network.num_sub_prompts]
         lx1 = self.lora_up(self.lora_down(x1)) * self.multiplier * self.scale
 
-        if self.network.is_last_network:
+        if network.is_last_network:
             lx = torch.zeros(
-                (self.network.num_sub_prompts * self.network.batch_size, *lx1.size()[1:]), device=lx1.device, dtype=lx1.dtype
+                (network.num_sub_prompts * network.batch_size, *lx1.size()[1:]), device=lx1.device, dtype=lx1.dtype
             )
-            self.network.shared[self.lora_name] = (lx, masks)
+            network.shared[self.lora_name] = (lx, masks)
 
         # logger.info(f"to_out_forward {lx.size()} {lx1.size()} {self.network.sub_prompt_index} {self.network.num_sub_prompts}")
-        lx[self.network.sub_prompt_index :: self.network.num_sub_prompts] += lx1
-        masks[self.network.sub_prompt_index] = self.get_mask_for_x(lx1)
+        lx[network.sub_prompt_index :: network.num_sub_prompts] += lx1
+        masks[network.sub_prompt_index] = self.get_mask_for_x(lx1)
 
         # if not last network, return x and masks
         x = self.org_forward(x)
-        if not self.network.is_last_network:
+        if not network.is_last_network:
             return x
 
-        lx, masks = self.network.shared.pop(self.lora_name)
+        lx, masks = network.shared.pop(self.lora_name)
 
         # if last network, combine separated x with mask weighted sum
-        has_real_uncond = x.size()[0] // self.network.batch_size == self.network.num_sub_prompts + 2
+        has_real_uncond = x.size()[0] // network.batch_size == network.num_sub_prompts + 2
 
-        out = torch.zeros((self.network.batch_size * (3 if has_real_uncond else 2), *x.size()[1:]), device=x.device, dtype=x.dtype)
-        out[: self.network.batch_size] = x[: self.network.batch_size]  # uncond
+        out = torch.zeros((network.batch_size * (3 if has_real_uncond else 2), *x.size()[1:]), device=x.device, dtype=x.dtype)
+        out[: network.batch_size] = x[: network.batch_size]  # uncond
         if has_real_uncond:
-            out[-self.network.batch_size :] = x[-self.network.batch_size :]  # real_uncond
+            out[-network.batch_size :] = x[-network.batch_size :]  # real_uncond
 
         # logger.info(f"to_out_forward {self.lora_name} {self.network.sub_prompt_index} {self.network.num_sub_prompts}")
         # if num_sub_prompts > num of LoRAs, fill with zero
@@ -532,20 +546,20 @@ class LoRAInfModule(LoRAModule):
 
         mask = torch.cat(masks)
         mask_sum = torch.sum(mask, dim=0) + 1e-4
-        for i in range(self.network.batch_size):
+        for i in range(network.batch_size):
             # 1枚の画像ごとに処理する
-            lx1 = lx[i * self.network.num_sub_prompts : (i + 1) * self.network.num_sub_prompts]
+            lx1 = lx[i * network.num_sub_prompts : (i + 1) * network.num_sub_prompts]
             lx1 = lx1 * mask
             lx1 = torch.sum(lx1, dim=0)
 
-            xi = self.network.batch_size + i * self.network.num_sub_prompts
-            x1 = x[xi : xi + self.network.num_sub_prompts]
+            xi = network.batch_size + i * network.num_sub_prompts
+            x1 = x[xi : xi + network.num_sub_prompts]
             x1 = x1 * mask
             x1 = torch.sum(x1, dim=0)
             x1 = x1 / mask_sum
 
             x1 = x1 + lx1
-            out[self.network.batch_size + i] = x1
+            out[network.batch_size + i] = x1
 
         # logger.info(f"to_out_forward {x.size()} {out.size()} {has_real_uncond}")
         return out
