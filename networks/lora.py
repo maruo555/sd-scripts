@@ -1404,6 +1404,17 @@ class LoRANetwork(torch.nn.Module):
 
         self._token_gate_modules = []
         applicable = 0
+
+        # up_block の末尾2つとmid_blockにしかtoken gateは適用しない
+        up_block_pattern = re.compile(r"up_blocks_(\d+)")
+        max_up_block_idx = None
+        for lora in self.unet_loras:
+            match = up_block_pattern.search(lora.lora_name)
+            if match:
+                idx = int(match.group(1))
+                if max_up_block_idx is None or idx > max_up_block_idx:
+                    max_up_block_idx = idx
+
         for lora in self.unet_loras:
             meta = self._lora_metadata.get(lora.lora_name)
             if meta is None:
@@ -1412,6 +1423,21 @@ class LoRANetwork(torch.nn.Module):
                 child_name = meta.get("child_name", "")
                 if "attn2" not in child_name:
                     continue
+
+            allow_gate = False
+            lora_name = lora.lora_name
+            if "mid_block" in lora_name:
+                allow_gate = True
+            else:
+                match = up_block_pattern.search(lora_name)
+                if match:
+                    idx = int(match.group(1))
+                    if max_up_block_idx is None or idx >= max(0, max_up_block_idx - 1):
+                        allow_gate = True
+
+            if not allow_gate:
+                continue
+
             num_heads = meta.get("num_heads")
             if num_heads is None or num_heads <= 0:
                 continue
