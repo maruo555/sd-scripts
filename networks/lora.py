@@ -1654,7 +1654,34 @@ class LoRANetwork(torch.nn.Module):
                 all_params.extend(params)
                 lr_descriptions.extend(["unet" + (" " + d if d else "") for d in descriptions])
 
-        return all_params, lr_descriptions
+        # ensure that each parameter appears in only one optimizer group
+        deduped_params = []
+        deduped_descriptions = []
+        seen_param_ids = set()
+        duplicate_detected = False
+        for param_group, desc in zip(all_params, lr_descriptions):
+            params_iter = param_group.get("params", [])
+            params_list = list(params_iter)
+            unique_params = []
+            for p in params_list:
+                pid = id(p)
+                if pid in seen_param_ids:
+                    duplicate_detected = True
+                    continue
+                seen_param_ids.add(pid)
+                unique_params.append(p)
+
+            if not unique_params:
+                continue
+
+            new_group = {**param_group, "params": unique_params}
+            deduped_params.append(new_group)
+            deduped_descriptions.append(desc)
+
+        if duplicate_detected:
+            logger.warning("duplicate parameters found in optimizer groups; extra references were dropped")
+
+        return deduped_params, deduped_descriptions
 
     def enable_gradient_checkpointing(self):
         # not supported
