@@ -1473,12 +1473,6 @@ class NetworkTrainer:
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
                     accelerator.backward(loss)
-                    te_metrics = None
-                    if accelerator.sync_gradients:
-                        if hasattr(accelerator, "scaler") and (use_grad_norm or te_scheduler is not None):
-                            accelerator.scaler.unscale_(optimizer)
-                        if te_scheduler is not None:
-                            te_metrics = te_scheduler.collect_metrics()
                     skip_step = False
                     if check_gradients_and_skip_update(network, epoch, step, loss.detach().item()):
                         accelerator.print(
@@ -1489,6 +1483,12 @@ class NetworkTrainer:
                         skip_step = True
 
                     if not skip_step:
+                        te_metrics = None
+                        if accelerator.sync_gradients:
+                            if hasattr(accelerator, "scaler") and (use_grad_norm or te_scheduler is not None):
+                                accelerator.scaler.unscale_(optimizer)
+                            if te_scheduler is not None:
+                                te_metrics = te_scheduler.collect_metrics()
                         if (
                             te_scheduler is not None
                             and accelerator.sync_gradients

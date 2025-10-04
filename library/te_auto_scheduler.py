@@ -404,7 +404,7 @@ class TeAutoScheduler:
 
         last_step = self._log_buffer[-1].step
         mode = "a" if self.log_path.exists() or self._log_header_written else "w"
-        with self.log_path.open(mode, encoding="utf-8") as fp:
+        with self.log_path.open(mode, encoding="utf-8", newline="") as fp:
             if self.log_format == "csv":
                 writer = csv.writer(fp)
                 if not self._log_header_written and mode == "w":
