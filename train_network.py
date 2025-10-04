@@ -49,6 +49,12 @@ from library.avg_ckpt_util import (
     load_lora_state_dict,
 )
 from library.utils import setup_logging, add_logging_arguments
+from library.te_auto_scheduler import (
+    TeAutoScheduler,
+    TeScheduleConfig,
+    build_optimizer_te_group_map,
+    build_te_param_maps,
+)
 from library.rounding_util import round_parameters
 from accelerate.utils import broadcast
 
@@ -1197,6 +1203,78 @@ class NetworkTrainer:
             def check_gradients_and_skip_update(model, epoch, step, loss_val):
                 return False
 
+        te_scheduler = None
+        te_schedule_mode = getattr(args, "te_auto_schedule", "off")
+        if train_text_encoder and te_schedule_mode in {"monitor", "freeze"}:
+            if args.deepspeed:
+                logger.warning("TE auto scheduling is disabled when DeepSpeed is active")
+            else:
+                unwrapped_network = accelerator.unwrap_model(network)
+                te_params = build_te_param_maps(unwrapped_network, te_selection_indices)
+                if not te_params:
+                    logger.warning("TE auto scheduling requested but no text encoder parameters were detected")
+                else:
+                    te_group_map = build_optimizer_te_group_map(optimizer, te_params)
+                    if not te_group_map:
+                        logger.warning("TE auto scheduling requested but optimizer parameter groups could not be resolved")
+                    else:
+                        def resolve_te_option(te_idx: int, name: str, default_value):
+                            specific = getattr(args, f"te{te_idx + 1}_{name}", None)
+                            if specific is not None:
+                                return specific
+                            base_value = getattr(args, f"te_{name}", None)
+                            if base_value is not None:
+                                return base_value
+                            return default_value
+
+                        baseline_beta = getattr(args, "te_baseline_ema_beta", 0.9)
+                        monitor_start_step = getattr(args, "te_monitor_start_step", 0)
+                        configs: List[TeScheduleConfig] = []
+                        multi_te = len(te_params) > 1
+                        for te_idx in sorted(te_params.keys()):
+                            warmup_steps = resolve_te_option(te_idx, "warmup_steps", 300)
+                            decay_threshold = resolve_te_option(te_idx, "decay_threshold", 0.4)
+                            freeze_threshold = resolve_te_option(te_idx, "freeze_threshold", 0.2)
+                            decay_patience = resolve_te_option(te_idx, "decay_patience", 100)
+                            freeze_patience = resolve_te_option(te_idx, "freeze_patience", 100)
+                            decay_factor = resolve_te_option(te_idx, "decay_factor", 0.5)
+                            decay_max = resolve_te_option(te_idx, "decay_max", 1)
+                            min_baseline = resolve_te_option(te_idx, "min_baseline", 1e-6)
+
+                            decay_max_val = -1 if decay_max is None else int(decay_max)
+
+                            cfg = TeScheduleConfig(
+                                te_index=te_idx,
+                                name=(f"TE{te_idx + 1}" if multi_te else "TE"),
+                                monitor_start_step=int(monitor_start_step),
+                                warmup_steps=int(warmup_steps),
+                                baseline_beta=float(baseline_beta),
+                                decay_threshold=float(decay_threshold),
+                                freeze_threshold=float(freeze_threshold),
+                                decay_patience=int(decay_patience),
+                                freeze_patience=int(freeze_patience),
+                                decay_factor=float(decay_factor),
+                                decay_max=decay_max_val,
+                                min_baseline=float(min_baseline),
+                                mode=te_schedule_mode,
+                            )
+                            configs.append(cfg)
+
+                        te_scheduler = TeAutoScheduler(
+                            configs=configs,
+                            optimizer=optimizer,
+                            te_param_groups=te_group_map,
+                            te_parameters=te_params,
+                            log_interval=getattr(args, "te_monitor_log_interval", 0),
+                            log_path=getattr(args, "te_monitor_log_path", None),
+                            verbose=bool(getattr(args, "te_monitor_verbose", False)),
+                        )
+                        logger.info(
+                            "TE auto scheduling enabled (%s) for %s",
+                            te_schedule_mode,
+                            ", ".join(cfg.name for cfg in configs),
+                        )
+
         # callback for step start
         if hasattr(accelerator.unwrap_model(network), "on_step_start"):
             on_step_start = accelerator.unwrap_model(network).on_step_start
@@ -1395,6 +1473,12 @@ class NetworkTrainer:
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
                     accelerator.backward(loss)
+                    te_metrics = None
+                    if accelerator.sync_gradients:
+                        if hasattr(accelerator, "scaler") and (use_grad_norm or te_scheduler is not None):
+                            accelerator.scaler.unscale_(optimizer)
+                        if te_scheduler is not None:
+                            te_metrics = te_scheduler.collect_metrics()
                     skip_step = False
                     if check_gradients_and_skip_update(network, epoch, step, loss.detach().item()):
                         accelerator.print(
@@ -1405,6 +1489,13 @@ class NetworkTrainer:
                         skip_step = True
 
                     if not skip_step:
+                        if (
+                            te_scheduler is not None
+                            and accelerator.sync_gradients
+                            and te_metrics is not None
+                        ):
+                            te_scheduler.step(global_step + 1, te_metrics)
+
                         if accelerator.sync_gradients:
                             self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                             if args.max_grad_norm != 0.0:
@@ -1549,6 +1640,9 @@ class NetworkTrainer:
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())
 
+        if te_scheduler is not None:
+            te_scheduler.flush(force=True)
+
         if log_grad_norm and len(log_buffer) > 0:
             with open(log_file_path, "a") as f:
                 f.writelines(log_buffer)
@@ -1607,6 +1701,143 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="learning rate for Text Encoder 2 (BiG-G) / Text Encoder 2 (BiG-G)の学習率",
     )
+
+    te_sched = parser.add_argument_group("Text Encoder auto scheduling")
+    te_sched.add_argument(
+        "--te-auto-schedule",
+        type=str,
+        default="off",
+        choices=["off", "monitor", "freeze"],
+        help="auto tune TE lr and freezing using relative warmup metrics (off/monitor/freeze) / relative_warmup指標でText Encoderの学習率・凍結を自動制御 (off/monitor/freeze)",
+    )
+    te_sched.add_argument(
+        "--te-monitor-start-step",
+        type=int,
+        default=0,
+        help="global step to start monitoring (steps before this only prime baseline) / 監視を開始するグローバルステップ（それ以前はベースライン収集のみ）",
+    )
+    te_sched.add_argument(
+        "--te-warmup-steps",
+        type=int,
+        default=300,
+        help="steps used to build baseline before ratios are evaluated / 比率評価の前にベースラインを構築するウォームアップステップ数",
+    )
+    te_sched.add_argument(
+        "--te-decay-threshold",
+        type=float,
+        default=0.4,
+        help="score threshold to trigger lr decay / 学習率を減衰させる判定スコアの閾値",
+    )
+    te_sched.add_argument(
+        "--te-freeze-threshold",
+        type=float,
+        default=0.2,
+        help="score threshold to trigger freeze (freeze mode only) / 凍結を実行する判定スコアの閾値（freezeモード時）",
+    )
+    te_sched.add_argument(
+        "--te-decay-patience",
+        type=int,
+        default=100,
+        help="consecutive steps below decay threshold before lr is reduced / 減衰閾値を下回り続ける必要ステップ数",
+    )
+    te_sched.add_argument(
+        "--te-freeze-patience",
+        type=int,
+        default=100,
+        help="consecutive steps below freeze threshold before freezing / 凍結閾値を下回り続ける必要ステップ数",
+    )
+    te_sched.add_argument(
+        "--te-decay-factor",
+        type=float,
+        default=0.5,
+        help="multiplier applied to TE lr when decaying / 学習率減衰時に掛ける倍率",
+    )
+    te_sched.add_argument(
+        "--te-decay-max",
+        type=int,
+        default=1,
+        help="maximum number of lr decays before forcing freeze (-1 for unlimited) / 凍結前に許容する学習率減衰の最大回数（-1で無制限）",
+    )
+    te_sched.add_argument(
+        "--te-min-baseline",
+        type=float,
+        default=1e-6,
+        help="lower bound for baseline to avoid division by zero / ベースラインに設定する最小値（ゼロ割防止）",
+    )
+    te_sched.add_argument(
+        "--te-baseline-ema-beta",
+        type=float,
+        default=0.9,
+        help="EMA beta used during warmup baseline aggregation / ベースライン算出に用いるEMAのβ",
+    )
+    te_sched.add_argument(
+        "--te-monitor-log-interval",
+        type=int,
+        default=0,
+        help="step interval for emitting monitor logs (0 to disable periodic logging) / ログ出力のステップ間隔（0で定期ログ無効）",
+    )
+    te_sched.add_argument(
+        "--te-monitor-log-path",
+        type=str,
+        default=None,
+        help="path to save TE monitor logs (csv/jsonl). writes every 200 steps when enabled / TEモニタログの保存先（csv/jsonl）。有効時は200ステップごとに書き込み",
+    )
+    te_sched.add_argument(
+        "--te-monitor-verbose",
+        action="store_true",
+        help="print TE monitor summary to stdout / TEモニタの要約を標準出力へ表示",
+    )
+
+    for te_idx in (1, 2):
+        suffix = f"TE{te_idx}"
+        te_sched.add_argument(
+            f"--te{te_idx}-warmup-steps",
+            type=int,
+            default=None,
+            help=f"override warmup steps for {suffix} / {suffix}用のウォームアップステップ数を個別指定",
+        )
+        te_sched.add_argument(
+            f"--te{te_idx}-decay-threshold",
+            type=float,
+            default=None,
+            help=f"override decay threshold for {suffix} / {suffix}の学習率減衰閾値を個別指定",
+        )
+        te_sched.add_argument(
+            f"--te{te_idx}-freeze-threshold",
+            type=float,
+            default=None,
+            help=f"override freeze threshold for {suffix} / {suffix}の凍結閾値を個別指定",
+        )
+        te_sched.add_argument(
+            f"--te{te_idx}-decay-patience",
+            type=int,
+            default=None,
+            help=f"override decay patience for {suffix} / {suffix}の減衰パティエンスを個別指定",
+        )
+        te_sched.add_argument(
+            f"--te{te_idx}-freeze-patience",
+            type=int,
+            default=None,
+            help=f"override freeze patience for {suffix} / {suffix}の凍結パティエンスを個別指定",
+        )
+        te_sched.add_argument(
+            f"--te{te_idx}-decay-factor",
+            type=float,
+            default=None,
+            help=f"override decay factor for {suffix} / {suffix}の減衰倍率を個別指定",
+        )
+        te_sched.add_argument(
+            f"--te{te_idx}-decay-max",
+            type=int,
+            default=None,
+            help=f"override decay max count for {suffix} (-1 unlimited) / {suffix}の減衰回数上限を個別指定（-1で無制限）",
+        )
+        te_sched.add_argument(
+            f"--te{te_idx}-min-baseline",
+            type=float,
+            default=None,
+            help=f"override minimum baseline for {suffix} / {suffix}のベースライン最小値を個別指定",
+        )
     parser.add_argument(
         "--network_te_train_targets",
         type=str,
