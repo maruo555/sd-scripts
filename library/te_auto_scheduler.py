@@ -139,6 +139,7 @@ class TeAutoScheduler:
         self._log_buffer: List[TeLogEntry] = []
         self._log_header_written = False
         self._last_flushed_step: Optional[int] = None
+        self._log_disabled = False
 
     # ------------------------------------------------------------------
     # Metric collection
@@ -351,6 +352,9 @@ class TeAutoScheduler:
     # Logging helpers
     # ------------------------------------------------------------------
     def _log(self, entry: TeLogEntry) -> None:
+        if self._log_disabled:
+            return
+
         if self.log_interval <= 0 and self.log_path is None and not self.verbose:
             return
 
@@ -393,7 +397,7 @@ class TeAutoScheduler:
                     self.flush(force=True)
 
     def flush(self, force: bool = False) -> None:
-        if self.log_path is None:
+        if self._log_disabled or self.log_path is None:
             return
 
         if not self._log_buffer:
@@ -404,24 +408,33 @@ class TeAutoScheduler:
 
         last_step = self._log_buffer[-1].step
         mode = "a" if self.log_path.exists() or self._log_header_written else "w"
-        with self.log_path.open(mode, encoding="utf-8", newline="") as fp:
-            if self.log_format == "csv":
-                writer = csv.writer(fp)
-                if not self._log_header_written and mode == "w":
-                    writer.writerow(TeLogEntry.csv_header())
-                for entry in self._log_buffer:
-                    writer.writerow(entry.to_csv_row())
-                self._log_header_written = True
-            elif self.log_format == "jsonl":
-                for entry in self._log_buffer:
-                    fp.write(json.dumps(entry.to_dict()) + "\n")
-                self._log_header_written = True
-            else:
-                for entry in self._log_buffer:
-                    fp.write(
-                        f"{entry.step}\t{entry.te_index}\t{entry.te_name}\t{entry.metric:.6e}\t{entry.baseline:.6e}\t{entry.score:.4f}\t{entry.lr:.6e}\t{entry.action}\n"
-                    )
-                self._log_header_written = True
+        try:
+            with self.log_path.open(mode, encoding="utf-8", newline="") as fp:
+                if self.log_format == "csv":
+                    writer = csv.writer(fp)
+                    if not self._log_header_written and mode == "w":
+                        writer.writerow(TeLogEntry.csv_header())
+                    for entry in self._log_buffer:
+                        writer.writerow(entry.to_csv_row())
+                    self._log_header_written = True
+                elif self.log_format == "jsonl":
+                    for entry in self._log_buffer:
+                        fp.write(json.dumps(entry.to_dict()) + "\n")
+                    self._log_header_written = True
+                else:
+                    for entry in self._log_buffer:
+                        fp.write(
+                            f"{entry.step}\t{entry.te_index}\t{entry.te_name}\t{entry.metric:.6e}\t{entry.baseline:.6e}\t{entry.score:.4f}\t{entry.lr:.6e}\t{entry.action}\n"
+                        )
+                    self._log_header_written = True
+        except OSError as err:
+            logger.warning(
+                "TE monitor log write failed (%s). Disabling further file logging.",
+                err,
+            )
+            self._log_disabled = True
+            self._log_buffer.clear()
+            return
 
         self._log_buffer.clear()
         self._last_flushed_step = last_step
