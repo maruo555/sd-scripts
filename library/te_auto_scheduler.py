@@ -12,39 +12,34 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-# Number of buffered log entries before touching disk
 LOG_FLUSH_FREQUENCY = 200
 
 
 @dataclass
 class TeScheduleConfig:
-    """Configuration for a single Text Encoder schedule."""
-
     te_index: int
     name: str
-    monitor_start_step: int = 0
-    warmup_steps: int = 300
-    baseline_beta: float = 0.9
-    decay_threshold: float = 0.4
-    freeze_threshold: float = 0.2
-    decay_patience: int = 100
-    freeze_patience: int = 100
-    decay_factor: float = 0.5
-    decay_max: int = 1
-    min_baseline: float = 1e-6
-    mode: str = "monitor"  # "monitor" or "freeze"
+    mode: str  # "monitor" or "freeze"
+    ema_fast_alpha: float
+    ema_slow_alpha: float
+    plateau_ratio: float
+    plateau_patience: int
+    min_step: int
+    decay_factor: float
+    decay_limit: int  # -1 for unlimited
+    freeze_ratio: float
+    freeze_patience: int
 
 
 @dataclass
 class TeScheduleState:
-    baseline_ema: Optional[float] = None
-    warmup_count: int = 0
-    baseline_finalized: bool = False
+    ema_fast: Optional[float] = None
+    ema_slow: Optional[float] = None
     last_metric: float = 0.0
-    last_score: float = 1.0
-    patience_decay: int = 0
-    patience_freeze: int = 0
-    decay_applied: int = 0
+    last_ratio: float = 1.0
+    plateau_counter: int = 0
+    freeze_counter: int = 0
+    decay_count: int = 0
     frozen: bool = False
     last_action: str = "init"
 
@@ -55,32 +50,15 @@ class TeLogEntry:
     te_index: int
     te_name: str
     metric: float
-    baseline: float
-    score: float
+    ema_fast: float
+    ema_slow: float
+    ratio: float
     lr: float
     action: str
-    warmup_remaining: int
-    decay_counter: int
+    plateau_counter: int
+    decay_count: int
     freeze_counter: int
-    decay_applied: int
-    baseline_ready: bool
-
-    def to_dict(self) -> Dict[str, object]:
-        return {
-            "step": self.step,
-            "te_index": self.te_index,
-            "te_name": self.te_name,
-            "metric": self.metric,
-            "baseline": self.baseline,
-            "score": self.score,
-            "lr": self.lr,
-            "action": self.action,
-            "warmup_remaining": self.warmup_remaining,
-            "decay_counter": self.decay_counter,
-            "freeze_counter": self.freeze_counter,
-            "decay_applied": self.decay_applied,
-            "baseline_ready": self.baseline_ready,
-        }
+    plateau_ready: bool
 
     @staticmethod
     def csv_header() -> Sequence[str]:
@@ -89,16 +67,33 @@ class TeLogEntry:
             "te_index",
             "te_name",
             "metric",
-            "baseline",
-            "score",
+            "ema_fast",
+            "ema_slow",
+            "ratio",
             "lr",
             "action",
-            "warmup_remaining",
-            "decay_counter",
+            "plateau_counter",
+            "decay_count",
             "freeze_counter",
-            "decay_applied",
-            "baseline_ready",
+            "plateau_ready",
         ]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "step": self.step,
+            "te_index": self.te_index,
+            "te_name": self.te_name,
+            "metric": self.metric,
+            "ema_fast": self.ema_fast,
+            "ema_slow": self.ema_slow,
+            "ratio": self.ratio,
+            "lr": self.lr,
+            "action": self.action,
+            "plateau_counter": self.plateau_counter,
+            "decay_count": self.decay_count,
+            "freeze_counter": self.freeze_counter,
+            "plateau_ready": self.plateau_ready,
+        }
 
     def to_csv_row(self) -> List[str]:
         data = self.to_dict()
@@ -106,7 +101,7 @@ class TeLogEntry:
 
 
 class TeAutoScheduler:
-    """Relative-warmup based controller for Text Encoder learning rate and freezing."""
+    """EMA-based plateau controller for Text Encoder LoRA training."""
 
     def __init__(
         self,
@@ -123,7 +118,6 @@ class TeAutoScheduler:
         self.optimizer = optimizer
         self.te_param_groups = {idx: list(group_indices) for idx, group_indices in te_param_groups.items()}
         self.te_parameters = {idx: list(params) for idx, params in te_parameters.items()}
-        self.log_interval = max(0, log_interval)
         self.verbose = verbose
 
         self.log_path: Optional[Path] = Path(log_path).expanduser() if log_path else None
@@ -177,118 +171,79 @@ class TeAutoScheduler:
         for te_idx, state in self.states.items():
             cfg = self.configs[te_idx]
             metric = metrics.get(te_idx, 0.0)
+            state.last_metric = metric
 
             if state.frozen:
-                entry = self._emit_entry(step_index, te_idx, metric, "frozen")
-                entries.append(entry)
-                continue
-
-            if step_index <= cfg.monitor_start_step:
-                # Pre-monitor phase: optionally prime baseline but count as no action
-                if state.baseline_ema is None:
-                    state.baseline_ema = metric
-                else:
-                    state.baseline_ema = cfg.baseline_beta * state.baseline_ema + (1.0 - cfg.baseline_beta) * metric
-                state.last_metric = metric
-                state.last_score = 1.0
-                state.last_action = "pre_monitor"
                 entry = self._emit_entry(step_index, te_idx, metric, state.last_action)
                 entries.append(entry)
                 continue
 
-            if state.warmup_count < cfg.warmup_steps:
-                state.warmup_count += 1
-                if state.baseline_ema is None:
-                    state.baseline_ema = metric
-                else:
-                    state.baseline_ema = cfg.baseline_beta * state.baseline_ema + (1.0 - cfg.baseline_beta) * metric
-                state.last_metric = metric
-                state.last_score = 1.0
-                state.last_action = "warmup"
-                if state.warmup_count >= cfg.warmup_steps:
-                    state.baseline_finalized = True
-                    state.last_action = "baseline_finalized"
-                entry = self._emit_entry(step_index, te_idx, metric, state.last_action)
-                entries.append(entry)
-                continue
+            state.ema_fast = _update_ema(state.ema_fast, metric, cfg.ema_fast_alpha)
+            state.ema_slow = _update_ema(state.ema_slow, metric, cfg.ema_slow_alpha)
 
-            if not state.baseline_finalized:
-                # Safeguard in case warmup_steps is 0
-                state.baseline_finalized = True
+            if state.ema_slow and state.ema_slow > 0:
+                ratio = state.ema_fast / state.ema_slow
+            else:
+                ratio = 1.0
+            if not math.isfinite(ratio):
+                ratio = 0.0
+            state.last_ratio = ratio
 
-            baseline = max(state.baseline_ema or 0.0, cfg.min_baseline)
-            score = min(metric / baseline, 1.0) if baseline > 0 else 0.0
-
-            state.last_metric = metric
-            state.last_score = score
-
+            plateau_ready = step_index >= cfg.min_step
             action = "monitor"
-            decay_triggered = False
-            freeze_triggered = False
 
-            if cfg.decay_patience <= 0:
-                decay_condition_met = score < cfg.decay_threshold
-                state.patience_decay = 0
-            else:
-                if score < cfg.decay_threshold:
-                    state.patience_decay += 1
+            if plateau_ready:
+                if ratio < cfg.plateau_ratio:
+                    state.plateau_counter += 1
                 else:
-                    state.patience_decay = 0
-                decay_condition_met = state.patience_decay >= cfg.decay_patience
+                    state.plateau_counter = 0
 
-            if cfg.mode == "freeze":
-                if cfg.freeze_patience <= 0:
-                    freeze_condition_met = score < cfg.freeze_threshold and state.baseline_ema >= cfg.min_baseline
-                    state.patience_freeze = 0
-                else:
-                    if score < cfg.freeze_threshold and state.baseline_ema >= cfg.min_baseline:
-                        state.patience_freeze += 1
+                if cfg.mode == "freeze":
+                    if ratio < cfg.freeze_ratio:
+                        state.freeze_counter += 1
                     else:
-                        state.patience_freeze = 0
-                    freeze_condition_met = state.patience_freeze >= cfg.freeze_patience
+                        state.freeze_counter = 0
+
+                if state.plateau_counter >= cfg.plateau_patience:
+                    if cfg.decay_limit < 0 or state.decay_count < cfg.decay_limit:
+                        if self._apply_decay(te_idx, cfg.decay_factor):
+                            state.decay_count += 1
+                            state.plateau_counter = 0
+                            state.freeze_counter = 0
+                            action = "decay"
+                        else:
+                            action = "decay_skipped"
+                    elif cfg.mode == "freeze":
+                        self._apply_freeze(te_idx)
+                        state.frozen = True
+                        state.plateau_counter = 0
+                        action = "freeze"
+                elif (
+                    cfg.mode == "freeze"
+                    and cfg.decay_limit >= 0
+                    and state.decay_count >= cfg.decay_limit
+                    and state.freeze_counter >= cfg.freeze_patience
+                ):
+                    self._apply_freeze(te_idx)
+                    state.frozen = True
+                    state.freeze_counter = 0
+                    action = "freeze"
             else:
-                freeze_condition_met = False
-
-            if decay_condition_met and (cfg.decay_max < 0 or state.decay_applied < cfg.decay_max):
-                decay_triggered = True
-
-            if cfg.mode == "freeze":
-                if freeze_condition_met:
-                    freeze_triggered = True
-                elif (cfg.decay_max >= 0 and state.decay_applied >= cfg.decay_max and decay_condition_met):
-                    freeze_triggered = True
-
-            if decay_triggered:
-                if self._apply_decay(te_idx, cfg.decay_factor):
-                    state.decay_applied += 1
-                    state.patience_decay = 0
-                    action = "decay"
-                else:
-                    state.last_action = "decay_skipped"
-                    entry = self._emit_entry(step_index, te_idx, metric, state.last_action)
-                    entries.append(entry)
-                    continue
-
-            if freeze_triggered and cfg.mode == "freeze":
-                self._apply_freeze(te_idx)
-                state.frozen = True
-                state.last_action = "freeze"
-                entry = self._emit_entry(step_index, te_idx, metric, state.last_action)
-                entries.append(entry)
-                continue
+                state.plateau_counter = 0
+                state.freeze_counter = 0
 
             state.last_action = action
-            entry = self._emit_entry(step_index, te_idx, metric, action)
+            entry = self._emit_entry(step_index, te_idx, metric, action, plateau_ready=plateau_ready)
             entries.append(entry)
 
         return entries
 
     # ------------------------------------------------------------------
-    # Helper methods
+    # Helpers
     # ------------------------------------------------------------------
     def _apply_decay(self, te_idx: int, factor: float) -> bool:
         if factor <= 0.0:
-            logger.warning("TE%d decay factor <= 0, skipping lr decay", te_idx + 1)
+            logger.warning("TE%d decay factor <= 0, skipping", te_idx + 1)
             return False
 
         updated = False
@@ -300,7 +255,7 @@ class TeAutoScheduler:
             updated = True
 
         if self.verbose and updated:
-            logger.info("TE%d learning rate decayed by factor %.4f", te_idx + 1, factor)
+            logger.info("TE%d learning rate decayed by %.4f", te_idx + 1, factor)
 
         return updated
 
@@ -318,31 +273,37 @@ class TeAutoScheduler:
         if self.verbose:
             logger.info("TE%d training frozen", te_idx + 1)
 
-    def _emit_entry(self, step_index: int, te_idx: int, metric: float, action: str) -> TeLogEntry:
+    def _emit_entry(
+        self,
+        step_index: int,
+        te_idx: int,
+        metric: float,
+        action: str,
+        plateau_ready: bool = True,
+    ) -> TeLogEntry:
         state = self.states[te_idx]
         cfg = self.configs[te_idx]
 
-        baseline = state.baseline_ema or 0.0
-        score = state.last_score
-        warmup_remaining = max(cfg.warmup_steps - state.warmup_count, 0)
-
+        ema_fast = state.ema_fast or 0.0
+        ema_slow = state.ema_slow or 0.0
+        ratio = state.last_ratio
         lr_values = [self.optimizer.param_groups[idx].get("lr", 0.0) for idx in self.te_param_groups.get(te_idx, [])]
         lr = lr_values[0] if lr_values else 0.0
 
         entry = TeLogEntry(
             step=step_index,
             te_index=te_idx,
-            te_name=self.configs[te_idx].name,
+            te_name=cfg.name,
             metric=metric,
-            baseline=baseline,
-            score=score,
+            ema_fast=ema_fast,
+            ema_slow=ema_slow,
+            ratio=ratio,
             lr=lr,
             action=action,
-            warmup_remaining=warmup_remaining,
-            decay_counter=self.states[te_idx].patience_decay,
-            freeze_counter=self.states[te_idx].patience_freeze,
-            decay_applied=self.states[te_idx].decay_applied,
-            baseline_ready=self.states[te_idx].baseline_finalized,
+            plateau_counter=state.plateau_counter,
+            decay_count=state.decay_count,
+            freeze_counter=state.freeze_counter,
+            plateau_ready=plateau_ready,
         )
 
         self._log(entry)
@@ -355,37 +316,24 @@ class TeAutoScheduler:
         if self._log_disabled:
             return
 
-        if self.log_interval <= 0 and self.log_path is None and not self.verbose:
+        if self.log_path is None and not self.verbose:
             return
 
         should_log = False
         if self.log_interval > 0 and entry.step % self.log_interval == 0:
             should_log = True
-        if entry.action in {"decay", "freeze", "baseline_finalized"}:
+        if entry.action in {"decay", "freeze"}:
             should_log = True
         if self.log_path is not None:
-            should_log = should_log or True
-
-        if not should_log:
-            if self.verbose:
-                logger.info(
-                    "[TE%d] step=%d metric=%.4e score=%.3f lr=%.4e action=%s",
-                    entry.te_index + 1,
-                    entry.step,
-                    entry.metric,
-                    entry.score,
-                    entry.lr,
-                    entry.action,
-                )
-            return
+            should_log = True
 
         if self.verbose:
             logger.info(
-                "[TE%d] step=%d metric=%.4e score=%.3f lr=%.4e action=%s",
+                "[TE%d] step=%d metric=%.4e ratio=%.3f lr=%.4e action=%s",
                 entry.te_index + 1,
                 entry.step,
                 entry.metric,
-                entry.score,
+                entry.ratio,
                 entry.lr,
                 entry.action,
             )
@@ -424,7 +372,7 @@ class TeAutoScheduler:
                 else:
                     for entry in self._log_buffer:
                         fp.write(
-                            f"{entry.step}\t{entry.te_index}\t{entry.te_name}\t{entry.metric:.6e}\t{entry.baseline:.6e}\t{entry.score:.4f}\t{entry.lr:.6e}\t{entry.action}\n"
+                            f"{entry.step}\t{entry.te_index}\t{entry.te_name}\t{entry.metric:.6e}\t{entry.ema_fast:.6e}\t{entry.ema_slow:.6e}\t{entry.ratio:.4f}\t{entry.lr:.6e}\t{entry.action}\n"
                         )
                     self._log_header_written = True
         except OSError as err:
@@ -440,12 +388,17 @@ class TeAutoScheduler:
         self._last_flushed_step = last_step
 
 
+def _update_ema(prev: Optional[float], value: float, alpha: float) -> float:
+    alpha = max(0.0, min(1.0, alpha))
+    if prev is None:
+        return value
+    return prev * (1.0 - alpha) + value * alpha
+
+
 def build_te_param_maps(
     network,
     te_selection_indices: Iterable[int],
 ) -> Dict[int, List[torch.nn.Parameter]]:
-    """Utility to gather TE LoRA parameters per encoder index."""
-
     te_params: Dict[int, List[torch.nn.Parameter]] = {}
     attr_name = "_text_encoder_loras_by_encoder"
     if not hasattr(network, attr_name):
@@ -466,8 +419,6 @@ def build_te_param_maps(
 
 
 def build_optimizer_te_group_map(optimizer, te_parameters: Dict[int, Sequence[torch.nn.Parameter]]) -> Dict[int, List[int]]:
-    """Map optimizer param_group indices to TE indices."""
-
     param_to_te: Dict[int, int] = {}
     for te_idx, params in te_parameters.items():
         for param in params:

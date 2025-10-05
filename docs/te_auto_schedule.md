@@ -1,62 +1,61 @@
-# Text Encoder 自動スケジュール（relative_warmup）
+# Text Encoder 自動スケジュール（EMA Plateau）
 
 ## 目的
-- SDXL の Text Encoder (TE1/TE2) をそれぞれモニタリングし、学習率の自動減衰や凍結まで任せたい。
-- AMP/GradScaler のスケールに影響されない "0〜1" の相対指標で判定し、閾値設定を直感的にする。
-- VRAM 消費や forward/backward を増やさず、LoRA 学習ループに最小限のフックで組み込む。
+- SDXL の Text Encoder (TE1/TE2) を別々に監視し、勾配ノルムの動きが高原（plateau）に入ったら自動的に学習率を下げ、必要に応じて凍結する。
+- 平滑化された EMA 比（高速 EMA / 低速 EMA）と連続観測カウンタを用いて、高原状態を安定して検出する。
+- 追加の forward/backward を発生させず、VRAM を消費しない純粋な統計的判定で制御する。
 
 ## アルゴリズム概要
-1. `--te-monitor-start-step` まではベースラインを集める準備期間。
-2. `--te-warmup-steps` のあいだ勾配ノルム（LoRA パラメータの L2）を収集し、EMA (`--te-baseline-ema-beta`) で基準値を決定。
-3. 監視フェーズでは `score = clamp(metric / baseline, 0〜1)` を計算し、しきい値を下回る状態が `patience` 回続いたら学習率を `--te-decay-factor` 倍する。
-4. `--te-auto-schedule freeze` の場合は、十分に減衰したあと `--te-freeze-threshold` 未満が続けば自動凍結。凍結後は Unet のみ更新。
-5. 解析ログは CPU 側でバッファリングし、`--te-monitor-log-path` 指定時は 200 step ごとにまとめてディスクへ追記。最終 step でもフラッシュされる。
-
-TE1/TE2 は独立した状態を持ち、`--te1-*` / `--te2-*` で個別に閾値やウォームアップ長を上書きできます。
+1. 各ステップで Text Encoder の LoRA 勾配ノルム（L2）を取得し、`ema_fast`（α ≈ 0.2）と `ema_slow`（α ≈ 0.02）の指数移動平均を更新。
+2. 比率 `ratio = ema_fast / ema_slow` が `--te-plateau-ratio` を下回った状態が `--te-plateau-patience` 回続けば plateau 検知と見なす（`--te-plateau-min-step` 以前は判定しない）。
+3. plateau を検知したら `--te-plateau-decay-factor` をかけて TE の学習率を減衰。`--te-plateau-decay-limit` 回まで繰り返す。
+4. `--te-auto-schedule freeze` の場合、減衰上限に達した後に `ratio < --te-plateau-freeze-ratio` が `--te-plateau-freeze-patience` 回継続すると凍結。凍結後は Unet のみ更新。
+5. ログは CPU 側でバッファリングし、`--te-monitor-log-path` 指定時に 200 step ごとにまとめて書き込み（最終ステップで必ず flush）。
 
 ## オプション一覧
 | オプション | 既定値 | 説明 |
 |-------------|:------:|------|
-| `--te-auto-schedule {off,monitor,freeze}` | `off` | 自動制御モード。`monitor` は学習率減衰まで、`freeze` は凍結まで行う。 |
-| `--te-monitor-start-step` | `0` | 監視を開始するグローバルステップ。ここまではベースラインの下準備のみ。 |
-| `--te-warmup-steps` | `300` | ベースライン収集に使うステップ数。終了時に `score=1` とみなす基準が確定。 |
-| `--te-decay-threshold` | `0.4` | `score` がこの値を下回り続けたら学習率を減衰。 |
-| `--te-decay-patience` | `100` | 減衰条件を満たす必要ステップ数。0 を指定すると即判定。 |
-| `--te-decay-factor` | `0.5` | 減衰時に掛ける倍率。 |
-| `--te-decay-max` | `1` | 減衰できる最大回数。`-1` で無制限。上限到達後は次の判定で凍結候補。 |
-| `--te-freeze-threshold` | `0.2` | freeze モード時、`score` がこの値を継続して下回れば凍結。 |
-| `--te-freeze-patience` | `100` | 凍結判定に必要な連続ステップ数。0 で即判定。 |
-| `--te-min-baseline` | `1e-6` | ベースラインの下限。基準が極端に小さいケースで凍結を遅延させる。 |
-| `--te-baseline-ema-beta` | `0.9` | ベースライン算出に使う EMA の係数。1 に近いほど滑らか。 |
-| `--te-monitor-log-interval` | `0` | `score`/`baseline` などのログを `n` ステップごとに記録。0 で定期ログ無効。 |
-| `--te-monitor-log-path` | `None` | CSV/JSONL の保存先。指定時は 200 step ごとにまとめて追記し、学習終了時にフラッシュ。 |
-| `--te-monitor-verbose` | `False` | 判定イベント（减衰/凍結/ベースライン確定）を標準出力へも表示。 |
+| `--te-auto-schedule {off,monitor,freeze}` | `off` | 自動制御のレベル。`monitor` は減衰まで、`freeze` は最終凍結まで行う。 |
+| `--te-ema-fast-alpha` | `0.2` | 高速 EMA の α。値を大きくすると直近の変化に敏感になる。 |
+| `--te-ema-slow-alpha` | `0.02` | 低速 EMA の α。小さいほど長期傾向を重視。 |
+| `--te-plateau-ratio` | `0.95` | `ema_fast / ema_slow` がこの値未満になったら plateau 候補。 |
+| `--te-plateau-patience` | `80` | plateau 比を下回り続ける必要ステップ数。 |
+| `--te-plateau-min-step` | `1000` | このステップまでは判定しない。初期ノイズ対策。 |
+| `--te-plateau-decay-factor` | `0.5` | plateau 検知時に学習率へ掛ける係数。 |
+| `--te-plateau-decay-limit` | `2` | 減衰可能な最大回数（`-1` で無制限）。 |
+| `--te-plateau-freeze-ratio` | `0.9` | 凍結モードで利用。減衰上限到達後、この比率を下回り続けたら凍結候補。 |
+| `--te-plateau-freeze-patience` | `160` | 凍結比を下回る必要ステップ数。 |
+| `--te-monitor-log-path` | `None` | CSV/JSONL 出力先。指定時は 200 step ごとにまとめて追記。 |
+| `--te-monitor-verbose` | `False` | 減衰や凍結イベントを標準出力へ表示。 |
 
 ### 個別オーバーライド
-`--te1-warmup-steps`, `--te1-decay-threshold`, … のように `te1-` / `te2-` プレフィックス付きで、TE1/TE2 それぞれの閾値・ウォームアップ長・減衰倍率などを上書きできます。未指定時は全体設定を継承します。
+`--te1-plateau-ratio`, `--te2-plateau-decay-factor` のように `te1-` / `te2-` プレフィックス付きオプションで、TE1/TE2ごとの α やしきい値・パティエンスを個別指定できます。未指定時は全体設定を継承します。
 
 ## ログ出力内容
-`--te-monitor-log-path` に CSV を指定した例:
+`--te-monitor-log-path` で CSV を保存した場合の例:
 
 ```
-step,te_index,te_name,metric,baseline,score,lr,action,warmup_remaining,decay_counter,freeze_counter,decay_applied,baseline_ready
-200,0,TE1,1.12e-03,2.45e-03,0.46,5.0e-05,decay,0,0,0,1,True
-400,1,TE2,5.87e-04,2.11e-03,0.28,5.0e-05,monitor,0,12,12,0,True
+step,te_index,te_name,metric,ema_fast,ema_slow,ratio,lr,action,plateau_counter,decay_count,freeze_counter,plateau_ready
+4090,0,TE1,0.0121,0.0109,0.0113,0.964,5.0e-05,decay,81,1,0,True
+6279,1,TE2,0.0154,0.0143,0.0158,0.907,5.0e-05,decay,85,2,0,True
 ```
 
-- `metric`: LoRA パラメータ勾配の L2 ノルム（unscale 後）。
-- `baseline`: ウォームアップで確定した基準値。
-- `score`: `metric / max(baseline, te_min_baseline)` を 0〜1 にクリップした指標。
-- `action`: `warmup`, `baseline_finalized`, `monitor`, `decay`, `freeze`, `frozen` などの状態遷移。
+- `metric`: 勾配ノルム (L2)。
+- `ema_fast` / `ema_slow`: それぞれの EMA 値。
+- `ratio`: `ema_fast / ema_slow`。
+- `action`: `monitor`, `decay`, `freeze`, `frozen` などの状態遷移。
+- `plateau_counter`: 連続してしきい値を下回ったカウンタ。
+- `decay_count`: 実行済みの減衰回数。
+- `freeze_counter`: 凍結候補カウンタ（freeze モード時）。
 
 ## 推奨プリセット
-1. **緩やかな自動減衰 (monitor モード)**  
-   `--te-auto-schedule monitor --te-warmup-steps 150 --te-decay-threshold 0.5 --te-decay-patience 80`
+1. **標準的な減衰のみ（monitor）**  
+   `--te-auto-schedule monitor --te-plateau-ratio 0.95 --te-plateau-patience 80`
 
-2. **凍結まで任せる (freeze モード)**  
-   `--te-auto-schedule freeze --te-decay-threshold 0.45 --te-freeze-threshold 0.15 --te-decay-max 3`
+2. **凍結まで任せる（freeze）**  
+   `--te-auto-schedule freeze --te-plateau-decay-limit 3 --te-plateau-freeze-ratio 0.9 --te-plateau-freeze-patience 160`
 
-3. **TE2 を長めに粘らせる個別設定**  
-   `--te-auto-schedule freeze --te2-warmup-steps 200 --te2-decay-threshold 0.55 --te2-decay-factor 0.7`
+3. **TE2 を粘らせる個別設定**  
+   `--te-auto-schedule freeze --te2-plateau-ratio 0.97 --te2-plateau-decay-factor 0.7`
 
-ログを観察しつつ `threshold` と `patience` を調整することで、収束スピードと表現力のバランスを取りやすくなります。学習率を外部スケジューラで操作している場合は、最小 LR (`optimizer` 側) と `te-decay-max` の整合に注意してください。
+ログで `ratio` と `plateau_counter` を確認しながら、検出タイミングが適切かどうか調整してください。EMA α を変えると plateau 判定の敏感さが変化します。 внешний学習率スケジューラと併用する場合は、`te-plateau-decay-limit` と最小 LR の整合に留意してください。

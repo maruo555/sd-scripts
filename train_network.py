@@ -1227,36 +1227,33 @@ class NetworkTrainer:
                                 return base_value
                             return default_value
 
-                        baseline_beta = getattr(args, "te_baseline_ema_beta", 0.9)
-                        monitor_start_step = getattr(args, "te_monitor_start_step", 0)
                         configs: List[TeScheduleConfig] = []
                         multi_te = len(te_params) > 1
                         for te_idx in sorted(te_params.keys()):
-                            warmup_steps = resolve_te_option(te_idx, "warmup_steps", 300)
-                            decay_threshold = resolve_te_option(te_idx, "decay_threshold", 0.4)
-                            freeze_threshold = resolve_te_option(te_idx, "freeze_threshold", 0.2)
-                            decay_patience = resolve_te_option(te_idx, "decay_patience", 100)
-                            freeze_patience = resolve_te_option(te_idx, "freeze_patience", 100)
-                            decay_factor = resolve_te_option(te_idx, "decay_factor", 0.5)
-                            decay_max = resolve_te_option(te_idx, "decay_max", 1)
-                            min_baseline = resolve_te_option(te_idx, "min_baseline", 1e-6)
+                            ema_fast_alpha = resolve_te_option(te_idx, "ema_fast_alpha", args.te_ema_fast_alpha)
+                            ema_slow_alpha = resolve_te_option(te_idx, "ema_slow_alpha", args.te_ema_slow_alpha)
+                            plateau_ratio = resolve_te_option(te_idx, "plateau_ratio", args.te_plateau_ratio)
+                            plateau_patience = resolve_te_option(te_idx, "plateau_patience", args.te_plateau_patience)
+                            min_step = resolve_te_option(te_idx, "plateau_min_step", args.te_plateau_min_step)
+                            decay_factor = resolve_te_option(te_idx, "plateau_decay_factor", args.te_plateau_decay_factor)
+                            decay_limit = resolve_te_option(te_idx, "plateau_decay_limit", args.te_plateau_decay_limit)
+                            freeze_ratio = resolve_te_option(te_idx, "plateau_freeze_ratio", args.te_plateau_freeze_ratio)
+                            freeze_patience = resolve_te_option(te_idx, "plateau_freeze_patience", args.te_plateau_freeze_patience)
 
-                            decay_max_val = -1 if decay_max is None else int(decay_max)
-
+                            decay_limit_val = -1 if decay_limit is None else int(decay_limit)
                             cfg = TeScheduleConfig(
                                 te_index=te_idx,
                                 name=(f"TE{te_idx + 1}" if multi_te else "TE"),
-                                monitor_start_step=int(monitor_start_step),
-                                warmup_steps=int(warmup_steps),
-                                baseline_beta=float(baseline_beta),
-                                decay_threshold=float(decay_threshold),
-                                freeze_threshold=float(freeze_threshold),
-                                decay_patience=int(decay_patience),
-                                freeze_patience=int(freeze_patience),
-                                decay_factor=float(decay_factor),
-                                decay_max=decay_max_val,
-                                min_baseline=float(min_baseline),
                                 mode=te_schedule_mode,
+                                ema_fast_alpha=float(ema_fast_alpha),
+                                ema_slow_alpha=float(ema_slow_alpha),
+                                plateau_ratio=float(plateau_ratio),
+                                plateau_patience=int(plateau_patience),
+                                min_step=int(min_step),
+                                decay_factor=float(decay_factor),
+                                decay_limit=decay_limit_val,
+                                freeze_ratio=float(freeze_ratio),
+                                freeze_patience=int(freeze_patience),
                             )
                             configs.append(cfg)
 
@@ -1702,7 +1699,7 @@ def setup_parser() -> argparse.ArgumentParser:
         help="learning rate for Text Encoder 2 (BiG-G) / Text Encoder 2 (BiG-G)の学習率",
     )
 
-    te_sched = parser.add_argument_group("Text Encoder auto scheduling")
+    te_sched = parser.add_argument_group("Text Encoder plateau auto scheduling")
     te_sched.add_argument(
         "--te-auto-schedule",
         type=str,
@@ -1711,70 +1708,58 @@ def setup_parser() -> argparse.ArgumentParser:
         help="auto tune TE lr and freezing using relative warmup metrics (off/monitor/freeze) / relative_warmup指標でText Encoderの学習率・凍結を自動制御 (off/monitor/freeze)",
     )
     te_sched.add_argument(
-        "--te-monitor-start-step",
-        type=int,
-        default=0,
-        help="global step to start monitoring (steps before this only prime baseline) / 監視を開始するグローバルステップ（それ以前はベースライン収集のみ）",
-    )
-    te_sched.add_argument(
-        "--te-warmup-steps",
-        type=int,
-        default=300,
-        help="steps used to build baseline before ratios are evaluated / 比率評価の前にベースラインを構築するウォームアップステップ数",
-    )
-    te_sched.add_argument(
-        "--te-decay-threshold",
-        type=float,
-        default=0.4,
-        help="score threshold to trigger lr decay / 学習率を減衰させる判定スコアの閾値",
-    )
-    te_sched.add_argument(
-        "--te-freeze-threshold",
+        "--te-ema-fast-alpha",
         type=float,
         default=0.2,
-        help="score threshold to trigger freeze (freeze mode only) / 凍結を実行する判定スコアの閾値（freezeモード時）",
+        help="alpha for fast EMA of TE metrics / TEメトリクスの高速EMAのα値",
     )
     te_sched.add_argument(
-        "--te-decay-patience",
+        "--te-ema-slow-alpha",
+        type=float,
+        default=0.02,
+        help="alpha for slow EMA of TE metrics / TEメトリクスの低速EMAのα値",
+    )
+    te_sched.add_argument(
+        "--te-plateau-ratio",
+        type=float,
+        default=0.95,
+        help="ema_fast/ema_slow ratio threshold to declare plateau / plateau判定に用いる ema_fast/ema_slow のしきい値",
+    )
+    te_sched.add_argument(
+        "--te-plateau-patience",
         type=int,
-        default=100,
-        help="consecutive steps below decay threshold before lr is reduced / 減衰閾値を下回り続ける必要ステップ数",
+        default=80,
+        help="consecutive steps below plateau ratio before action / plateau比を下回り続ける必要ステップ数",
     )
     te_sched.add_argument(
-        "--te-freeze-patience",
+        "--te-plateau-min-step",
         type=int,
-        default=100,
-        help="consecutive steps below freeze threshold before freezing / 凍結閾値を下回り続ける必要ステップ数",
+        default=1000,
+        help="minimum global step before plateau detection starts / plateau検出を開始する最小ステップ数",
     )
     te_sched.add_argument(
-        "--te-decay-factor",
+        "--te-plateau-decay-factor",
         type=float,
         default=0.5,
         help="multiplier applied to TE lr when decaying / 学習率減衰時に掛ける倍率",
     )
     te_sched.add_argument(
-        "--te-decay-max",
+        "--te-plateau-decay-limit",
         type=int,
-        default=1,
-        help="maximum number of lr decays before forcing freeze (-1 for unlimited) / 凍結前に許容する学習率減衰の最大回数（-1で無制限）",
+        default=2,
+        help="maximum number of plateau-driven lr decays (-1 for unlimited) / plateau検出による減衰の最大回数（-1で無制限）",
     )
     te_sched.add_argument(
-        "--te-min-baseline",
-        type=float,
-        default=1e-6,
-        help="lower bound for baseline to avoid division by zero / ベースラインに設定する最小値（ゼロ割防止）",
-    )
-    te_sched.add_argument(
-        "--te-baseline-ema-beta",
+        "--te-plateau-freeze-ratio",
         type=float,
         default=0.9,
-        help="EMA beta used during warmup baseline aggregation / ベースライン算出に用いるEMAのβ",
+        help="ratio threshold to trigger freeze when decay limit reached / 減衰上限到達後の凍結判定に使う比率しきい値",
     )
     te_sched.add_argument(
-        "--te-monitor-log-interval",
+        "--te-plateau-freeze-patience",
         type=int,
-        default=0,
-        help="step interval for emitting monitor logs (0 to disable periodic logging) / ログ出力のステップ間隔（0で定期ログ無効）",
+        default=160,
+        help="consecutive steps below freeze ratio before freezing / 凍結比を下回り続ける必要ステップ数",
     )
     te_sched.add_argument(
         "--te-monitor-log-path",
@@ -1791,52 +1776,58 @@ def setup_parser() -> argparse.ArgumentParser:
     for te_idx in (1, 2):
         suffix = f"TE{te_idx}"
         te_sched.add_argument(
-            f"--te{te_idx}-warmup-steps",
-            type=int,
-            default=None,
-            help=f"override warmup steps for {suffix} / {suffix}用のウォームアップステップ数を個別指定",
-        )
-        te_sched.add_argument(
-            f"--te{te_idx}-decay-threshold",
+            f"--te{te_idx}-ema-fast-alpha",
             type=float,
             default=None,
-            help=f"override decay threshold for {suffix} / {suffix}の学習率減衰閾値を個別指定",
+            help=f"override EMA fast alpha for {suffix} / {suffix}用の高速EMAαを個別指定",
         )
         te_sched.add_argument(
-            f"--te{te_idx}-freeze-threshold",
+            f"--te{te_idx}-ema-slow-alpha",
             type=float,
             default=None,
-            help=f"override freeze threshold for {suffix} / {suffix}の凍結閾値を個別指定",
+            help=f"override EMA slow alpha for {suffix} / {suffix}用の低速EMAαを個別指定",
         )
         te_sched.add_argument(
-            f"--te{te_idx}-decay-patience",
+            f"--te{te_idx}-plateau-ratio",
+            type=float,
+            default=None,
+            help=f"override plateau ratio for {suffix} / {suffix}のplateau比を個別指定",
+        )
+        te_sched.add_argument(
+            f"--te{te_idx}-plateau-patience",
             type=int,
             default=None,
-            help=f"override decay patience for {suffix} / {suffix}の減衰パティエンスを個別指定",
+            help=f"override plateau patience for {suffix} / {suffix}のplateauパティエンスを個別指定",
         )
         te_sched.add_argument(
-            f"--te{te_idx}-freeze-patience",
+            f"--te{te_idx}-plateau-min_step",
             type=int,
             default=None,
-            help=f"override freeze patience for {suffix} / {suffix}の凍結パティエンスを個別指定",
+            help=f"override plateau min step for {suffix} / {suffix}のplateau開始ステップを個別指定",
         )
         te_sched.add_argument(
-            f"--te{te_idx}-decay-factor",
+            f"--te{te_idx}-plateau-decay-factor",
             type=float,
             default=None,
             help=f"override decay factor for {suffix} / {suffix}の減衰倍率を個別指定",
         )
         te_sched.add_argument(
-            f"--te{te_idx}-decay-max",
+            f"--te{te_idx}-plateau-decay-limit",
             type=int,
             default=None,
-            help=f"override decay max count for {suffix} (-1 unlimited) / {suffix}の減衰回数上限を個別指定（-1で無制限）",
+            help=f"override decay limit for {suffix} (-1 unlimited) / {suffix}の減衰上限を個別指定（-1で無制限）",
         )
         te_sched.add_argument(
-            f"--te{te_idx}-min-baseline",
+            f"--te{te_idx}-plateau-freeze-ratio",
             type=float,
             default=None,
-            help=f"override minimum baseline for {suffix} / {suffix}のベースライン最小値を個別指定",
+            help=f"override freeze ratio for {suffix} / {suffix}の凍結比を個別指定",
+        )
+        te_sched.add_argument(
+            f"--te{te_idx}-plateau-freeze-patience",
+            type=int,
+            default=None,
+            help=f"override freeze patience for {suffix} / {suffix}の凍結パティエンスを個別指定",
         )
     parser.add_argument(
         "--network_te_train_targets",
