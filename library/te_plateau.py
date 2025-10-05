@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import math
 import os
 from collections import deque
@@ -30,24 +31,34 @@ def _parse_te_index(description: str) -> Optional[int]:
     return int(suffix) - 1
 
 
-class MonotonicMaxQueue:
-    def __init__(self, maxlen: int) -> None:
+class TrimmedMaxQueue:
+    def __init__(self, maxlen: int, trim_ratio: float = 0.0) -> None:
         self.maxlen = maxlen
+        self.trim_ratio = max(0.0, min(trim_ratio, 0.5))
         self._data: deque[float] = deque()
-        self._candidates: deque[float] = deque()
+        self._sorted: List[float] = []
 
     def push(self, value: float) -> None:
         self._data.append(value)
-        while self._candidates and self._candidates[-1] < value:
-            self._candidates.pop()
-        self._candidates.append(value)
+        bisect.insort(self._sorted, float(value))
         if len(self._data) > self.maxlen:
             removed = self._data.popleft()
-            if self._candidates and removed == self._candidates[0]:
-                self._candidates.popleft()
+            idx = bisect.bisect_left(self._sorted, removed)
+            if idx < len(self._sorted):
+                self._sorted.pop(idx)
 
     def max(self) -> float:
-        return self._candidates[0] if self._candidates else 0.0
+        if not self._sorted:
+            return 0.0
+        if self.trim_ratio <= 0.0:
+            return self._sorted[-1]
+        trim_count = int(len(self._sorted) * self.trim_ratio)
+        if trim_count <= 0:
+            return self._sorted[-1]
+        index = len(self._sorted) - trim_count - 1
+        if index < 0:
+            index = 0
+        return self._sorted[index]
 
 
 @dataclass
@@ -65,6 +76,7 @@ class TePlateauConfig:
     local_window: int
     peak_window: int
     global_window: int
+    peak_trim_ratio: float
     local_patience: int
     global_patience: int
     decay_mult: float
@@ -88,8 +100,8 @@ class TePlateauState:
     param_group_lrs: Dict[int, float]
     state: str = "active"
     local_values: deque = field(default_factory=deque)
-    local_peak: MonotonicMaxQueue = field(init=False)
-    global_peak: MonotonicMaxQueue = field(init=False)
+    local_peak: TrimmedMaxQueue = field(init=False)
+    global_peak: TrimmedMaxQueue = field(init=False)
     global_ema: Optional[float] = None
     global_counter: int = 0
     local_counter: int = 0
@@ -102,8 +114,8 @@ class TePlateauState:
 
     def initialise_queues(self, config: TePlateauConfig) -> None:
         self.local_values = deque(maxlen=config.local_window)
-        self.local_peak = MonotonicMaxQueue(config.peak_window)
-        self.global_peak = MonotonicMaxQueue(config.global_window)
+        self.local_peak = TrimmedMaxQueue(config.peak_window, config.peak_trim_ratio)
+        self.global_peak = TrimmedMaxQueue(config.global_window, config.peak_trim_ratio)
 
     def current_lr(self) -> float:
         if not self.param_group_lrs:
@@ -133,6 +145,7 @@ class TePlateauController:
         self.active = False
         self.log_buffer: List[str] = []
         self.last_log_flush_step: Optional[int] = None
+        self.log_header_written = False
 
         self._build_states(network, lr_descriptions, te_indices)
         if self.states:
@@ -426,18 +439,28 @@ class TePlateauController:
         event: str,
     ) -> str:
         return (
-            f"{step}\t{name}\t{grad_norm:.6e}\t{median:.6e}\t{spread:.6e}\t{trend:.6e}\t"
-            f"{drop_local:.6e}\t{drop_global:.6e}\t{state}\t{lr_value:.6e}\t{event}"
+            f"{step},{name},{grad_norm:.6e},{median:.6e},{spread:.6e},{trend:.6e},"
+            f"{drop_local:.6e},{drop_global:.6e},{state},{lr_value:.6e},{event}"
         )
 
     def flush_logs(self) -> None:
-        if not (self.config.log_path and self.log_buffer):
+        log_path = self.config.log_path
+        if not (log_path and self.log_buffer):
             return
 
-        directory = os.path.dirname(self.config.log_path)
+        directory = os.path.dirname(log_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        with open(self.config.log_path, "a", encoding="utf-8") as fp:
+        if not self.log_header_written:
+            if os.path.exists(log_path) and os.path.getsize(log_path) > 0:
+                self.log_header_written = True
+        with open(log_path, "a", encoding="utf-8", newline="") as fp:
+            if not self.log_header_written or fp.tell() == 0:
+                fp.write(
+                    "step,te_name,grad_norm,median_local,spread_local,trend_ratio,"
+                    "drop_ratio_local,drop_ratio_global,state,lr,event\n"
+                )
+                self.log_header_written = True
             for line in self.log_buffer:
                 fp.write(line + "\n")
         self.log_buffer.clear()

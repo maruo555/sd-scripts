@@ -16,8 +16,8 @@
 
 ### ウィンドウの役割
 - **local_window** … 直近 `N` ステップの勾配を蓄積し、中央値・分位幅・線形回帰傾きを算出するための母集団です。局所的に横ばいになっているかを測定します。
-- **peak_window** … `local_window` とは別に、同区間で観測された最大値 (peak) を維持します。`median_local / peak_recent` を計算することで、「直近ピークからどれだけ落ち込んだか」を追跡します。
-- **global_window** … 指数移動平均 (EMA) を再度ピークトラッキングし、より長期的な減衰を測るための窓です。ここでのピークに対する比率が `global_drop` を下回ると、大局的に十分落ちたと見なします。
+- **peak_window** … `local_window` とは別に、同区間で観測された値から**上位 5% を捨てたうえでの最大値**を保持します。`median_local / peak_recent` を計算することで、「直近ピークからどれだけ落ち込んだか」を追跡します。
+- **global_window** … 指数移動平均 (EMA) を同様にトリム付きピークとして追跡し、より長期的な減衰を測るための窓です。ここでのピークに対する比率が `global_drop` を下回ると、大局的に十分落ちたと見なします。
 
 ## オプション一覧
 
@@ -26,8 +26,8 @@
 |-------------|--------|------|
 | `--te-plateau-enable` | `False` | プレート制御を有効化。SDXL テキストエンコーダーを学習対象に含む場合のみ意味を持つ。 |
 | `--te-plateau-local-window` | `512` | 局所中央値・分位幅・傾きを計算する履歴窓。 |
-| `--te-plateau-peak-window` | `4096` | 直近ピーク (max) を保持する窓。局所ドロップ比の分母に利用。 |
-| `--te-plateau-global-window` | `8192` | グローバル EMA のピークを保持する窓。ウィンドウ外のピークは再利用されない。 |
+| `--te-plateau-peak-window` | `4096` | 直近ピークを保持する窓。内部的には**上位 5% の値を除外した最大値**でピークを決め、スパイクの影響を抑える。 |
+| `--te-plateau-global-window` | `8192` | グローバル EMA のピークを保持する窓。こちらも上位 5% を除外した最大値を使ってスパイク耐性を確保。 |
 | `--te-plateau-local-patience` | `128` | 局所停滞判定を連続何ステップ満たせばよいか。 |
 | `--te-plateau-global-patience` | `128` | 大局フラグを立てるのに必要な連続ステップ数。 |
 | `--te-plateau-drop-threshold` | 既定なし | ローカル中央値/ピーク比 (`drop_ratio_local`) の共通閾値。未指定なら TE ごとの既定を使用。 |
@@ -40,7 +40,7 @@
 | `--te-plateau-decay-mult` | `0.5` | 減衰発火時に学習率へ掛ける係数 (単発)。 |
 | `--te-plateau-ignore-steps` | `2048` | 判定を開始するまでのウォームアップ期間。 |
 | `--te-plateau-cooldown` | `512` | 減衰・凍結後に判定を停止するステップ数。 |
-| `--te-plateau-log-path` | 未指定 | 指定すると TSV ログを出力。 |
+| `--te-plateau-log-path` | 未指定 | 指定するとヘッダー付き CSV ログ (UTF-8) を出力。 |
 | `--te-plateau-log-interval` | `500` | ログをファイルへフラッシュする間隔 (ステップ数)。 |
 
 ### TE 個別閾値
@@ -71,13 +71,13 @@
 - 逆に減衰が遅いと感じたら、共通値 (`--te-plateau-global-drop` など) で全体を緩めたうえで TE1/TE2 のどちらかだけ個別に上書きする、という流れで調整するのが扱いやすいです。
 
 ## ログ出力
-`--te-plateau-log-path` を指定すると、以下の列構成で `--te-plateau-log-interval` ごとに TSV を追記します:
+`--te-plateau-log-path` を指定すると、以下の列構成で `--te-plateau-log-interval` ごとに CSV を追記します:
 
 ```
-step \t te \t grad_norm \t median \t spread \t trend \t drop_local \t drop_global \t state \t lr \t event
+step,te_name,grad_norm,median_local,spread_local,trend_ratio,drop_ratio_local,drop_ratio_global,state,lr,event
 ```
 
-イベント列には `decay` / `freeze` が記録されます。凍結以降は指標のみ出力され、追加イベントは発生しません。
+イベント列には `decay` / `freeze` が記録されます。凍結後は指標のみが更新され、追加イベントは発生しません。
 
 ## 判定ロジック早見表
 
@@ -95,12 +95,13 @@ step \t te \t grad_norm \t median \t spread \t trend \t drop_local \t drop_globa
 - `--fused_optimizer_groups` や `--deepspeed` が有効な構成では現在サポートしていません。
 - 凍結 (`Frozen`) 状態では勾配が計算されないため、`grad_norm` は最後に観測した値を保持します。再開は行わない設計のため、凍結後はそのまま停止状態として扱ってください。
 - `--skip_grad_norm` / `--grad_norm_log` も未スケール勾配を利用するよう統一されているため、両機能のログで同じ値を確認できます。
+- `--te-plateau-log-path` の CSV にはヘッダー行が付きます（`step, te_name, grad_norm, ... , event`）。Excel などに読み込む場合は UTF-8 を指定してください。
 
 ## おすすめプリセット
 
 ### 1. クイックスタート (既定値のまま使う)
 ```
---te-plateau-enable --te-plateau-log-path logs/te_plateau.tsv
+--te-plateau-enable --te-plateau-log-path logs/te_plateau.csv
 ```
 共通オプションは指定せず、TE1/TE2 の既定閾値をそのまま利用します。ログだけ取りたい場合に最小構成です。
 
@@ -110,7 +111,7 @@ step \t te \t grad_norm \t median \t spread \t trend \t drop_local \t drop_globa
 --te-plateau-global-drop 0.7 \
 --te2-plateau-global-drop 0.68 \
 --te-plateau-drop-threshold 0.38 \
---te-plateau-log-path logs/te_plateau.tsv
+--te-plateau-log-path logs/te_plateau.csv
 ```
 共通 `global_drop` を 0.70 に緩めつつ、TE2 は個別に 0.68 に調整しています。`drop_threshold` も 0.38 に引き上げ、ピークから 38% 程度の落ち込みでも減衰を許容する設定です。
 
@@ -120,6 +121,6 @@ step \t te \t grad_norm \t median \t spread \t trend \t drop_local \t drop_globa
 --te-plateau-freeze-threshold-local 0.18 \
 --te-plateau-freeze-threshold-global 0.5 \
 --te1-plateau-spread-limit 0.2 \
---te-plateau-log-path logs/te_plateau.tsv
+--te-plateau-log-path logs/te_plateau.csv
 ```
 凍結条件を共通で引き締めつつ、TE1 のスプレッド閾値を 0.20 に下げています。よりフラットな状態になってから凍結したい場合に有効です。

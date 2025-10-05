@@ -137,6 +137,7 @@ def build_te_plateau_config(args, te_indices: Sequence[int]) -> Optional[TePlate
         local_window=getattr(args, "te_plateau_local_window", 512),
         peak_window=getattr(args, "te_plateau_peak_window", 4096),
         global_window=getattr(args, "te_plateau_global_window", 8192),
+        peak_trim_ratio=getattr(args, "te_plateau_peak_trim_ratio", 0.05),
         local_patience=getattr(args, "te_plateau_local_patience", 128),
         global_patience=getattr(args, "te_plateau_global_patience", 128),
         decay_mult=getattr(args, "te_plateau_decay_mult", 0.5),
@@ -1544,11 +1545,20 @@ class NetworkTrainer:
                         lr_scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
 
-                        if te_events and accelerator.is_main_process:
-                            for event in te_events:
-                                accelerator.print(
-                                    f"[TE-Plateau] {event['te']} {event['type']} at step {event['step']} (lr={event['lr']})"
-                                )
+                        if te_events:
+                            if use_grad_norm and log_grad_cosine:
+                                for event in te_events:
+                                    if event.get("type") == "freeze":
+                                        # 凍結で勾配の個数が変わるため、次ステップで再サンプルさせる
+                                        prev_grad_list = None
+                                        prev_grad_norm = None
+                                        break
+
+                            if accelerator.is_main_process:
+                                for event in te_events:
+                                    accelerator.print(
+                                        f"[TE-Plateau] {event['te']} {event['type']} at step {event['step']} (lr={event['lr']})"
+                                    )
 
                         # Optional: quantize/round LoRA trainable parameters after each optimizer step
                         if (
