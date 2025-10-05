@@ -139,8 +139,17 @@ class TeAutoScheduler:
     # ------------------------------------------------------------------
     # Metric collection
     # ------------------------------------------------------------------
-    def collect_metrics(self) -> Dict[int, float]:
+    def collect_metrics(self, grad_scale: float = 1.0) -> Dict[int, float]:
         metrics: Dict[int, float] = {}
+        inv_scale = 1.0
+        grad_scale_f: Optional[float] = None
+        if grad_scale is not None:
+            try:
+                grad_scale_f = float(grad_scale)
+            except (TypeError, ValueError):
+                grad_scale_f = None
+        if grad_scale_f is not None and grad_scale_f not in (0.0, 1.0) and math.isfinite(grad_scale_f):
+            inv_scale = 1.0 / grad_scale_f
         for te_idx, params in self.te_parameters.items():
             state = self.states.get(te_idx)
             if state is None or state.frozen:
@@ -154,6 +163,8 @@ class TeAutoScheduler:
                     continue
                 has_grad = True
                 grad_fp32 = grad.detach().float()
+                if inv_scale != 1.0:
+                    grad_fp32 = grad_fp32 * inv_scale
                 if not torch.isfinite(grad_fp32).all():
                     grad_fp32 = torch.nan_to_num(grad_fp32, nan=0.0, posinf=0.0, neginf=0.0)
                 total += grad_fp32.pow(2).sum().item()

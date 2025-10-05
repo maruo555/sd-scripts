@@ -1067,7 +1067,7 @@ class NetworkTrainer:
             idle_free_counter = 0
             in_idle_free = False
 
-            def check_gradients_and_skip_update(model, epoch, step, loss_val):
+            def check_gradients_and_skip_update(model, epoch, step, loss_val, grad_scale=1.0):
                 nonlocal trigger_count, cap_release_counter
                 nonlocal prev_grad_list, prev_grad_norm, idle_counter, idle_free_counter, in_idle_free
                 device = next(model.parameters()).device
@@ -1076,19 +1076,31 @@ class NetworkTrainer:
                 dot_sum = torch.tensor(0.0, device=device) if (log_grad_cosine and prev_grad_list is not None) else None
                 cur_grads = [] if log_grad_cosine else None
 
+                inv_scale = 1.0
+                grad_scale_f = None
+                if grad_scale is not None:
+                    try:
+                        grad_scale_f = float(grad_scale)
+                    except (TypeError, ValueError):
+                        grad_scale_f = None
+                if grad_scale_f is not None and grad_scale_f not in (0.0, 1.0) and math.isfinite(grad_scale_f):
+                    inv_scale = 1.0 / grad_scale_f
+
                 # 各パラメータの勾配ノルムの二乗を加算
                 with torch.no_grad():
                     idx = 0
                     for param in model.parameters():
                         if param.grad is not None:
-                            grad = param.grad
-                            # sum of squares
-                            grad_norm_sqr += (grad.detach() * grad.detach()).sum()
+                            grad_fp32 = param.grad.detach().float()
+                            if inv_scale != 1.0:
+                                grad_fp32 = grad_fp32 * inv_scale
+                            # sum of squares using unscaled gradients
+                            grad_norm_sqr += (grad_fp32 * grad_fp32).sum()
                             if log_grad_cosine:
                                 if prev_grad_list is not None and idx < len(prev_grad_list):
                                     # accumulate dot product per-parameter to avoid giant torch.cat
-                                    dot_sum += (grad.detach() * prev_grad_list[idx]).sum()
-                                cur_grads.append(grad.detach().clone())
+                                    dot_sum += (grad_fp32 * prev_grad_list[idx]).sum()
+                                cur_grads.append(grad_fp32.clone())
                                 idx += 1
                 current_grad_norm = torch.sqrt(grad_norm_sqr).item()
 
@@ -1472,14 +1484,20 @@ class NetworkTrainer:
                     accelerator.backward(loss)
 
                     te_metrics = None
+                    grad_scale = 1.0
+                    if hasattr(accelerator, "scaler"):
+                        try:
+                            grad_scale = float(accelerator.scaler.get_scale())
+                        except (AttributeError, TypeError, ValueError):
+                            grad_scale = 1.0
+                        if not math.isfinite(grad_scale) or grad_scale <= 0.0:
+                            grad_scale = 1.0
                     if accelerator.sync_gradients:
-                        if hasattr(accelerator, "scaler") and (use_grad_norm or te_scheduler is not None):
-                            accelerator.scaler.unscale_(optimizer)
                         if te_scheduler is not None:
-                            te_metrics = te_scheduler.collect_metrics()
+                            te_metrics = te_scheduler.collect_metrics(grad_scale=grad_scale)
 
                     skip_step = False
-                    if check_gradients_and_skip_update(network, epoch, step, loss.detach().item()):
+                    if check_gradients_and_skip_update(network, epoch, step, loss.detach().item(), grad_scale):
                         accelerator.print(
                             f"\nSkipping update at Epoch: {epoch}, Step: {step} due to large gradients."
                         )
