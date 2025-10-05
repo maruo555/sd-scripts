@@ -638,7 +638,8 @@ class NetworkTrainer:
         # lr schedulerを用意する
         lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
         te_plateau_config = None
-        if train_text_encoder and not args.deepspeed and not args.fused_optimizer_groups:
+        fused_optimizer_groups = getattr(args, "fused_optimizer_groups", None)
+        if train_text_encoder and not args.deepspeed and not fused_optimizer_groups:
             te_plateau_config = build_te_plateau_config(args, te_selection_indices)
 
         # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
