@@ -11,7 +11,7 @@ import toml
 from collections import deque
 import numpy as np
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from tqdm import tqdm
 
@@ -51,11 +51,105 @@ from library.avg_ckpt_util import (
 from library.utils import setup_logging, add_logging_arguments
 from library.rounding_util import round_parameters
 from accelerate.utils import broadcast
+from library.te_plateau import TePlateauConfig, TeThresholds, TePlateauController
 
 setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _get_te_threshold(
+    args,
+    base: TeThresholds,
+    te_idx: int,
+) -> TeThresholds:
+    drop_comm = getattr(args, "te_plateau_drop_threshold", None)
+    spread_comm = getattr(args, "te_plateau_spread_limit", None)
+    trend_comm = getattr(args, "te_plateau_trend_limit", None)
+    global_comm = getattr(args, "te_plateau_global_drop", None)
+    freeze_local_comm = getattr(args, "te_plateau_freeze_threshold_local", None)
+    freeze_global_comm = getattr(args, "te_plateau_freeze_threshold_global", None)
+
+    drop = drop_comm if drop_comm is not None else base.drop_threshold
+    spread = spread_comm if spread_comm is not None else base.spread_limit
+    trend = trend_comm if trend_comm is not None else base.trend_limit
+    global_thresh = global_comm if global_comm is not None else base.global_drop
+    freeze_local = (
+        freeze_local_comm if freeze_local_comm is not None else base.freeze_local
+    )
+    freeze_global = (
+        freeze_global_comm if freeze_global_comm is not None else base.freeze_global
+    )
+
+    specific_prefix = f"te{te_idx + 1}_plateau_"
+    spec_drop = getattr(args, specific_prefix + "drop_threshold", None)
+    spec_spread = getattr(args, specific_prefix + "spread_limit", None)
+    spec_trend = getattr(args, specific_prefix + "trend_limit", None)
+    spec_global = getattr(args, specific_prefix + "global_drop", None)
+    spec_freeze_local = getattr(args, specific_prefix + "freeze_threshold_local", None)
+    spec_freeze_global = getattr(args, specific_prefix + "freeze_threshold_global", None)
+
+    if spec_drop is not None:
+        drop = spec_drop
+    if spec_spread is not None:
+        spread = spec_spread
+    if spec_trend is not None:
+        trend = spec_trend
+    if spec_global is not None:
+        global_thresh = spec_global
+    if spec_freeze_local is not None:
+        freeze_local = spec_freeze_local
+    if spec_freeze_global is not None:
+        freeze_global = spec_freeze_global
+
+    return TeThresholds(
+        drop_threshold=drop,
+        spread_limit=spread,
+        trend_limit=trend,
+        global_drop=global_thresh,
+        freeze_local=freeze_local,
+        freeze_global=freeze_global,
+    )
+
+
+def build_te_plateau_config(args, te_indices: Sequence[int]) -> Optional[TePlateauConfig]:
+    if not getattr(args, "te_plateau_enable", False):
+        return None
+
+    defaults = {
+        0: TeThresholds(0.34, 0.22, 4.0e-4, 0.62, 0.20, 0.55),
+        1: TeThresholds(0.34, 0.25, 4.5e-4, 0.72, 0.26, 0.62),
+    }
+
+    thresholds: Dict[int, TeThresholds] = {}
+    for te_idx in te_indices:
+        base = defaults.get(te_idx, defaults[0])
+        thresholds[te_idx] = _get_te_threshold(args, base, te_idx)
+
+    if not thresholds:
+        return None
+
+    log_path = getattr(args, "te_plateau_log_path", None)
+    log_interval = getattr(args, "te_plateau_log_interval", 500) or 500
+
+    return TePlateauConfig(
+        local_window=getattr(args, "te_plateau_local_window", 512),
+        peak_window=getattr(args, "te_plateau_peak_window", 4096),
+        global_window=getattr(args, "te_plateau_global_window", 8192),
+        local_patience=getattr(args, "te_plateau_local_patience", 128),
+        global_patience=getattr(args, "te_plateau_global_patience", 128),
+        decay_mult=getattr(args, "te_plateau_decay_mult", 0.5),
+        freeze_patience=getattr(args, "te_plateau_freeze_patience", 256),
+        ignore_steps=getattr(args, "te_plateau_ignore_steps", 2048),
+        cooldown=getattr(args, "te_plateau_cooldown", 512),
+        thresholds=thresholds,
+        log_path=log_path,
+        log_interval=log_interval,
+        global_alpha=0.005,
+        flag_expire=getattr(args, "te_plateau_global_window", 8192),
+        flag_thaw_ratio=0.9,
+    )
 
 
 class NetworkTrainer:
@@ -456,6 +550,7 @@ class NetworkTrainer:
 
         # 学習に必要なクラスを準備する
         accelerator.print("prepare optimizer, data loader etc.")
+        te_plateau_controller = None
 
         te_lr_overrides: Dict[int, float] = {}
         if train_text_encoder:
@@ -542,6 +637,9 @@ class NetworkTrainer:
 
         # lr schedulerを用意する
         lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+        te_plateau_config = None
+        if train_text_encoder and not args.deepspeed and not args.fused_optimizer_groups:
+            te_plateau_config = build_te_plateau_config(args, te_selection_indices)
 
         # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
         if args.full_fp16:
@@ -610,6 +708,24 @@ class NetworkTrainer:
                 network, optimizer, train_dataloader, lr_scheduler
             )
             training_model = network
+
+        if te_plateau_config is not None:
+            unwrapped_network = accelerator.unwrap_model(network)
+            te_plateau_controller = TePlateauController(
+                te_plateau_config,
+                optimizer,
+                lr_scheduler,
+                lr_descriptions,
+                te_selection_indices,
+                unwrapped_network,
+                logger,
+                accelerator.is_main_process,
+            )
+            if not te_plateau_controller.is_active():
+                if accelerator.is_main_process:
+                    logger.warning("TE plateau controller disabled: no matching Text Encoder parameters found")
+                te_plateau_controller = None
+
 
         if args.gradient_checkpointing:
             # according to TI example in Diffusers, train is required
@@ -1069,20 +1185,25 @@ class NetworkTrainer:
                 # accumulate dot product with previous grads without concatenation
                 dot_sum = torch.tensor(0.0, device=device) if (log_grad_cosine and prev_grad_list is not None) else None
                 cur_grads = [] if log_grad_cosine else None
+                scale_for_grad = scaler_for_log.get_scale() if scaler_for_log is not None else 1.0
+                inv_scale = 1.0
+                if scale_for_grad != 0.0 and math.isfinite(scale_for_grad):
+                    inv_scale = 1.0 / scale_for_grad
 
                 # 各パラメータの勾配ノルムの二乗を加算
                 with torch.no_grad():
                     idx = 0
                     for param in model.parameters():
                         if param.grad is not None:
-                            grad = param.grad
-                            # sum of squares
-                            grad_norm_sqr += (grad.detach() * grad.detach()).sum()
+                            grad = param.grad.detach()
+                            if inv_scale != 1.0:
+                                grad = grad * inv_scale
+                            grad_norm_sqr += (grad * grad).sum()
                             if log_grad_cosine:
                                 if prev_grad_list is not None and idx < len(prev_grad_list):
                                     # accumulate dot product per-parameter to avoid giant torch.cat
                                     dot_sum += (grad.detach() * prev_grad_list[idx]).sum()
-                                cur_grads.append(grad.detach().clone())
+                                cur_grads.append(grad.clone())
                                 idx += 1
                 current_grad_norm = torch.sqrt(grad_norm_sqr).item()
 
@@ -1170,7 +1291,7 @@ class NetworkTrainer:
 
                 # ログをファイルに出力
                 if log_grad_norm:
-                    scale_val = scaler_for_log.get_scale() if log_grad_scale else None
+                    scale_val = scale_for_grad if log_grad_scale else None
                     flag = 2 if in_idle_free else (1 if math.isnan(dynamic_threshold) else 0)
                     log_line = f"{epoch},{step},{current_grad_norm},{dynamic_threshold},{loss_val},{flag}"
                     if log_grad_scale:
@@ -1404,7 +1525,14 @@ class NetworkTrainer:
                         optimizer.zero_grad(set_to_none=True)
                         skip_step = True
 
+                    te_events: List[Dict[str, str]] = []
                     if not skip_step:
+                        if te_plateau_controller is not None and accelerator.sync_gradients:
+                            grad_scale_val = 1.0
+                            if scaler_for_log is not None:
+                                grad_scale_val = scaler_for_log.get_scale()
+                            te_events = te_plateau_controller.update(global_step, grad_scale_val)
+
                         if accelerator.sync_gradients:
                             self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                             if args.max_grad_norm != 0.0:
@@ -1414,6 +1542,12 @@ class NetworkTrainer:
                         optimizer.step()
                         lr_scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
+
+                        if te_events and accelerator.is_main_process:
+                            for event in te_events:
+                                accelerator.print(
+                                    f"[TE-Plateau] {event['te']} {event['type']} at step {event['step']} (lr={event['lr']})"
+                                )
 
                         # Optional: quantize/round LoRA trainable parameters after each optimizer step
                         if (
@@ -1554,6 +1688,9 @@ class NetworkTrainer:
                 f.writelines(log_buffer)
             log_buffer.clear()
 
+        if te_plateau_controller is not None:
+            te_plateau_controller.finalize()
+
         if is_main_process:
             network = accelerator.unwrap_model(network)
 
@@ -1606,6 +1743,186 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="learning rate for Text Encoder 2 (BiG-G) / Text Encoder 2 (BiG-G)の学習率",
+    )
+    parser.add_argument(
+        "--te-plateau-enable",
+        action="store_true",
+        help="enable SDXL Text Encoder plateau controller / SDXL Text Encoder向け学習率プレート制御を有効化",
+    )
+    parser.add_argument(
+        "--te-plateau-local-window",
+        type=int,
+        default=512,
+        help="window size for local median statistics / ローカル中央値統計の窓サイズ",
+    )
+    parser.add_argument(
+        "--te-plateau-peak-window",
+        type=int,
+        default=4096,
+        help="window size for recent peak tracking / 直近ピークトラッキングの窓サイズ",
+    )
+    parser.add_argument(
+        "--te-plateau-global-window",
+        type=int,
+        default=8192,
+        help="window size for global EMA peak tracking / グローバルEMAピークトラッキングの窓サイズ",
+    )
+    parser.add_argument(
+        "--te-plateau-local-patience",
+        type=int,
+        default=128,
+        help="consecutive steps required for local plateau / ローカル停滞とみなす連続ステップ数",
+    )
+    parser.add_argument(
+        "--te-plateau-global-patience",
+        type=int,
+        default=128,
+        help="consecutive steps required for global drop flag / 大局的減衰フラグを立てる連続ステップ数",
+    )
+    parser.add_argument(
+        "--te-plateau-drop-threshold",
+        type=float,
+        default=None,
+        help="override local drop ratio threshold for all TEs / 全TE共通のローカルドロップ閾値",
+    )
+    parser.add_argument(
+        "--te-plateau-spread-limit",
+        type=float,
+        default=None,
+        help="override spread limit (pct90-pct10) multiplier / スプレッド許容倍数の共通上書き",
+    )
+    parser.add_argument(
+        "--te-plateau-trend-limit",
+        type=float,
+        default=None,
+        help="override normalized trend limit for all TEs / 正規化トレンド閾値の共通上書き",
+    )
+    parser.add_argument(
+        "--te-plateau-global-drop",
+        type=float,
+        default=None,
+        help="override global drop ratio threshold for all TEs / 大局ドロップ閾値の共通上書き",
+    )
+    parser.add_argument(
+        "--te-plateau-decay-mult",
+        type=float,
+        default=0.5,
+        help="learning rate multiplier applied once plateau triggers / プレート検知時に適用する学習率倍率",
+    )
+    parser.add_argument(
+        "--te-plateau-freeze-threshold-local",
+        type=float,
+        default=None,
+        help="override local threshold for freeze / 凍結判定用ローカル閾値の共通上書き",
+    )
+    parser.add_argument(
+        "--te-plateau-freeze-threshold-global",
+        type=float,
+        default=None,
+        help="override global threshold for freeze / 凍結判定用グローバル閾値の共通上書き",
+    )
+    parser.add_argument(
+        "--te-plateau-freeze-patience",
+        type=int,
+        default=256,
+        help="consecutive steps required to freeze after decay / 減衰後に凍結へ移る連続ステップ数",
+    )
+    parser.add_argument(
+        "--te-plateau-ignore-steps",
+        type=int,
+        default=2048,
+        help="steps to ignore before enabling plateau evaluation / 判定開始まで無視するステップ数",
+    )
+    parser.add_argument(
+        "--te-plateau-cooldown",
+        type=int,
+        default=512,
+        help="cooldown steps after decay/freeze / 減衰や凍結後に判定を休止するステップ数",
+    )
+    parser.add_argument(
+        "--te-plateau-log-path",
+        type=str,
+        default=None,
+        help="optional TSV log path for TE plateau metrics / プレート指標を保存するTSVファイルパス",
+    )
+    parser.add_argument(
+        "--te-plateau-log-interval",
+        type=int,
+        default=500,
+        help="flush interval (steps) for TE plateau logs / ログ書き出し間隔(ステップ数)",
+    )
+    # TE-specific overrides
+    parser.add_argument(
+        "--te1-plateau-drop-threshold",
+        type=float,
+        default=None,
+        help="local drop ratio threshold override for TE1 / TE1向けローカルドロップ閾値",
+    )
+    parser.add_argument(
+        "--te2-plateau-drop-threshold",
+        type=float,
+        default=None,
+        help="local drop ratio threshold override for TE2 / TE2向けローカルドロップ閾値",
+    )
+    parser.add_argument(
+        "--te1-plateau-spread-limit",
+        type=float,
+        default=None,
+        help="spread limit override for TE1 / TE1向けスプレッド閾値",
+    )
+    parser.add_argument(
+        "--te2-plateau-spread-limit",
+        type=float,
+        default=None,
+        help="spread limit override for TE2 / TE2向けスプレッド閾値",
+    )
+    parser.add_argument(
+        "--te1-plateau-trend-limit",
+        type=float,
+        default=None,
+        help="trend limit override for TE1 / TE1向けトレンド閾値",
+    )
+    parser.add_argument(
+        "--te2-plateau-trend-limit",
+        type=float,
+        default=None,
+        help="trend limit override for TE2 / TE2向けトレンド閾値",
+    )
+    parser.add_argument(
+        "--te1-plateau-global-drop",
+        type=float,
+        default=None,
+        help="global drop threshold override for TE1 / TE1向けグローバル閾値",
+    )
+    parser.add_argument(
+        "--te2-plateau-global-drop",
+        type=float,
+        default=None,
+        help="global drop threshold override for TE2 / TE2向けグローバル閾値",
+    )
+    parser.add_argument(
+        "--te1-plateau-freeze-threshold-local",
+        type=float,
+        default=None,
+        help="freeze local threshold override for TE1 / TE1向け凍結ローカル閾値",
+    )
+    parser.add_argument(
+        "--te2-plateau-freeze-threshold-local",
+        type=float,
+        default=None,
+        help="freeze local threshold override for TE2 / TE2向け凍結ローカル閾値",
+    )
+    parser.add_argument(
+        "--te1-plateau-freeze-threshold-global",
+        type=float,
+        default=None,
+        help="freeze global threshold override for TE1 / TE1向け凍結グローバル閾値",
+    )
+    parser.add_argument(
+        "--te2-plateau-freeze-threshold-global",
+        type=float,
+        default=None,
+        help="freeze global threshold override for TE2 / TE2向け凍結グローバル閾値",
     )
     parser.add_argument(
         "--network_te_train_targets",

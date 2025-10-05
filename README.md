@@ -13,8 +13,9 @@
 | `--te_mlp_fc_only` | 全層 | Text Encoder の学習対象を **MLP (全結合) 層だけ**に限定。キーワードベースのキャラ LoRA で“語彙を固めつつ柔軟性を保つ”目的。 | 本家 PR #1964 以前の挙動を再現。|
 | `--fp16_safe_norms` | `False` | 縮約系（LayerNorm/GroupNorm/Softmax）だけ **fp32 で演算**し、重みと他演算は fp16 のまま。fp16 + 小バッチ（例: `batch_size=1`）で学習安定性を向上。 | `library/sdxl_original_unet.py` にラッパ実装。<br>注意: Softmax の fp32 化は通常のAttention経路のみ（`--xformers`/`--sdpa` 使用時は各実装に依存）。Normは全経路でfp32化。|
 | `--network_te_train_targets`,<br>`--text_encoder_lr1`,<br>`--text_encoder_lr2` | `None` | SDXLの2系統Text EncoderのLoRA学習対象と学習率を個別に制御。未指定時は従来通り両方を同じ学習率で更新。 | 詳細は [docs/sdxl_lora_te_options-ja.md](docs/sdxl_lora_te_options-ja.md) を参照。|
+| `--te-plateau-enable` | `False` | 勾配ノルムの大局的減衰と局所停滞を組み合わせて TE ごとに**学習率を1回だけ減衰 → 凍結 (再開なし)** まで自動制御。 | 仕様と推奨値は [docs/te_plateau_controller-ja.md](docs/te_plateau_controller-ja.md) を参照。|
 | `--skip_grad_norm` | ― | 直近 *N = 200* step の **勾配 L2 ノルムの移動平均 + 2.5σ** を動的しきい値とし、超過 step の更新をスキップ。NaN/Inf も既定でスキップ。 | 破綻防止・fp16 の安定化補助。しきい値は `--skip_grad_norm_max` で上限可。|
-| `--skip_grad_norm_max` | 無制限 | `--skip_grad_norm` が計算する動的しきい値の**上限キャップ**。 | 例: `--skip_grad_norm_max 200000` |
+| `--skip_grad_norm_max` | 無制限 | `--skip_grad_norm` が計算する動的しきい値の**上限キャップ**。 | 例: `--skip_grad_norm_max 1.0` |
 | `--grad_norm_log` | 無効 | 100 step ごとに **(epoch, step, norm, threshold, loss, ThreshOff)** を `gradient_logs+<LoRA名>.txt` へ追記。<br>ThreshOffは、0=閾値有効, 1=閾値がNaNで無効, 2=閾値が`--idle_free_phase`で無効 | スキップを *OFF* にすれば純ログモード。 |
 | `--grad_cosine_log` | 無効 | 直前 step との **勾配コサイン類似度** を `grad_norm_log` に追加。 | 経路探索の可視化用。 |
 | `--nan_to_window`, `--inf_to_window` | `False` | NaN / Inf を移動平均窓に**含める／含めない**を切替。含めると *threshold* が NaN となり、窓サイズ分だけスキップ判定が無効化＝“ブレーキ解除”。 | fp16 で意図的にスパイクを許容したい実験用。 |
@@ -32,7 +33,7 @@
 | 名称 | 目的 / 特徴 | 推奨コマンド例 |
 |------|-------------|----------------|
 | **Preset A — “当たり狙い”** | *NaN/Inf もスキップ*。スケールが際限なく上がるため破綻リスクはあるものの、少量高品質データで“化ける”ことがある。 | `--downscale_freq_shift  --te_mlp_fc_only --skip_grad_norm --grad_norm_log --grad_cosine_log` |
-| **Preset B — “安定重視”** | *NaN/Inf をスキップしない*ことで GradScaler の自動調整を生かしつつ、動的しきい値で大スパイクのみ遮断。窓にNaN/Infを入れることで“ブレーキ解除”。最も汎用的。 | `--downscale_freq_shift --te_mlp_fc_only --skip_grad_norm --grad_norm_log --grad_cosine_log --skip_grad_norm_max 200000 --nan_to_window --inf_to_window --no-skip_nan_immediate --no-skip_inf_immediate` |
+| **Preset B — “安定重視”** | *NaN/Inf をスキップしない*ことで GradScaler の自動調整を生かしつつ、動的しきい値で大スパイクのみ遮断。窓にNaN/Infを入れることで“ブレーキ解除”。最も汎用的。 | `--downscale_freq_shift --te_mlp_fc_only --skip_grad_norm --grad_norm_log --grad_cosine_log --skip_grad_norm_max 1.0 --nan_to_window --inf_to_window --no-skip_nan_immediate --no-skip_inf_immediate` |
 | **Preset C — “停滞打破実験”** | Preset B + `--auto_cap_release`。谷底で停滞したら一時的にキャップを緩めて脱出を試みる。効果はケース依存。(あまり効果なし) | `Preset B` に `--auto_cap_release` を追加 |
 | **Preset D' — “停滞打破実験”** | Preset B + `--idle_free_phase`。窓にNaNが長期間入らない場合も定期的に“ブレーキ解除”。(安定しない) | `Preset B` に `--idle_free_phase` を追加 |
 | **Preset E' — “実験”** | Preset B + `--idle_free_phase`。途中のエポックから直近数個のエポックとの平均をとりながら学習を進める。(いいかも) | `Preset B` に `--avg_cp --avg_window 4 --avg_begin 0.6 --avg_mode ema --avg_reset_stats` を追加 |
