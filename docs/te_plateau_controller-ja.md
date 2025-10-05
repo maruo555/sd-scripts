@@ -55,8 +55,6 @@
 | `--te1-plateau-freeze-threshold-local` / `--te2-plateau-freeze-threshold-local` | 0.20 | 0.26 | 凍結判定時に要求するローカル比。 |
 | `--te1-plateau-freeze-threshold-global` / `--te2-plateau-freeze-threshold-global` | 0.55 | 0.62 | 凍結判定時に要求するグローバル比。 |
 
-これらの既定値は `temp/te_monitor_twtg_hktu_xl05ad_nb.csv` を基に調整しており、TE1 では約 7.7k step、TE2 では約 15k step で減衰が発動する想定です。
-
 各パラメータの目安（いずれも **「値を下回ったら」 条件成立**）:
 - **drop_threshold** … `median_local / peak_recent` がこの値を下回るとピークから十分落ち込んだと判定。例: 0.34 ならピークの 34% 以下に沈んだときに条件が成立する。
 - **spread_limit** … `pct90 - pct10` を `peak_recent` で割った値が上限未満なら局所変動が収束しているとみなす。値を小さくするほど「ほぼ一定に張り付いた」状態のみ停滞扱いになる。
