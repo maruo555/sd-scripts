@@ -130,6 +130,7 @@ class TeAutoScheduler:
                 self.log_format = "csv"
             if self.log_path.parent and not self.log_path.parent.exists():
                 self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_interval = max(0, log_interval)
         self._log_buffer: List[TeLogEntry] = []
         self._log_header_written = False
         self._last_flushed_step: Optional[int] = None
