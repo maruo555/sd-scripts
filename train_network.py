@@ -58,6 +58,155 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class TextEncoderLrScaleManager:
+    """
+    単一のしきい値でText Encoder用パラメータグループの学習率に倍率を適用するヘルパー。
+    global_stepがしきい値に到達したタイミングで一度だけ倍率を掛ける。
+    """
+
+    def __init__(
+        self,
+        *,
+        optimizer: torch.optim.Optimizer,
+        lr_scheduler,
+        lr_descriptions: Optional[List[str]],
+        te_group_indices: List[int],
+        trigger_step: int,
+        scale_factor: float,
+    ):
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.lr_descriptions = lr_descriptions or []
+        self.te_group_indices = te_group_indices
+        self.trigger_step = trigger_step
+        self.scale_factor = scale_factor
+        self.enabled = bool(te_group_indices)
+
+        self._applied = False
+        self._initially_marked = False
+        self._restored_adjustments: List[str] = []
+        if self.enabled:
+            scaled_flags = []
+            for idx in self.te_group_indices:
+                group = self.optimizer.param_groups[idx]
+                flag = bool(group.get("te_lr_scaled", False))
+                scaled_flags.append(flag)
+                existing_factor = group.get("te_lr_scale_factor", None)
+                if flag and existing_factor is not None and not math.isclose(existing_factor, self.scale_factor):
+                    old_lr = group["lr"]
+                    if existing_factor == 0:
+                        continue
+                    base_lr_estimate = old_lr / existing_factor
+                    new_lr = base_lr_estimate * self.scale_factor
+                    group["lr"] = new_lr
+                    group["initial_lr"] = new_lr
+                    group["te_lr_scale_factor"] = self.scale_factor
+                    if hasattr(self.lr_scheduler, "base_lrs"):
+                        try:
+                            self.lr_scheduler.base_lrs[idx] = new_lr
+                        except (IndexError, AttributeError):
+                            pass
+                    if hasattr(self.lr_scheduler, "_last_lr"):
+                        try:
+                            self.lr_scheduler._last_lr[idx] = new_lr
+                        except (IndexError, AttributeError):
+                            pass
+                    self._restored_adjustments.append(
+                        f"{self.lr_descriptions[idx] if idx < len(self.lr_descriptions) else f'group{idx}'}:"
+                        f"{old_lr:.7g}->{new_lr:.7g} (factor {existing_factor}->{self.scale_factor})"
+                    )
+
+            if scaled_flags and all(scaled_flags):
+                self._applied = True
+                self._initially_marked = True
+
+    def log_initial_state(self, current_step: int):
+        if not self.enabled:
+            return
+        group_labels = []
+        for idx in self.te_group_indices:
+            if idx < len(self.lr_descriptions):
+                group_labels.append(self.lr_descriptions[idx])
+            else:
+                group_labels.append(f"group{idx}")
+
+        current_lrs = [
+            self.optimizer.param_groups[idx]["lr"] for idx in self.te_group_indices
+        ]
+        logger.info(
+            "text encoder lr scale scheduled: step>=%s factor=%s groups=%s current_lrs=%s current_step=%s",
+            self.trigger_step,
+            self.scale_factor,
+            group_labels,
+            current_lrs,
+            current_step,
+        )
+        if self._initially_marked:
+            logger.info("text encoder lr scale flag already present in optimizer state; keeping scaled mode enabled.")
+        if self._restored_adjustments:
+            logger.info(
+                "text encoder lr scale factor updated on resume (%s)",
+                ", ".join(self._restored_adjustments),
+            )
+
+    def maybe_apply(self, current_step: int):
+        if not self.enabled or self._applied:
+            return
+        if current_step >= self.trigger_step:
+            self._apply_scale(log=True, step=current_step)
+            self._applied = True
+
+    def _apply_scale(self, log: bool, step: Optional[int] = None):
+        if self.scale_factor == 1.0:
+            # 倍率1.0は実質変化なしだが、適用済みフラグだけ設定する
+            for idx in self.te_group_indices:
+                group = self.optimizer.param_groups[idx]
+                group["te_lr_scaled"] = True
+                group["te_lr_scale_factor"] = self.scale_factor
+            return
+
+        log_entries = []
+        for idx in self.te_group_indices:
+            group = self.optimizer.param_groups[idx]
+            old_lr = group["lr"]
+            new_lr = old_lr * self.scale_factor
+            group["lr"] = new_lr
+            group["initial_lr"] = new_lr
+            group["te_lr_scaled"] = True
+            group["te_lr_scale_factor"] = self.scale_factor
+            if hasattr(self.lr_scheduler, "base_lrs"):
+                try:
+                    self.lr_scheduler.base_lrs[idx] = new_lr
+                except (IndexError, AttributeError):
+                    pass
+
+            if hasattr(self.lr_scheduler, "_last_lr"):
+                try:
+                    self.lr_scheduler._last_lr[idx] = new_lr
+                except (IndexError, AttributeError):
+                    pass
+
+            if log:
+                label = (
+                    self.lr_descriptions[idx]
+                    if idx < len(self.lr_descriptions)
+                    else f"group{idx}"
+                )
+                log_entries.append(f"{label}: {old_lr:.7g}->{new_lr:.7g}")
+
+        if log and log_entries:
+            if step is not None:
+                logger.info(
+                    "text encoder lr scaled at step %s (%s)",
+                    step,
+                    ", ".join(log_entries),
+                )
+            else:
+                logger.info(
+                    "text encoder lr scaled (%s)",
+                    ", ".join(log_entries),
+                )
+
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
@@ -162,6 +311,20 @@ class NetworkTrainer:
                 f"lora rounding: step={args.round_lora_step}, mode={args.round_lora_mode}, "
                 f"every={args.round_lora_every}, begin={args.round_lora_begin}"
             )
+
+        te_lr_scale_step = getattr(args, "text_encoder_lr_scale_step", None)
+        te_lr_scale_factor = getattr(args, "text_encoder_lr_scale_factor", None)
+        if (te_lr_scale_step is None) != (te_lr_scale_factor is None):
+            raise ValueError(
+                "both --text_encoder_lr_scale_step and --text_encoder_lr_scale_factor must be specified together "
+                "/ --text_encoder_lr_scale_stepと--text_encoder_lr_scale_factorは同時に指定してください"
+            )
+        if te_lr_scale_step is not None:
+            if te_lr_scale_step < 0:
+                raise ValueError("--text_encoder_lr_scale_step must be >= 0")
+            if te_lr_scale_factor <= 0:
+                raise ValueError("--text_encoder_lr_scale_factor must be > 0")
+
         # parse bits schedule if provided
         def _parse_bits_sched(spec: str):
             items = []
@@ -515,6 +678,17 @@ class NetworkTrainer:
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
 
+        te_lr_group_indices: List[int] = []
+        if lr_descriptions is not None:
+            te_lr_group_indices = [
+                idx for idx, desc in enumerate(lr_descriptions) if desc.startswith("textencoder")
+            ]
+        elif getattr(args, "text_encoder_lr_scale_step", None) is not None:
+            logger.warning(
+                "text encoder lr scaling is requested but lr_descriptions are unavailable; "
+                "unable to determine parameter groups to scale / lr_descriptionsが取得できないためText EncoderのLR拡縮を特定できません"
+            )
+
         # dataloaderを準備する
         # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
@@ -610,6 +784,28 @@ class NetworkTrainer:
                 network, optimizer, train_dataloader, lr_scheduler
             )
             training_model = network
+
+        te_lr_scale_manager: Optional[TextEncoderLrScaleManager] = None
+        if te_lr_scale_step is not None:
+            if not train_text_encoder:
+                logger.warning(
+                    "text encoder lr scaling is specified but text encoder training is disabled; ignoring setting / "
+                    "Text Encoderの学習を行わないため学習率の倍率変更設定を無視します"
+                )
+            elif len(te_lr_group_indices) == 0:
+                logger.warning(
+                    "text encoder lr scaling is specified but no text encoder parameter groups were identified; ignoring setting / "
+                    "Text Encoderの対象パラメータが特定できないため倍率変更設定を無視します"
+                )
+            else:
+                te_lr_scale_manager = TextEncoderLrScaleManager(
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    lr_descriptions=lr_descriptions,
+                    te_group_indices=te_lr_group_indices,
+                    trigger_step=te_lr_scale_step,
+                    scale_factor=te_lr_scale_factor,
+                )
 
         if args.gradient_checkpointing:
             # according to TI example in Diffusers, train is required
@@ -1237,6 +1433,10 @@ class NetworkTrainer:
                 initial_step -= len(train_dataloader)
             global_step = initial_step
 
+        if te_lr_scale_manager:
+            te_lr_scale_manager.log_initial_state(global_step)
+            te_lr_scale_manager.maybe_apply(global_step)
+
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
@@ -1444,6 +1644,8 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+                    if te_lr_scale_manager:
+                        te_lr_scale_manager.maybe_apply(global_step)
                     if (
                         not nan_inf_switched
                         and nan_inf_until_step is not None
@@ -1606,6 +1808,19 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="learning rate for Text Encoder 2 (BiG-G) / Text Encoder 2 (BiG-G)の学習率",
+    )
+    parser.add_argument(
+        "--text_encoder_lr_scale_step",
+        type=int,
+        default=None,
+        help="after this global step, scale text encoder learning rate once / 指定グローバルステップ以降でText EncoderのLRを一度だけ倍率変更します",
+    )
+    parser.add_argument(
+        "--text_encoder_lr_scale_factor",
+        type=float,
+        default=None,
+        help="scale factor applied to text encoder learning rate when --text_encoder_lr_scale_step is triggered (e.g. 0.5) / "
+        "指定ステップ到達時にText Encoderの学習率へ掛ける倍率（例:0.5）",
     )
     parser.add_argument(
         "--network_te_train_targets",
