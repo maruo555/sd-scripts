@@ -1,11 +1,15 @@
 import itertools
 import json
-from typing import Any, List, NamedTuple, Optional, Tuple, Union, Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union, Callable
 import glob
 import importlib
 import inspect
 import time
 import zipfile
+from collections import OrderedDict
+import shlex
 from diffusers.utils import deprecate
 from diffusers.configuration_utils import FrozenDict
 import argparse
@@ -51,6 +55,7 @@ import library.train_util as train_util
 import library.sdxl_model_util as sdxl_model_util
 import library.sdxl_train_util as sdxl_train_util
 from networks.lora import LoRANetwork
+from networks.svd_merge_lora import LAYER12, LAYER17, LAYER20, LAYER26, get_lbw_block_index
 from library.sdxl_original_unet import InferSdxlUNet2DConditionModel
 from library.original_unet import FlashAttentionFunction
 from networks.control_net_lllite import ControlNetLLLite
@@ -73,6 +78,581 @@ LATENT_CHANNELS = 4
 DOWNSAMPLING_FACTOR = 8
 
 CLIP_VISION_MODEL = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
+
+LBW_PRESETS: Dict[str, List[float]] = {
+    "XLALL": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    "XLINS": [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "XLIND": [1, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+    "XLINALL": [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+    "XLMIDD": [1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    "XLMIDD2": [1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0],
+    "XLOUTD": [1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0],
+    "XLOUTS": [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1],
+    "XLOUTALL": [1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1],
+    "XLMLT0": [1, 1, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1],
+    "XLMLT1": [1, 1, 0, 0, 1, 1, 0.6, 1, 1, 1, 0, 1],
+    "XLMLT2": [1, 1, 0, 0, 0, 0.6, 1, 1, 1, 1, 0, 1],
+    "XLMLT3": [1, 1, 0, 0, 1, 0.6, 1, 1, 1, 1, 0, 1],
+}
+
+
+@dataclass
+class LoRASpec:
+    module: str
+    weight_path: str
+    alias: str
+    multiplier: float = 1.0
+    block_weights: Optional[List[float]] = None
+    auto: bool = False
+    precalc: bool = False
+    extra_args: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class PromptLoraOverride:
+    alias: str
+    multiplier: Optional[float] = None
+    block_weights: Optional[List[float]] = None
+
+
+@dataclass
+class LoRAEntry:
+    spec: LoRASpec
+    network: LoRANetwork
+    default_multiplier: float
+    default_block_weights: Optional[List[float]]
+    is_sdxl: bool
+
+
+RE_LORA_TAG = re.compile(r"<lora:([^>]+)>", re.IGNORECASE)
+
+
+class LoRAManager:
+    def __init__(
+        self,
+        device,
+        dtype,
+        text_encoders: List[CLIPTextModel],
+        unet: InferSdxlUNet2DConditionModel,
+        vae: AutoencoderKL,
+        opt_channels_last: bool,
+    ):
+        self.device = device
+        self.dtype = dtype
+        self.text_encoders = text_encoders
+        self.unet = unet
+        self.vae = vae
+        self.opt_channels_last = opt_channels_last
+        self._entries: "OrderedDict[str, LoRAEntry]" = OrderedDict()
+        self._alias_lookup: Dict[str, str] = {}
+        self._warned_precalc = False
+        self._sdxl_lbw_flags = {
+            12: _indices_from_layer_flags(LAYER12),
+            20: _indices_from_layer_flags(LAYER20),
+            26: list(range(len(LAYER26))),
+        }
+        self._sd1_lbw_flags = {
+            12: _indices_from_layer_flags(LAYER12),
+            17: _indices_from_layer_flags(LAYER17),
+            20: _indices_from_layer_flags(LAYER20),
+            26: list(range(len(LAYER26))),
+        }
+
+    @property
+    def networks(self) -> List[LoRANetwork]:
+        return [entry.network for entry in self._entries.values()]
+
+    @property
+    def default_multipliers(self) -> Tuple[float, ...]:
+        return tuple(entry.default_multiplier for entry in self._entries.values())
+
+    @property
+    def aliases(self) -> List[str]:
+        return list(self._entries.keys())
+
+    def has_entries(self) -> bool:
+        return len(self._entries) > 0
+
+    def register(self, spec: LoRASpec) -> LoRAEntry:
+        alias_key = spec.alias.lower()
+        if alias_key in self._alias_lookup:
+            raise ValueError(f"duplicate LoRA alias detected: {spec.alias}")
+
+        imported_module = importlib.import_module(spec.module)
+        network, weights_sd = imported_module.create_network_from_weights(
+            spec.multiplier, spec.weight_path, self.vae, self.text_encoders, self.unet, for_inference=True, **spec.extra_args
+        )
+        if network is None:
+            raise RuntimeError(f"failed to load LoRA weights: {spec.weight_path}")
+        network.apply_to(self.text_encoders, self.unet)
+        info = network.load_state_dict(weights_sd, False)
+        logger.info(f"LoRA weights loaded for {spec.alias}: {info}")
+
+        if self.opt_channels_last:
+            network.to(memory_format=torch.channels_last)
+        network.to(self.dtype).to(self.device)
+
+        if spec.precalc:
+            if not self._warned_precalc:
+                logger.warning("network_pre_calc is disabled for dynamic LoRA control.")
+                self._warned_precalc = True
+            spec.precalc = False
+
+        is_sdxl = self._detect_is_sdxl(network)
+        entry = LoRAEntry(
+            spec=spec,
+            network=network,
+            default_multiplier=spec.multiplier,
+            default_block_weights=spec.block_weights[:] if spec.block_weights else None,
+            is_sdxl=is_sdxl,
+        )
+
+        self._entries[spec.alias] = entry
+        self._alias_lookup[alias_key] = spec.alias
+        return entry
+
+    def unload(self, alias: str) -> None:
+        key = self._alias_lookup.pop(alias.lower(), None)
+        if key is None:
+            raise ValueError(f"LoRA alias '{alias}' is not loaded.")
+        entry = self._entries.pop(key)
+        entry.network.set_enabled(False)
+        entry.network.to("cpu")
+        clean_memory()
+
+    def reload(self, alias: str, weight_path: Optional[str] = None, multiplier: Optional[float] = None) -> LoRAEntry:
+        normalized = self._alias_lookup.get(alias.lower())
+        if normalized is None:
+            raise ValueError(f"LoRA alias '{alias}' is not loaded.")
+        entry = self._entries.pop(normalized)
+        self._alias_lookup.pop(alias.lower(), None)
+        entry.network.set_enabled(False)
+        new_spec = LoRASpec(
+            module=entry.spec.module,
+            weight_path=weight_path or entry.spec.weight_path,
+            alias=normalized,
+            multiplier=multiplier if multiplier is not None else entry.spec.multiplier,
+            block_weights=entry.spec.block_weights[:] if entry.spec.block_weights else None,
+            auto=entry.spec.auto,
+            precalc=False,
+            extra_args=entry.spec.extra_args.copy(),
+        )
+        return self.register(new_spec)
+
+    def set_auto(self, alias: str, enabled: bool) -> None:
+        entry = self._get_entry(alias)
+        entry.spec.auto = enabled
+
+    def set_block_weights(self, alias: str, weights: Optional[List[float]]) -> None:
+        entry = self._get_entry(alias)
+        entry.spec.block_weights = weights[:] if weights is not None else None
+
+    def resolve_prompt_config(
+        self,
+        overrides: Optional[List[PromptLoraOverride]],
+        manual_multipliers: Optional[List[float]],
+    ) -> Tuple[Tuple[float, ...], Tuple[Optional[Tuple[float, ...]], ...]]:
+        overrides = overrides or []
+        override_map = {ov.alias.lower(): ov for ov in overrides}
+        multipliers: List[float] = []
+        block_weights: List[Optional[Tuple[float, ...]]] = []
+
+        for idx, (alias, entry) in enumerate(self._entries.items()):
+            base_mul = entry.spec.multiplier
+            if manual_multipliers is not None and idx < len(manual_multipliers):
+                base_mul = manual_multipliers[idx]
+
+            override = override_map.pop(alias.lower(), None)
+            if override:
+                target_mul = base_mul if override.multiplier is None else override.multiplier
+                bw = override.block_weights if override.block_weights is not None else entry.spec.block_weights
+            elif entry.spec.auto:
+                target_mul = base_mul
+                bw = entry.spec.block_weights
+            else:
+                target_mul = 0.0
+                bw = None
+
+            multipliers.append(target_mul)
+            block_weights.append(tuple(bw) if bw is not None else None)
+
+        for alias_key in override_map.keys():
+            logger.warning(f"LoRA alias '{alias_key}' is not loaded; tag is ignored.")
+
+        return tuple(multipliers), tuple(block_weights)
+
+    def prepare_for_batch(
+        self,
+        multipliers: Tuple[float, ...],
+        block_weights: Optional[Tuple[Optional[Tuple[float, ...]], ...]],
+        batch_size: int,
+        width: int,
+        height: int,
+        num_sub_prompts: Optional[int],
+        regional_network: bool,
+    ) -> Dict[str, Any]:
+        shared: Dict[str, Any] = {}
+        block_weights = block_weights or tuple([None] * len(multipliers))
+        for (alias, entry), multiplier, bw in zip(self._entries.items(), multipliers, block_weights):
+            entry.network.set_multiplier(multiplier)
+            self._apply_block_weights(entry, multiplier, bw)
+            if regional_network and multiplier != 0:
+                entry.network.set_current_generation(batch_size, num_sub_prompts, width, height, shared)
+        return shared
+
+    def list_entries(self) -> List[Dict[str, Any]]:
+        info = []
+        for alias, entry in self._entries.items():
+            info.append(
+                {
+                    "alias": alias,
+                    "module": entry.spec.module,
+                    "weight": entry.spec.weight_path,
+                    "multiplier": entry.spec.multiplier,
+                    "auto": entry.spec.auto,
+                    "block_weights": entry.spec.block_weights,
+                }
+            )
+        return info
+
+    def parse_prompt_tags(self, prompt: str) -> Tuple[str, List[PromptLoraOverride]]:
+        overrides: List[PromptLoraOverride] = []
+
+        def repl(match: re.Match) -> str:
+            inner = match.group(1)
+            parts = [p.strip() for p in inner.split(":") if p.strip()]
+            if not parts:
+                return ""
+            alias = parts[0]
+            multiplier = None
+            block_weights: Optional[List[float]] = None
+            for token in parts[1:]:
+                if token.lower().startswith("lbw="):
+                    lbw_value = token[4:]
+                    block_weights = parse_lbw_value(lbw_value)
+                else:
+                    try:
+                        multiplier = float(token)
+                    except ValueError:
+                        logger.warning(f"Invalid multiplier value in <lora> tag: '{token}'")
+            overrides.append(PromptLoraOverride(alias=alias, multiplier=multiplier, block_weights=block_weights))
+            return ""
+
+        cleaned = RE_LORA_TAG.sub(repl, prompt)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        return cleaned, overrides
+
+    def _get_entry(self, alias: str) -> LoRAEntry:
+        normalized = self._alias_lookup.get(alias.lower())
+        if normalized is None:
+            raise ValueError(f"LoRA alias '{alias}' is not loaded.")
+        return self._entries[normalized]
+
+    def _detect_is_sdxl(self, network: LoRANetwork) -> bool:
+        for lora in network.unet_loras:
+            name = lora.lora_name
+            if "input_blocks" in name or "output_blocks" in name:
+                return True
+        return False
+
+    def _apply_block_weights(self, entry: LoRAEntry, multiplier: float, block_weights: Optional[Tuple[float, ...]]):
+        if block_weights is None:
+            for lora in entry.network.text_encoder_loras + entry.network.unet_loras:
+                lora.multiplier = multiplier
+            return
+
+        mapping = self._build_block_weight_mapping(entry, list(block_weights))
+        for lora in entry.network.text_encoder_loras:
+            block_idx = get_lbw_block_index(lora.lora_name, entry.is_sdxl)
+            scale = mapping.get(block_idx, 1.0)
+            lora.multiplier = multiplier * scale
+        for lora in entry.network.unet_loras:
+            block_idx = get_lbw_block_index(lora.lora_name, entry.is_sdxl)
+            scale = mapping.get(block_idx, 1.0)
+            lora.multiplier = multiplier * scale
+
+    def _build_block_weight_mapping(self, entry: LoRAEntry, weights: List[float]) -> Dict[int, float]:
+        if not weights:
+            return {}
+        target_indices = self._get_lbw_target_indices(entry.is_sdxl, len(weights))
+        if target_indices is None:
+            return self._legacy_block_weight_mapping(entry, weights)
+
+        values = weights[: len(target_indices)]
+        if len(values) < len(target_indices):
+            values.extend([values[-1]] * (len(target_indices) - len(values)))
+
+        mapping: Dict[int, float] = {}
+        for idx, value in zip(target_indices, values):
+            mapping[idx] = value
+        return mapping
+
+    def _get_lbw_target_indices(self, is_sdxl: bool, length: int) -> Optional[List[int]]:
+        flags_map = self._sdxl_lbw_flags if is_sdxl else self._sd1_lbw_flags
+        if length not in flags_map:
+            return None
+        return flags_map[length]
+
+    def _legacy_block_weight_mapping(self, entry: LoRAEntry, weights: List[float]) -> Dict[int, float]:
+        mapping: Dict[int, float] = {}
+        unique_indices: List[int] = []
+        seen = set()
+        for lora in entry.network.unet_loras:
+            idx = get_lbw_block_index(lora.lora_name, entry.is_sdxl)
+            if idx < 0 or idx in seen:
+                continue
+            seen.add(idx)
+            unique_indices.append(idx)
+        if not unique_indices:
+            return mapping
+        values = weights[:]
+        while len(values) < len(unique_indices):
+            values.append(values[-1])
+        for i, idx in enumerate(unique_indices):
+            mapping[idx] = values[i] if i < len(values) else values[-1]
+        return mapping
+
+
+def parse_lbw_value(raw: str) -> List[float]:
+    preset = LBW_PRESETS.get(raw.upper())
+    if preset is not None:
+        return preset[:]
+
+    try:
+        values = [float(v.strip()) for v in raw.split(",") if v.strip()]
+    except ValueError as ex:
+        raise ValueError(f"Invalid LBW specification: {raw}") from ex
+    if not values:
+        raise ValueError("LBW specification is empty.")
+    return values
+
+
+def _indices_from_layer_flags(layer_flags: Dict[str, bool]) -> List[int]:
+    return [i for i, flag in enumerate(layer_flags.values()) if flag]
+
+
+def bool_from_string(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def sanitize_alias(alias: str) -> str:
+    alias = alias.strip()
+    alias = re.sub(r"[\\/:]+", "_", alias)
+    alias = re.sub(r"\s+", "_", alias)
+    return alias
+
+
+def alias_from_weight(weight_path: str) -> str:
+    return sanitize_alias(Path(weight_path).stem)
+
+
+def parse_lora_cli_entry(entry: str, default_precalc: bool) -> LoRASpec:
+    parts = entry.split("|")
+    if len(parts) < 2:
+        raise ValueError(f"--lora expects at least module|weight, got: {entry}")
+
+    module_part = parts[0]
+    if "=" in module_part:
+        alias_raw, module = module_part.split("=", 1)
+        alias = sanitize_alias(alias_raw)
+    else:
+        module = module_part
+        alias = alias_from_weight(parts[1])
+
+    weight_path = parts[1]
+    multiplier = 1.0
+    block_weights: Optional[List[float]] = None
+    auto = False
+    precalc = default_precalc
+    extra_args: Dict[str, str] = {}
+
+    for option in parts[2:]:
+        if "=" not in option:
+            raise ValueError(f"Invalid option '{option}' in --lora specification.")
+        key, value = option.split("=", 1)
+        key_lower = key.strip().lower()
+        value = value.strip()
+        if key_lower == "mul":
+            multiplier = float(value)
+        elif key_lower == "lbw":
+            block_weights = parse_lbw_value(value)
+        elif key_lower == "auto":
+            auto = bool_from_string(value)
+        elif key_lower == "precalc":
+            precalc = bool_from_string(value)
+        elif key_lower == "args":
+            for kv in value.split(";"):
+                if not kv:
+                    continue
+                if "=" not in kv:
+                    raise ValueError(f"Invalid args entry '{kv}' in --lora specification.")
+                k, v = kv.split("=", 1)
+                extra_args[k.strip()] = v.strip()
+        else:
+            raise ValueError(f"Unknown option '{key}' in --lora specification.")
+
+    return LoRASpec(
+        module=module,
+        weight_path=weight_path,
+        alias=alias,
+        multiplier=multiplier,
+        block_weights=block_weights,
+        auto=auto,
+        precalc=precalc,
+        extra_args=extra_args,
+    )
+
+
+def collect_lora_specs(args) -> Tuple[List[LoRASpec], bool]:
+    specs: List[LoRASpec] = []
+    used_legacy = False
+
+    if args.network_module:
+        used_legacy = True
+        if not args.network_weights or len(args.network_weights) < len(args.network_module):
+            raise ValueError("--network_module requires --network_weights.")
+        for idx, module in enumerate(args.network_module):
+            weight_path = args.network_weights[idx]
+            multiplier = (
+                1.0 if args.network_mul is None or len(args.network_mul) <= idx else args.network_mul[idx]
+            )
+            alias = alias_from_weight(weight_path)
+            extra_args: Dict[str, str] = {}
+            if args.network_args and idx < len(args.network_args):
+                net_args = args.network_args[idx].split(";")
+                for arg in net_args:
+                    if not arg:
+                        continue
+                    key, value = arg.split("=")
+                    extra_args[key] = value
+            specs.append(
+                LoRASpec(
+                    module=module,
+                    weight_path=weight_path,
+                    alias=alias,
+                    multiplier=multiplier,
+                    block_weights=None,
+                    auto=True,
+                    precalc=bool(args.network_pre_calc),
+                    extra_args=extra_args,
+                )
+            )
+
+    if args.lora:
+        for entry in args.lora:
+            specs.append(parse_lora_cli_entry(entry, bool(args.network_pre_calc)))
+
+    return specs, used_legacy
+
+
+def _parse_command_options(tokens: List[str]) -> Dict[str, str]:
+    options: Dict[str, str] = {}
+    for token in tokens:
+        if "=" not in token:
+            raise ValueError(f"Expected key=value format but got '{token}'")
+        key, value = token.split("=", 1)
+        options[key.strip().lower()] = value.strip()
+    return options
+
+
+def handle_lora_command(command: str, manager: Optional[LoRAManager]) -> bool:
+    stripped = command.strip()
+    if not stripped.lower().startswith("!lora"):
+        return False
+
+    tokens = shlex.split(stripped)
+    if len(tokens) == 1:
+        logger.info("LoRA command requires a subcommand. Type '!lora list' to inspect loaded LoRAs.")
+        return True
+
+    subcmd = tokens[1].lower()
+    if manager is None:
+        logger.warning("LoRA manager is not available. Load LoRA modules via --lora or --network_module first.")
+        return True
+
+    try:
+        if subcmd == "load":
+            opts = _parse_command_options(tokens[2:])
+            module = opts.get("module")
+            weight = opts.get("weight")
+            if not module or not weight:
+                raise ValueError("!lora load requires module=<module> and weight=<path>.")
+            spec = LoRASpec(
+                module=module,
+                weight_path=weight,
+                alias=sanitize_alias(opts.get("alias", alias_from_weight(weight))),
+                multiplier=float(opts.get("mul", 1.0)),
+                block_weights=parse_lbw_value(opts["lbw"]) if "lbw" in opts else None,
+                auto=bool_from_string(opts.get("auto", "false")),
+                precalc=False,
+                extra_args={},
+            )
+            if "args" in opts:
+                for kv in opts["args"].split(";"):
+                    if not kv:
+                        continue
+                    key, value = kv.split("=", 1)
+                    spec.extra_args[key.strip()] = value.strip()
+            manager.register(spec)
+            logger.info(f"LoRA '{spec.alias}' loaded.")
+        elif subcmd == "reload":
+            if len(tokens) < 3:
+                raise ValueError("!lora reload <alias> [weight=...] [mul=...]")
+            alias = tokens[2]
+            opts = _parse_command_options(tokens[3:]) if len(tokens) > 3 else {}
+            weight = opts.get("weight")
+            multiplier = float(opts["mul"]) if "mul" in opts else None
+            manager.reload(alias, weight, multiplier)
+            logger.info(f"LoRA '{alias}' reloaded.")
+        elif subcmd == "unload":
+            if len(tokens) < 3:
+                raise ValueError("!lora unload <alias>")
+            manager.unload(tokens[2])
+            logger.info(f"LoRA '{tokens[2]}' unloaded.")
+        elif subcmd == "lbw":
+            if len(tokens) < 3:
+                raise ValueError("!lora lbw <alias> preset=<name>|custom=<values>|clear")
+            alias = tokens[2]
+            if len(tokens) == 4 and tokens[3].lower() == "clear":
+                manager.set_block_weights(alias, None)
+                logger.info(f"Cleared LBW for '{alias}'.")
+            else:
+                opts = _parse_command_options(tokens[3:])
+                if "preset" in opts:
+                    weights = parse_lbw_value(opts["preset"])
+                elif "custom" in opts:
+                    weights = parse_lbw_value(opts["custom"])
+                else:
+                    raise ValueError("Specify preset=<name> or custom=<values> for !lora lbw.")
+                manager.set_block_weights(alias, weights)
+                logger.info(f"Set LBW for '{alias}' to {weights}.")
+        elif subcmd == "enable":
+            if len(tokens) < 3:
+                raise ValueError("!lora enable <alias>")
+            manager.set_auto(tokens[2], True)
+            logger.info(f"LoRA '{tokens[2]}' set to auto-apply.")
+        elif subcmd == "disable":
+            if len(tokens) < 3:
+                raise ValueError("!lora disable <alias>")
+            manager.set_auto(tokens[2], False)
+            logger.info(f"LoRA '{tokens[2]}' set to manual apply.")
+        elif subcmd == "list":
+            entries = manager.list_entries()
+            if not entries:
+                logger.info("No LoRA is currently loaded.")
+            else:
+                for entry in entries:
+                    logger.info(
+                        f"[{entry['alias']}] module={entry['module']} weight={entry['weight']} "
+                        f"mul={entry['multiplier']} auto={'on' if entry['auto'] else 'off'} "
+                        f"lbw={entry['block_weights']}"
+                    )
+        else:
+            raise ValueError(f"Unknown !lora subcommand: {subcmd}")
+    except Exception as ex:
+        logger.error(f"LoRA command failed: {ex}")
+    return True
+
 
 # region モジュール入れ替え部
 """
@@ -1447,6 +2027,7 @@ class BatchDataBase(NamedTuple):
     clip_prompt: str
     guide_image: Any
     raw_prompt: str
+    lora_overrides: Optional[List[PromptLoraOverride]]
 
 
 class BatchDataExt(NamedTuple):
@@ -1464,6 +2045,7 @@ class BatchDataExt(NamedTuple):
     negative_scale: float
     strength: float
     network_muls: Tuple[float]
+    network_block_weights: Optional[Tuple[Optional[Tuple[float, ...]], ...]]
     num_sub_prompts: int
 
 
@@ -1658,81 +2240,38 @@ def main(args):
     text_encoder2.eval()
     unet.eval()
 
-    # networkを組み込む
-    if args.network_module:
-        networks = []
-        network_default_muls = []
-        network_pre_calc = args.network_pre_calc
+    specs, used_legacy_lora_args = collect_lora_specs(args)
+    if used_legacy_lora_args:
+        logger.warning("--network_module/--network_weights are deprecated. Please migrate to --lora.")
 
-        # merge関連の引数を統合する
-        if args.network_merge:
-            network_merge = len(args.network_module)  # all networks are merged
-        elif args.network_merge_n_models:
-            network_merge = args.network_merge_n_models
-        else:
-            network_merge = 0
-        logger.info(f"network_merge: {network_merge}")
-
-        for i, network_module in enumerate(args.network_module):
-            logger.info(f"import network module: {network_module}")
-            imported_module = importlib.import_module(network_module)
-
-            network_mul = 1.0 if args.network_mul is None or len(args.network_mul) <= i else args.network_mul[i]
-
-            net_kwargs = {}
-            if args.network_args and i < len(args.network_args):
-                network_args = args.network_args[i]
-                # TODO escape special chars
-                network_args = network_args.split(";")
-                for net_arg in network_args:
-                    key, value = net_arg.split("=")
-                    net_kwargs[key] = value
-
-            if args.network_weights is None or len(args.network_weights) <= i:
-                raise ValueError("No weight. Weight is required.")
-
-            network_weight = args.network_weights[i]
-            logger.info(f"load network weights from: {network_weight}")
-
-            if model_util.is_safetensors(network_weight) and args.network_show_meta:
+    if len(specs) > 0:
+        lora_manager = LoRAManager(
+            device,
+            dtype,
+            [text_encoder1, text_encoder2],
+            unet,
+            vae,
+            args.opt_channels_last,
+        )
+        for spec in specs:
+            logger.info(f"loading LoRA '{spec.alias}' from {spec.weight_path} (module={spec.module})")
+            if model_util.is_safetensors(spec.weight_path) and args.network_show_meta:
                 from safetensors.torch import safe_open
 
-                with safe_open(network_weight, framework="pt") as f:
+                with safe_open(spec.weight_path, framework="pt") as f:
                     metadata = f.metadata()
                 if metadata is not None:
-                    logger.info(f"metadata for: {network_weight}: {metadata}")
+                    logger.info(f"metadata for: {spec.weight_path}: {metadata}")
+            lora_manager.register(spec)
 
-            network, weights_sd = imported_module.create_network_from_weights(
-                network_mul, network_weight, vae, [text_encoder1, text_encoder2], unet, for_inference=True, **net_kwargs
-            )
-            if network is None:
-                return
-
-            mergeable = network.is_mergeable()
-            if network_merge and not mergeable:
-                logger.warning("network is not mergiable. ignore merge option.")
-
-            if not mergeable or i >= network_merge:
-                # not merging
-                network.apply_to([text_encoder1, text_encoder2], unet)
-                info = network.load_state_dict(weights_sd, False)  # network.load_weightsを使うようにするとよい
-                logger.info(f"weights are loaded: {info}")
-
-                if args.opt_channels_last:
-                    network.to(memory_format=torch.channels_last)
-                network.to(dtype).to(device)
-
-                if network_pre_calc:
-                    logger.info("backup original weights")
-                    network.backup_weights()
-
-                networks.append(network)
-                network_default_muls.append(network_mul)
-            else:
-                network.merge_to([text_encoder1, text_encoder2], unet, weights_sd, dtype, device)
-
+        networks = lora_manager.networks
+        network_default_muls = lora_manager.default_multipliers
+        network_pre_calc = False
     else:
+        lora_manager = None
         networks = []
+        network_default_muls = []
+        network_pre_calc = False
 
     # upscalerの指定があれば取得する
     upscaler = None
@@ -1799,8 +2338,9 @@ def main(args):
         text_encoder2.to(memory_format=torch.channels_last)
         vae.to(memory_format=torch.channels_last)
         unet.to(memory_format=torch.channels_last)
-        if networks:
-            for network in networks:
+        active_networks = lora_manager.networks if lora_manager and lora_manager.has_entries() else networks
+        if active_networks:
+            for network in active_networks:
                 network.to(memory_format=torch.channels_last)
 
         for cn in control_nets:
@@ -2024,13 +2564,14 @@ def main(args):
             mask_images = resize_images(mask_images, (w, h))
 
     regional_network = False
-    if networks and mask_images:
+    active_networks = lora_manager.networks if lora_manager and lora_manager.has_entries() else networks
+    if active_networks and mask_images:
         # mask を領域情報として流用する、現在は一回のコマンド呼び出しで1枚だけ対応
         regional_network = True
         logger.info("use mask as region")
 
         size = None
-        for i, network in enumerate(networks):
+        for i, network in enumerate(active_networks):
             if (i < 3 and args.network_regional_mask_max_color_codes is None) or i < args.network_regional_mask_max_color_codes:
                 np_mask = np.array(mask_images[0])
 
@@ -2047,7 +2588,7 @@ def main(args):
             else:
                 np_mask = np.full(size, 255, dtype=np.uint8)
             mask = torch.from_numpy(np_mask.astype(np.float32) / 255.0)
-            network.set_region(i, i == len(networks) - 1, mask)
+            network.set_region(i, i == len(active_networks) - 1, mask)
         mask_images = None
 
     prev_image = None  # for VGG16 guided
@@ -2136,6 +2677,7 @@ def main(args):
                         ext.negative_scale,
                         strength_1st,
                         ext.network_muls,
+                        ext.network_block_weights,
                         ext.num_sub_prompts,
                     )
                     batch_1st.append(BatchData(is_1st_latent, base, ext_1st))
@@ -2180,7 +2722,19 @@ def main(args):
 
                 batch_2nd = []
                 for i, (bd, image) in enumerate(zip(batch, images_1st)):
-                    bd_2nd = BatchData(False, BatchDataBase(*bd.base[0:3], bd.base.seed + 1, image, None, *bd.base[6:]), bd.ext)
+                    bd_2nd_base = BatchDataBase(
+                        bd.base.step,
+                        bd.base.prompt,
+                        bd.base.negative_prompt,
+                        bd.base.seed + 1,
+                        image,
+                        None,
+                        bd.base.clip_prompt,
+                        bd.base.guide_image,
+                        bd.base.raw_prompt,
+                        bd.base.lora_overrides,
+                    )
+                    bd_2nd = BatchData(False, bd_2nd_base, bd.ext)
                     batch_2nd.append(bd_2nd)
                 batch = batch_2nd
 
@@ -2190,7 +2744,7 @@ def main(args):
             # このバッチの情報を取り出す
             (
                 return_latents,
-                (step_first, _, _, _, init_image, mask_image, _, guide_image, _),
+                (step_first, _, _, _, init_image, mask_image, _, guide_image, _, _),
                 (
                     width,
                     height,
@@ -2205,6 +2759,7 @@ def main(args):
                     negative_scale,
                     strength,
                     network_muls,
+                    network_block_weights,
                     num_sub_prompts,
                 ),
             ) = batch[0]
@@ -2303,8 +2858,18 @@ def main(args):
                     guide_images = guide_images[0]
 
             # generate
-            if networks:
-                # 追加ネットワークの処理
+            if lora_manager and lora_manager.has_entries():
+                shared = lora_manager.prepare_for_batch(
+                    network_muls,
+                    network_block_weights,
+                    batch_size,
+                    width,
+                    height,
+                    num_sub_prompts,
+                    regional_network,
+                )
+            elif networks:
+                # 追加ネットワークの処理（旧仕様）
                 shared = {}
                 for n, m in zip(networks, network_muls if network_muls else network_default_muls):
                     n.set_multiplier(m)
@@ -2317,6 +2882,8 @@ def main(args):
                     for n in networks:
                         n.pre_calculation()
                     logger.info("pre-calculation... done")
+            else:
+                shared = {}
 
             images = pipe(
                 prompts,
@@ -2411,15 +2978,21 @@ def main(args):
             if len(prompt_list) == 0:
                 # interactive
                 valid = False
-                while not valid:
+                while True:
                     logger.info("")
                     logger.info("Type prompt:")
                     try:
                         raw_prompt = input()
                     except EOFError:
                         break
-
-                    valid = len(raw_prompt.strip().split(" --")[0].strip()) > 0
+                    if raw_prompt is None:
+                        continue
+                    if handle_lora_command(raw_prompt, lora_manager):
+                        continue
+                    if len(raw_prompt.strip().split(" --")[0].strip()) > 0:
+                        valid = True
+                        break
+                    logger.info("Empty prompt. Please input text or '!lora ...' command.")
                 if not valid:  # EOF, end app
                     break
             else:
@@ -2467,8 +3040,18 @@ def main(args):
                     gl_ratio_step = args.gradual_latent_ratio_step
                     gl_s_noise = args.gradual_latent_s_noise
                     gl_unsharp_params = args.gradual_latent_unsharp_params
+                    lora_overrides: Optional[List[PromptLoraOverride]] = None
+                    network_block_weights = None
 
-                    prompt_args = raw_prompt.strip().split(" --")
+                    parsed_prompt = raw_prompt.strip()
+                    if lora_manager and lora_manager.has_entries():
+                        prompt, overrides = lora_manager.parse_prompt_tags(parsed_prompt)
+                        lora_overrides = overrides
+                    else:
+                        prompt = parsed_prompt
+                        lora_overrides = None
+
+                    prompt_args = prompt.split(" --")
                     prompt = prompt_args[0]
                     logger.info(f"prompt {prompt_index+1}/{len(prompt_list)}: {prompt}")
 
@@ -2570,7 +3153,10 @@ def main(args):
                             m = re.match(r"am ([\d\.\-,]+)", parg, re.IGNORECASE)
                             if m:  # network multiplies
                                 network_muls = [float(v) for v in m.group(1).split(",")]
-                                while len(network_muls) < len(networks):
+                                target_networks = (
+                                    lora_manager.networks if lora_manager and lora_manager.has_entries() else networks
+                                )
+                                while len(network_muls) < len(target_networks):
                                     network_muls.append(network_muls[-1])
                                 logger.info(f"network mul: {network_muls}")
                                 continue
@@ -2781,33 +3367,56 @@ def main(args):
 
                 if regional_network:
                     num_sub_prompts = len(prompt.split(" AND "))
+                    current_networks = lora_manager.networks if lora_manager and lora_manager.has_entries() else networks
                     assert (
-                        len(networks) <= num_sub_prompts
+                        len(current_networks) <= num_sub_prompts
                     ), "Number of networks must be less than or equal to number of sub prompts."
                 else:
                     num_sub_prompts = None
 
+                if lora_manager and lora_manager.has_entries():
+                    manual_muls = network_muls if network_muls is not None else None
+                    resolved_muls, resolved_block_weights = lora_manager.resolve_prompt_config(
+                        lora_overrides or [], manual_muls
+                    )
+                    network_muls = list(resolved_muls)
+                    network_block_weights = resolved_block_weights
+                else:
+                    if network_muls is None:
+                        network_muls = list(network_default_muls) if networks else []
+                    network_block_weights = None
+
                 b1 = BatchData(
-                    False,
-                    BatchDataBase(
-                        global_step, prompt, negative_prompt, seed, init_image, mask_image, clip_prompt, guide_image, raw_prompt
-                    ),
-                    BatchDataExt(
-                        width,
-                        height,
-                        original_width,
+                        False,
+                        BatchDataBase(
+                            global_step,
+                            prompt,
+                            negative_prompt,
+                            seed,
+                            init_image,
+                            mask_image,
+                            clip_prompt,
+                            guide_image,
+                            raw_prompt,
+                            lora_overrides,
+                        ),
+                        BatchDataExt(
+                            width,
+                            height,
+                            original_width,
                         original_height,
                         original_width_negative,
                         original_height_negative,
                         crop_left,
                         crop_top,
                         steps,
-                        scale,
-                        negative_scale,
-                        strength,
-                        tuple(network_muls) if network_muls else None,
-                        num_sub_prompts,
-                    ),
+                            scale,
+                            negative_scale,
+                            strength,
+                            tuple(network_muls) if network_muls else tuple(network_default_muls),
+                            network_block_weights,
+                            num_sub_prompts,
+                        ),
                 )
                 if len(batch_data) > 0 and batch_data[-1].ext != b1.ext:  # バッチ分割必要？
                     process_batch(batch_data, highres_fix)
@@ -2986,6 +3595,13 @@ def setup_parser() -> argparse.ArgumentParser:
         "--opt_channels_last",
         action="store_true",
         help="set channels last option to model / モデルにchannels lastを指定し最適化する",
+    )
+    parser.add_argument(
+        "--lora",
+        type=str,
+        nargs="*",
+        default=None,
+        help="LoRA spec [alias=]module|weight[|mul=1.0][|lbw=preset][|auto=0/1] / LoRA指定（新形式）",
     )
     parser.add_argument(
         "--network_module",
