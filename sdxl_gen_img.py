@@ -455,26 +455,41 @@ def alias_from_weight(weight_path: str) -> str:
 
 
 def parse_lora_cli_entry(entry: str, default_precalc: bool) -> LoRASpec:
-    parts = entry.split("|")
+    parts = [p.strip() for p in entry.split("|")]
     if len(parts) < 2:
         raise ValueError(f"--lora expects at least module|weight, got: {entry}")
 
+    alias: Optional[str] = None
+    option_start = 2
+
     module_part = parts[0]
-    if "=" in module_part:
+    if module_part.lower().startswith("alias="):
+        alias_raw = module_part.split("=", 1)[1].strip()
+        if len(parts) < 3:
+            raise ValueError(
+                f"--lora expects alias=NAME|module|weight_path..., got: {entry}"
+            )
+        module = parts[1]
+        weight_path = parts[2]
+        option_start = 3
+        alias = sanitize_alias(alias_raw) or alias_from_weight(weight_path)
+    elif "=" in module_part:
         alias_raw, module = module_part.split("=", 1)
         alias = sanitize_alias(alias_raw)
+        weight_path = parts[1]
     else:
         module = module_part
-        alias = alias_from_weight(parts[1])
+        weight_path = parts[1]
+        alias = alias_from_weight(weight_path)
+    alias = alias or alias_from_weight(weight_path)
 
-    weight_path = parts[1]
     multiplier = 1.0
     block_weights: Optional[List[float]] = None
     auto = False
     precalc = default_precalc
     extra_args: Dict[str, str] = {}
 
-    for option in parts[2:]:
+    for option in parts[option_start:]:
         if "=" not in option:
             raise ValueError(f"Invalid option '{option}' in --lora specification.")
         key, value = option.split("=", 1)
