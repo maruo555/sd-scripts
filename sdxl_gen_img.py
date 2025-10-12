@@ -10,6 +10,7 @@ import time
 import zipfile
 from collections import OrderedDict
 import shlex
+import sys
 from diffusers.utils import deprecate
 from diffusers.configuration_utils import FrozenDict
 import argparse
@@ -55,6 +56,12 @@ import library.train_util as train_util
 import library.sdxl_model_util as sdxl_model_util
 import library.sdxl_train_util as sdxl_train_util
 from networks.lora import LoRANetwork
+import networks.lora as networks_lora_module
+import networks.oft as networks_oft_module
+
+sys.modules.setdefault("lora", networks_lora_module)
+sys.modules.setdefault("oft", networks_oft_module)
+
 from networks.svd_merge_lora import LAYER12, LAYER17, LAYER20, LAYER26, get_lbw_block_index
 from library.sdxl_original_unet import InferSdxlUNet2DConditionModel
 from library.original_unet import FlashAttentionFunction
@@ -94,6 +101,7 @@ LBW_PRESETS: Dict[str, List[float]] = {
     "XLMLT2": [1, 1, 0, 0, 0, 0.6, 1, 1, 1, 1, 0, 1],
     "XLMLT3": [1, 1, 0, 0, 1, 0.6, 1, 1, 1, 1, 0, 1],
 }
+
 
 
 @dataclass
