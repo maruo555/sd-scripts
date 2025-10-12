@@ -369,19 +369,19 @@ class LoRAManager:
                 lora.multiplier = multiplier
             return
 
-        mapping = self._build_block_weight_mapping(entry, list(block_weights))
+        mapping, default_scale = self._build_block_weight_mapping(entry, list(block_weights))
         for lora in entry.network.text_encoder_loras:
             block_idx = get_lbw_block_index(lora.lora_name, entry.is_sdxl)
-            scale = mapping.get(block_idx, 1.0)
+            scale = mapping.get(block_idx, default_scale if block_idx >= 0 else 1.0)
             lora.multiplier = multiplier * scale
         for lora in entry.network.unet_loras:
             block_idx = get_lbw_block_index(lora.lora_name, entry.is_sdxl)
-            scale = mapping.get(block_idx, 1.0)
+            scale = mapping.get(block_idx, default_scale if block_idx >= 0 else 1.0)
             lora.multiplier = multiplier * scale
 
-    def _build_block_weight_mapping(self, entry: LoRAEntry, weights: List[float]) -> Dict[int, float]:
+    def _build_block_weight_mapping(self, entry: LoRAEntry, weights: List[float]) -> Tuple[Dict[int, float], float]:
         if not weights:
-            return {}
+            return {}, 1.0
         target_indices = self._get_lbw_target_indices(entry.is_sdxl, len(weights))
         if target_indices is None:
             return self._legacy_block_weight_mapping(entry, weights)
@@ -390,10 +390,11 @@ class LoRAManager:
         if len(values) < len(target_indices):
             values.extend([values[-1]] * (len(target_indices) - len(values)))
 
-        mapping: Dict[int, float] = {}
+        all_indices = list(range(len(LAYER26)))
+        mapping: Dict[int, float] = {idx: 0.0 for idx in all_indices}
         for idx, value in zip(target_indices, values):
             mapping[idx] = value
-        return mapping
+        return mapping, 0.0
 
     def _get_lbw_target_indices(self, is_sdxl: bool, length: int) -> Optional[List[int]]:
         flags_map = self._sdxl_lbw_flags if is_sdxl else self._sd1_lbw_flags
@@ -401,7 +402,7 @@ class LoRAManager:
             return None
         return flags_map[length]
 
-    def _legacy_block_weight_mapping(self, entry: LoRAEntry, weights: List[float]) -> Dict[int, float]:
+    def _legacy_block_weight_mapping(self, entry: LoRAEntry, weights: List[float]) -> Tuple[Dict[int, float], float]:
         mapping: Dict[int, float] = {}
         unique_indices: List[int] = []
         seen = set()
@@ -412,13 +413,13 @@ class LoRAManager:
             seen.add(idx)
             unique_indices.append(idx)
         if not unique_indices:
-            return mapping
+            return mapping, 1.0
         values = weights[:]
         while len(values) < len(unique_indices):
             values.append(values[-1])
         for i, idx in enumerate(unique_indices):
             mapping[idx] = values[i] if i < len(values) else values[-1]
-        return mapping
+        return mapping, 1.0
 
 
 def parse_lbw_value(raw: str) -> List[float]:
