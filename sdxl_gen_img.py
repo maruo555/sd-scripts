@@ -2823,7 +2823,18 @@ def main(args):
             all_guide_images_are_same = True
             for i, (
                 _,
-                (_, prompt, negative_prompt, seed, init_image, mask_image, clip_prompt, guide_image, raw_prompt),
+                (
+                    _,
+                    prompt,
+                    negative_prompt,
+                    seed,
+                    init_image,
+                    mask_image,
+                    clip_prompt,
+                    guide_image,
+                    raw_prompt,
+                    _lora_overrides,
+                ),
                 _,
             ) in enumerate(batch):
                 prompts.append(prompt)
