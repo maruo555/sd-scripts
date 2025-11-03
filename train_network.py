@@ -363,6 +363,7 @@ class NetworkTrainer:
             "group_labels": [],
             "applied": False,
             "applied_step": None,
+            "resumed_completed_steps": 0,
         }
 
     @staticmethod
@@ -480,7 +481,9 @@ class NetworkTrainer:
         ):
             return
 
-        if next_step_idx <= cfg["threshold_step"]:
+        base_completed_steps = cfg.get("resumed_completed_steps", 0)
+        effective_step = base_completed_steps + next_step_idx
+        if effective_step <= cfg["threshold_step"]:
             return
 
         multiplier = cfg["mult"]
@@ -493,14 +496,14 @@ class NetworkTrainer:
             self._update_scheduler_state_after_lr_change(lr_scheduler, group_idx, multiplier, new_lr)
 
         cfg["applied"] = True
-        cfg["applied_step"] = next_step_idx
+        cfg["applied_step"] = effective_step
         target_desc = cfg.get("group_labels") or [f"TE{idx + 1}" for idx in sorted(cfg["target_indices"])]
         logger.info(
             "applied te_lr_after at step %d: scaled %s lr by %.6f / te_lr_after: ステップ%d超で %s の学習率に倍率%.6fを適用しました",
-            next_step_idx,
+            effective_step,
             ", ".join(target_desc),
             multiplier,
-            next_step_idx,
+            effective_step,
             ", ".join(target_desc),
             multiplier,
         )
@@ -509,6 +512,13 @@ class NetworkTrainer:
         cfg = self._te_lr_after_cfg
         if not cfg:
             return
+
+        base_completed_steps = 0
+        if self._te_lr_after_resumed and not getattr(args, "skip_until_initial_step", False):
+            resume_step = self._te_lr_after_resume_step
+            if resume_step is not None:
+                base_completed_steps = max(0, resume_step - 1)
+        cfg["resumed_completed_steps"] = base_completed_steps
 
         resume_state = self._te_lr_after_resume_state
         if resume_state is not None:
@@ -522,28 +532,6 @@ class NetworkTrainer:
                     cfg["applied_step"],
                 )
             return
-
-        resume_step = self._te_lr_after_resume_step
-        threshold = cfg.get("threshold_step")
-        completed_step = None
-        if resume_step is not None:
-            completed_step = max(0, resume_step - 1)
-        if (
-            self._te_lr_after_resumed
-            and completed_step is not None
-            and threshold is not None
-            and completed_step > threshold
-        ):
-            cfg["applied"] = True
-            cfg["applied_step"] = completed_step
-            logger.info(
-                "te_lr_after: last completed step %d exceeded threshold %d; assuming multiplier already applied / "
-                "te_lr_after: 再開時点の完了ステップ %d がしきい値 %d を超えているため、倍率適用済みと見なします",
-                completed_step,
-                threshold,
-                completed_step,
-                threshold,
-            )
 
     def _finalize_te_lr_after_setup(self, args):
         cfg = self._te_lr_after_cfg
@@ -566,6 +554,9 @@ class NetworkTrainer:
         status_detail = status
         if applied_step is not None:
             status_detail += f" (step={applied_step})"
+        resumed_completed = cfg.get("resumed_completed_steps", 0)
+        if resumed_completed:
+            status_detail += f", resumed_completed={resumed_completed}"
 
         if threshold is None:
             logger.info(
