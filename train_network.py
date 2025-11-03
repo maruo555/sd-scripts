@@ -363,7 +363,6 @@ class NetworkTrainer:
             "group_labels": [],
             "applied": False,
             "applied_step": None,
-            "resume_offset": 0,
         }
 
     @staticmethod
@@ -481,9 +480,7 @@ class NetworkTrainer:
         ):
             return
 
-        offset = cfg.get("resume_offset", 0)
-        effective_step = next_step_idx + offset
-        if effective_step <= cfg["threshold_step"]:
+        if next_step_idx <= cfg["threshold_step"]:
             return
 
         multiplier = cfg["mult"]
@@ -496,14 +493,14 @@ class NetworkTrainer:
             self._update_scheduler_state_after_lr_change(lr_scheduler, group_idx, multiplier, new_lr)
 
         cfg["applied"] = True
-        cfg["applied_step"] = effective_step
+        cfg["applied_step"] = next_step_idx
         target_desc = cfg.get("group_labels") or [f"TE{idx + 1}" for idx in sorted(cfg["target_indices"])]
         logger.info(
             "applied te_lr_after at step %d: scaled %s lr by %.6f / te_lr_after: ステップ%d超で %s の学習率に倍率%.6fを適用しました",
-            effective_step,
+            next_step_idx,
             ", ".join(target_desc),
             multiplier,
-            effective_step,
+            next_step_idx,
             ", ".join(target_desc),
             multiplier,
         )
@@ -512,13 +509,6 @@ class NetworkTrainer:
         cfg = self._te_lr_after_cfg
         if not cfg:
             return
-
-        offset = 0
-        if self._te_lr_after_resumed and not getattr(args, "skip_until_initial_step", False):
-            resume_step = self._te_lr_after_resume_step
-            if resume_step is not None:
-                offset = max(0, resume_step - 1)
-        cfg["resume_offset"] = offset
 
         resume_state = self._te_lr_after_resume_state
         if resume_state is not None:
@@ -576,9 +566,6 @@ class NetworkTrainer:
         status_detail = status
         if applied_step is not None:
             status_detail += f" (step={applied_step})"
-        offset = cfg.get("resume_offset", 0)
-        if offset > 0:
-            status_detail += f", resume_offset={offset}"
 
         if threshold is None:
             logger.info(
@@ -1286,7 +1273,7 @@ class NetworkTrainer:
 
         # resumeする
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
-        self._finalize_te_lr_after_setup()
+        self._finalize_te_lr_after_setup(args)
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
