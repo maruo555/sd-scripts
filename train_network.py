@@ -363,6 +363,7 @@ class NetworkTrainer:
             "group_labels": [],
             "applied": False,
             "applied_step": None,
+            "resume_offset": 0,
         }
 
     @staticmethod
@@ -480,7 +481,9 @@ class NetworkTrainer:
         ):
             return
 
-        if next_step_idx <= cfg["threshold_step"]:
+        offset = cfg.get("resume_offset", 0)
+        effective_step = next_step_idx + offset
+        if effective_step <= cfg["threshold_step"]:
             return
 
         multiplier = cfg["mult"]
@@ -493,22 +496,29 @@ class NetworkTrainer:
             self._update_scheduler_state_after_lr_change(lr_scheduler, group_idx, multiplier, new_lr)
 
         cfg["applied"] = True
-        cfg["applied_step"] = next_step_idx
+        cfg["applied_step"] = effective_step
         target_desc = cfg.get("group_labels") or [f"TE{idx + 1}" for idx in sorted(cfg["target_indices"])]
         logger.info(
             "applied te_lr_after at step %d: scaled %s lr by %.6f / te_lr_after: ステップ%d超で %s の学習率に倍率%.6fを適用しました",
-            next_step_idx,
+            effective_step,
             ", ".join(target_desc),
             multiplier,
-            next_step_idx,
+            effective_step,
             ", ".join(target_desc),
             multiplier,
         )
 
-    def _handle_te_lr_after_resume(self):
+    def _handle_te_lr_after_resume(self, args):
         cfg = self._te_lr_after_cfg
         if not cfg:
             return
+
+        offset = 0
+        if self._te_lr_after_resumed and not getattr(args, "skip_until_initial_step", False):
+            resume_step = self._te_lr_after_resume_step
+            if resume_step is not None:
+                offset = max(0, resume_step - 1)
+        cfg["resume_offset"] = offset
 
         resume_state = self._te_lr_after_resume_state
         if resume_state is not None:
@@ -543,6 +553,60 @@ class NetworkTrainer:
                 threshold,
                 completed_step,
                 threshold,
+            )
+
+    def _finalize_te_lr_after_setup(self, args):
+        cfg = self._te_lr_after_cfg
+        if not cfg:
+            return
+
+        self._handle_te_lr_after_resume(args)
+
+        labels = cfg.get("group_labels")
+        if not labels:
+            labels = [f"TE{idx + 1}" for idx in sorted(cfg.get("target_indices", []))]
+            cfg["group_labels"] = labels
+
+        threshold = cfg.get("threshold_step")
+        ratio = cfg.get("ratio")
+        mult = cfg.get("mult")
+
+        status = "applied" if cfg.get("applied") else "pending"
+        applied_step = cfg.get("applied_step")
+        status_detail = status
+        if applied_step is not None:
+            status_detail += f" (step={applied_step})"
+        offset = cfg.get("resume_offset", 0)
+        if offset > 0:
+            status_detail += f", resume_offset={offset}"
+
+        if threshold is None:
+            logger.info(
+                "te_lr_after configured (%s): multiplier %.6f for %s (ratio=%.4f) / "
+                "te_lr_after: 状態=%s。割合=%.4f で %s に倍率%.6fを適用します（しきい値は未確定）",
+                status_detail,
+                mult,
+                ", ".join(labels),
+                ratio,
+                status_detail,
+                ratio,
+                ", ".join(labels),
+                mult,
+            )
+        else:
+            logger.info(
+                "te_lr_after ready (%s): scale %s lr by %.6f after step > %d (ratio=%.4f) / "
+                "te_lr_after: 状態=%s。ステップ%d超で %s の学習率に倍率%.6f (割合=%.4f) を適用します",
+                status_detail,
+                ", ".join(labels),
+                mult,
+                threshold,
+                ratio,
+                status_detail,
+                threshold,
+                ", ".join(labels),
+                mult,
+                ratio,
             )
     def assert_extra_args(self, args, train_dataset_group):
         train_dataset_group.verify_bucket_reso_steps(64)
@@ -1051,28 +1115,7 @@ class NetworkTrainer:
                 labels = self._te_lr_after_cfg.get("group_labels")
                 if not labels:
                     labels = [f"TE{idx + 1}" for idx in sorted(self._te_lr_after_cfg.get("target_indices", []))]
-                mult = self._te_lr_after_cfg["mult"]
-                ratio = self._te_lr_after_cfg["ratio"]
-                self._handle_te_lr_after_resume()
-                status = "applied" if self._te_lr_after_cfg.get("applied") else "pending"
-                applied_step = self._te_lr_after_cfg.get("applied_step")
-                status_detail = f"{status}"
-                if applied_step is not None:
-                    status_detail += f" (step={applied_step})"
-                logger.info(
-                    "te_lr_after ready (%s): scale %s lr by %.6f after step > %d (ratio=%.4f) / "
-                    "te_lr_after: 状態=%s。ステップ%d超で %s の学習率に倍率%.6f (割合=%.4f) を適用します",
-                    status_detail,
-                    ", ".join(labels),
-                    mult,
-                    threshold,
-                    ratio,
-                    status_detail,
-                    threshold,
-                    ", ".join(labels),
-                    mult,
-                    ratio,
-                )
+                self._te_lr_after_cfg["group_labels"] = labels
 
         # データセット側にも学習ステップを送信
         train_dataset_group.set_max_train_steps(args.max_train_steps)
@@ -1243,6 +1286,7 @@ class NetworkTrainer:
 
         # resumeする
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+        self._finalize_te_lr_after_setup()
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
