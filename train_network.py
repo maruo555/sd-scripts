@@ -2080,7 +2080,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--te-lr-after",
         nargs="+",
         default=None,
-        metavar=("RATIO", "MULT", "TARGET"),
+        metavar="VALUE",
         help=(
             "Apply a learning rate multiplier to text encoder(s) once training progress exceeds the specified ratio "
             "(single-step change). Provide ratio (0-1), multiplier, and optional target (both|te1|te2). / "
