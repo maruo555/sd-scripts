@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 from tqdm import tqdm
 
 import torch
+import torch.distributed as dist
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
@@ -640,6 +641,196 @@ class NetworkTrainer:
                 f"mode={args.dq_delta_mode}, begin={args.dq_delta_begin}, granularity={getattr(args,'dq_delta_granularity',None)}, "
                 f"stat={getattr(args,'dq_delta_stat',None)}, range_mul={getattr(args,'dq_delta_range_mul',None)}, bits_sched={dq_bits_sched}"
             )
+
+        dq_log_enabled = bool(getattr(args, "dq_delta_log", False))
+        dq_log_every = max(1, int(getattr(args, "dq_delta_log_every", 100)))
+        dq_log_scope = getattr(args, "dq_delta_log_scope", None) or getattr(args, "dq_delta_scope", "both")
+        dq_log_mode = getattr(args, "dq_delta_log_mode", "summary")
+        dq_log_extra = set(getattr(args, "dq_delta_log_extra", []) or [])
+
+        dq_auto_enabled = bool(getattr(args, "dq_delta_auto_range_mul", False))
+        dq_auto_every = max(1, int(getattr(args, "dq_delta_auto_every", 50)))
+        dq_auto_clip_low = float(getattr(args, "dq_delta_auto_clip_low", 0.0005))
+        dq_auto_clip_high = float(getattr(args, "dq_delta_auto_clip_high", 0.003))
+        dq_auto_mul_up = float(getattr(args, "dq_delta_auto_mul_up", 1.07))
+        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.97))
+        dq_auto_min = float(getattr(args, "dq_delta_auto_min", 1.0))
+        dq_auto_max = float(getattr(args, "dq_delta_auto_max", 6.0))
+        dq_auto_ema = float(getattr(args, "dq_delta_auto_ema", 0.95))
+        dq_auto_log_format = getattr(args, "dq_delta_auto_log_format", "minimal")
+
+        dq_log_path = None
+        dq_auto_log_path = None
+        if dq_log_enabled:
+            dq_log_path = getattr(args, "dq_delta_log_file", None)
+            if dq_log_path is None:
+                dq_log_path = os.path.join(args.output_dir, f"dq_delta_logs+{args.output_name}.txt")
+        if dq_auto_enabled:
+            dq_auto_log_path = getattr(args, "dq_delta_auto_log_file", None)
+            if dq_auto_log_path is None:
+                dq_auto_log_path = os.path.join(args.output_dir, f"dq_delta_auto+{args.output_name}.txt")
+
+        dq_log_header_written = False
+        dq_auto_log_header_written = False
+
+        def _write_csv(path: str, header: str, line: str):
+            nonlocal dq_log_header_written, dq_auto_log_header_written
+            if not path:
+                return
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if path == dq_log_path:
+                header_written = dq_log_header_written
+            else:
+                header_written = dq_auto_log_header_written
+            if not header_written:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(header + "\n")
+                if path == dq_log_path:
+                    dq_log_header_written = True
+                else:
+                    dq_auto_log_header_written = True
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+        if dq_auto_enabled:
+            if args.dq_delta_stat != "rms":
+                logger.warning("dq_delta_auto_range_mul is enabled but dq_delta_stat is not rms; auto will be inactive.")
+            if not ((args.dq_delta_bits is not None and args.dq_delta_bits) or dq_bits_sched):
+                logger.warning("dq_delta_auto_range_mul is enabled but dq_delta_bits/bits_sched is not set; auto will be inactive.")
+
+        def _dq_format_value(v):
+            if v is None:
+                return ""
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            if isinstance(v, (float, int)):
+                return f"{v:.6g}"
+            return str(v)
+
+        def _dq_log_header(log_mode: str, include_near_zero: bool):
+            cols = [
+                "Epoch",
+                "TrainStep",
+                "Scope",
+                "Target",
+                "Bits",
+                "DQStepSize",
+                "RangeMul",
+                "Stat",
+                "Granularity",
+                "Mode",
+            ]
+            if log_mode == "per_module":
+                cols += ["Module", "Shape"]
+            cols += [
+                "RMS",
+                "AbsMax",
+                "Range",
+                "ScaleMin",
+                "ScaleMean",
+                "ScaleMax",
+                "Qmax",
+                "ClipRateRaw",
+                "ClipRateEMA",
+                "ZeroRate",
+            ]
+            if include_near_zero:
+                cols.append("NearZeroRate")
+            cols += ["Numel", "AutoApplied", "RangeMulBefore", "RangeMulAfter"]
+            return ",".join(cols)
+
+        def _dq_auto_log_header(full_schema: bool, include_near_zero: bool):
+            if full_schema:
+                return _dq_log_header("summary", include_near_zero)
+            return "TrainStep,Scope,Target,Bits,ClipRateRaw,ClipRateEMA,RangeMulBefore,RangeMulAfter,AutoApplied"
+
+        def _dq_reduce_stats(accum_by_scope, collect_full: bool, collect_zero: bool, collect_near_zero: bool):
+            if accelerator.num_processes <= 1 or not dist.is_available() or not dist.is_initialized():
+                return accum_by_scope
+
+            scopes = ["unet", "te"]
+            sum_fields = []
+            sum_refs = []
+            for scope in scopes:
+                acc = accum_by_scope[scope]
+                sum_fields.append(acc.numel)
+                sum_refs.append((acc, "numel"))
+                sum_fields.append(acc.clip_count)
+                sum_refs.append((acc, "clip_count"))
+                if collect_zero:
+                    sum_fields.append(acc.zero_count)
+                    sum_refs.append((acc, "zero_count"))
+                if collect_near_zero:
+                    sum_fields.append(acc.near_zero_count)
+                    sum_refs.append((acc, "near_zero_count"))
+                if collect_full:
+                    sum_fields.append(acc.sumsq)
+                    sum_refs.append((acc, "sumsq"))
+                    sum_fields.append(acc.scale_sum)
+                    sum_refs.append((acc, "scale_sum"))
+                    sum_fields.append(acc.scale_count)
+                    sum_refs.append((acc, "scale_count"))
+
+            if sum_fields:
+                sum_vec = torch.stack(sum_fields)
+                dist.all_reduce(sum_vec, op=dist.ReduceOp.SUM)
+                for idx, (acc, name) in enumerate(sum_refs):
+                    setattr(acc, name, sum_vec[idx])
+
+            if collect_full:
+                max_fields = []
+                max_refs = []
+                min_fields = []
+                min_refs = []
+                for scope in scopes:
+                    acc = accum_by_scope[scope]
+                    max_fields.append(acc.absmax)
+                    max_refs.append((acc, "absmax"))
+                    max_fields.append(acc.scale_max)
+                    max_refs.append((acc, "scale_max"))
+                    min_fields.append(acc.scale_min)
+                    min_refs.append((acc, "scale_min"))
+
+                if max_fields:
+                    max_vec = torch.stack(max_fields)
+                    dist.all_reduce(max_vec, op=dist.ReduceOp.MAX)
+                    for idx, (acc, name) in enumerate(max_refs):
+                        setattr(acc, name, max_vec[idx])
+                if min_fields:
+                    min_vec = torch.stack(min_fields)
+                    dist.all_reduce(min_vec, op=dist.ReduceOp.MIN)
+                    for idx, (acc, name) in enumerate(min_refs):
+                        setattr(acc, name, min_vec[idx])
+
+            return accum_by_scope
+
+        def _dq_compute_metrics(acc, qmax, collect_full: bool, collect_zero: bool, collect_near_zero: bool):
+            numel = acc.numel.item() if acc.numel is not None else 0.0
+            clip_rate = (acc.clip_count / acc.numel).item() if numel > 0 else None
+            zero_rate = (acc.zero_count / acc.numel).item() if collect_zero and numel > 0 else None
+            near_zero_rate = (acc.near_zero_count / acc.numel).item() if collect_near_zero and numel > 0 else None
+            rms = absmax = scale_min = scale_max = scale_mean = range_val = None
+            if collect_full and numel > 0:
+                rms = math.sqrt((acc.sumsq / acc.numel).item()) if acc.sumsq is not None else None
+                absmax = acc.absmax.item() if acc.absmax is not None else None
+                scale_min = acc.scale_min.item() if acc.scale_min is not None else None
+                scale_max = acc.scale_max.item() if acc.scale_max is not None else None
+                if acc.scale_sum is not None and acc.scale_count is not None and acc.scale_count.item() > 0:
+                    scale_mean = (acc.scale_sum / acc.scale_count).item()
+            if scale_mean is not None and qmax is not None:
+                range_val = scale_mean * qmax
+            return {
+                "numel": numel,
+                "clip_rate": clip_rate,
+                "zero_rate": zero_rate,
+                "near_zero_rate": near_zero_rate,
+                "rms": rms,
+                "absmax": absmax,
+                "scale_min": scale_min,
+                "scale_max": scale_max,
+                "scale_mean": scale_mean,
+                "range": range_val,
+            }
 
         cache_latents = args.cache_latents
         use_dreambooth_method = args.in_json is None
@@ -1668,6 +1859,8 @@ class NetworkTrainer:
                 initial_step -= len(train_dataloader)
             global_step = initial_step
 
+        dq_auto_ema_state = None
+        dq_bits_changed_since_auto = False
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
@@ -1689,8 +1882,9 @@ class NetworkTrainer:
                 if initial_step > 0:
                     initial_step -= 1
                     continue
-
+                skip_step_flag = False
                 with accelerator.accumulate(training_model):
+                    dq_bits_changed_this_step = False
                     # Toggle delta fake-quantization based on training progress
                     if hasattr(accelerator.unwrap_model(network), "set_delta_quant_enabled"):
                         dq_configured = (
@@ -1721,6 +1915,36 @@ class NetworkTrainer:
                                         on_z=getattr(args, "dq_quantize_z", False),
                                     )
                                     last_applied_bits = cur_bits
+                                    dq_bits_changed_this_step = True
+                                    dq_bits_changed_since_auto = True
+
+                        # dq_delta stats collection control (LogStep / AutoStep)
+                        if hasattr(accelerator.unwrap_model(network), "set_dq_stats_state"):
+                            step_idx = global_step + 1
+                            quant_enabled = dq_configured and (progress_frac >= args.dq_delta_begin)
+                            do_log = dq_log_enabled and quant_enabled and (step_idx % dq_log_every == 0)
+                            auto_eligible = dq_auto_enabled and quant_enabled and (
+                                (getattr(args, "dq_delta_bits", None) is not None and args.dq_delta_bits) or bool(dq_bits_sched)
+                            ) and (args.dq_delta_stat == "rms")
+                            do_auto = auto_eligible and (step_idx % dq_auto_every == 0)
+                            collect_full = bool(do_log)
+                            collect_zero = bool(do_log)
+                            collect_near_zero = bool(do_log and ("near_zero_rate" in dq_log_extra))
+                            target = "z" if getattr(args, "dq_quantize_z", False) else "delta"
+
+                            accelerator.unwrap_model(network).set_dq_stats_state(
+                                step_idx=step_idx,
+                                device=accelerator.device,
+                                do_log=do_log,
+                                do_auto=do_auto,
+                                collect_full=collect_full,
+                                collect_zero=collect_zero,
+                                collect_near_zero=collect_near_zero,
+                                log_mode=dq_log_mode,
+                                log_scope=dq_log_scope,
+                                auto_scope=getattr(args, "dq_delta_scope", "both"),
+                                target=target,
+                            )
 
                     on_step_start(text_encoder, unet)
 
@@ -1834,6 +2058,7 @@ class NetworkTrainer:
                         skipped_steps += 1
                         optimizer.zero_grad(set_to_none=True)
                         skip_step = True
+                        skip_step_flag = True
 
                     if not skip_step:
                         if accelerator.sync_gradients:
@@ -1876,6 +2101,247 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+                    if hasattr(accelerator.unwrap_model(network), "export_dq_stats"):
+                        step_idx = global_step
+                        if skip_step_flag:
+                            accelerator.unwrap_model(network).discard_dq_stats_step(step_idx)
+                        else:
+                            dq_stats = accelerator.unwrap_model(network).export_dq_stats()
+                            if dq_stats is not None and dq_stats.get("step_idx") == step_idx:
+                                accum_by_scope = dq_stats["accum"]
+                                collect_full = dq_stats["collect_full"]
+                                collect_zero = dq_stats["collect_zero"]
+                                collect_near_zero = dq_stats["collect_near_zero"]
+                                _dq_reduce_stats(accum_by_scope, collect_full, collect_zero, collect_near_zero)
+
+                                cur_bits = last_applied_bits
+                                qmax = (1 << (cur_bits - 1)) - 1 if cur_bits is not None else None
+                                metrics = {
+                                    "unet": _dq_compute_metrics(accum_by_scope["unet"], qmax, collect_full, collect_zero, collect_near_zero),
+                                    "te": _dq_compute_metrics(accum_by_scope["te"], qmax, collect_full, collect_zero, collect_near_zero),
+                                }
+
+                                auto_applied = 0
+                                range_mul_before = getattr(args, "dq_delta_range_mul", None)
+                                range_mul_after = range_mul_before
+                                clip_rate_raw = None
+                                clip_rate_ema = dq_auto_ema_state
+
+                                if dq_stats["do_auto"]:
+                                    auto_scope = dq_stats["auto_scope"]
+                                    if accelerator.is_main_process:
+                                        if auto_scope == "unet":
+                                            auto_metrics = metrics["unet"]
+                                        elif auto_scope == "te":
+                                            auto_metrics = metrics["te"]
+                                        else:
+                                            # combine unet + te
+                                            combined = accum_by_scope["unet"]
+                                            other = accum_by_scope["te"]
+                                            numel = combined.numel + other.numel
+                                            clip = combined.clip_count + other.clip_count
+                                            zero = None
+                                            if collect_zero:
+                                                zero = combined.zero_count + other.zero_count
+                                            near_zero = None
+                                            if collect_near_zero:
+                                                near_zero = combined.near_zero_count + other.near_zero_count
+                                            sumsq = None
+                                            absmax = None
+                                            scale_min = None
+                                            scale_max = None
+                                            scale_sum = None
+                                            scale_count = None
+                                            if collect_full:
+                                                sumsq = combined.sumsq + other.sumsq
+                                                absmax = torch.maximum(combined.absmax, other.absmax)
+                                                scale_min = torch.minimum(combined.scale_min, other.scale_min)
+                                                scale_max = torch.maximum(combined.scale_max, other.scale_max)
+                                                scale_sum = combined.scale_sum + other.scale_sum
+                                                scale_count = combined.scale_count + other.scale_count
+                                            temp_acc = type(combined)(combined.numel.device, collect_full, collect_zero, collect_near_zero)
+                                            temp_acc.numel = numel
+                                            temp_acc.clip_count = clip
+                                            temp_acc.zero_count = zero
+                                            temp_acc.near_zero_count = near_zero
+                                            temp_acc.sumsq = sumsq
+                                            temp_acc.absmax = absmax
+                                            temp_acc.scale_min = scale_min
+                                            temp_acc.scale_max = scale_max
+                                            temp_acc.scale_sum = scale_sum
+                                            temp_acc.scale_count = scale_count
+                                            auto_metrics = _dq_compute_metrics(temp_acc, qmax, collect_full, collect_zero, collect_near_zero)
+
+                                        clip_rate_raw = auto_metrics["clip_rate"]
+                                        if clip_rate_raw is not None:
+                                            if dq_bits_changed_since_auto:
+                                                dq_auto_ema_state = clip_rate_raw
+                                                dq_bits_changed_since_auto = False
+                                            else:
+                                                if dq_auto_ema_state is None:
+                                                    dq_auto_ema_state = clip_rate_raw
+                                                else:
+                                                    dq_auto_ema_state = dq_auto_ema_state * dq_auto_ema + (1.0 - dq_auto_ema) * clip_rate_raw
+                                            clip_rate_ema = dq_auto_ema_state
+
+                                            if range_mul_before is None:
+                                                range_mul_before = getattr(args, "dq_delta_range_mul", 3.0)
+                                            range_mul_after = range_mul_before
+                                            if clip_rate_ema > dq_auto_clip_high:
+                                                range_mul_after = range_mul_before * dq_auto_mul_up
+                                            elif clip_rate_ema < dq_auto_clip_low:
+                                                range_mul_after = range_mul_before * dq_auto_mul_down
+                                            range_mul_after = max(dq_auto_min, min(dq_auto_max, range_mul_after))
+                                            if range_mul_after != range_mul_before:
+                                                auto_applied = 1
+
+                                    if dist.is_available() and dist.is_initialized():
+                                        range_tensor = torch.tensor(
+                                            range_mul_after if accelerator.is_main_process else 0.0,
+                                            device=accelerator.device,
+                                            dtype=torch.float32,
+                                        )
+                                        dist.broadcast(range_tensor, src=0)
+                                        range_mul_after = float(range_tensor.item())
+
+                                    if range_mul_after is not None:
+                                        args.dq_delta_range_mul = range_mul_after
+                                        accelerator.unwrap_model(network).set_delta_fake_quant(
+                                            getattr(args, "dq_delta_step", None),
+                                            args.dq_delta_mode,
+                                            granularity=args.dq_delta_granularity,
+                                            stat=args.dq_delta_stat,
+                                            bits=cur_bits,
+                                            range_mul=range_mul_after,
+                                            on_z=getattr(args, "dq_quantize_z", False),
+                                        )
+
+                                if dq_stats["do_log"] and accelerator.is_main_process and dq_log_path:
+                                    include_near_zero = "near_zero_rate" in dq_log_extra
+                                    header = _dq_log_header(dq_log_mode, include_near_zero)
+                                    log_scopes = ["unet", "te"] if dq_stats["log_scope"] == "both" else [dq_stats["log_scope"]]
+                                    for scope in log_scopes:
+                                        m = metrics[scope]
+                                        values = [
+                                            epoch + 1,
+                                            step_idx,
+                                            scope,
+                                            dq_stats["target"],
+                                            cur_bits if cur_bits is not None else "",
+                                            getattr(args, "dq_delta_step", None) or "",
+                                            range_mul_after if range_mul_after is not None else "",
+                                            args.dq_delta_stat,
+                                            args.dq_delta_granularity,
+                                            args.dq_delta_mode,
+                                        ]
+                                        if dq_log_mode == "per_module":
+                                            for item in dq_stats["per_module"]:
+                                                if item["scope"] != scope:
+                                                    continue
+                                                numel = item["numel"].item()
+                                                clip_rate = (item["clip_count"] / item["numel"]).item() if numel > 0 else None
+                                                zero_rate = (item["zero_count"] / item["numel"]).item() if item["zero_count"] is not None and numel > 0 else None
+                                                near_zero_rate = (item["near_zero_count"] / item["numel"]).item() if item["near_zero_count"] is not None and numel > 0 else None
+                                                rms = math.sqrt((item["sumsq"] / item["numel"]).item()) if item["sumsq"] is not None and numel > 0 else None
+                                                absmax = item["absmax"].item() if item["absmax"] is not None else None
+                                                scale_min = item["scale_min"].item() if item["scale_min"] is not None else None
+                                                scale_max = item["scale_max"].item() if item["scale_max"] is not None else None
+                                                scale_mean = (item["scale_sum"] / item["scale_count"]).item() if item["scale_sum"] is not None and item["scale_count"] is not None and item["scale_count"].item() > 0 else None
+                                                range_val = scale_mean * qmax if scale_mean is not None and qmax is not None else None
+                                                row = values + [
+                                                    item["module"],
+                                                    item["shape"],
+                                                    rms,
+                                                    absmax,
+                                                    range_val,
+                                                    scale_min,
+                                                    scale_mean,
+                                                    scale_max,
+                                                    qmax if qmax is not None else "",
+                                                    clip_rate,
+                                                    clip_rate_ema if clip_rate_ema is not None else "",
+                                                    zero_rate,
+                                                ]
+                                                if include_near_zero:
+                                                    row.append(near_zero_rate)
+                                                row += [
+                                                    numel,
+                                                    auto_applied,
+                                                    range_mul_before if range_mul_before is not None else "",
+                                                    range_mul_after if range_mul_after is not None else "",
+                                                ]
+                                                _write_csv(dq_log_path, header, ",".join(_dq_format_value(v) for v in row))
+                                        else:
+                                            row = values + [
+                                                m["rms"],
+                                                m["absmax"],
+                                                m["range"],
+                                                m["scale_min"],
+                                                m["scale_mean"],
+                                                m["scale_max"],
+                                                qmax if qmax is not None else "",
+                                                m["clip_rate"],
+                                                clip_rate_ema if clip_rate_ema is not None else "",
+                                                m["zero_rate"],
+                                            ]
+                                            if include_near_zero:
+                                                row.append(m["near_zero_rate"])
+                                            row += [
+                                                m["numel"],
+                                                auto_applied,
+                                                range_mul_before if range_mul_before is not None else "",
+                                                range_mul_after if range_mul_after is not None else "",
+                                            ]
+                                            _write_csv(dq_log_path, header, ",".join(_dq_format_value(v) for v in row))
+
+                                if dq_stats["do_auto"] and accelerator.is_main_process and dq_auto_log_path:
+                                    include_near_zero = "near_zero_rate" in dq_log_extra
+                                    header = _dq_auto_log_header(dq_auto_log_format == "full_schema", include_near_zero)
+                                    if dq_auto_log_format == "full_schema":
+                                        row = [
+                                            epoch + 1,
+                                            step_idx,
+                                            dq_stats["auto_scope"],
+                                            dq_stats["target"],
+                                            cur_bits if cur_bits is not None else "",
+                                            getattr(args, "dq_delta_step", None) or "",
+                                            range_mul_after if range_mul_after is not None else "",
+                                            args.dq_delta_stat,
+                                            args.dq_delta_granularity,
+                                            args.dq_delta_mode,
+                                            "",
+                                            "",
+                                            "",
+                                            "",
+                                            "",
+                                            "",
+                                            qmax if qmax is not None else "",
+                                            clip_rate_raw if clip_rate_raw is not None else "",
+                                            clip_rate_ema if clip_rate_ema is not None else "",
+                                            "",
+                                        ]
+                                        if include_near_zero:
+                                            row.append("")
+                                        row += [
+                                            "",
+                                            auto_applied,
+                                            range_mul_before if range_mul_before is not None else "",
+                                            range_mul_after if range_mul_after is not None else "",
+                                        ]
+                                        _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
+                                    else:
+                                        row = [
+                                            step_idx,
+                                            dq_stats["auto_scope"],
+                                            dq_stats["target"],
+                                            cur_bits if cur_bits is not None else "",
+                                            clip_rate_raw if clip_rate_raw is not None else "",
+                                            clip_rate_ema if clip_rate_ema is not None else "",
+                                            range_mul_before if range_mul_before is not None else "",
+                                            range_mul_after if range_mul_after is not None else "",
+                                            auto_applied,
+                                        ]
+                                        _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
                     if (
                         not nan_inf_switched
                         and nan_inf_until_step is not None
@@ -2240,6 +2706,111 @@ def setup_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Schedule bits by progress fraction, e.g. '0.0:6,0.5:8,0.8:10' / 学習進行率に応じたビット数スケジュール（例: '0.0:6,0.5:8,0.8:10'）",
+    )
+    # dq_delta logging / auto-tuning
+    parser.add_argument(
+        "--dq_delta_log",
+        action="store_true",
+        help="Enable dq_delta logging / dq_delta ログを有効化",
+    )
+    parser.add_argument(
+        "--dq_delta_log_every",
+        type=int,
+        default=100,
+        help="Log every N optimizer steps / ログ間隔（optimizer step）",
+    )
+    parser.add_argument(
+        "--dq_delta_log_scope",
+        type=str,
+        default=None,
+        choices=["unet", "te", "both"],
+        help="Scope for dq_delta log; defaults to dq_delta_scope / dq_delta ログ対象（未指定時は dq_delta_scope）",
+    )
+    parser.add_argument(
+        "--dq_delta_log_mode",
+        type=str,
+        default="summary",
+        choices=["summary", "per_module"],
+        help="dq_delta log mode: summary or per_module / dq_delta ログ粒度（summary/per_module）",
+    )
+    parser.add_argument(
+        "--dq_delta_log_file",
+        type=str,
+        default=None,
+        help="Path for dq_delta log file / dq_delta ログ出力先",
+    )
+    parser.add_argument(
+        "--dq_delta_log_extra",
+        nargs="*",
+        default=[],
+        choices=["near_zero_rate"],
+        help="Extra dq_delta log fields / dq_delta 追加ログ項目",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_range_mul",
+        action="store_true",
+        help="Enable auto range_mul tuning / range_mul の自動調整を有効化",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_every",
+        type=int,
+        default=50,
+        help="Auto update interval in optimizer steps / 自動調整間隔（optimizer step）",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_clip_low",
+        type=float,
+        default=0.0005,
+        help="Auto clip_rate low threshold / clip_rate 下限",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_clip_high",
+        type=float,
+        default=0.003,
+        help="Auto clip_rate high threshold / clip_rate 上限",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_mul_up",
+        type=float,
+        default=1.07,
+        help="Auto range_mul increase factor / range_mul 上げ係数",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_mul_down",
+        type=float,
+        default=0.97,
+        help="Auto range_mul decrease factor / range_mul 下げ係数",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_min",
+        type=float,
+        default=1.0,
+        help="Auto range_mul min / range_mul 下限",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_max",
+        type=float,
+        default=6.0,
+        help="Auto range_mul max / range_mul 上限",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_ema",
+        type=float,
+        default=0.95,
+        help="Auto clip_rate EMA / clip_rate EMA 係数",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_log_file",
+        type=str,
+        default=None,
+        help="Path for dq_delta auto log file / dq_delta auto ログ出力先",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_log_format",
+        type=str,
+        default="minimal",
+        choices=["minimal", "full_schema"],
+        help="Auto log format / auto ログ形式（minimal/full_schema）",
     )
     # ema_* options removed
     # LoRA rounding options

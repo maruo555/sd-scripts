@@ -30,6 +30,236 @@ logger = logging.getLogger(__name__)
 RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions)_(\d+)_")
 
 
+def _fake_quantize_levels_with_q(
+    x: torch.Tensor,
+    *,
+    scale: Union[float, torch.Tensor],
+    qmin: int,
+    qmax: int,
+    mode: str,
+):
+    if not isinstance(scale, torch.Tensor):
+        s = torch.tensor(scale, dtype=torch.float32, device=x.device)
+    else:
+        s = scale.to(device=x.device, dtype=torch.float32)
+    y = x.to(torch.float32) / s
+    q_clamp = torch.clamp(y, qmin, qmax)
+    if mode == "det":
+        q = torch.round(q_clamp)
+    elif mode == "stoch":
+        frac = q_clamp - torch.floor(q_clamp)
+        probs = frac.clamp(0.0, 1.0)
+        q = torch.floor(q_clamp) + (torch.rand_like(probs) < probs).to(q_clamp.dtype)
+    else:
+        raise ValueError(f"unknown round mode: {mode}")
+    q = torch.clamp(q, qmin, qmax)
+    q_out = (q * s).to(x.dtype)
+    return x + (q_out - x).detach(), q_clamp, s
+
+
+class DQStatsAccumulator:
+    def __init__(self, device, collect_full: bool, collect_zero: bool, collect_near_zero: bool):
+        self.device = device
+        self.collect_full = collect_full
+        self.collect_zero = collect_zero
+        self.collect_near_zero = collect_near_zero
+        self.numel = torch.zeros(1, device=device, dtype=torch.float32)
+        self.clip_count = torch.zeros(1, device=device, dtype=torch.float32)
+        self.zero_count = torch.zeros(1, device=device, dtype=torch.float32) if collect_zero else None
+        self.near_zero_count = torch.zeros(1, device=device, dtype=torch.float32) if collect_near_zero else None
+        self.sumsq = torch.zeros(1, device=device, dtype=torch.float32) if collect_full else None
+        self.absmax = torch.zeros(1, device=device, dtype=torch.float32) if collect_full else None
+        self.scale_min = torch.full((1,), float("inf"), device=device, dtype=torch.float32) if collect_full else None
+        self.scale_max = torch.zeros(1, device=device, dtype=torch.float32) if collect_full else None
+        self.scale_sum = torch.zeros(1, device=device, dtype=torch.float32) if collect_full else None
+        self.scale_count = torch.zeros(1, device=device, dtype=torch.float32) if collect_full else None
+
+    def add(
+        self,
+        *,
+        numel: torch.Tensor,
+        clip_count: torch.Tensor,
+        zero_count: Optional[torch.Tensor] = None,
+        near_zero_count: Optional[torch.Tensor] = None,
+        sumsq: Optional[torch.Tensor] = None,
+        absmax: Optional[torch.Tensor] = None,
+        scale_min: Optional[torch.Tensor] = None,
+        scale_max: Optional[torch.Tensor] = None,
+        scale_sum: Optional[torch.Tensor] = None,
+        scale_count: Optional[torch.Tensor] = None,
+    ):
+        self.numel += numel
+        self.clip_count += clip_count
+        if self.collect_zero and zero_count is not None:
+            self.zero_count += zero_count
+        if self.collect_near_zero and near_zero_count is not None:
+            self.near_zero_count += near_zero_count
+        if self.collect_full:
+            if sumsq is not None:
+                self.sumsq += sumsq
+            if absmax is not None:
+                self.absmax = torch.maximum(self.absmax, absmax)
+            if scale_min is not None:
+                self.scale_min = torch.minimum(self.scale_min, scale_min)
+            if scale_max is not None:
+                self.scale_max = torch.maximum(self.scale_max, scale_max)
+            if scale_sum is not None:
+                self.scale_sum += scale_sum
+            if scale_count is not None:
+                self.scale_count += scale_count
+
+
+class DQStatsManager:
+    def __init__(self):
+        self.active = False
+        self.step_idx = None
+        self.collect_full = False
+        self.collect_zero = False
+        self.collect_near_zero = False
+        self.log_mode = "summary"
+        self.log_scope = "both"
+        self.auto_scope = "both"
+        self.target = "delta"
+        self.do_log = False
+        self.do_auto = False
+        self.accum = {}
+        self.per_module = []
+
+    def _reset(self, device):
+        self.accum = {
+            "unet": DQStatsAccumulator(device, self.collect_full, self.collect_zero, self.collect_near_zero),
+            "te": DQStatsAccumulator(device, self.collect_full, self.collect_zero, self.collect_near_zero),
+        }
+        self.per_module = []
+
+    def begin_step(
+        self,
+        *,
+        step_idx: int,
+        device,
+        do_log: bool,
+        do_auto: bool,
+        collect_full: bool,
+        collect_zero: bool,
+        collect_near_zero: bool,
+        log_mode: str,
+        log_scope: str,
+        auto_scope: str,
+        target: str,
+    ):
+        if not do_log and not do_auto:
+            self.active = False
+            self.step_idx = None
+            return
+        if (not self.active) or (self.step_idx != step_idx):
+            self.collect_full = collect_full
+            self.collect_zero = collect_zero
+            self.collect_near_zero = collect_near_zero
+            self.log_mode = log_mode
+            self.log_scope = log_scope
+            self.auto_scope = auto_scope
+            self.target = target
+            self.do_log = do_log
+            self.do_auto = do_auto
+            self.step_idx = step_idx
+            self.active = True
+            self._reset(device)
+        else:
+            self.collect_full = collect_full
+            self.collect_zero = collect_zero
+            self.collect_near_zero = collect_near_zero
+            self.log_mode = log_mode
+            self.log_scope = log_scope
+            self.auto_scope = auto_scope
+            self.target = target
+            self.do_log = do_log
+            self.do_auto = do_auto
+
+    def discard_step(self, step_idx: int):
+        if self.step_idx == step_idx:
+            self.active = False
+            self.step_idx = None
+
+    def _scope_enabled(self, scope: str) -> bool:
+        if not self.active:
+            return False
+        log_ok = self.do_log and (self.log_scope == "both" or self.log_scope == scope)
+        auto_ok = self.do_auto and (self.auto_scope == "both" or self.auto_scope == scope)
+        return log_ok or auto_ok
+
+    def wants_scope(self, scope: str) -> bool:
+        return self._scope_enabled(scope)
+
+    def add_stats(
+        self,
+        *,
+        scope: str,
+        module_name: str,
+        shape: str,
+        numel: torch.Tensor,
+        clip_count: torch.Tensor,
+        zero_count: Optional[torch.Tensor],
+        near_zero_count: Optional[torch.Tensor],
+        sumsq: Optional[torch.Tensor],
+        absmax: Optional[torch.Tensor],
+        scale_min: Optional[torch.Tensor],
+        scale_max: Optional[torch.Tensor],
+        scale_sum: Optional[torch.Tensor],
+        scale_count: Optional[torch.Tensor],
+    ):
+        if not self._scope_enabled(scope):
+            return
+        acc = self.accum[scope]
+        acc.add(
+            numel=numel,
+            clip_count=clip_count,
+            zero_count=zero_count,
+            near_zero_count=near_zero_count,
+            sumsq=sumsq,
+            absmax=absmax,
+            scale_min=scale_min,
+            scale_max=scale_max,
+            scale_sum=scale_sum,
+            scale_count=scale_count,
+        )
+        if self.do_log and self.log_mode == "per_module" and (self.log_scope == "both" or self.log_scope == scope):
+            self.per_module.append(
+                {
+                    "scope": scope,
+                    "module": module_name,
+                    "shape": shape,
+                    "numel": numel.detach(),
+                    "clip_count": clip_count.detach(),
+                    "zero_count": zero_count.detach() if zero_count is not None else None,
+                    "near_zero_count": near_zero_count.detach() if near_zero_count is not None else None,
+                    "sumsq": sumsq.detach() if sumsq is not None else None,
+                    "absmax": absmax.detach() if absmax is not None else None,
+                    "scale_min": scale_min.detach() if scale_min is not None else None,
+                    "scale_max": scale_max.detach() if scale_max is not None else None,
+                    "scale_sum": scale_sum.detach() if scale_sum is not None else None,
+                    "scale_count": scale_count.detach() if scale_count is not None else None,
+                }
+            )
+
+    def export(self):
+        if not self.active:
+            return None
+        return {
+            "step_idx": self.step_idx,
+            "do_log": self.do_log,
+            "do_auto": self.do_auto,
+            "log_mode": self.log_mode,
+            "log_scope": self.log_scope,
+            "auto_scope": self.auto_scope,
+            "target": self.target,
+            "collect_full": self.collect_full,
+            "collect_zero": self.collect_zero,
+            "collect_near_zero": self.collect_near_zero,
+            "accum": self.accum,
+            "per_module": self.per_module,
+        }
+
+
 class LoRAModule(torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
@@ -109,6 +339,8 @@ class LoRAModule(torch.nn.Module):
         # when True, quantize z=A(x) and then apply B: Delta' = B(Q(z))
         # otherwise quantize Delta directly: Delta' = Q(B(z))
         self.delta_q_on_z = bool(delta_q_on_z)
+        self.dq_stats_manager: Optional[DQStatsManager] = None
+        self.dq_scope = "te" if lora_name.startswith("lora_te") else "unet"
 
     # no EMA buffers/statistics for delta quantization (ema_* removed)
 
@@ -116,6 +348,57 @@ class LoRAModule(torch.nn.Module):
         self.org_forward = self.org_module.forward
         self.org_module.forward = self.forward
         del self.org_module
+
+    def _record_dq_stats(
+        self,
+        x_in: torch.Tensor,
+        quantized: torch.Tensor,
+        q_clamp: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        qmax: Optional[int],
+    ):
+        mgr = self.dq_stats_manager
+        if mgr is None or not mgr.active or not mgr.wants_scope(self.dq_scope):
+            return
+        if mgr.target == "z" and not self.delta_q_on_z:
+            return
+        if mgr.target == "delta" and self.delta_q_on_z:
+            return
+        with torch.no_grad():
+            device = x_in.device
+            numel = torch.tensor(float(x_in.numel()), device=device, dtype=torch.float32)
+            if q_clamp is not None and qmax is not None:
+                clip_count = (q_clamp.abs() >= qmax).to(torch.float32).sum()
+            else:
+                clip_count = torch.zeros(1, device=device, dtype=torch.float32)
+            zero_count = (quantized == 0).to(torch.float32).sum() if mgr.collect_zero else None
+            near_zero_count = None
+            if mgr.collect_near_zero and scale is not None:
+                near_zero_count = (x_in.abs() < (0.5 * scale)).to(torch.float32).sum()
+            sumsq = (x_in.to(torch.float32) ** 2).sum() if mgr.collect_full else None
+            absmax = x_in.abs().max() if mgr.collect_full else None
+            scale_min = scale_max = scale_sum = scale_count = None
+            if mgr.collect_full and scale is not None:
+                scale_min = scale.min()
+                scale_max = scale.max()
+                scale_sum = scale.sum()
+                scale_count = torch.tensor(float(scale.numel()), device=device, dtype=torch.float32)
+
+            mgr.add_stats(
+                scope=self.dq_scope,
+                module_name=self.lora_name,
+                shape=str(tuple(x_in.shape)),
+                numel=numel,
+                clip_count=clip_count,
+                zero_count=zero_count,
+                near_zero_count=near_zero_count,
+                sumsq=sumsq,
+                absmax=absmax,
+                scale_min=scale_min,
+                scale_max=scale_max,
+                scale_sum=scale_sum,
+                scale_count=scale_count,
+            )
 
     def forward(self, x):
         org_forwarded = self.org_forward(x)
@@ -149,7 +432,6 @@ class LoRAModule(torch.nn.Module):
         # Optionally apply fake quantization to z before up-projection
         if self.training and self.delta_q_enabled and self.delta_q_on_z:
             if self.delta_q_bits is not None and self.delta_q_bits > 0:
-                # stats do not need grad; avoid building autograd graph
                 with torch.no_grad():
                     z_scale = compute_scale_bits(
                         lx,
@@ -159,14 +441,24 @@ class LoRAModule(torch.nn.Module):
                         range_mul=self.delta_q_range_mul,
                     )
                     qmax = (1 << (self.delta_q_bits - 1)) - 1
-                lx = fake_quantize_levels(lx, scale=z_scale, qmin=-qmax, qmax=qmax, mode=self.delta_q_mode)
+                x_in = lx
+                if self.dq_stats_manager is not None and self.dq_stats_manager.wants_scope(self.dq_scope) and self.dq_stats_manager.active:
+                    lx, q_clamp, scale_t = _fake_quantize_levels_with_q(
+                        x_in, scale=z_scale, qmin=-qmax, qmax=qmax, mode=self.delta_q_mode
+                    )
+                    self._record_dq_stats(x_in, lx, q_clamp, scale_t, qmax)
+                else:
+                    lx = fake_quantize_levels(lx, scale=z_scale, qmin=-qmax, qmax=qmax, mode=self.delta_q_mode)
             elif self.delta_q_step is not None and self.delta_q_step > 0:
                 if self.delta_q_granularity == "channel":
                     with torch.no_grad():
                         step_t = compute_per_channel_step(lx, self.delta_q_step, stat=self.delta_q_stat)
                 else:
                     step_t = self.delta_q_step
+                x_in = lx
                 lx = fake_quantize(lx, step=step_t, mode=self.delta_q_mode)
+                if self.dq_stats_manager is not None and self.dq_stats_manager.wants_scope(self.dq_scope) and self.dq_stats_manager.active:
+                    self._record_dq_stats(x_in, lx, None, None, None)
             # ensure memory contiguity for faster lora_up (matmul/conv)
             lx = lx.contiguous()
 
@@ -188,14 +480,24 @@ class LoRAModule(torch.nn.Module):
                         range_mul=self.delta_q_range_mul,
                     )
                     qmax = (1 << (self.delta_q_bits - 1)) - 1
-                delta = fake_quantize_levels(delta, scale=d_scale, qmin=-qmax, qmax=qmax, mode=self.delta_q_mode)
+                x_in = delta
+                if self.dq_stats_manager is not None and self.dq_stats_manager.wants_scope(self.dq_scope) and self.dq_stats_manager.active:
+                    delta, q_clamp, scale_t = _fake_quantize_levels_with_q(
+                        x_in, scale=d_scale, qmin=-qmax, qmax=qmax, mode=self.delta_q_mode
+                    )
+                    self._record_dq_stats(x_in, delta, q_clamp, scale_t, qmax)
+                else:
+                    delta = fake_quantize_levels(delta, scale=d_scale, qmin=-qmax, qmax=qmax, mode=self.delta_q_mode)
             elif self.delta_q_step is not None and self.delta_q_step > 0:
                 if self.delta_q_granularity == "channel":
                     with torch.no_grad():
                         step_t = compute_per_channel_step(delta, self.delta_q_step, stat=self.delta_q_stat)
                 else:
                     step_t = self.delta_q_step
+                x_in = delta
                 delta = fake_quantize(delta, step=step_t, mode=self.delta_q_mode)
+                if self.dq_stats_manager is not None and self.dq_stats_manager.wants_scope(self.dq_scope) and self.dq_stats_manager.active:
+                    self._record_dq_stats(x_in, delta, None, None, None)
 
         return org_forwarded + delta
 
@@ -1014,6 +1316,7 @@ class LoRANetwork(torch.nn.Module):
         self.delta_q_bits = delta_q_bits
         self.delta_q_range_mul = delta_q_range_mul
         self.delta_q_on_z = bool(delta_q_on_z)
+        self.dq_stats_manager = DQStatsManager()
 
         self.loraplus_lr_ratio = None
         self.loraplus_unet_lr_ratio = None
@@ -1119,6 +1422,7 @@ class LoRANetwork(torch.nn.Module):
                                 delta_q_range_mul=self.delta_q_range_mul,
                                 delta_q_on_z=self.delta_q_on_z,
                             )
+                            lora.dq_stats_manager = self.dq_stats_manager
                             loras.append(lora)
             return loras, skipped
 
@@ -1217,6 +1521,47 @@ class LoRANetwork(torch.nn.Module):
     def set_delta_quant_enabled(self, enabled: bool):
         for l in self.text_encoder_loras + self.unet_loras:
             l.delta_q_enabled = enabled
+
+    def set_dq_stats_state(
+        self,
+        *,
+        step_idx: int,
+        device,
+        do_log: bool,
+        do_auto: bool,
+        collect_full: bool,
+        collect_zero: bool,
+        collect_near_zero: bool,
+        log_mode: str,
+        log_scope: str,
+        auto_scope: str,
+        target: str,
+    ):
+        if self.dq_stats_manager is None:
+            return
+        self.dq_stats_manager.begin_step(
+            step_idx=step_idx,
+            device=device,
+            do_log=do_log,
+            do_auto=do_auto,
+            collect_full=collect_full,
+            collect_zero=collect_zero,
+            collect_near_zero=collect_near_zero,
+            log_mode=log_mode,
+            log_scope=log_scope,
+            auto_scope=auto_scope,
+            target=target,
+        )
+
+    def discard_dq_stats_step(self, step_idx: int):
+        if self.dq_stats_manager is None:
+            return
+        self.dq_stats_manager.discard_step(step_idx)
+
+    def export_dq_stats(self):
+        if self.dq_stats_manager is None:
+            return None
+        return self.dq_stats_manager.export()
 
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
