@@ -1861,6 +1861,24 @@ class NetworkTrainer:
 
         dq_auto_ema_state = None
         dq_bits_changed_since_auto = False
+        def _dq_bits_for_progress(progress_frac: float, default_bits: Optional[int]):
+            if not dq_bits_sched:
+                return default_bits
+            cur_bits = default_bits
+            for p, b in dq_bits_sched:
+                if progress_frac >= p:
+                    cur_bits = b
+                else:
+                    break
+            return cur_bits
+
+        # initialize last_applied_bits based on current progress (avoid per-epoch reset)
+        if args.max_train_steps > 0:
+            initial_progress = global_step / float(args.max_train_steps)
+        else:
+            initial_progress = 0.0
+        last_applied_bits = _dq_bits_for_progress(initial_progress, getattr(args, "dq_delta_bits", None))
+
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
@@ -1873,9 +1891,6 @@ class NetworkTrainer:
             if initial_step > 0:
                 skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step - 1)
                 initial_step = 1
-
-            # track last applied bits to avoid redundant updates
-            last_applied_bits = getattr(args, "dq_delta_bits", None)
 
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
                 current_step.value = global_step
