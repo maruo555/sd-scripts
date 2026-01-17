@@ -1874,12 +1874,9 @@ class NetworkTrainer:
                     break
             return cur_bits
 
-        # initialize last_applied_bits based on current progress (avoid per-epoch reset)
-        if args.max_train_steps > 0:
-            initial_progress = global_step / float(args.max_train_steps)
-        else:
-            initial_progress = 0.0
-        last_applied_bits = _dq_bits_for_progress(initial_progress, getattr(args, "dq_delta_bits", None))
+        # initialize last_applied_bits from args (avoid per-epoch reset)
+        last_applied_bits = getattr(args, "dq_delta_bits", None)
+        dq_bits_force_apply = bool(dq_bits_sched and last_applied_bits is None)
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -1921,7 +1918,7 @@ class NetworkTrainer:
                                         cur_bits = b
                                     else:
                                         break
-                                if cur_bits != last_applied_bits:
+                                if dq_bits_force_apply or (cur_bits != last_applied_bits):
                                     accelerator.unwrap_model(network).set_delta_fake_quant(
                                         getattr(args, "dq_delta_step", None),
                                         args.dq_delta_mode,
@@ -1932,6 +1929,7 @@ class NetworkTrainer:
                                         on_z=getattr(args, "dq_quantize_z", False),
                                     )
                                     last_applied_bits = cur_bits
+                                    dq_bits_force_apply = False
                                     dq_bits_changed_this_step = True
                                     dq_bits_changed_since_auto = True
 
