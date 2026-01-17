@@ -71,14 +71,6 @@ class GradNormGuardianConfig:
     inf_to_window: bool
     skip_nan_immediate: bool
     skip_inf_immediate: bool
-    auto_cap_release: bool
-    cap_release_trigger_ratio: float
-    cap_release_trigger_steps: int
-    cap_release_length: int
-    cap_release_scale: float
-    idle_free_phase: bool
-    idle_max_steps: int
-    idle_free_len: int
     moving_avg_window: int = 200
     log_flush_interval: int = 100
     initial_threshold: float = 200_000.0
@@ -99,11 +91,6 @@ class GradNormGuardian:
         self.log_buffer: List[str] = []
         self.prev_grad_list = None
         self.prev_grad_norm = None
-        self.trigger_count = 0
-        self.cap_release_counter = 0
-        self.idle_counter = 0
-        self.idle_free_counter = 0
-        self.in_idle_free = False
 
         if self.config.log_grad_norm and self.log_file_path is not None:
             with open(self.log_file_path, "w") as f:
@@ -113,22 +100,6 @@ class GradNormGuardian:
                 if self.config.log_grad_cosine:
                     header += ",CosineSim"
                 f.write(header + "\n")
-
-    def update_nan_inf_behavior(
-        self,
-        nan_to_window: Optional[bool] = None,
-        inf_to_window: Optional[bool] = None,
-        skip_nan_immediate: Optional[bool] = None,
-        skip_inf_immediate: Optional[bool] = None,
-    ):
-        if nan_to_window is not None:
-            self.config.nan_to_window = nan_to_window
-        if inf_to_window is not None:
-            self.config.inf_to_window = inf_to_window
-        if skip_nan_immediate is not None:
-            self.config.skip_nan_immediate = skip_nan_immediate
-        if skip_inf_immediate is not None:
-            self.config.skip_inf_immediate = skip_inf_immediate
 
     def observe(self, model, epoch: int, step: int, loss_val: float) -> bool:
         device = next(model.parameters()).device
@@ -166,31 +137,13 @@ class GradNormGuardian:
         is_nan = math.isnan(current_grad_norm)
         is_inf = math.isinf(current_grad_norm)
 
-        appended = False
         if not is_nan and not is_inf:
             self.moving_avg_window.append(current_grad_norm)
         else:
             if is_nan and self.config.nan_to_window:
                 self.moving_avg_window.append(current_grad_norm)  # NOTE: intentionally poison the window so threshold stays NaN
-                appended = True
             if is_inf and self.config.inf_to_window:
                 self.moving_avg_window.append(current_grad_norm)  # NOTE: same idea for Inf; keep threshold disabled until flushed out
-                appended = True
-
-        if self.in_idle_free:
-            self.idle_free_counter += 1
-            if self.idle_free_counter >= self.config.idle_free_len:
-                self.in_idle_free = False
-                self.idle_free_counter = 0
-        else:
-            if appended:
-                self.idle_counter = 0
-            else:
-                self.idle_counter += 1
-                if self.config.idle_free_phase and self.idle_counter >= self.config.idle_max_steps:
-                    self.in_idle_free = True
-                    self.idle_counter = 0
-                    self.idle_free_counter = 0
 
         if len(self.moving_avg_window) == self.moving_avg_window.maxlen:
             mean_norm = np.mean(self.moving_avg_window)
@@ -199,31 +152,15 @@ class GradNormGuardian:
         else:
             dynamic_threshold_pre_cap = self.config.initial_threshold
 
-        effective_max = self.config.skip_grad_norm_max
-        if self.config.auto_cap_release and self.config.skip_grad_norm_max is not None:
-            if self.cap_release_counter > 0:
-                effective_max = self.config.skip_grad_norm_max * self.config.cap_release_scale
-                dynamic_threshold_pre_cap = effective_max
-                self.cap_release_counter -= 1
-            else:
-                trigger_threshold = self.config.cap_release_trigger_ratio * self.config.skip_grad_norm_max
-                if not math.isnan(dynamic_threshold_pre_cap) and dynamic_threshold_pre_cap >= trigger_threshold:
-                    self.trigger_count += 1
-                    if self.trigger_count >= self.config.cap_release_trigger_steps:
-                        self.cap_release_counter = self.config.cap_release_length
-                        self.trigger_count = 0
-                else:
-                    self.trigger_count = 0
-
         dynamic_threshold = dynamic_threshold_pre_cap
-        if effective_max is not None and dynamic_threshold > effective_max:
-            dynamic_threshold = effective_max
+        if self.config.skip_grad_norm_max is not None and dynamic_threshold > self.config.skip_grad_norm_max:
+            dynamic_threshold = self.config.skip_grad_norm_max
         if len(self.moving_avg_window) < self.moving_avg_window.maxlen:
             dynamic_threshold = dynamic_threshold_pre_cap
 
         if self.config.log_grad_norm:
             scale_val = self.scaler_for_log.get_scale() if self.config.log_grad_scale and self.scaler_for_log else None
-            flag = 2 if self.in_idle_free else (1 if math.isnan(dynamic_threshold) else 0)
+            flag = 1 if math.isnan(dynamic_threshold) else 0
             log_line = f"{epoch},{step},{current_grad_norm},{dynamic_threshold},{loss_val},{flag}"
             if self.config.log_grad_scale:
                 log_line += f",{scale_val}"
@@ -241,10 +178,74 @@ class GradNormGuardian:
         if (is_nan and self.config.skip_nan_immediate) or (is_inf and self.config.skip_inf_immediate):
             return True
 
-        if self.in_idle_free:
-            return False
-
         return current_grad_norm > dynamic_threshold
+
+
+GRAD_NORM_PRESETS = {
+    "stable": {
+        "skip_grad_norm": True,
+        "log_grad_norm": True,
+        "log_grad_cosine": True,
+        "skip_grad_norm_max": 200000.0,
+        "nan_to_window": True,
+        "inf_to_window": True,
+        "skip_nan_immediate": False,
+        "skip_inf_immediate": False,
+    },
+    "gamble": {
+        "skip_grad_norm": True,
+        "log_grad_norm": True,
+        "log_grad_cosine": True,
+        "skip_grad_norm_max": None,
+        "nan_to_window": False,
+        "inf_to_window": False,
+        "skip_nan_immediate": True,
+        "skip_inf_immediate": True,
+    },
+}
+
+
+def resolve_grad_norm_settings(args):
+    grad_norm_mode = getattr(args, "grad_norm_mode", None)
+    if grad_norm_mode is not None:
+        preset = GRAD_NORM_PRESETS[grad_norm_mode]
+        skip_grad_norm = preset["skip_grad_norm"]
+        log_grad_norm = preset["log_grad_norm"]
+        log_grad_cosine = preset["log_grad_cosine"]
+        skip_grad_norm_max = preset["skip_grad_norm_max"]
+        nan_to_window = preset["nan_to_window"]
+        inf_to_window = preset["inf_to_window"]
+        skip_nan_immediate = preset["skip_nan_immediate"]
+        skip_inf_immediate = preset["skip_inf_immediate"]
+
+        # Allow only explicit negation flags to override preset behavior.
+        if getattr(args, "skip_nan_immediate", True) is False:
+            skip_nan_immediate = False
+        if getattr(args, "skip_inf_immediate", True) is False:
+            skip_inf_immediate = False
+    else:
+        skip_grad_norm = getattr(args, "skip_grad_norm", False)
+        log_grad_norm = getattr(args, "grad_norm_log", False)
+        log_grad_cosine = getattr(args, "grad_cosine_log", False)
+        skip_grad_norm_max = getattr(args, "skip_grad_norm_max", None)
+        nan_to_window = getattr(args, "nan_to_window", False)
+        inf_to_window = getattr(args, "inf_to_window", False)
+        skip_nan_immediate = getattr(args, "skip_nan_immediate", True)
+        skip_inf_immediate = getattr(args, "skip_inf_immediate", True)
+
+    log_grad_cosine = log_grad_norm and log_grad_cosine
+
+    return (
+        grad_norm_mode,
+        skip_grad_norm,
+        log_grad_norm,
+        log_grad_cosine,
+        skip_grad_norm_max,
+        nan_to_window,
+        inf_to_window,
+        skip_nan_immediate,
+        skip_inf_immediate,
+    )
 
 
 class NetworkTrainer:
@@ -1756,34 +1757,24 @@ class NetworkTrainer:
         del train_dataset_group
 
         # prepare gradient skipping if enabled (複数 GPUではrankごとに判定がズレる恐れありらしい)
-        skip_grad_norm = getattr(args, "skip_grad_norm", False)
-        log_grad_norm = getattr(args, "grad_norm_log", False)
+        (
+            grad_norm_mode,
+            skip_grad_norm,
+            log_grad_norm,
+            log_grad_cosine,
+            skip_grad_norm_max,
+            nan_to_window,
+            inf_to_window,
+            skip_nan_immediate,
+            skip_inf_immediate,
+        ) = resolve_grad_norm_settings(args)
         scaler_for_log = accelerator.scaler if hasattr(accelerator, "scaler") else None
         log_grad_scale = log_grad_norm and scaler_for_log is not None
-        log_grad_cosine = log_grad_norm and getattr(args, "grad_cosine_log", False)
-        skip_grad_norm_max = getattr(args, "skip_grad_norm_max", None)
-        nan_to_window = getattr(args, "nan_to_window", False)
-        inf_to_window = getattr(args, "inf_to_window", False)
-        skip_nan_immediate = getattr(args, "skip_nan_immediate", True)
-        skip_inf_immediate = getattr(args, "skip_inf_immediate", True)
-        nan_inf_until_step = getattr(args, "nan_inf_until_step", None)
-        auto_cap_release = getattr(args, "auto_cap_release", False)
-        cap_release_trigger_ratio = getattr(args, "cap_release_trigger_ratio", 0.66)
-        cap_release_trigger_steps = getattr(args, "cap_release_trigger_steps", 200)
-        cap_release_length = getattr(args, "cap_release_length", 200)
-        cap_release_scale = getattr(args, "cap_release_scale", 3.0)
-        idle_free_phase = getattr(args, "idle_free_phase", False)
-        idle_max_steps = getattr(args, "idle_max_steps", 4000)
-        idle_free_len = getattr(args, "idle_free_len", 200)
-        nan_inf_switched = False
         logger.info(
-            f"skip_grad_norm: {skip_grad_norm}, grad_norm_log: {log_grad_norm}, "
+            f"grad_norm_mode: {grad_norm_mode}, skip_grad_norm: {skip_grad_norm}, grad_norm_log: {log_grad_norm}, "
             f"skip_grad_norm_max: {skip_grad_norm_max}, nan_to_window: {nan_to_window}, "
             f"inf_to_window: {inf_to_window}, skip_nan_immediate: {skip_nan_immediate}, "
-            f"skip_inf_immediate: {skip_inf_immediate}, nan_inf_until_step: {nan_inf_until_step}, auto_cap_release: {auto_cap_release}, "
-            f"cap_release_trigger_ratio: {cap_release_trigger_ratio}, cap_release_trigger_steps: {cap_release_trigger_steps}, "
-            f"cap_release_length: {cap_release_length}, cap_release_scale: {cap_release_scale}, "
-            f"idle_free_phase: {idle_free_phase}, idle_max_steps: {idle_max_steps}, idle_free_len: {idle_free_len}"
+            f"skip_inf_immediate: {skip_inf_immediate}"
         )
         use_grad_norm = skip_grad_norm or log_grad_norm
         grad_norm_guardian: Optional[GradNormGuardian] = None
@@ -1801,14 +1792,6 @@ class NetworkTrainer:
                 inf_to_window=inf_to_window,
                 skip_nan_immediate=skip_nan_immediate,
                 skip_inf_immediate=skip_inf_immediate,
-                auto_cap_release=auto_cap_release,
-                cap_release_trigger_ratio=cap_release_trigger_ratio,
-                cap_release_trigger_steps=cap_release_trigger_steps,
-                cap_release_length=cap_release_length,
-                cap_release_scale=cap_release_scale,
-                idle_free_phase=idle_free_phase,
-                idle_max_steps=idle_max_steps,
-                idle_free_len=idle_free_len,
             )
             grad_norm_guardian = GradNormGuardian(
                 config=guardian_config,
@@ -2369,28 +2352,6 @@ class NetworkTrainer:
                                             auto_applied,
                                         ]
                                         _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
-                    if (
-                        not nan_inf_switched
-                        and nan_inf_until_step is not None
-                        and global_step >= nan_inf_until_step
-                    ):
-                        nan_to_window = False
-                        inf_to_window = False
-                        skip_nan_immediate = True
-                        skip_inf_immediate = True
-                        if grad_norm_guardian is not None:
-                            grad_norm_guardian.update_nan_inf_behavior(
-                                nan_to_window=nan_to_window,
-                                inf_to_window=inf_to_window,
-                                skip_nan_immediate=skip_nan_immediate,
-                                skip_inf_immediate=skip_inf_immediate,
-                            )
-                        nan_inf_switched = True
-                        accelerator.print(
-                            f"nan_inf switched at step {global_step}: nan_to_window={nan_to_window}, inf_to_window={inf_to_window}, "
-                            f"skip_nan_immediate={skip_nan_immediate}, skip_inf_immediate={skip_inf_immediate}"
-                        )
-
                     self.sample_images(accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
                     # 指定ステップごとにモデルを保存

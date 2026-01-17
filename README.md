@@ -14,15 +14,8 @@
 | `--fp16_safe_norms` | `False` | 縮約系（LayerNorm/GroupNorm/Softmax）だけ **fp32 で演算**し、重みと他演算は fp16 のまま。fp16 + 小バッチ（例: `batch_size=1`）で学習安定性を向上。 | `library/sdxl_original_unet.py` にラッパ実装。<br>注意: Softmax の fp32 化は通常のAttention経路のみ（`--xformers`/`--sdpa` 使用時は各実装に依存）。Normは全経路でfp32化。|
 | `--network_te_train_targets`,<br>`--text_encoder_lr1`,<br>`--text_encoder_lr2` | `None` | SDXLの2系統Text EncoderのLoRA学習対象と学習率を個別に制御。未指定時は従来通り両方を同じ学習率で更新。 | 詳細は [docs/sdxl_lora_te_options-ja.md](docs/sdxl_lora_te_options-ja.md) を参照。|
 | `--te-lr-after <ratio> <mult> [target]` | `None` | 総ステップ数に対する割合 `ratio` を超えたタイミングで、指定Text Encoder（`target=both/te1/te2`）の学習率に倍率 `mult` を一度だけ恒久適用。段切り的に後半だけLRを落ち着かせたいケース向け。 | `train_network.py` ベースで処理。`target=te2` は SDXL など TE2 を持つモデルのみ有効。`ratio` は 0〜1、小数指定可。 |
-| `--skip_grad_norm` | ― | 直近 *N = 200* step の **勾配 L2 ノルムの移動平均 + 2.5σ** を動的しきい値とし、超過 step の更新をスキップ。NaN/Inf も既定でスキップ。 | 破綻防止・fp16 の安定化補助。しきい値は `--skip_grad_norm_max` で上限可。|
-| `--skip_grad_norm_max` | 無制限 | `--skip_grad_norm` が計算する動的しきい値の**上限キャップ**。 | 例: `--skip_grad_norm_max 200000` |
-| `--grad_norm_log` | 無効 | 100 step ごとに **(epoch, step, norm, threshold, loss, ThreshOff)** を `--output_dir/gradient_logs+<LoRA名>.txt` へ追記。<br>ThreshOffは、0=閾値有効, 1=閾値がNaNで無効, 2=閾値が`--idle_free_phase`で無効 | スキップを *OFF* にすれば純ログモード。 |
-| `--grad_cosine_log` | 無効 | 直前 step との **勾配コサイン類似度** を `grad_norm_log` に追加。 | 経路探索の可視化用。 |
-| `--nan_to_window`, `--inf_to_window` | `False` | NaN / Inf を移動平均窓に**含める／含めない**を切替。含めると *threshold* が NaN となり、窓サイズ分だけスキップ判定が無効化＝“ブレーキ解除”。 | fp16 で意図的にスパイクを許容したい実験用。 |
-| `--skip_nan_immediate`, `--skip_inf_immediate`<br>`--no-skip_nan_immediate`, `--no-skip_inf_immediate` | `True` | NaN / Inf が出た step を **無条件でスキップするかどうか**。スキップしない場合は GradScaler に値が渡るため、fp16 で scale 自動調整が効く。 | |
-| `--nan_inf_until_step N` | `None` | 上記 4 項目の設定を **グローバル step ≤ N** の間だけ有効化し、その後は既定動作に戻す。 | 学習前半だけ GradScaler を安定させ、後半は scale 上昇を狙う用途。|
-| `--auto_cap_release` | `False` | **停滞検知 → 一時的に上限キャップ緩和**。<br>閾値が `ratio × skip_grad_norm_max` を `trigger_steps` 連続で超えたら、以後 `cap_release_length` step だけ `skip_grad_norm_max × cap_release_scale` に拡大。 | デフォルトの各パラメータ:<br>`ratio=0.66`, `trigger_steps=200`, `length=200`, `scale=3.0` |
-| `--idle_free_phase` | `False` | **指定間隔で上限キャップ撤廃**。<br>移動平均窓にNan/Infが `idle_max_steps` 連続で入らなければ発動、 `idle_free_len` step だけスキップ判定が無効化＝“ブレーキ解除” | デフォルトの各パラメータ:<br>`idle_max_steps=4000`, `idle_free_len=200` |
+| `--grad_norm_mode {stable,gamble}` | `None` | `skip_grad_norm` 系の推奨プリセットを一括指定。`stable`=安定重視、`gamble`=当たり狙い。 | 指定時は個別オプションを無視し、`--no-skip_nan_immediate` / `--no-skip_inf_immediate` のみ上書き可。詳細: [docs/skip_grad_norm_refactor_plan-ja.md](docs/skip_grad_norm_refactor_plan-ja.md) |
+| `--skip_grad_norm`, `--skip_grad_norm_max`, `--grad_norm_log`, `--grad_cosine_log`<br>`--nan_to_window`, `--inf_to_window`<br>`--skip_nan_immediate`, `--skip_inf_immediate`,<br>`--no-skip_nan_immediate`, `--no-skip_inf_immediate` | 混在 | 勾配ノルムのスキップ/ログ/NaN・Inf 挙動を詳細制御。<br>`--skip_grad_norm` は *N=200* の移動平均+2.5σで超過更新をスキップし、`--skip_grad_norm_max` で上限キャップ。<br>`--grad_norm_log` は 100 step ごとにログを追記し、`--grad_cosine_log` で類似度を追加。<br>NaN/Inf の窓混入や即時スキップの可否を切替可能。 | 主要既定値: `skip_grad_norm` 無効、`skip_grad_norm_max` 無制限、`grad_norm_log`/`grad_cosine_log` 無効、`nan_to_window`/`inf_to_window` False、`skip_nan_immediate`/`skip_inf_immediate` True。 |
 | `--avg_cp` | **False** | 有効化するとエポック間の LoRA 重みを平均して安定化（SWA/EMA 相当）。<br>  推奨プリセット：`--avg_cp --avg_window 4 --avg_begin 0.6 --avg_mode ema --avg_reset_stats`<br>  併用オプション:<br>  • `--avg_window <int>` 平均に使うチェックポイント数。<br>  • `--avg_begin <0-1>` 学習の進行率。ここを過ぎてから窓に溜め始め、<br>    窓が満杯になったエポック以降で平均が発動。<br>    流れ：①エポック末に raw ckpt を保存 → ②窓が満杯なら平均 → ③平均後の<br>    重みで次エポックを開始。<br>  • `--avg_mode {uniform,ema,metric}` 平均方法。`uniform`=等重み, `ema`=指数移動平均,<br>    `metric`=指標重み付き（準備中）。<br>  • `--avg_reset_stats / --no_avg_reset_stats` 平均直後に Optimizer のモーメンタム統計を<br>    安全にリセットして発散を防ぐかどうか。 | LoRAを学習後に最後の数エポックを平均するといい結果になるという話があるので、学習後半から平均しながら学習を進められるるようにする検証用 |
 | `--dq_delta_step` / `--dq_delta_bits` | `None` | 学習のforwardで、LoRAの“差分出力(Δ)”だけをフェイク量子化（STE）。重み自体は量子化しないため、勾配は恒等で流れる。<br>指定方法は2通り:<br>• `--dq_delta_step <float>` = 等間隔の刻み幅を直接指定。<br>• `--dq_delta_bits <int>` = Nビットの等間隔量子化を模擬（推奨: 8）。`stat`と`range_mul`からスケールを自動算出し、[-Qmax,Qmax]でクランプ（Qmax=2^(N-1)-1）。<br>併用オプション:<br>• `--dq_delta_mode {det,stoch}` `det`=最近傍、`stoch`=確率的丸め。<br>• `--dq_delta_begin <0-1>` 学習進行率。この割合以降のみ有効化。<br>• `--dq_delta_scope {unet,te,both}` 適用対象の限定（U-Netのみ/Text Encoderのみ/両方）。<br>• `--dq_delta_granularity {tensor,channel}` 粒度（テンソル全体/チャネル別）。<br>• `--dq_delta_stat {rms,absmax,none}` bits/stepのスケール基準（per-channel時はチャネルごとに計算）。<br>• `--dq_delta_range_mul <float>` bitsモード×`stat=rms`時の有効レンジ倍率（range=倍率×RMS、既定3.0）。<br>• `--dq_delta_bits_sched 'p1:bits1,p2:bits2,...'` 学習進行率pでビット数を段階的に切替（例: `0.0:6,0.5:8,0.8:10`）。<br>• `--dq_quantize_z` = Δ ではなく z=A(x) を量子化（B(Q(z))）。rank r の z を対象に統計を取るため軽量化。 | 実装は `networks/lora.py` の LoRA forward 内。SDXL でも有効。<br>※ LoRA-FA (`networks/lora_fa.py`) は現在メンテ対象外であり、サポートしていません。<br>※ `--dq_delta_bits` は本ドキュメントの仕様準拠設定を推奨。 |
 | `--dq_delta_log`<br>`--dq_delta_auto_range_mul` | 無効 | **dq_delta のログ**と**range_mul の自動調整**。<br>• `--dq_delta_log` = dq_delta の統計ログを出力。<br>• `--dq_delta_auto_range_mul` = clip_rate を見て range_mul を自動調整。<br>発動条件:<br>• `--dq_delta_log` は dq_delta 有効時のみ。<br>• `--dq_delta_auto_range_mul` は **bits モード + `stat=rms`** の時のみ有効（`--dq_delta_bits` または `--dq_delta_bits_sched` が必要）。 | 詳細は [docs/dq_delta_autotune_spec-ja.md](docs/dq_delta_autotune_spec-ja.md) を参照。 |
@@ -33,12 +26,9 @@
 
 | 名称 | 目的 / 特徴 | 推奨コマンド例 |
 |------|-------------|----------------|
-| **Preset A — “当たり狙い”** | *NaN/Inf もスキップ*。スケールが際限なく上がるため破綻リスクはあるものの、少量高品質データで“化ける”ことがある。 | `--downscale_freq_shift  --te_mlp_fc_only --skip_grad_norm --grad_norm_log --grad_cosine_log` |
-| **Preset B — “安定重視”** | *NaN/Inf をスキップしない*ことで GradScaler の自動調整を生かしつつ、動的しきい値で大スパイクのみ遮断。窓にNaN/Infを入れることで“ブレーキ解除”。最も汎用的。 | `--downscale_freq_shift --te_mlp_fc_only --skip_grad_norm --grad_norm_log --grad_cosine_log --skip_grad_norm_max 200000 --nan_to_window --inf_to_window --no-skip_nan_immediate --no-skip_inf_immediate` |
-| **Preset C — “停滞打破実験”** | Preset B + `--auto_cap_release`。谷底で停滞したら一時的にキャップを緩めて脱出を試みる。効果はケース依存。(あまり効果なし) | `Preset B` に `--auto_cap_release` を追加 |
-| **Preset D' — “停滞打破実験”** | Preset B + `--idle_free_phase`。窓にNaNが長期間入らない場合も定期的に“ブレーキ解除”。(安定しない) | `Preset B` に `--idle_free_phase` を追加 |
-| **Preset E' — “実験”** | Preset B + `--idle_free_phase`。途中のエポックから直近数個のエポックとの平均をとりながら学習を進める。(いいかも) | `Preset B` に `--avg_cp --avg_window 4 --avg_begin 0.6 --avg_mode ema --avg_reset_stats` を追加 |
-| **Preset F — “Optimizer Args Playground”** | 標準機能でoptimizerの wd & β₂ を微調整してLLMの論文（arXiv:2507.07101）の内容を検証。標準は wd = 0.01, β = (0.9, 0.999) で本家同等。<br>— wd↓0.0‑0.005: 過収縮抑制・多様性↑／過学習注意。<br>— wd↑0.02‑0.05: 線細・沈みがち。<br>— β₂↓0.995‑0.998: 刻み↑だが荒れ／発散リスク。<br>— β₂↑0.9994‑0.9999: 平滑・多様化↑、LoRAではキャラ薄傾向。<br>論文は wd = 0 & β₂≈0.99986 を推奨、小バッチで安定。(SDXLのLoRAの学習には逆効果かも)|`--optimizer_type AdamW8bit --optimizer_args "weight_decay=0.01" "betas=0.9,0.999"` ←ここを例: wd=0 / betas=0.9,0.9998 などに書き換えて試行|
+| **Preset A — “当たり狙い”** | *NaN/Inf もスキップ*。スケールが際限なく上がるため破綻リスクはあるものの、少量高品質データで“化ける”ことがある。 | `--downscale_freq_shift  --te_mlp_fc_only --grad_norm_mode gamble` |
+| **Preset B — “安定重視”** | *NaN/Inf をスキップしない*ことで GradScaler の自動調整を生かしつつ、動的しきい値で大スパイクのみ遮断。窓にNaN/Infを入れることで“ブレーキ解除”。最も汎用的。 | `--downscale_freq_shift --te_mlp_fc_only --grad_norm_mode stable` |
+| **Preset E' — “実験”** | Preset B + エポック平均。途中から直近数個のエポックとの平均をとりながら学習を進める。(いいかも) | `Preset B` に `--avg_cp --avg_window 4 --avg_begin 0.6 --avg_mode ema --avg_reset_stats` を追加 |
 | **Preset G — “量子化＋安全正規化”** | Preset B に fp16 安全正規化と LoRA Δ 量子化を組み合わせ、勾配スパイクを抑えつつ高周波を約束的に削るモード。キャラの保持と背景の滑らかさを両立しやすい反面、量子化と追加の正規化計算で処理時間はおおよそ 1.5 倍になる。 | `Preset B` に `--fp16_safe_norms --dq_delta_bits 8 --dq_delta_granularity channel --dq_delta_stat rms --dq_delta_range_mul 3.0 --dq_delta_mode stoch --dq_delta_begin 0 --dq_delta_scope unet --dq_delta_bits_sched "0.0:6,0.4:8,0.9:10"` を追加 |
 
 **ターゲット想定**  
@@ -53,7 +43,6 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 
 1. **まずは Preset B** で学習曲線とログを観察し、`norm` が *skip* されずに推移していることを確認。  
 2. キャラクターの再現度が足りなければ **Preset A** に切り替え、当たり／破綻のリスクをトレードオフ。  
-3. 長時間止まったように見える箇所があれば **`--auto_cap_release`** を追加して挙動を比較。  
 
 ---
 

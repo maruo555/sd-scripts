@@ -342,6 +342,13 @@ def add_sdxl_training_arguments(parser: argparse.ArgumentParser):
         help="disable mmap load for safetensors. Speed up model loading in WSL environment / safetensorsのmmapロードを無効にする。WSL環境等でモデル読み込みを高速化できる",
     )
     parser.add_argument(
+        "--grad_norm_mode",
+        type=str,
+        default=None,
+        choices=["stable", "gamble"],
+        help="preset for skip_grad_norm options: stable or gamble / skip_grad_norm関連のプリセット指定（stable または gamble）",
+    )
+    parser.add_argument(
         "--skip_grad_norm",
         action="store_true",
         help="skip step if gradient norm exceeds moving average + 2.5 sigma / 勾配ノルムが移動平均+2.5σを超える場合にステップをスキップする",
@@ -383,58 +390,6 @@ def add_sdxl_training_arguments(parser: argparse.ArgumentParser):
         action=argparse.BooleanOptionalAction,
         default=True,
         help="skip step immediately if gradient norm is Inf / Inf が出た step を閾値に関係なくスキップする",
-    )
-    parser.add_argument(
-        "--nan_inf_until_step",
-        type=int,
-        default=None,
-        help="use nan/inf related options only until the specified step, then revert to default / 指定stepまでNaN/Inf処理を適用し、その後デフォルトに戻す",
-    )
-    parser.add_argument(
-        "--auto_cap_release",
-        action="store_true",
-        help="temporarily relax skip_grad_norm_max when stagnation detected / 停滞時に一時的にキャップを緩和する",
-    )
-    parser.add_argument(
-        "--cap_release_trigger_ratio",
-        type=float,
-        default=0.66,
-        help="trigger ratio for --auto_cap_release / auto_cap_release 発動の閾値比率",
-    )
-    parser.add_argument(
-        "--cap_release_trigger_steps",
-        type=int,
-        default=200,
-        help="trigger steps for --auto_cap_release / auto_cap_release 発動までの連続ステップ数",
-    )
-    parser.add_argument(
-        "--cap_release_length",
-        type=int,
-        default=200,
-        help="release length in steps for --auto_cap_release / auto_cap_release 発動後の開放ステップ数",
-    )
-    parser.add_argument(
-        "--cap_release_scale",
-        type=float,
-        default=3.0,
-        help="multiplier for skip_grad_norm_max during release / 開放中の skip_grad_norm_max の倍率",
-    )
-    parser.add_argument(
-        "--idle_free_phase",
-        action="store_true",
-        help="enable forced threshold-free phase when idle / 閾値撤廃フェーズを有効にする",
-    )
-    parser.add_argument(
-        "--idle_max_steps",
-        type=int,
-        default=4000,
-        help="max idle steps before free phase / 閾値撤廃フェーズに入るまでの無トリガstep数",
-    )
-    parser.add_argument(
-        "--idle_free_len",
-        type=int,
-        default=200,
-        help="length of forced free phase / 閾値撤廃フェーズの長さ",
     )
 
 

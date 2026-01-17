@@ -16,9 +16,10 @@
 
 ## 動的しきい値と関連オプション
 - **基本式**: `threshold = mean(window) + 2.5 * std(window)`（窓サイズ 200）。値は `numpy` 計算で、NaN が混入すると式全体が NaN になり、後続の比較は `False` 扱い。
-- **`--skip_grad_norm_max <float>`**: 動的しきい値の絶対上限。設定しない場合は無制限。`--auto_cap_release` が無効でも、窓が埋まる前は常に 200000 を使用する点に注意。
-- **`--grad_norm_log`**: `--output_dir/gradient_logs+<output_name>.txt` に CSV 形式で `Epoch,Step,Gradient Norm,Threshold,Loss,ThreshOff[,Scale][,CosineSim]` を出力。100 ステップごとに追記。`ThreshOff=1` は NaN 阻害、`2` は idle free フェーズを示す。
+- **`--skip_grad_norm_max <float>`**: 動的しきい値の絶対上限。設定しない場合は無制限。窓が埋まる前は常に 200000 を使用する点に注意。
+- **`--grad_norm_log`**: `--output_dir/gradient_logs+<output_name>.txt` に CSV 形式で `Epoch,Step,Gradient Norm,Threshold,Loss,ThreshOff[,Scale][,CosineSim]` を出力。100 ステップごとに追記。`ThreshOff=1` は NaN によりしきい値が無効化された状態を示す。
 - **`--grad_cosine_log`**: `--grad_norm_log` 併用時に有効。前ステップの勾配テンソルを複製保持し、コサイン類似度を計算・出力する。保持コストが掛かるが挙動には影響しない。
+- **`--grad_norm_mode {stable,gamble}`**: 推奨プリセットを一括指定。`stable` は安定重視、`gamble` は当たり狙い。指定時は個別オプションを無視し、`--no-skip_nan_immediate` / `--no-skip_inf_immediate` のみ上書き可能。
 - **GradScaler との関係**: スケール適用前の勾配に切り替えると学習結果が変わったため、仕様として「スケール適用済みの勾配ノルムで平均を作る」ことを前提にしている。スケールが変動した瞬間は窓の平均が追随するまでスキップ判定が遅れる。
 
 ## NaN/Inf 取り扱い関連
@@ -26,15 +27,14 @@
 - **`--skip_nan_immediate` / `--skip_inf_immediate`**: 既定値は `True`。オンのままだと NaN/Inf 発生時に即スキップし、GradScaler のヒステリシスが働かずスケールが上がり続けるケースがある。
   - `--no-skip_nan_immediate --no-skip_inf_immediate` を付けると NaN/Inf が出てもステップをスキップしないため、GradScaler が `found_inf` を検知してスケールを下げるトリガーが復活する。
   - このとき `--nan_to_window --inf_to_window` を併用すると、窓が NaN で満たされスキップが完全に停止する「隙間時間」がランダムに挿入され、実運用ではこの不規則性が好ましいとされている。
-- **`--nan_inf_until_step <int>`**: 指定ステップまでは NaN/Inf 関連オプションを尊重し、以降は `nan_to_window=False`, `inf_to_window=False`, `skip_nan_immediate=True`, `skip_inf_immediate=True` に強制復帰する仕組み。よく使うプリセットでは未使用。
 
 ## よく使うプリセットの挙動
-- **設定 1**<br>`--skip_grad_norm --grad_norm_log --grad_cosine_log --skip_grad_norm_max 200000 --nan_to_window --inf_to_window --no-skip_nan_immediate --no-skip_inf_immediate`
+- **設定 1（`--grad_norm_mode stable`）**<br>`--grad_norm_mode stable`
   - 200 ステップ窓を維持しつつしきい値は 200000 にキャップ。ログはノルム・閾値・GradScaler スケール・勾配類似度まで記録。
   - NaN/Inf を窓に混入させ、即スキップは無効化するため、ランダムな「スキップ停止区間」が生まれ、GradScaler によるスケール調整も維持される。
   - 実質的に「極端なスパイクのみスキップし、NaN/Inf は学習を止めずにスケール調整へ渡す」挙動になる。
-- **設定 2**<br>`--skip_grad_norm --grad_norm_log`
-  - 最小構成。移動平均 + 2.5σ を超えたステップをスキップし、ログにはノルムと閾値と Loss のみを出力。
+- **設定 2（`--grad_norm_mode gamble`）**<br>`--grad_norm_mode gamble`
+  - 最小構成。移動平均 + 2.5σ を超えたステップをスキップし、ログにはノルム・閾値・Loss・勾配類似度が出力される。
   - NaN/Inf は即時スキップする（デフォルト値）ため、GradScaler がトリガーされずスケールが上昇し続ける場合がある点に注意。
 
 ## 学習進行への影響
@@ -48,11 +48,10 @@
 - 主な列:
   - `Gradient Norm`: そのステップの L2 ノルム（スケール適用済み）。
   - `Threshold`: 動的しきい値（NaN の場合は空欄になる）。
-  - `ThreshOff`: `0`=通常、`1`=しきい値が NaN で無効、`2`=idle free フェーズ。
+  - `ThreshOff`: `0`=通常、`1`=しきい値が NaN で無効。
   - `Scale`: `--grad_norm_log` かつ GradScaler 利用時のみ。`torch.cuda.amp.GradScaler.get_scale()` の生値。
   - `CosineSim`: `--grad_cosine_log` 追加時のみ。直前ステップと現ステップの勾配のコサイン類似度。前ステップが存在しない場合は `NaN`。
 
 ## 注意事項と既知の挙動
 - `skip_grad_norm` をオフにしても `--grad_norm_log` だけでログ記録が可能。その場合はステップスキップは一切行われない。
 - `--nan_to_window` で窓に NaN を入れると移動平均が NaN のまま残るが、窓から押し出されるまで自動で回復する。強制的にリセットする仕組みはない。
-- `idle_free_phase` 系オプションが残っているが、LoRA SDXL 学習では未調整のままであり、通常は無効化のまま使用することを想定している。
