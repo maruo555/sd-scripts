@@ -1,8 +1,7 @@
-# dq_delta オートチューナ（方式A）仕様案
+# dq_delta オートチューナ（方式A）仕様
 
 本ドキュメントは、`--dq_delta_step / --dq_delta_bits` のフェイク量子化に対して、
-「ログ追加」と「range_mul のフィードバック制御（自動調律）」を導入するための仕様案です。
-実装は未着手のため、**仕様レビュー用**として扱います。
+「ログ追加」と「range_mul のフィードバック制御（自動調律）」を導入するための仕様です。
 
 ## 目的
 
@@ -18,7 +17,7 @@
 
 ## 追加ログ仕様
 
-### 有効化オプション（案）
+### 有効化オプション
 
 - `--dq_delta_log` : dq_delta ログを有効化（デフォルト無効）
 - `--dq_delta_log_every <int>` : ログ間隔（optimizer step 単位、デフォルト 100）
@@ -99,9 +98,68 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,12345678,1,3.0,3.21
 ```
 
+## ログの見方（初心者向け）
+
+### logs（`--dq_delta_log`）: summary
+
+| 項目名 | 説明 | 読み取り方 |
+| --- | --- | --- |
+| Epoch | エポック番号 | 学習の周回数。進行の目安。 |
+| TrainStep | optimizer step | ログのタイミング。100なら100回更新後。 |
+| Scope | 対象範囲 | `unet`/`te`/`both`。どこを測っているか。 |
+| Target | 量子化対象 | `delta` または `z`。 |
+| Bits | 現在のビット数 | `bits_sched` 適用中の値。 |
+| DQStepSize | step モードの刻み | bitsモードなら空欄。 |
+| RangeMul | range_mul | 大きいほどレンジが広い。 |
+| Stat | 統計方式 | `rms/absmax/none`。 |
+| Granularity | 粒度 | `tensor`/`channel`。 |
+| Mode | 丸め方式 | `det`/`stoch`。 |
+| RMS | 入力のRMS | 大きいほどΔが大きい。 |
+| AbsMax | 入力の最大絶対値 | 外れ値の指標。 |
+| Range | 有効レンジ | `ScaleMean * Qmax` の目安。 |
+| ScaleMin | scale最小 | チャネル差の下側。 |
+| ScaleMean | scale平均 | Range算出に使う中心値。 |
+| ScaleMax | scale最大 | チャネル差の上側。 |
+| Qmax | 量子化上限 | 6bitなら31など。 |
+| ClipRateRaw | 生のクリップ率 | 目標帯域に収まるか確認。 |
+| ClipRateEMA | EMA平滑値 | auto判定に使う値。 |
+| ZeroRate | 量子化後0の割合 | 潰れの兆候。 |
+| NearZeroRate | 0近傍の割合 | `--dq_delta_log_extra near_zero_rate`時のみ。 |
+| Numel | 要素数 | 統計の母数。 |
+| AutoApplied | auto適用 | 1ならrange_mulが変化。 |
+| RangeMulBefore | 変更前 | auto適用時の前値。 |
+| RangeMulAfter | 変更後 | auto適用時の後値。 |
+
+### logs（`--dq_delta_log`）: per_module
+
+| 項目名 | 説明 | 読み取り方 |
+| --- | --- | --- |
+| Module | LoRAモジュール名 | どの層の統計か。 |
+| Shape | テンソル形状 | 層の規模感の目安。 |
+
+※ per_module は上記 summary の列に `Module/Shape` が追加されます。
+
+### auto（`--dq_delta_auto_log_file`）: minimal
+
+| 項目名 | 説明 | 読み取り方 |
+| --- | --- | --- |
+| TrainStep | optimizer step | 自動調整の判定タイミング。 |
+| Scope | 対象範囲 | `unet`/`te`/`both`。 |
+| Target | 量子化対象 | `delta`/`z`。 |
+| Bits | 現在のビット数 | スケジュールに依存。 |
+| ClipRateRaw | 生のクリップ率 | 目標帯域に収まるか確認。 |
+| ClipRateEMA | EMA平滑値 | auto判定値。 |
+| RangeMulBefore | 変更前 | auto適用時の前値。 |
+| RangeMulAfter | 変更後 | auto適用時の後値。 |
+| AutoApplied | auto適用 | 1ならrange_mulが変化。 |
+
+### auto（`--dq_delta_auto_log_file`）: full_schema
+
+full_schema は **logs（summary）と同じ列構成**で出力します。  
+LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 ## range_mul フィードバック制御仕様
 
-### 有効化オプション（案）
+### 有効化オプション
 
 - `--dq_delta_auto_range_mul` : range_mul の自動調整を有効化（デフォルト無効）
 - `--dq_delta_auto_every <int>` : 調整間隔（optimizer step 単位、デフォルト 50）
@@ -128,7 +186,7 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 - `--dq_delta_step` のみ（bits モード不使用）
 - `--dq_delta_stat=absmax` または `none`
 
-### 制御ロジック（案）
+### 制御ロジック
 
 - 各 `auto_every` optimizer step で clip_rate を集計（summary）
 - EMA で平滑化し、次のルールで更新
