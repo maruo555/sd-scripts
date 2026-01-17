@@ -677,7 +677,9 @@ class NetworkTrainer:
             nonlocal dq_log_header_written, dq_auto_log_header_written
             if not path:
                 return
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            dirpath = os.path.dirname(path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
             if path == dq_log_path:
                 header_written = dq_log_header_written
             else:
