@@ -1710,6 +1710,7 @@ class NetworkTrainer:
         progress_bar = tqdm(
             range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
         )
+        progress_bar_started = False
 
         epoch_to_start = 0
         if initial_step > 0:
@@ -1896,6 +1897,17 @@ class NetworkTrainer:
                 if initial_step > 0:
                     initial_step -= 1
                     continue
+                if not progress_bar_started:
+                    elapsed = time.time() - training_started_at
+                    if accelerator.is_main_process:
+                        logger.info(
+                            f"startup time before first training step: {elapsed:.2f} sec"
+                            f" / 学習開始前の初期化時間: {elapsed:.2f} 秒"
+                        )
+                    # Reset timer to exclude init/data loading overhead from it/s.
+                    progress_bar.start_t = time.time()
+                    progress_bar.last_print_t = progress_bar.start_t
+                    progress_bar_started = True
                 skip_step_flag = False
                 with accelerator.accumulate(training_model):
                     dq_bits_changed_this_step = False
