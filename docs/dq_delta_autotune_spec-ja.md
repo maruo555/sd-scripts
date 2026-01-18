@@ -162,6 +162,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 ### 有効化オプション
 
 - `--dq_delta_auto_range_mul` : range_mul の自動調整を有効化（デフォルト無効）
+- `--dq_delta_auto_preset {default,clip_rate_high}` : auto range_mul のプリセット（指定時は clip_low/high, mul_up/down を上書き）
 - `--dq_delta_auto_every <int>` : 調整間隔（optimizer step 単位、デフォルト 50）
 - `--dq_delta_auto_clip_low <float>` : clip_rate 下限（デフォルト 0.0005 = 0.05%）
 - `--dq_delta_auto_clip_high <float>` : clip_rate 上限（デフォルト 0.003 = 0.3%）
@@ -172,6 +173,13 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 - `--dq_delta_auto_ema <float>` : clip_rate の EMA 係数（デフォルト 0.95）
 - `--dq_delta_auto_log_file <path>` : 省略時は `--output_dir/dq_delta_auto+<output_name>.txt`（auto イベントのみ記録）
 - `--dq_delta_auto_log_format {minimal,full_schema}` : auto ログの列形式（デフォルト minimal）
+
+### auto プリセット一覧
+
+| preset | clip_low | clip_high | mul_up | mul_down | 目的 |
+| --- | --- | --- | --- | --- | --- |
+| `default` | 0.0005 | 0.003 | 1.07 | 0.97 | 安全汎用。特徴が薄まりやすい。 |
+| `clip_rate_high` | 0.003 | 0.005 | 1.01 | 0.995 | キャラクター学習向け。clip_rate 高め＋mul_up/mul_down を細かくして急変動を回避。 |
 
 ### 発動条件（重要）
 

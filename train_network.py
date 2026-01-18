@@ -248,6 +248,38 @@ def resolve_grad_norm_settings(args):
     )
 
 
+DQ_DELTA_AUTO_PRESETS = {
+    "default": {
+        "clip_low": 0.0005,
+        "clip_high": 0.003,
+        "mul_up": 1.07,
+        "mul_down": 0.97,
+    },
+    "clip_rate_high": {
+        "clip_low": 0.003,
+        "clip_high": 0.005,
+        "mul_up": 1.01,
+        "mul_down": 0.995,
+    },
+}
+
+
+def resolve_dq_delta_auto_settings(args):
+    auto_preset = getattr(args, "dq_delta_auto_preset", None)
+    if auto_preset is not None:
+        preset = DQ_DELTA_AUTO_PRESETS[auto_preset]
+        dq_auto_clip_low = preset["clip_low"]
+        dq_auto_clip_high = preset["clip_high"]
+        dq_auto_mul_up = preset["mul_up"]
+        dq_auto_mul_down = preset["mul_down"]
+    else:
+        dq_auto_clip_low = float(getattr(args, "dq_delta_auto_clip_low", 0.0005))
+        dq_auto_clip_high = float(getattr(args, "dq_delta_auto_clip_high", 0.003))
+        dq_auto_mul_up = float(getattr(args, "dq_delta_auto_mul_up", 1.07))
+        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.97))
+    return auto_preset, dq_auto_clip_low, dq_auto_clip_high, dq_auto_mul_up, dq_auto_mul_down
+
+
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
@@ -650,11 +682,23 @@ class NetworkTrainer:
         dq_log_extra = set(getattr(args, "dq_delta_log_extra", []) or [])
 
         dq_auto_enabled = bool(getattr(args, "dq_delta_auto_range_mul", False))
+        (
+            dq_auto_preset,
+            dq_auto_clip_low,
+            dq_auto_clip_high,
+            dq_auto_mul_up,
+            dq_auto_mul_down,
+        ) = resolve_dq_delta_auto_settings(args)
+        if dq_auto_preset is not None:
+            logger.info(
+                "dq_delta_auto_preset: %s (clip_low=%s, clip_high=%s, mul_up=%s, mul_down=%s)",
+                dq_auto_preset,
+                dq_auto_clip_low,
+                dq_auto_clip_high,
+                dq_auto_mul_up,
+                dq_auto_mul_down,
+            )
         dq_auto_every = max(1, int(getattr(args, "dq_delta_auto_every", 50)))
-        dq_auto_clip_low = float(getattr(args, "dq_delta_auto_clip_low", 0.0005))
-        dq_auto_clip_high = float(getattr(args, "dq_delta_auto_clip_high", 0.003))
-        dq_auto_mul_up = float(getattr(args, "dq_delta_auto_mul_up", 1.07))
-        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.97))
         dq_auto_min = float(getattr(args, "dq_delta_auto_min", 1.0))
         dq_auto_max = float(getattr(args, "dq_delta_auto_max", 6.0))
         dq_auto_ema = float(getattr(args, "dq_delta_auto_ema", 0.95))
@@ -2738,6 +2782,16 @@ def setup_parser() -> argparse.ArgumentParser:
         "--dq_delta_auto_range_mul",
         action="store_true",
         help="Enable auto range_mul tuning / range_mul の自動調整を有効化",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_preset",
+        type=str,
+        default=None,
+        choices=["default", "clip_rate_high"],
+        help=(
+            "Preset for auto range_mul tuning (overrides clip_low/high, mul_up/down) / "
+            "auto range_mul 調整プリセット（clip_low/high, mul_up/down を上書き）"
+        ),
     )
     parser.add_argument(
         "--dq_delta_auto_every",
