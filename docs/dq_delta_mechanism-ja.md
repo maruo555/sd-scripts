@@ -32,6 +32,23 @@
     
 -   フェイク量子化（dq\_delta / dq\_quantize\_z）
     
+### dq\_delta オプション一覧（基本）
+
+※ `--dq_delta_log` / `--dq_delta_auto_range_mul` 系は [docs/dq_delta_autotune_spec-ja.md](docs/dq_delta_autotune_spec-ja.md) に記載。
+
+| オプション | 説明 |
+| --- | --- |
+| `--dq_delta_step <float>` | 等間隔の刻み幅を直接指定（step モード）。 |
+| `--dq_delta_bits <int>` | Nビットの等間隔量子化を模擬（推奨: 8）。`stat` と `range_mul` からスケール算出し、`[-Qmax, Qmax]` にクランプ（`Qmax=2^(N-1)-1`）。 |
+| `--dq_delta_mode {det,stoch}` | `det`=最近傍、`stoch`=確率的丸め。 |
+| `--dq_delta_begin <0-1>` | 学習進行率。この割合以降のみ有効化。 |
+| `--dq_delta_scope {unet,te,both}` | 適用対象の限定（U-Netのみ/Text Encoderのみ/両方）。 |
+| `--dq_delta_granularity {tensor,channel}` | 粒度（テンソル全体/チャネル別）。 |
+| `--dq_delta_stat {rms,absmax,none}` | bits/step のスケール基準（per-channel時はチャネルごとに計算）。 |
+| `--dq_delta_range_mul <float>` | bits モード×`stat=rms`時の有効レンジ倍率（range=倍率×RMS、既定3.0）。 |
+| `--dq_delta_bits_sched 'p1:bits1,p2:bits2,...'` | 学習進行率 p でビット数を段階的に切替（例: `0.0:6,0.5:8,0.8:10`）。 |
+| `--dq_quantize_z` | Δ ではなく `z=A(x)` を量子化（`B(Q(z))`）。rank r の z を対象に統計を取るため軽量化。 |
+
 
 ### 量子化モードの前提
 
