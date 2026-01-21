@@ -338,7 +338,19 @@ bits 切替時は量子化の性質が変わるので、
     auto を使う場合は `auto_clip_low/high` を少し低めにして過度なクリップを抑える。
     
 補足: `QuantErrRatio` は `RMS(x)` が小さい局面で見かけ上大きく出ることがあるため、**単独では判断せず** `QuantErrRMS` の絶対量と必ず併せて判断する。
+
+読み方の目安2:
+
+-   `ClipRate` が低いのに `QuantErrRatio` が高い場合、次の2系統がありうる：
     
+    1.  **レンジが広く刻みが粗い**（`range_mul` 高め / `bits` 低め）
+        　→ 対策：`range_mul` を下げる、`bits` を上げる（または `bits_sched` を早める）
+        
+    2.  **外れ値が大きく、少数でも誤差エネルギーを支配**（`AbsMax >> Range`）
+        　→ 対策：`range_mul` を上げる（または `clip_high` を下げて早めに拡張させる）、必要なら `bits` を上げる
+        
+-   見分け方：`AbsMax / Range` が極端に大きい場合は (2) の可能性が高い。
+
 
 ### auto\_only ログ（dq\_delta\_auto\_log\_file）
 
