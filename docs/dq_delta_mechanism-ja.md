@@ -32,6 +32,23 @@
     
 -   フェイク量子化（dq\_delta / dq\_quantize\_z）
     
+### dq\_delta オプション一覧（基本）
+
+※ `--dq_delta_log` / `--dq_delta_auto_range_mul` 系は [docs/dq_delta_autotune_spec-ja.md](docs/dq_delta_autotune_spec-ja.md) に記載。
+
+| オプション | 説明 |
+| --- | --- |
+| `--dq_delta_step <float>` | 等間隔の刻み幅を直接指定（step モード）。 |
+| `--dq_delta_bits <int>` | Nビットの等間隔量子化を模擬（推奨: 8）。`stat` と `range_mul` からスケール算出し、`[-Qmax, Qmax]` にクランプ（`Qmax=2^(N-1)-1`）。 |
+| `--dq_delta_mode {det,stoch}` | `det`=最近傍、`stoch`=確率的丸め。 |
+| `--dq_delta_begin <0-1>` | 学習進行率。この割合以降のみ有効化。 |
+| `--dq_delta_scope {unet,te,both}` | 適用対象の限定（U-Netのみ/Text Encoderのみ/両方）。 |
+| `--dq_delta_granularity {tensor,channel}` | 粒度（テンソル全体/チャネル別）。 |
+| `--dq_delta_stat {rms,absmax,none}` | bits/step のスケール基準（per-channel時はチャネルごとに計算）。 |
+| `--dq_delta_range_mul <float>` | bits モード×`stat=rms`時の有効レンジ倍率（range=倍率×RMS、既定3.0）。 |
+| `--dq_delta_bits_sched 'p1:bits1,p2:bits2,...'` | 学習進行率 p でビット数を段階的に切替（例: `0.0:6,0.5:8,0.8:10`）。 |
+| `--dq_quantize_z` | Δ ではなく `z=A(x)` を量子化（`B(Q(z))`）。rank r の z を対象に統計を取るため軽量化。 |
+
 
 ### 量子化モードの前提
 
@@ -223,17 +240,17 @@ AutoStep のたびに
 
 EMA の時間定数に基づく自動決定を採用する。
 
--   `warmup_updates = ceil(1 / (1 - auto_ema))`
+-   `warmup_updates = ceil(2 / (1 - auto_ema))`
     
 
 例:
 
--   `auto_ema=0.95` -> `warmup_updates=20`
+-   `auto_ema=0.95` -> `warmup_updates=40`
     
 
 warmup は **AutoStep の回数**で数える。
 
--   `auto_every=50` の場合、20 回 -> 1000 step 相当の時間スケール
+-   `auto_every=50` の場合、40 回 -> 2000 step 相当の時間スケール
     
 
 ### 早期終了（推奨）
@@ -290,6 +307,8 @@ bits 切替時は量子化の性質が変わるので、
     
 -   監視: `ClipRateRaw, ClipRateEMA, ZeroRate`
     
+-   補助: `QuantErrRMSRaw/QuantErrRMSEMA`, `QuantErrRatioRaw/QuantErrRatioEMA`（LogStep のみ）
+    
 -   制御: `AutoApplied, RangeMulBefore, RangeMulAfter`
     
 -   warmup を入れる場合（推奨）:
@@ -300,6 +319,38 @@ bits 切替時は量子化の性質が変わるので、
         
     -   `AutoReason`（warmup / clip\_high / clip\_low / in\_band など）
         
+### “clipだけ見ない” 2指標ログ（実装済み）
+
+-   `QuantErrRMSRaw = RMS(x - x_q)` で量子化誤差を直接観測する
+    
+-   `QuantErrRatioRaw = QuantErrRMSRaw / (RMS(x) + eps)` で相対化（`eps=1e-12`）
+    
+-   LogStep のみ計測し、dq_delta_log が有効な時だけ出力する
+    
+読み方の目安:
+
+-   `ClipRate` が低いのに `QuantErrRatio` が高い → 刻みが粗く「薄まり」方向  
+    対処: `--dq_delta_range_mul` を下げる（例: -0.1、まだ薄いなら -0.2）。`ClipRate` が上がり過ぎたら戻す。  
+    併用案: `--dq_delta_bits` を上げる、または終盤だけ10にする（例: `--dq_delta_bits_sched "0.0:8,0.9:10"`）。
+    
+-   `QuantErrRatio` が低いのに `ClipRate` が高い → クリップ歪みが支配的  
+    対処: `--dq_delta_range_mul` を上げる、または `--dq_delta_bits` を上げて刻みを細かくする。  
+    auto を使う場合は `auto_clip_low/high` を少し低めにして過度なクリップを抑える。
+    
+補足: `QuantErrRatio` は `RMS(x)` が小さい局面で見かけ上大きく出ることがあるため、**単独では判断せず** `QuantErrRMS` の絶対量と必ず併せて判断する。
+
+読み方の目安2:
+
+-   `ClipRate` が低いのに `QuantErrRatio` が高い場合、次の2系統がありうる：
+    
+    1.  **レンジが広く刻みが粗い**（`range_mul` 高め / `bits` 低め）
+        　→ 対策：`range_mul` を下げる、`bits` を上げる（または `bits_sched` を早める）
+        
+    2.  **外れ値が大きく、少数でも誤差エネルギーを支配**（`AbsMax >> Range`）
+        　→ 対策：`range_mul` を上げる（または `clip_high` を下げて早めに拡張させる）、必要なら `bits` を上げる
+        
+-   見分け方：`AbsMax / Range` が極端に大きい場合は (2) の可能性が高い。
+
 
 ### auto\_only ログ（dq\_delta\_auto\_log\_file）
 
@@ -361,6 +412,8 @@ AutoStep のみを出す CSV。
 
 ただし、bits は **クリップではなく “刻み幅” を変えるノブ**なので、
 clip\_rate が似ていても量子化誤差（刻みの粗さ）は変わり得る点に注意。
+
+QuantErrRatio を見ると差が出やすい。
 
 * * *
 
@@ -452,34 +505,7 @@ bash
 
 ## 既知の課題と改善アイデア（今後の発展）
 
-### 1) “clipだけ見ない” 2指標制御
-
-clip\_rate だけだと、
-
--   クリップが少ないが刻みが粗い（薄まる）
-    
--   クリップが少ないが量子化誤差が大きい
-    
-
-を拾いにくい。
-
-LogStep のみに限定してもよいので、例えば
-
--   `quant_error_rms = RMS(x - dequantize(quantize(x)))`
-    
-
-を追加ログし、
-
--   clip\_rate は帯域内
-    
--   しかし quant\_error\_rms が悪化するなら mul を下げる（刻みを細かく）
-    
-
-のように 2指標で制御すると、「薄まる」方向を抑えやすくなる。
-
-（量子化最適化の文脈では、ACIQ などの「歪みの合計最小」や、PACT/LSQ のような発想に近い）
-
-### 2) ターゲット clip 帯域のスケジュール
+### 1) ターゲット clip 帯域のスケジュール
 
 キャラ用途では「少しクリップ多めが良い」ことがある一方、
 安定性重視用途では「クリップ少なめ」が良いことがある。
@@ -493,7 +519,7 @@ LogStep のみに限定してもよいので、例えば
 
 のように、目的に応じて「狙い帯域」をスケジュールするのも考えられる。
 
-### 3) scope別 range\_mul（UNet と TE を分離）
+### 2) scope別 range\_mul（UNet と TE を分離）
 
 UNet と TE で分布が違う場合があるので、
 
@@ -516,7 +542,7 @@ UNet と TE で分布が違う場合があるので、
     
 -   学習序盤は EMA が立ち上がり途中で誤制御しやすいので、**制御のみ停止するウォームアップ**が有効
     
--   ログ（clip\_rate\_raw/ema、range\_mul、auto\_applied、warmup情報）を残すことで、学習の挙動差を定量的に比較できる
+-   ログ（clip\_rate\_raw/ema、quant\_err、range\_mul、auto\_applied、warmup情報）を残すことで、学習の挙動差を定量的に比較できる
     
 
 * * *
