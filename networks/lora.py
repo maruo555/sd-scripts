@@ -73,6 +73,8 @@ class DQStatsAccumulator:
         self.scale_max = torch.zeros(1, device=device, dtype=torch.float32) if collect_full else None
         self.scale_sum = torch.zeros(1, device=device, dtype=torch.float32) if collect_full else None
         self.scale_count = torch.zeros(1, device=device, dtype=torch.float32) if collect_full else None
+        self.xq_sumsq = torch.zeros(1, device=device, dtype=torch.float32) if collect_full else None
+        self.xxq_sum = torch.zeros(1, device=device, dtype=torch.float32) if collect_full else None
 
     def add(
         self,
@@ -82,6 +84,8 @@ class DQStatsAccumulator:
         zero_count: Optional[torch.Tensor] = None,
         near_zero_count: Optional[torch.Tensor] = None,
         sumsq: Optional[torch.Tensor] = None,
+        xq_sumsq: Optional[torch.Tensor] = None,
+        xxq_sum: Optional[torch.Tensor] = None,
         absmax: Optional[torch.Tensor] = None,
         scale_min: Optional[torch.Tensor] = None,
         scale_max: Optional[torch.Tensor] = None,
@@ -97,6 +101,10 @@ class DQStatsAccumulator:
         if self.collect_full:
             if sumsq is not None:
                 self.sumsq += sumsq
+            if xq_sumsq is not None:
+                self.xq_sumsq += xq_sumsq
+            if xxq_sum is not None:
+                self.xxq_sum += xxq_sum
             if absmax is not None:
                 self.absmax = torch.maximum(self.absmax, absmax)
             if scale_min is not None:
@@ -201,6 +209,8 @@ class DQStatsManager:
         zero_count: Optional[torch.Tensor],
         near_zero_count: Optional[torch.Tensor],
         sumsq: Optional[torch.Tensor],
+        xq_sumsq: Optional[torch.Tensor],
+        xxq_sum: Optional[torch.Tensor],
         absmax: Optional[torch.Tensor],
         scale_min: Optional[torch.Tensor],
         scale_max: Optional[torch.Tensor],
@@ -216,6 +226,8 @@ class DQStatsManager:
             zero_count=zero_count,
             near_zero_count=near_zero_count,
             sumsq=sumsq,
+            xq_sumsq=xq_sumsq,
+            xxq_sum=xxq_sum,
             absmax=absmax,
             scale_min=scale_min,
             scale_max=scale_max,
@@ -233,6 +245,8 @@ class DQStatsManager:
                     "zero_count": zero_count.detach() if zero_count is not None else None,
                     "near_zero_count": near_zero_count.detach() if near_zero_count is not None else None,
                     "sumsq": sumsq.detach() if sumsq is not None else None,
+                    "xq_sumsq": xq_sumsq.detach() if xq_sumsq is not None else None,
+                    "xxq_sum": xxq_sum.detach() if xxq_sum is not None else None,
                     "absmax": absmax.detach() if absmax is not None else None,
                     "scale_min": scale_min.detach() if scale_min is not None else None,
                     "scale_max": scale_max.detach() if scale_max is not None else None,
@@ -375,8 +389,16 @@ class LoRAModule(torch.nn.Module):
             near_zero_count = None
             if mgr.collect_near_zero and scale is not None:
                 near_zero_count = (x_in.abs() < (0.5 * scale)).to(torch.float32).sum()
-            sumsq = (x_in.to(torch.float32) ** 2).sum() if mgr.collect_full else None
-            absmax = x_in.abs().max() if mgr.collect_full else None
+            sumsq = xq_sumsq = xxq_sum = absmax = None
+            if mgr.collect_full:
+                x_fp32 = x_in.to(torch.float32)
+                x_flat = x_fp32.reshape(-1)
+                sumsq = torch.dot(x_flat, x_flat)
+                q_fp32 = quantized.to(torch.float32)
+                q_flat = q_fp32.reshape(-1)
+                xq_sumsq = torch.dot(q_flat, q_flat)
+                xxq_sum = torch.dot(x_flat, q_flat)
+                absmax = x_in.abs().max()
             scale_min = scale_max = scale_sum = scale_count = None
             if mgr.collect_full and scale is not None:
                 scale_min = scale.min()
@@ -393,6 +415,8 @@ class LoRAModule(torch.nn.Module):
                 zero_count=zero_count,
                 near_zero_count=near_zero_count,
                 sumsq=sumsq,
+                xq_sumsq=xq_sumsq,
+                xxq_sum=xxq_sum,
                 absmax=absmax,
                 scale_min=scale_min,
                 scale_max=scale_max,

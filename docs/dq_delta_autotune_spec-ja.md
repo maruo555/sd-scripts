@@ -49,6 +49,11 @@
 - `clip_rate_raw` : 今回計測した clip_rate
 - `clip_rate_ema` : EMA 平滑化した clip_rate（制御に使用）
 - `zero_rate` : 量子化後に 0 になった割合
+- `quant_err_rms_raw` : `RMS(x - x_q)`（フェイク量子化の誤差）
+- `quant_err_rms_ema` : `quant_err_rms_raw` の EMA（係数は `dq_delta_auto_ema`）
+- `quant_err_ratio_raw` : `quant_err_rms_raw / (rms + eps)`（`eps=1e-12`）
+- `quant_err_ratio_ema` : `quant_err_ratio_raw` の EMA（係数は `dq_delta_auto_ema`）
+  - EMA は scope 共通の 1 系列。`log_scope=both` の場合は unet+te 合算で更新。
 - `numel` : 計測対象の要素数（集計値）
 - 任意: `near_zero_rate` : `|x| < 0.5*scale` の割合（0 になりやすい帯域）
 - `auto_applied` : AutoStep で range_mul 更新が適用された場合は 1、それ以外は 0
@@ -65,17 +70,22 @@
 - summary に加え `module_name,shape` を出力
 - 1行 = 1モジュールの計測
 - DDP 時は **main rank のローカル値のみ**を出力（per_module は all-reduce しない）
+- quant_error 系（`quant_err_*`）も summary と同じ列で出力
 
 ### 集計定義（summary）
 
 - `numel_sum` : 計測対象の全要素数
 - `sumsq_sum` : `x^2` の総和（fp32 で集計）
+- `xq_sumsq_sum` : `x_q^2` の総和（fp32 で集計）
+- `xxq_sum` : `x * x_q` の総和（fp32 で集計）
 - `clip_count_sum` : クリップに該当した要素数（`|x| > range_elem` 相当）
 - `zero_count_sum` : 量子化後に 0 になった要素数
 - `rms = sqrt(sumsq_sum / numel_sum)`
 - `absmax = max(|x|)`（全要素の最大値）
 - `clip_rate = clip_count_sum / numel_sum`
 - `zero_rate = zero_count_sum / numel_sum`
+- `quant_err_rms = sqrt((sumsq_sum + xq_sumsq_sum - 2*xxq_sum) / numel_sum)`
+- `quant_err_ratio = quant_err_rms / (rms + eps)`（`eps=1e-12`）
 
 ※ `range_elem` は `granularity=channel` の場合はチャネル別 range をブロードキャストした per-element range を使う。  
 ※ 分散学習時は `numel_sum/sumsq_sum/clip_count_sum/zero_count_sum` を **all-reduce (sum)** してから算出する。  
@@ -93,12 +103,13 @@
   - （任意）`zero_count_sum`
 - **LogStep のみ**で **full stats**（`sumsq_sum/absmax/scale_*` など）を計測する。
   LogStep 以外の AutoStep は最小統計に限定する。
+- `quant_err_*` は full stats の一部として **LogStep のみ**で計算する。
 
 ### 出力例（summary）
 
 ```
-Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason
-2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,12345678,1,3.0,3.21,0,0,clip_high
+Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason
+2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high
 ```
 
 ## ログの見方（初心者向け）
@@ -127,6 +138,10 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | ClipRateRaw | 生のクリップ率 | 目標帯域に収まるか確認。 |
 | ClipRateEMA | EMA平滑値 | auto判定に使う値。 |
 | ZeroRate | 量子化後0の割合 | 潰れの兆候。 |
+| QuantErrRMSRaw | 量子化誤差のRMS | 「クリップは少ないが刻みが粗い」を検出。 |
+| QuantErrRMSEMA | QuantErrRMS のEMA | ノイズの安定した傾向を見る。 |
+| QuantErrRatioRaw | 誤差RMS/入力RMS | 入力に対する誤差の割合。 |
+| QuantErrRatioEMA | QuantErrRatio のEMA | 比率の安定した傾向を見る。 |
 | NearZeroRate | 0近傍の割合 | `--dq_delta_log_extra near_zero_rate`時のみ。 |
 | Numel | 要素数 | 統計の母数。 |
 | AutoApplied | auto適用 | 1ならrange_mulが変化。 |
@@ -135,6 +150,10 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | WarmupActive | warmup中 | 1なら range_mul は固定。 |
 | WarmupRemain | warmup残り | 0なら warmup終了。 |
 | AutoReason | 判定理由 | `warmup`/`clip_high`/`clip_low`/`in_band`。 |
+
+補足（読み解きの目安）:
+- `ClipRate` が低いのに `QuantErrRatio` が高い場合、**レンジが広く刻みが粗い**可能性がある（`range_mul` 高め / `bits` 低め）。
+- `QuantErrRatio` が低いのに `ClipRate` が高い場合、**クリップ歪み**が支配的な可能性がある。
 
 ### logs（`--dq_delta_log`）: per_module
 
@@ -229,10 +248,10 @@ range_mul = clamp(range_mul, auto_min, auto_max)
 - warmup 回数は EMA 係数から自動決定し、追加パラメータは持たない
 
 ```
-warmup_updates = ceil(1 / (1 - dq_delta_auto_ema))
+warmup_updates = ceil(2 / (1 - dq_delta_auto_ema))
 ```
 
-例: `dq_delta_auto_ema=0.95` -> 20 回、`0.90` -> 10 回、`0.98` -> 50 回
+例: `dq_delta_auto_ema=0.95` -> 40 回、`0.90` -> 20 回、`0.98` -> 100 回
 
 #### 早期終了
 

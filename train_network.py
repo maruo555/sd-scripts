@@ -706,7 +706,7 @@ class NetworkTrainer:
         dq_auto_warmup_updates = 0
         if dq_auto_warmup_enabled:
             if 0.0 < dq_auto_ema < 1.0:
-                dq_auto_warmup_updates = int(math.ceil(1.0 / (1.0 - dq_auto_ema)))
+                dq_auto_warmup_updates = int(math.ceil(2.0 / (1.0 - dq_auto_ema)))
             else:
                 dq_auto_warmup_enabled = False
                 logger.warning(
@@ -790,6 +790,10 @@ class NetworkTrainer:
                 "ClipRateRaw",
                 "ClipRateEMA",
                 "ZeroRate",
+                "QuantErrRMSRaw",
+                "QuantErrRMSEMA",
+                "QuantErrRatioRaw",
+                "QuantErrRatioEMA",
             ]
             if include_near_zero:
                 cols.append("NearZeroRate")
@@ -826,6 +830,10 @@ class NetworkTrainer:
                 if collect_full:
                     sum_fields.append(acc.sumsq)
                     sum_refs.append((acc, "sumsq"))
+                    sum_fields.append(acc.xq_sumsq)
+                    sum_refs.append((acc, "xq_sumsq"))
+                    sum_fields.append(acc.xxq_sum)
+                    sum_refs.append((acc, "xxq_sum"))
                     sum_fields.append(acc.scale_sum)
                     sum_refs.append((acc, "scale_sum"))
                     sum_fields.append(acc.scale_count)
@@ -870,6 +878,7 @@ class NetworkTrainer:
             zero_rate = (acc.zero_count / acc.numel).item() if collect_zero and numel > 0 else None
             near_zero_rate = (acc.near_zero_count / acc.numel).item() if collect_near_zero and numel > 0 else None
             rms = absmax = scale_min = scale_max = scale_mean = range_val = None
+            quant_err_rms = quant_err_ratio = None
             if collect_full and numel > 0:
                 rms = math.sqrt((acc.sumsq / acc.numel).item()) if acc.sumsq is not None else None
                 absmax = acc.absmax.item() if acc.absmax is not None else None
@@ -877,6 +886,12 @@ class NetworkTrainer:
                 scale_max = acc.scale_max.item() if acc.scale_max is not None else None
                 if acc.scale_sum is not None and acc.scale_count is not None and acc.scale_count.item() > 0:
                     scale_mean = (acc.scale_sum / acc.scale_count).item()
+                if acc.xq_sumsq is not None and acc.xxq_sum is not None and acc.sumsq is not None:
+                    err_sumsq = acc.sumsq + acc.xq_sumsq - (2.0 * acc.xxq_sum)
+                    err_sumsq = torch.clamp(err_sumsq, min=0.0)
+                    quant_err_rms = math.sqrt((err_sumsq / acc.numel).item())
+                    if rms is not None:
+                        quant_err_ratio = quant_err_rms / (rms + 1e-12)
             if scale_mean is not None and qmax is not None:
                 range_val = scale_mean * qmax
             return {
@@ -884,6 +899,8 @@ class NetworkTrainer:
                 "clip_rate": clip_rate,
                 "zero_rate": zero_rate,
                 "near_zero_rate": near_zero_rate,
+                "quant_err_rms": quant_err_rms,
+                "quant_err_ratio": quant_err_ratio,
                 "rms": rms,
                 "absmax": absmax,
                 "scale_min": scale_min,
@@ -891,6 +908,37 @@ class NetworkTrainer:
                 "scale_mean": scale_mean,
                 "range": range_val,
             }
+
+        def _dq_merge_acc(acc_a, acc_b, collect_full: bool, collect_zero: bool, collect_near_zero: bool):
+            numel = acc_a.numel + acc_b.numel
+            clip = acc_a.clip_count + acc_b.clip_count
+            zero = acc_a.zero_count + acc_b.zero_count if collect_zero else None
+            near_zero = acc_a.near_zero_count + acc_b.near_zero_count if collect_near_zero else None
+            sumsq = absmax = scale_min = scale_max = scale_sum = scale_count = None
+            xq_sumsq = xxq_sum = None
+            if collect_full:
+                sumsq = acc_a.sumsq + acc_b.sumsq
+                xq_sumsq = acc_a.xq_sumsq + acc_b.xq_sumsq
+                xxq_sum = acc_a.xxq_sum + acc_b.xxq_sum
+                absmax = torch.maximum(acc_a.absmax, acc_b.absmax)
+                scale_min = torch.minimum(acc_a.scale_min, acc_b.scale_min)
+                scale_max = torch.maximum(acc_a.scale_max, acc_b.scale_max)
+                scale_sum = acc_a.scale_sum + acc_b.scale_sum
+                scale_count = acc_a.scale_count + acc_b.scale_count
+            temp_acc = type(acc_a)(acc_a.numel.device, collect_full, collect_zero, collect_near_zero)
+            temp_acc.numel = numel
+            temp_acc.clip_count = clip
+            temp_acc.zero_count = zero
+            temp_acc.near_zero_count = near_zero
+            temp_acc.sumsq = sumsq
+            temp_acc.xq_sumsq = xq_sumsq
+            temp_acc.xxq_sum = xxq_sum
+            temp_acc.absmax = absmax
+            temp_acc.scale_min = scale_min
+            temp_acc.scale_max = scale_max
+            temp_acc.scale_sum = scale_sum
+            temp_acc.scale_count = scale_count
+            return temp_acc
 
         cache_latents = args.cache_latents
         use_dreambooth_method = args.in_json is None
@@ -1903,6 +1951,8 @@ class NetworkTrainer:
             global_step = initial_step
 
         dq_auto_ema_state = None
+        dq_quant_err_rms_ema_state = None
+        dq_quant_err_ratio_ema_state = None
         dq_bits_changed_since_auto = False
         dq_auto_warmup_remaining = dq_auto_warmup_updates
         dq_auto_warmup_inband_streak = 0
@@ -2213,40 +2263,13 @@ class NetworkTrainer:
                                             auto_metrics = metrics["te"]
                                         else:
                                             # combine unet + te
-                                            combined = accum_by_scope["unet"]
-                                            other = accum_by_scope["te"]
-                                            numel = combined.numel + other.numel
-                                            clip = combined.clip_count + other.clip_count
-                                            zero = None
-                                            if collect_zero:
-                                                zero = combined.zero_count + other.zero_count
-                                            near_zero = None
-                                            if collect_near_zero:
-                                                near_zero = combined.near_zero_count + other.near_zero_count
-                                            sumsq = None
-                                            absmax = None
-                                            scale_min = None
-                                            scale_max = None
-                                            scale_sum = None
-                                            scale_count = None
-                                            if collect_full:
-                                                sumsq = combined.sumsq + other.sumsq
-                                                absmax = torch.maximum(combined.absmax, other.absmax)
-                                                scale_min = torch.minimum(combined.scale_min, other.scale_min)
-                                                scale_max = torch.maximum(combined.scale_max, other.scale_max)
-                                                scale_sum = combined.scale_sum + other.scale_sum
-                                                scale_count = combined.scale_count + other.scale_count
-                                            temp_acc = type(combined)(combined.numel.device, collect_full, collect_zero, collect_near_zero)
-                                            temp_acc.numel = numel
-                                            temp_acc.clip_count = clip
-                                            temp_acc.zero_count = zero
-                                            temp_acc.near_zero_count = near_zero
-                                            temp_acc.sumsq = sumsq
-                                            temp_acc.absmax = absmax
-                                            temp_acc.scale_min = scale_min
-                                            temp_acc.scale_max = scale_max
-                                            temp_acc.scale_sum = scale_sum
-                                            temp_acc.scale_count = scale_count
+                                            temp_acc = _dq_merge_acc(
+                                                accum_by_scope["unet"],
+                                                accum_by_scope["te"],
+                                                collect_full,
+                                                collect_zero,
+                                                collect_near_zero,
+                                            )
                                             auto_metrics = _dq_compute_metrics(temp_acc, qmax, collect_full, collect_zero, collect_near_zero)
 
                                         clip_rate_raw = auto_metrics["clip_rate"]
@@ -2319,6 +2342,40 @@ class NetworkTrainer:
                                     include_near_zero = "near_zero_rate" in dq_log_extra
                                     header = _dq_log_header(dq_log_mode, include_near_zero)
                                     log_scopes = ["unet", "te"] if dq_stats["log_scope"] == "both" else [dq_stats["log_scope"]]
+                                    quant_err_rms_ema = dq_quant_err_rms_ema_state
+                                    quant_err_ratio_ema = dq_quant_err_ratio_ema_state
+                                    if dq_stats["log_scope"] == "both":
+                                        ema_acc = _dq_merge_acc(
+                                            accum_by_scope["unet"],
+                                            accum_by_scope["te"],
+                                            collect_full,
+                                            collect_zero,
+                                            collect_near_zero,
+                                        )
+                                        ema_metrics = _dq_compute_metrics(ema_acc, qmax, collect_full, collect_zero, collect_near_zero)
+                                    else:
+                                        ema_metrics = metrics[dq_stats["log_scope"]]
+                                    if ema_metrics is not None:
+                                        quant_err_rms_raw = ema_metrics["quant_err_rms"]
+                                        quant_err_ratio_raw = ema_metrics["quant_err_ratio"]
+                                        if quant_err_rms_raw is not None:
+                                            if dq_quant_err_rms_ema_state is None:
+                                                dq_quant_err_rms_ema_state = quant_err_rms_raw
+                                            else:
+                                                dq_quant_err_rms_ema_state = (
+                                                    dq_quant_err_rms_ema_state * dq_auto_ema
+                                                    + (1.0 - dq_auto_ema) * quant_err_rms_raw
+                                                )
+                                        if quant_err_ratio_raw is not None:
+                                            if dq_quant_err_ratio_ema_state is None:
+                                                dq_quant_err_ratio_ema_state = quant_err_ratio_raw
+                                            else:
+                                                dq_quant_err_ratio_ema_state = (
+                                                    dq_quant_err_ratio_ema_state * dq_auto_ema
+                                                    + (1.0 - dq_auto_ema) * quant_err_ratio_raw
+                                                )
+                                        quant_err_rms_ema = dq_quant_err_rms_ema_state
+                                        quant_err_ratio_ema = dq_quant_err_ratio_ema_state
                                     for scope in log_scopes:
                                         m = metrics[scope]
                                         values = [
@@ -2347,6 +2404,13 @@ class NetworkTrainer:
                                                 scale_max = item["scale_max"].item() if item["scale_max"] is not None else None
                                                 scale_mean = (item["scale_sum"] / item["scale_count"]).item() if item["scale_sum"] is not None and item["scale_count"] is not None and item["scale_count"].item() > 0 else None
                                                 range_val = scale_mean * qmax if scale_mean is not None and qmax is not None else None
+                                                quant_err_rms = quant_err_ratio = None
+                                                if item["sumsq"] is not None and item["xq_sumsq"] is not None and item["xxq_sum"] is not None and numel > 0:
+                                                    err_sumsq = item["sumsq"] + item["xq_sumsq"] - (2.0 * item["xxq_sum"])
+                                                    err_sumsq = torch.clamp(err_sumsq, min=0.0)
+                                                    quant_err_rms = math.sqrt((err_sumsq / item["numel"]).item())
+                                                    if rms is not None:
+                                                        quant_err_ratio = quant_err_rms / (rms + 1e-12)
                                                 row = values + [
                                                     item["module"],
                                                     item["shape"],
@@ -2360,6 +2424,10 @@ class NetworkTrainer:
                                                     clip_rate,
                                                     clip_rate_ema if clip_rate_ema is not None else "",
                                                     zero_rate,
+                                                    quant_err_rms,
+                                                    quant_err_rms_ema if quant_err_rms_ema is not None else "",
+                                                    quant_err_ratio,
+                                                    quant_err_ratio_ema if quant_err_ratio_ema is not None else "",
                                                 ]
                                                 if include_near_zero:
                                                     row.append(near_zero_rate)
@@ -2385,6 +2453,10 @@ class NetworkTrainer:
                                                 m["clip_rate"],
                                                 clip_rate_ema if clip_rate_ema is not None else "",
                                                 m["zero_rate"],
+                                                m["quant_err_rms"],
+                                                quant_err_rms_ema if quant_err_rms_ema is not None else "",
+                                                m["quant_err_ratio"],
+                                                quant_err_ratio_ema if quant_err_ratio_ema is not None else "",
                                             ]
                                             if include_near_zero:
                                                 row.append(m["near_zero_rate"])
@@ -2423,6 +2495,10 @@ class NetworkTrainer:
                                             qmax if qmax is not None else "",
                                             clip_rate_raw if clip_rate_raw is not None else "",
                                             clip_rate_ema if clip_rate_ema is not None else "",
+                                            "",
+                                            "",
+                                            "",
+                                            "",
                                             "",
                                         ]
                                         if include_near_zero:
