@@ -337,7 +337,7 @@ bits 切替時は量子化の性質が変わるので、
     対処: `--dq_delta_range_mul` を上げる、または `--dq_delta_bits` を上げて刻みを細かくする。  
     auto を使う場合は `auto_clip_low/high` を少し低めにして過度なクリップを抑える。
     
-補足: `QuantErrRatio` は `RMS(x)` が小さい局面で大きく見えることがあるため、`QuantErrRMS` の絶対量と併せて判断する。
+補足: `QuantErrRatio` は `RMS(x)` が小さい局面で見かけ上大きく出ることがあるため、**単独では判断せず** `QuantErrRMS` の絶対量と必ず併せて判断する。
     
 
 ### auto\_only ログ（dq\_delta\_auto\_log\_file）

@@ -253,6 +253,8 @@ warmup_updates = ceil(2 / (1 - dq_delta_auto_ema))
 
 例: `dq_delta_auto_ema=0.95` -> 40 回、`0.90` -> 20 回、`0.98` -> 100 回
 
+※ `1/(1-ema)` は **EMA の実効履歴長**の目安であり、warmup 回数とは別概念。
+
 #### 早期終了
 
 - `clip_low <= clip_rate_ema <= clip_high` が **3 回連続**で成立したら warmup を終了
