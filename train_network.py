@@ -252,10 +252,16 @@ DQ_DELTA_AUTO_PRESETS = {
     "default": {
         "clip_low": 0.0005,
         "clip_high": 0.003,
-        "mul_up": 1.07,
-        "mul_down": 0.97,
+        "mul_up": 1.01,
+        "mul_down": 0.995,
     },
     "clip_rate_high": {
+        "clip_low": 0.003,
+        "clip_high": 0.005,
+        "mul_up": 1.01,
+        "mul_down": 0.995,
+    },
+    "adaptive": {
         "clip_low": 0.003,
         "clip_high": 0.005,
         "mul_up": 1.01,
@@ -275,8 +281,8 @@ def resolve_dq_delta_auto_settings(args):
     else:
         dq_auto_clip_low = float(getattr(args, "dq_delta_auto_clip_low", 0.0005))
         dq_auto_clip_high = float(getattr(args, "dq_delta_auto_clip_high", 0.003))
-        dq_auto_mul_up = float(getattr(args, "dq_delta_auto_mul_up", 1.07))
-        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.97))
+        dq_auto_mul_up = float(getattr(args, "dq_delta_auto_mul_up", 1.01))
+        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.995))
     return auto_preset, dq_auto_clip_low, dq_auto_clip_high, dq_auto_mul_up, dq_auto_mul_down
 
 
@@ -698,6 +704,17 @@ class NetworkTrainer:
                 dq_auto_mul_up,
                 dq_auto_mul_down,
             )
+        dq_auto_adaptive_enabled = dq_auto_enabled and dq_auto_preset == "adaptive"
+        if dq_auto_adaptive_enabled and not dq_log_enabled:
+            raise ValueError("--dq_delta_auto_preset adaptive requires --dq_delta_log.")
+        dq_auto_active_preset = dq_auto_preset if dq_auto_enabled else None
+        dq_auto_adaptive_switched = False
+        dq_auto_adaptive_streak = 0
+        dq_auto_adaptive_quant_err_ratio_ema_state = None
+        dq_auto_adaptive_threshold = 0.30
+        dq_auto_adaptive_streak_limit = 5
+        if dq_auto_adaptive_enabled:
+            dq_auto_active_preset = "clip_rate_high"
         dq_auto_every = max(1, int(getattr(args, "dq_delta_auto_every", 50)))
         dq_auto_min = float(getattr(args, "dq_delta_auto_min", 1.0))
         dq_auto_max = float(getattr(args, "dq_delta_auto_max", 6.0))
@@ -764,7 +781,7 @@ class NetworkTrainer:
                 return f"{v:.6g}"
             return str(v)
 
-        def _dq_log_header(log_mode: str, include_near_zero: bool):
+        def _dq_log_header(log_mode: str, include_near_zero: bool, include_preset: bool = True):
             cols = [
                 "Epoch",
                 "TrainStep",
@@ -798,11 +815,13 @@ class NetworkTrainer:
             if include_near_zero:
                 cols.append("NearZeroRate")
             cols += ["Numel", "AutoApplied", "RangeMulBefore", "RangeMulAfter", "WarmupActive", "WarmupRemain", "AutoReason"]
+            if include_preset:
+                cols += ["AutoPreset", "PresetSwitchApplied"]
             return ",".join(cols)
 
         def _dq_auto_log_header(full_schema: bool, include_near_zero: bool):
             if full_schema:
-                return _dq_log_header("summary", include_near_zero)
+                return _dq_log_header("summary", include_near_zero, include_preset=False)
             return (
                 "TrainStep,Scope,Target,Bits,ClipRateRaw,ClipRateEMA,RangeMulBefore,RangeMulAfter,AutoApplied,"
                 "WarmupActive,WarmupRemain,AutoReason"
@@ -2253,6 +2272,45 @@ class NetworkTrainer:
                                     auto_reason = "in_band"
                                 else:
                                     auto_reason = ""
+                                preset_switch_applied = 0
+
+                                if dq_auto_adaptive_enabled and dq_stats["do_log"] and accelerator.is_main_process:
+                                    adaptive_acc = _dq_merge_acc(
+                                        accum_by_scope["unet"],
+                                        accum_by_scope["te"],
+                                        collect_full,
+                                        collect_zero,
+                                        collect_near_zero,
+                                    )
+                                    adaptive_metrics = _dq_compute_metrics(
+                                        adaptive_acc, qmax, collect_full, collect_zero, collect_near_zero
+                                    )
+                                    adaptive_ratio_raw = (
+                                        adaptive_metrics["quant_err_ratio"] if adaptive_metrics is not None else None
+                                    )
+                                    if adaptive_ratio_raw is not None:
+                                        if dq_auto_adaptive_quant_err_ratio_ema_state is None:
+                                            dq_auto_adaptive_quant_err_ratio_ema_state = adaptive_ratio_raw
+                                        else:
+                                            dq_auto_adaptive_quant_err_ratio_ema_state = (
+                                                dq_auto_adaptive_quant_err_ratio_ema_state * dq_auto_ema
+                                                + (1.0 - dq_auto_ema) * adaptive_ratio_raw
+                                            )
+                                    adaptive_ratio_ema = dq_auto_adaptive_quant_err_ratio_ema_state
+                                    if not warmup_active and not dq_auto_adaptive_switched:
+                                        if adaptive_ratio_ema is not None and adaptive_ratio_ema > dq_auto_adaptive_threshold:
+                                            dq_auto_adaptive_streak += 1
+                                        else:
+                                            dq_auto_adaptive_streak = 0
+                                        if dq_auto_adaptive_streak >= dq_auto_adaptive_streak_limit:
+                                            dq_auto_adaptive_switched = True
+                                            dq_auto_active_preset = "default"
+                                            preset_switch_applied = 1
+                                            preset = DQ_DELTA_AUTO_PRESETS["default"]
+                                            dq_auto_clip_low = preset["clip_low"]
+                                            dq_auto_clip_high = preset["clip_high"]
+                                            dq_auto_mul_up = preset["mul_up"]
+                                            dq_auto_mul_down = preset["mul_down"]
 
                                 if dq_stats["do_auto"]:
                                     auto_scope = dq_stats["auto_scope"]
@@ -2280,6 +2338,8 @@ class NetworkTrainer:
                                                 if dq_auto_warmup_enabled:
                                                     dq_auto_warmup_remaining = dq_auto_warmup_updates
                                                     dq_auto_warmup_inband_streak = 0
+                                                    if dq_auto_adaptive_enabled:
+                                                        dq_auto_adaptive_streak = 0
                                             else:
                                                 if dq_auto_ema_state is None:
                                                     dq_auto_ema_state = clip_rate_raw
@@ -2376,6 +2436,7 @@ class NetworkTrainer:
                                                 )
                                         quant_err_rms_ema = dq_quant_err_rms_ema_state
                                         quant_err_ratio_ema = dq_quant_err_ratio_ema_state
+                                    auto_preset_label = dq_auto_active_preset if (dq_auto_enabled and dq_auto_active_preset) else ""
                                     for scope in log_scopes:
                                         m = metrics[scope]
                                         values = [
@@ -2439,6 +2500,8 @@ class NetworkTrainer:
                                                     warmup_active,
                                                     warmup_remain,
                                                     auto_reason,
+                                                    auto_preset_label,
+                                                    preset_switch_applied,
                                                 ]
                                                 _write_csv(dq_log_path, header, ",".join(_dq_format_value(v) for v in row))
                                         else:
@@ -2468,6 +2531,8 @@ class NetworkTrainer:
                                                 warmup_active,
                                                 warmup_remain,
                                                 auto_reason,
+                                                auto_preset_label,
+                                                preset_switch_applied,
                                             ]
                                             _write_csv(dq_log_path, header, ",".join(_dq_format_value(v) for v in row))
 
@@ -2920,7 +2985,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--dq_delta_auto_preset",
         type=str,
         default=None,
-        choices=["default", "clip_rate_high"],
+        choices=["default", "clip_rate_high", "adaptive"],
         help=(
             "Preset for auto range_mul tuning (overrides clip_low/high, mul_up/down) / "
             "auto range_mul 調整プリセット（clip_low/high, mul_up/down を上書き）"
@@ -2947,13 +3012,13 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dq_delta_auto_mul_up",
         type=float,
-        default=1.07,
+        default=1.01,
         help="Auto range_mul increase factor / range_mul 上げ係数",
     )
     parser.add_argument(
         "--dq_delta_auto_mul_down",
         type=float,
-        default=0.97,
+        default=0.995,
         help="Auto range_mul decrease factor / range_mul 下げ係数",
     )
     parser.add_argument(

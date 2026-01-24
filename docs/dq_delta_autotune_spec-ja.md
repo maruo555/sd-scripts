@@ -108,8 +108,8 @@
 ### 出力例（summary）
 
 ```
-Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason
-2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high
+Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason,AutoPreset,PresetSwitchApplied
+2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high,clip_rate_high,0
 ```
 
 ## ログの見方（初心者向け）
@@ -150,6 +150,8 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | WarmupActive | warmup中 | 1なら range_mul は固定。 |
 | WarmupRemain | warmup残り | 0なら warmup終了。 |
 | AutoReason | 判定理由 | `warmup`/`clip_high`/`clip_low`/`in_band`。 |
+| AutoPreset | 現在のプリセット | `default`/`clip_rate_high`。adaptive の場合は現在の実効プリセット。 |
+| PresetSwitchApplied | プリセット切替 | adaptive で切替が起きた LogStep の行だけ 1。 |
 
 補足（読み解きの目安）:
 - `ClipRate` が低いのに `QuantErrRatio` が高い場合、**レンジが広く刻みが粗い**可能性がある（`range_mul` 高め / `bits` 低め）。
@@ -183,19 +185,19 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 
 ### auto（`--dq_delta_auto_log_file`）: full_schema
 
-full_schema は **logs（summary）と同じ列構成**で出力します。  
+full_schema は **logs（summary）とほぼ同じ列構成**で出力します（`AutoPreset`/`PresetSwitchApplied` は含めません）。  
 LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 ## range_mul フィードバック制御仕様
 
 ### 有効化オプション
 
 - `--dq_delta_auto_range_mul` : range_mul の自動調整を有効化（デフォルト無効）
-- `--dq_delta_auto_preset {default,clip_rate_high}` : auto range_mul のプリセット（指定時は clip_low/high, mul_up/down を上書き）
+- `--dq_delta_auto_preset {default,clip_rate_high,adaptive}` : auto range_mul のプリセット（指定時は clip_low/high, mul_up/down を上書き）
 - `--dq_delta_auto_every <int>` : 調整間隔（optimizer step 単位、デフォルト 50）
 - `--dq_delta_auto_clip_low <float>` : clip_rate 下限（デフォルト 0.0005 = 0.05%）
 - `--dq_delta_auto_clip_high <float>` : clip_rate 上限（デフォルト 0.003 = 0.3%）
-- `--dq_delta_auto_mul_up <float>` : 上げ係数（デフォルト 1.07）
-- `--dq_delta_auto_mul_down <float>` : 下げ係数（デフォルト 0.97）
+- `--dq_delta_auto_mul_up <float>` : 上げ係数（デフォルト 1.01）
+- `--dq_delta_auto_mul_down <float>` : 下げ係数（デフォルト 0.995）
 - `--dq_delta_auto_min <float>` : range_mul 下限（デフォルト 1.0）
 - `--dq_delta_auto_max <float>` : range_mul 上限（デフォルト 6.0）
 - `--dq_delta_auto_ema <float>` : clip_rate の EMA 係数（デフォルト 0.95）
@@ -207,8 +209,15 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 
 | preset | clip_low | clip_high | mul_up | mul_down | 目的 |
 | --- | --- | --- | --- | --- | --- |
-| `default` | 0.0005 | 0.003 | 1.07 | 0.97 | 安全汎用。特徴が薄まりやすい。 |
+| `default` | 0.0005 | 0.003 | 1.01 | 0.995 | 安全汎用。特徴が薄まりやすい。 |
 | `clip_rate_high` | 0.003 | 0.005 | 1.01 | 0.995 | キャラクター学習向け。clip_rate 高め＋mul_up/mul_down を細かくして急変動を回避。 |
+| `adaptive` | 0.003 | 0.005 | 1.01 | 0.995 | `clip_rate_high` で開始し、LogStep の `QuantErrRatioEMA > 0.30` が 5 連続で起きたら `default` に切替。`--dq_delta_log` 必須。 |
+
+補足（adaptive）:
+- 意図: `clip_rate_high` で「薄まり」方向に行くデータを、`QuantErrRatio` の跳ね上がりを安全弁として検知し、暴走を止める。`ClipRate` は「何個クリップしたか」、`QuantErr` は「どれだけ歪んだか」を見る指標。
+- 判定は LogStep の **merge（unet+te 合算）** を使う。
+- warmup 中は連続判定を進めない。
+- warmup 開始時は連続カウントをリセットする。
 
 ### 発動条件（重要）
 
