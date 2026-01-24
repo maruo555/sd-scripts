@@ -821,7 +821,7 @@ class NetworkTrainer:
 
         def _dq_auto_log_header(full_schema: bool, include_near_zero: bool):
             if full_schema:
-                return _dq_log_header("summary", include_near_zero, include_preset=False)
+                return _dq_log_header("summary", include_near_zero, include_preset=True)
             return (
                 "TrainStep,Scope,Target,Bits,ClipRateRaw,ClipRateEMA,RangeMulBefore,RangeMulAfter,AutoApplied,"
                 "WarmupActive,WarmupRemain,AutoReason"
@@ -2576,6 +2576,8 @@ class NetworkTrainer:
                                             warmup_active,
                                             warmup_remain,
                                             auto_reason,
+                                            "",
+                                            "",
                                         ]
                                         _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
                                     else:

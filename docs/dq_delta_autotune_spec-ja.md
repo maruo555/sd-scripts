@@ -185,7 +185,7 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 
 ### auto（`--dq_delta_auto_log_file`）: full_schema
 
-full_schema は **logs（summary）とほぼ同じ列構成**で出力します（`AutoPreset`/`PresetSwitchApplied` は含めません）。  
+full_schema は **logs（summary）と同じ列構成**で出力します。  
 LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 ## range_mul フィードバック制御仕様
 
