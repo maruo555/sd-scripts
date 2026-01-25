@@ -275,12 +275,12 @@ def resolve_dq_delta_auto_settings(args):
         dq_auto_clip_low = preset["clip_low"]
         dq_auto_clip_high = preset["clip_high"]
         dq_auto_mul_up = float(getattr(args, "dq_delta_auto_mul_up", 1.01))
-        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.9901))
+        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.995))
     else:
         dq_auto_clip_low = float(getattr(args, "dq_delta_auto_clip_low", 0.0005))
         dq_auto_clip_high = float(getattr(args, "dq_delta_auto_clip_high", 0.003))
         dq_auto_mul_up = float(getattr(args, "dq_delta_auto_mul_up", 1.01))
-        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.9901))
+        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.995))
     return auto_preset, dq_auto_clip_low, dq_auto_clip_high, dq_auto_mul_up, dq_auto_mul_down
 
 
@@ -2972,7 +2972,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dq_delta_auto_mul_down",
         type=float,
-        default=0.9901,
+        default=0.995,
         help="Auto range_mul decrease factor / range_mul 下げ係数",
     )
     parser.add_argument(

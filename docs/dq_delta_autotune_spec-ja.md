@@ -195,7 +195,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 - `--dq_delta_auto_clip_low <float>` : clip_rate 下限（デフォルト 0.0005 = 0.05%）
 - `--dq_delta_auto_clip_high <float>` : clip_rate 上限（デフォルト 0.003 = 0.3%）
 - `--dq_delta_auto_mul_up <float>` : 上げ係数（デフォルト 1.01）
-- `--dq_delta_auto_mul_down <float>` : 下げ係数（デフォルト 0.9901）
+- `--dq_delta_auto_mul_down <float>` : 下げ係数（デフォルト 0.995）
 - `--dq_delta_auto_min <float>` : range_mul 下限（デフォルト 1.0）
 - `--dq_delta_auto_max <float>` : range_mul 上限（デフォルト 6.0）
 - `--dq_delta_auto_ema <float>` : clip_rate の EMA 係数（デフォルト 0.95）
@@ -206,7 +206,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 
 ### auto プリセット一覧
 
-※ preset は clip_low/high のみ切替。mul_up/mul_down は `--dq_delta_auto_mul_up/down` に従う（既定 1.01 / 0.9901）。
+※ preset は clip_low/high のみ切替。mul_up/mul_down は `--dq_delta_auto_mul_up/down` に従う（既定 1.01 / 0.995）。
 ※ `--dq_delta_auto_use_raw` 指定時は変化がなだらかになり、既存 preset では mul があまり動かないことがあるため、mul を積極的に動かしたい用途向けに `clip_rate_high_narrow` / `clip_rate_low` を追加。
 
 | preset | clip_low | clip_high | mul_up | mul_down | 目的 |
