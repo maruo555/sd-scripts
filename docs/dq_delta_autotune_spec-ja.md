@@ -190,12 +190,12 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 ### 有効化オプション
 
 - `--dq_delta_auto_range_mul` : range_mul の自動調整を有効化（デフォルト無効）
-- `--dq_delta_auto_preset {default,clip_rate_high}` : auto range_mul のプリセット（指定時は clip_low/high, mul_up/down を上書き）
+- `--dq_delta_auto_preset {default,clip_rate_high,clip_rate_high_narrow,clip_rate_low}` : auto range_mul のプリセット（指定時は clip_low/high のみ上書き）
 - `--dq_delta_auto_every <int>` : 調整間隔（optimizer step 単位、デフォルト 50）
 - `--dq_delta_auto_clip_low <float>` : clip_rate 下限（デフォルト 0.0005 = 0.05%）
 - `--dq_delta_auto_clip_high <float>` : clip_rate 上限（デフォルト 0.003 = 0.3%）
-- `--dq_delta_auto_mul_up <float>` : 上げ係数（デフォルト 1.07）
-- `--dq_delta_auto_mul_down <float>` : 下げ係数（デフォルト 0.97）
+- `--dq_delta_auto_mul_up <float>` : 上げ係数（デフォルト 1.01）
+- `--dq_delta_auto_mul_down <float>` : 下げ係数（デフォルト 0.9901）
 - `--dq_delta_auto_min <float>` : range_mul 下限（デフォルト 1.0）
 - `--dq_delta_auto_max <float>` : range_mul 上限（デフォルト 6.0）
 - `--dq_delta_auto_ema <float>` : clip_rate の EMA 係数（デフォルト 0.95）
@@ -205,10 +205,14 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 
 ### auto プリセット一覧
 
+※ preset は clip_low/high のみ切替。mul_up/mul_down は `--dq_delta_auto_mul_up/down` に従う（既定 1.01 / 0.9901）。
+
 | preset | clip_low | clip_high | mul_up | mul_down | 目的 |
 | --- | --- | --- | --- | --- | --- |
-| `default` | 0.0005 | 0.003 | 1.07 | 0.97 | 安全汎用。特徴が薄まりやすい。 |
-| `clip_rate_high` | 0.003 | 0.005 | 1.01 | 0.995 | キャラクター学習向け。clip_rate 高め＋mul_up/mul_down を細かくして急変動を回避。 |
+| `default` | 0.0005 | 0.003 | args | args | 安全汎用。特徴が薄まりやすい。 |
+| `clip_rate_high` | 0.003 | 0.005 | args | args | キャラクター学習向け。clip_rate 高めを狙う。 |
+| `clip_rate_high_narrow` | 0.0038 | 0.0046 | args | args | キャラクター学習向け2。狭い範囲を狙う。 |
+| `clip_rate_low` | 0.0005 | 0.0022 | args | args | defaultより安定方向に振る。 |
 
 ### 発動条件（重要）
 
@@ -226,11 +230,11 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 ### 制御ロジック
 
 - 各 `auto_every` optimizer step で clip_rate を集計（summary）
-- EMA で平滑化し、次のルールで更新
+- EMA で平滑化し、EMA と raw の両方が閾値を超えた場合のみ更新
 
 ```
-if clip_rate_ema > clip_high: range_mul *= mul_up
-elif clip_rate_ema < clip_low: range_mul *= mul_down
+if clip_rate_ema > clip_high and clip_rate_raw > clip_high: range_mul *= mul_up
+elif clip_rate_ema < clip_low and clip_rate_raw < clip_low: range_mul *= mul_down
 range_mul = clamp(range_mul, auto_min, auto_max)
 ```
 
@@ -271,8 +275,8 @@ warmup_updates = ceil(2 / (1 - dq_delta_auto_ema))
 #### warmup 終了後の挙動（既存通り）
 
 ```
-if clip_rate_ema > clip_high: range_mul *= mul_up
-elif clip_rate_ema < clip_low: range_mul *= mul_down
+if clip_rate_ema > clip_high and clip_rate_raw > clip_high: range_mul *= mul_up
+elif clip_rate_ema < clip_low and clip_rate_raw < clip_low: range_mul *= mul_down
 else: no change
 ```
 
