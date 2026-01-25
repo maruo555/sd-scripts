@@ -716,29 +716,21 @@ class NetworkTrainer:
         adaptive_monitor_steps = 30
         qerr_hard_hi = 0.30
         qerr_hard_count = 3
-        qerr_soft_margin_abs = 0.08
-        qerr_soft_margin_rel = 0.6
-        qerr_soft_floor = 0.0
+        qerr_soft_margin_start = 0.02
+        qerr_soft_margin_end = 0.08
         qerr_soft_hysteresis = 0.01
         qerr_soft_count = 5
-        qerr_rate_k = 3.0
-        qerr_rate_min_abs = 0.0015
-        qerr_rate_count = 5
 
         dq_auto_adaptive_state = "CALIB" if dq_auto_adaptive_enabled else ""
         dq_auto_adaptive_switched = False
         dq_auto_adaptive_qerr_ema_state = None
-        dq_auto_adaptive_qerr_samples = []
-        dq_auto_adaptive_qerr_diffs = []
+        dq_auto_adaptive_qerr_samples = deque(maxlen=adaptive_calib_steps)
+        dq_auto_adaptive_warmup_samples = deque(maxlen=adaptive_calib_steps)
         dq_auto_adaptive_qerr_base = None
-        dq_auto_adaptive_qerr_rate_hi = None
         dq_auto_adaptive_calib_steps = 0
         dq_auto_adaptive_monitor_steps = 0
-        dq_auto_adaptive_qerr_step = 0
-        dq_auto_adaptive_calib_end_step = None
         dq_auto_adaptive_hard_count = 0
         dq_auto_adaptive_soft_level_count = 0
-        dq_auto_adaptive_soft_rate_count = 0
         dq_auto_every = max(1, int(getattr(args, "dq_delta_auto_every", 50)))
         dq_auto_min = float(getattr(args, "dq_delta_auto_min", 1.0))
         dq_auto_max = float(getattr(args, "dq_delta_auto_max", 6.0))
@@ -845,11 +837,9 @@ class NetworkTrainer:
                     "PresetSwitchApplied",
                     "AdaptiveState",
                     "QErrBase",
-                    "QErrSoftHi",
-                    "QErrHardHi",
-                    "QErrRateHi",
+                    "SoftHiEnd",
+                    "SoftHiT",
                     "SoftLevelCount",
-                    "SoftRateCount",
                     "HardCount",
                     "PresetSwitchReason",
                 ]
@@ -2310,8 +2300,8 @@ class NetworkTrainer:
                                     auto_reason = ""
                                 preset_switch_applied = 0
                                 preset_switch_reason = ""
-                                qerr_soft_hi = None
-                                qerr_rate_hi_value = None
+                                soft_hi_end_value = None
+                                soft_hi_t_value = None
 
                                 if dq_auto_adaptive_enabled and dq_stats["do_log"] and accelerator.is_main_process:
                                     adaptive_acc = _dq_merge_acc(
@@ -2336,76 +2326,55 @@ class NetworkTrainer:
                                                 + (1.0 - dq_auto_ema) * adaptive_ratio_raw
                                             )
                                     adaptive_ratio_ema = dq_auto_adaptive_qerr_ema_state
-                                    if adaptive_ratio_ema is not None:
-                                        dq_auto_adaptive_qerr_step += 1
-
                                     if dq_auto_adaptive_state != "LOCKED" and adaptive_ratio_ema is not None:
                                         if dq_auto_adaptive_state == "CALIB":
-                                            use_warmup_tail = dq_auto_warmup_enabled and dq_auto_warmup_remaining > 0
-                                            in_warmup_tail = use_warmup_tail and dq_auto_warmup_remaining <= adaptive_calib_steps
-                                            if (not use_warmup_tail) or in_warmup_tail:
-                                                if dq_auto_adaptive_qerr_samples:
-                                                    dq_auto_adaptive_qerr_diffs.append(
-                                                        adaptive_ratio_ema - dq_auto_adaptive_qerr_samples[-1]
-                                                    )
-                                                dq_auto_adaptive_qerr_samples.append(adaptive_ratio_ema)
-                                                dq_auto_adaptive_calib_steps = len(dq_auto_adaptive_qerr_samples)
-                                                if dq_auto_adaptive_calib_steps >= adaptive_calib_steps:
+                                            if warmup_active:
+                                                dq_auto_adaptive_warmup_samples.append(adaptive_ratio_ema)
+                                            else:
+                                                if len(dq_auto_adaptive_warmup_samples) >= adaptive_calib_steps:
                                                     dq_auto_adaptive_qerr_base = statistics.median(
-                                                        dq_auto_adaptive_qerr_samples
+                                                        list(dq_auto_adaptive_warmup_samples)
                                                     )
-                                                    diff_mad = 0.0
-                                                    if dq_auto_adaptive_qerr_diffs:
-                                                        diff_med = statistics.median(dq_auto_adaptive_qerr_diffs)
-                                                        diff_mad = statistics.median(
-                                                            [abs(d - diff_med) for d in dq_auto_adaptive_qerr_diffs]
+                                                else:
+                                                    if not dq_auto_adaptive_qerr_samples and dq_auto_adaptive_warmup_samples:
+                                                        dq_auto_adaptive_qerr_samples.extend(dq_auto_adaptive_warmup_samples)
+                                                    if len(dq_auto_adaptive_qerr_samples) < adaptive_calib_steps:
+                                                        dq_auto_adaptive_qerr_samples.append(adaptive_ratio_ema)
+                                                    dq_auto_adaptive_calib_steps = len(dq_auto_adaptive_qerr_samples)
+                                                    if dq_auto_adaptive_calib_steps >= adaptive_calib_steps:
+                                                        dq_auto_adaptive_qerr_base = statistics.median(
+                                                            list(dq_auto_adaptive_qerr_samples)
                                                         )
-                                                    dq_auto_adaptive_qerr_rate_hi = max(qerr_rate_min_abs, qerr_rate_k * diff_mad)
-                                                    dq_auto_adaptive_calib_end_step = dq_auto_adaptive_qerr_step
+                                                if dq_auto_adaptive_qerr_base is not None:
                                                     dq_auto_adaptive_state = "MONITOR"
                                                     dq_auto_adaptive_monitor_steps = 0
                                                     dq_auto_adaptive_hard_count = 0
                                                     dq_auto_adaptive_soft_level_count = 0
-                                                    dq_auto_adaptive_soft_rate_count = 0
+                                                    dq_auto_adaptive_warmup_samples.clear()
                                         elif dq_auto_adaptive_state == "MONITOR":
                                             if not warmup_active:
                                                 if dq_auto_adaptive_qerr_base is not None:
-                                                    qerr_soft_hi = max(
-                                                        qerr_soft_floor,
-                                                        dq_auto_adaptive_qerr_base + qerr_soft_margin_abs,
-                                                        dq_auto_adaptive_qerr_base * (1.0 + qerr_soft_margin_rel),
-                                                    )
-                                                    qerr_soft_lo = qerr_soft_hi - qerr_soft_hysteresis
+                                                    soft_hi_end_value = dq_auto_adaptive_qerr_base + qerr_soft_margin_end
+                                                    progress = dq_auto_adaptive_monitor_steps / max(1, adaptive_monitor_steps - 1)
+                                                    margin_t = qerr_soft_margin_start + (
+                                                        qerr_soft_margin_end - qerr_soft_margin_start
+                                                    ) * progress
+                                                    soft_hi_t_value = dq_auto_adaptive_qerr_base + margin_t
+                                                    soft_lo_t = soft_hi_t_value - qerr_soft_hysteresis
                                                 else:
-                                                    qerr_soft_lo = None
+                                                    soft_lo_t = None
 
                                                 if adaptive_ratio_ema > qerr_hard_hi:
                                                     dq_auto_adaptive_hard_count += 1
                                                 else:
-                                                    dq_auto_adaptive_hard_count = 0
+                                                    dq_auto_adaptive_hard_count = max(0, dq_auto_adaptive_hard_count - 1)
 
-                                                if qerr_soft_hi is not None and qerr_soft_lo is not None:
-                                                    if adaptive_ratio_ema > qerr_soft_hi:
+                                                if soft_hi_t_value is not None and soft_lo_t is not None:
+                                                    if adaptive_ratio_ema > soft_hi_t_value:
                                                         dq_auto_adaptive_soft_level_count += 1
-                                                    elif adaptive_ratio_ema < qerr_soft_lo:
+                                                    elif adaptive_ratio_ema < soft_lo_t:
                                                         dq_auto_adaptive_soft_level_count = max(
                                                             0, dq_auto_adaptive_soft_level_count - 1
-                                                        )
-
-                                                if dq_auto_adaptive_qerr_base is not None and dq_auto_adaptive_calib_end_step is not None:
-                                                    elapsed = max(1, dq_auto_adaptive_qerr_step - dq_auto_adaptive_calib_end_step)
-                                                    qerr_rate = (adaptive_ratio_ema - dq_auto_adaptive_qerr_base) / float(elapsed)
-                                                    qerr_rate_hi = max(
-                                                        qerr_rate_min_abs,
-                                                        dq_auto_adaptive_qerr_rate_hi if dq_auto_adaptive_qerr_rate_hi is not None else 0.0,
-                                                    )
-                                                    qerr_rate_hi_value = qerr_rate_hi
-                                                    qerr_rate_lo = 0.5 * qerr_rate_hi
-                                                    if qerr_rate > qerr_rate_hi:
-                                                        dq_auto_adaptive_soft_rate_count += 1
-                                                    elif qerr_rate < qerr_rate_lo:
-                                                        dq_auto_adaptive_soft_rate_count = max(
-                                                            0, dq_auto_adaptive_soft_rate_count - 1
                                                         )
 
                                                 if dq_auto_adaptive_hard_count >= qerr_hard_count:
@@ -2430,17 +2399,6 @@ class NetworkTrainer:
                                                     dq_auto_mul_up = preset["mul_up"]
                                                     dq_auto_mul_down = preset["mul_down"]
                                                     dq_auto_adaptive_state = "LOCKED"
-                                                elif dq_auto_adaptive_soft_rate_count >= qerr_rate_count:
-                                                    dq_auto_adaptive_switched = True
-                                                    dq_auto_active_preset = "default"
-                                                    preset_switch_applied = 1
-                                                    preset_switch_reason = "soft_rate"
-                                                    preset = DQ_DELTA_AUTO_PRESETS["default"]
-                                                    dq_auto_clip_low = preset["clip_low"]
-                                                    dq_auto_clip_high = preset["clip_high"]
-                                                    dq_auto_mul_up = preset["mul_up"]
-                                                    dq_auto_mul_down = preset["mul_down"]
-                                                    dq_auto_adaptive_state = "LOCKED"
 
                                                 dq_auto_adaptive_monitor_steps += 1
                                                 if (
@@ -2448,8 +2406,19 @@ class NetworkTrainer:
                                                     and not dq_auto_adaptive_switched
                                                     and dq_auto_adaptive_monitor_steps >= adaptive_monitor_steps
                                                 ):
+                                                    if dq_auto_adaptive_soft_level_count > 0 or dq_auto_adaptive_hard_count > 0:
+                                                        dq_auto_adaptive_switched = True
+                                                        dq_auto_active_preset = "default"
+                                                        preset_switch_applied = 1
+                                                        preset_switch_reason = "deadline_peak_fail"
+                                                        preset = DQ_DELTA_AUTO_PRESETS["default"]
+                                                        dq_auto_clip_low = preset["clip_low"]
+                                                        dq_auto_clip_high = preset["clip_high"]
+                                                        dq_auto_mul_up = preset["mul_up"]
+                                                        dq_auto_mul_down = preset["mul_down"]
+                                                    else:
+                                                        preset_switch_reason = "deadline_pass"
                                                     dq_auto_adaptive_state = "LOCKED"
-                                                    preset_switch_reason = "deadline_lock"
 
                                 if dq_stats["do_auto"]:
                                     auto_scope = dq_stats["auto_scope"]
@@ -2480,17 +2449,13 @@ class NetworkTrainer:
                                                 if dq_auto_adaptive_enabled and not dq_auto_adaptive_switched:
                                                     dq_auto_active_preset = "clip_rate_high"
                                                     dq_auto_adaptive_state = "CALIB"
-                                                    dq_auto_adaptive_qerr_samples = []
-                                                    dq_auto_adaptive_qerr_diffs = []
+                                                    dq_auto_adaptive_qerr_samples = deque(maxlen=adaptive_calib_steps)
+                                                    dq_auto_adaptive_warmup_samples = deque(maxlen=adaptive_calib_steps)
                                                     dq_auto_adaptive_qerr_base = None
-                                                    dq_auto_adaptive_qerr_rate_hi = None
                                                     dq_auto_adaptive_calib_steps = 0
                                                     dq_auto_adaptive_monitor_steps = 0
-                                                    dq_auto_adaptive_qerr_step = 0
-                                                    dq_auto_adaptive_calib_end_step = None
                                                     dq_auto_adaptive_hard_count = 0
                                                     dq_auto_adaptive_soft_level_count = 0
-                                                    dq_auto_adaptive_soft_rate_count = 0
                                             else:
                                                 if dq_auto_ema_state is None:
                                                     dq_auto_ema_state = clip_rate_raw
@@ -2561,18 +2526,18 @@ class NetworkTrainer:
 
                                 adaptive_state_label = dq_auto_adaptive_state if dq_auto_adaptive_enabled else ""
                                 qerr_base_value = dq_auto_adaptive_qerr_base if dq_auto_adaptive_enabled else None
-                                qerr_hard_hi_value = qerr_hard_hi if dq_auto_adaptive_enabled else None
-                                if dq_auto_adaptive_enabled and qerr_rate_hi_value is None:
-                                    qerr_rate_hi_value = dq_auto_adaptive_qerr_rate_hi
-                                qerr_soft_hi_value = None
-                                if dq_auto_adaptive_enabled and dq_auto_adaptive_qerr_base is not None:
-                                    qerr_soft_hi_value = max(
-                                        qerr_soft_floor,
-                                        dq_auto_adaptive_qerr_base + qerr_soft_margin_abs,
-                                        dq_auto_adaptive_qerr_base * (1.0 + qerr_soft_margin_rel),
-                                    )
+                                if dq_auto_adaptive_enabled and dq_auto_adaptive_qerr_base is not None and soft_hi_end_value is None:
+                                    soft_hi_end_value = dq_auto_adaptive_qerr_base + qerr_soft_margin_end
+                                if (
+                                    dq_auto_adaptive_enabled
+                                    and dq_auto_adaptive_qerr_base is not None
+                                    and soft_hi_t_value is None
+                                    and dq_auto_adaptive_state == "MONITOR"
+                                ):
+                                    progress = dq_auto_adaptive_monitor_steps / max(1, adaptive_monitor_steps - 1)
+                                    margin_t = qerr_soft_margin_start + (qerr_soft_margin_end - qerr_soft_margin_start) * progress
+                                    soft_hi_t_value = dq_auto_adaptive_qerr_base + margin_t
                                 soft_level_count_value = dq_auto_adaptive_soft_level_count if dq_auto_adaptive_enabled else None
-                                soft_rate_count_value = dq_auto_adaptive_soft_rate_count if dq_auto_adaptive_enabled else None
                                 hard_count_value = dq_auto_adaptive_hard_count if dq_auto_adaptive_enabled else None
 
                                 if dq_stats["do_log"] and accelerator.is_main_process and dq_log_path:
@@ -2681,11 +2646,9 @@ class NetworkTrainer:
                                                     preset_switch_applied,
                                                     adaptive_state_label,
                                                     qerr_base_value if qerr_base_value is not None else "",
-                                                    qerr_soft_hi_value if qerr_soft_hi_value is not None else "",
-                                                    qerr_hard_hi_value if qerr_hard_hi_value is not None else "",
-                                                    qerr_rate_hi_value if qerr_rate_hi_value is not None else "",
+                                                    soft_hi_end_value if soft_hi_end_value is not None else "",
+                                                    soft_hi_t_value if soft_hi_t_value is not None else "",
                                                     soft_level_count_value if soft_level_count_value is not None else "",
-                                                    soft_rate_count_value if soft_rate_count_value is not None else "",
                                                     hard_count_value if hard_count_value is not None else "",
                                                     preset_switch_reason,
                                                 ]
@@ -2721,11 +2684,9 @@ class NetworkTrainer:
                                                 preset_switch_applied,
                                                 adaptive_state_label,
                                                 qerr_base_value if qerr_base_value is not None else "",
-                                                qerr_soft_hi_value if qerr_soft_hi_value is not None else "",
-                                                qerr_hard_hi_value if qerr_hard_hi_value is not None else "",
-                                                qerr_rate_hi_value if qerr_rate_hi_value is not None else "",
+                                                soft_hi_end_value if soft_hi_end_value is not None else "",
+                                                soft_hi_t_value if soft_hi_t_value is not None else "",
                                                 soft_level_count_value if soft_level_count_value is not None else "",
-                                                soft_rate_count_value if soft_rate_count_value is not None else "",
                                                 hard_count_value if hard_count_value is not None else "",
                                                 preset_switch_reason,
                                             ]
@@ -2771,8 +2732,6 @@ class NetworkTrainer:
                                             warmup_active,
                                             warmup_remain,
                                             auto_reason,
-                                            "",
-                                            "",
                                             "",
                                             "",
                                             "",

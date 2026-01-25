@@ -109,8 +109,8 @@
 ### 出力例（summary）
 
 ```
-Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason,AutoPreset,PresetSwitchApplied,AdaptiveState,QErrBase,QErrSoftHi,QErrHardHi,QErrRateHi,SoftLevelCount,SoftRateCount,HardCount,PresetSwitchReason
-2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high,clip_rate_high,0,MONITOR,0.12,0.20,0.30,0.002,2,1,0,
+Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason,AutoPreset,PresetSwitchApplied,AdaptiveState,QErrBase,SoftHiEnd,SoftHiT,SoftLevelCount,HardCount,PresetSwitchReason
+2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high,clip_rate_high,0,MONITOR,0.12,0.20,0.15,2,0,
 ```
 
 ## ログの見方（初心者向け）
@@ -155,13 +155,11 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | PresetSwitchApplied | プリセット切替 | adaptive で切替が起きた LogStep の行だけ 1。 |
 | AdaptiveState | adaptive状態 | `CALIB`/`MONITOR`/`LOCKED`。adaptive 無効時は空欄。 |
 | QErrBase | 基準値 | CALIB で求めた QuantErrRatioEMA の基準。 |
-| QErrSoftHi | soft上限 | soft判定の上限値。 |
-| QErrHardHi | hard上限 | hard判定の固定上限。 |
-| QErrRateHi | rate上限 | 上昇レート判定の上限。 |
+| SoftHiEnd | soft上限（終盤） | `qerr_base + margin_end`。 |
+| SoftHiT | soft上限（現在） | MONITOR 進行に応じて ramp した上限。 |
 | SoftLevelCount | softレベル回数 | `qerr > soft_hi`で増加、`qerr < soft_lo`で減少。 |
-| SoftRateCount | softレート回数 | `qerr_rate > rate_hi`で増加、`qerr_rate < rate_lo`で減少。 |
 | HardCount | hard回数 | `qerr > hard_hi` の連続回数。 |
-| PresetSwitchReason | 切替理由 | `hard`/`soft_level`/`soft_rate`/`deadline_lock`。 |
+| PresetSwitchReason | 切替理由 | `hard`/`soft_level`/`deadline_peak_fail`/`deadline_pass`。 |
 
 補足（読み解きの目安）:
 - `ClipRate` が低いのに `QuantErrRatio` が高い場合、**レンジが広く刻みが粗い**可能性がある（`range_mul` 高め / `bits` 低め）。
@@ -227,12 +225,13 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 - 意図: `clip_rate_high` で「薄まり」方向に行くデータを、`QuantErrRatio` の跳ね上がりを安全弁として検知し、暴走を止める。`ClipRate` は「何個クリップしたか」、`QuantErr` は「どれだけ歪んだか」を見る指標。
 - 判定は LogStep の **merge（unet+te 合算）** を使う。
 - 状態は `CALIB`（基準づくり）/`MONITOR`（監視）/`LOCKED`（固定）。
-- CALIB は **warmup 最後の10回**を優先し、足りない場合は warmup 後の最初の10回で補完する。
+- CALIB は **warmup 末尾の LogStep サンプル 10 件**を優先し、足りない場合は warmup 後の LogStep で補完する。
 - `qerr_base` は CALIB 中の QuantErrRatioEMA の **中央値**。
-- MONITOR は 30 回まで監視し、期限内に切替が起きなければ `LOCKED`（`clip_rate_high` 固定）。
-- hard 判定: `QuantErrRatioEMA > 0.30` が 3 回で即切替。
-- soft 判定: ベース + マージン（abs/rel）で閾値を作り、**レベル**と**上昇レート**のどちらかが一定回数に達したら切替。
-- レート閾値は CALIB 中の差分の MAD（中央値絶対偏差）から算出する。
+- MONITOR は 30 回まで監視し、期限到達時は **soft/hard のカウントで合否判定**して `LOCKED` にする。
+- hard 判定: `QuantErrRatioEMA > 0.30` で `hard_count` を +1、下回れば減衰（`max(0, count-1)`）。`hard_count >= 3` で即切替。
+- soft 判定: `soft_hi_t` を MONITOR 進行で ramp（`margin_start=0.02` → `margin_end=0.08`）し、`soft_lo_t = soft_hi_t - 0.01`。
+- soft_count: `qerr > soft_hi_t` で +1、`qerr < soft_lo_t` で減衰。`soft_count >= 5` で切替。
+- deadline 判定: 期限到達時に `soft_count > 0` または `hard_count > 0` なら fail（defaultへ切替、`deadline_peak_fail`）。どちらも 0 なら pass（`deadline_pass`）。
 - warmup 中は判定を進めない。bits 切替時は **CALIB に戻す**（既に default へ切替済みなら維持）。QuantErrRatioEMA は継続する。
 - adaptive の閾値は **内部固定定数**（CLI からは変更不可）。
 
@@ -242,14 +241,10 @@ adaptive_calib_steps = 10
 adaptive_monitor_steps = 30
 qerr_hard_hi = 0.30
 qerr_hard_count = 3
-qerr_soft_margin_abs = 0.08
-qerr_soft_margin_rel = 0.6
-qerr_soft_floor = 0.0
+qerr_soft_margin_start = 0.02
+qerr_soft_margin_end = 0.08
 qerr_soft_hysteresis = 0.01
 qerr_soft_count = 5
-qerr_rate_k = 3.0
-qerr_rate_min_abs = 0.0015
-qerr_rate_count = 5
 ```
 
 ### 発動条件（重要）
