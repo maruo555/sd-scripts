@@ -199,6 +199,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 - `--dq_delta_auto_min <float>` : range_mul 下限（デフォルト 1.0）
 - `--dq_delta_auto_max <float>` : range_mul 上限（デフォルト 6.0）
 - `--dq_delta_auto_ema <float>` : clip_rate の EMA 係数（デフォルト 0.95）
+- `--dq_delta_auto_use_raw` : auto 判定に clip_rate_raw も使う（既定 OFF）
 - `--dq_delta_auto_warmup` / `--no-dq_delta_auto_warmup` : warmup 期間は range_mul を変更しない（auto 有効時のみ、既定 ON）
 - `--dq_delta_auto_log_file <path>` : 省略時は `--output_dir/dq_delta_auto+<output_name>.txt`（auto イベントのみ記録）
 - `--dq_delta_auto_log_format {minimal,full_schema}` : auto ログの列形式（デフォルト minimal）
@@ -230,11 +231,16 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 ### 制御ロジック
 
 - 各 `auto_every` optimizer step で clip_rate を集計（summary）
-- EMA で平滑化し、EMA と raw の両方が閾値を超えた場合のみ更新
+- EMA で平滑化し、既定は **EMA のみ**で判定
+- `--dq_delta_auto_use_raw` 指定時は **EMA と raw の両方**が閾値を超えた場合のみ更新
 
 ```
-if clip_rate_ema > clip_high and clip_rate_raw > clip_high: range_mul *= mul_up
-elif clip_rate_ema < clip_low and clip_rate_raw < clip_low: range_mul *= mul_down
+if use_raw:
+    if clip_rate_ema > clip_high and clip_rate_raw > clip_high: range_mul *= mul_up
+    elif clip_rate_ema < clip_low and clip_rate_raw < clip_low: range_mul *= mul_down
+else:
+    if clip_rate_ema > clip_high: range_mul *= mul_up
+    elif clip_rate_ema < clip_low: range_mul *= mul_down
 range_mul = clamp(range_mul, auto_min, auto_max)
 ```
 
@@ -275,9 +281,13 @@ warmup_updates = ceil(2 / (1 - dq_delta_auto_ema))
 #### warmup 終了後の挙動（既存通り）
 
 ```
-if clip_rate_ema > clip_high and clip_rate_raw > clip_high: range_mul *= mul_up
-elif clip_rate_ema < clip_low and clip_rate_raw < clip_low: range_mul *= mul_down
-else: no change
+if use_raw:
+    if clip_rate_ema > clip_high and clip_rate_raw > clip_high: range_mul *= mul_up
+    elif clip_rate_ema < clip_low and clip_rate_raw < clip_low: range_mul *= mul_down
+else:
+    if clip_rate_ema > clip_high: range_mul *= mul_up
+    elif clip_rate_ema < clip_low: range_mul *= mul_down
+# 条件に当たらない場合は変更なし
 ```
 
 `auto_reason` は `clip_high` / `clip_low` / `in_band` を記録する。

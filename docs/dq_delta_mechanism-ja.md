@@ -171,7 +171,7 @@ AutoStep のたびに
     
 3.  EMA が目標レンジから外れていれば `range_mul` を少し上下
     
-    （※実際は EMA と raw が両方閾値を超えた場合のみ）
+    （※`--dq_delta_auto_use_raw` 指定時は EMA と raw の両方が閾値を超えた場合のみ）
     
 
 という負帰還（フィードバック）を回す。
@@ -183,9 +183,11 @@ AutoStep のたびに
 
 制御:
 
--   `clip_rate_ema > clip_high` かつ `clip_rate_raw > clip_high` -> `range_mul *= mul_up`（レンジ拡大、クリップ減）
+-   `clip_rate_ema > clip_high` -> `range_mul *= mul_up`（レンジ拡大、クリップ減）
     
--   `clip_rate_ema < clip_low` かつ `clip_rate_raw < clip_low` -> `range_mul *= mul_down`（レンジ縮小、クリップ増）
+-   `clip_rate_ema < clip_low` -> `range_mul *= mul_down`（レンジ縮小、クリップ増）
+    
+-   `--dq_delta_auto_use_raw` 指定時は `clip_rate_raw` も同時に判定
     
 -   その後 `range_mul` を `[auto_min, auto_max]` にクランプ
     
