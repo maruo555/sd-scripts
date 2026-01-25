@@ -109,8 +109,8 @@
 ### 出力例（summary）
 
 ```
-Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason,AutoPreset,PresetSwitchApplied,AdaptiveState,QErrBase,SoftHiEnd,SoftHiT,SoftLevelCount,HardCount,PresetSwitchReason
-2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high,clip_rate_high,0,MONITOR,0.12,0.20,0.15,2,0,
+Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason,AutoPreset,AutoPresetArg,PresetSwitchApplied,AdaptiveState,QErrBase,SoftHiEnd,SoftHiT,SoftLevelCount,HardCount,PresetSwitchReason
+2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high,clip_rate_high,clip_rate_high,0,MONITOR,0.12,0.20,0.15,2,0,
 ```
 
 ## ログの見方（初心者向け）
@@ -152,6 +152,7 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | WarmupRemain | warmup残り | 0なら warmup終了。 |
 | AutoReason | 判定理由 | `warmup`/`clip_high`/`clip_low`/`in_band`。 |
 | AutoPreset | 現在のプリセット | `default`/`clip_rate_high`。adaptive の場合は現在の実効プリセット。 |
+| AutoPresetArg | 指定プリセット | `--dq_delta_auto_preset` の指定値。未指定なら空欄。 |
 | PresetSwitchApplied | プリセット切替 | adaptive で切替が起きた LogStep の行だけ 1。 |
 | AdaptiveState | adaptive状態 | `CALIB`/`MONITOR`/`LOCKED`。adaptive 無効時は空欄。 |
 | QErrBase | 基準値 | CALIB で求めた QuantErrRatioEMA の基準。 |

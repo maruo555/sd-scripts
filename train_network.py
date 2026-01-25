@@ -834,6 +834,7 @@ class NetworkTrainer:
             if include_preset:
                 cols += [
                     "AutoPreset",
+                    "AutoPresetArg",
                     "PresetSwitchApplied",
                     "AdaptiveState",
                     "QErrBase",
@@ -2575,6 +2576,7 @@ class NetworkTrainer:
                                         quant_err_rms_ema = dq_quant_err_rms_ema_state
                                         quant_err_ratio_ema = dq_quant_err_ratio_ema_state
                                     auto_preset_label = dq_auto_active_preset if (dq_auto_enabled and dq_auto_active_preset) else ""
+                                    auto_preset_arg_label = dq_auto_preset if (dq_auto_enabled and dq_auto_preset is not None) else ""
                                     for scope in log_scopes:
                                         m = metrics[scope]
                                         values = [
@@ -2639,6 +2641,7 @@ class NetworkTrainer:
                                                     warmup_remain,
                                                     auto_reason,
                                                     auto_preset_label,
+                                                    auto_preset_arg_label,
                                                     preset_switch_applied,
                                                     adaptive_state_label,
                                                     qerr_base_value if qerr_base_value is not None else "",
@@ -2677,6 +2680,7 @@ class NetworkTrainer:
                                                 warmup_remain,
                                                 auto_reason,
                                                 auto_preset_label,
+                                                auto_preset_arg_label,
                                                 preset_switch_applied,
                                                 adaptive_state_label,
                                                 qerr_base_value if qerr_base_value is not None else "",
@@ -2728,6 +2732,7 @@ class NetworkTrainer:
                                             warmup_active,
                                             warmup_remain,
                                             auto_reason,
+                                            "",
                                             "",
                                             "",
                                             "",
