@@ -2480,7 +2480,6 @@ class NetworkTrainer:
                                                 if dq_auto_adaptive_enabled and not dq_auto_adaptive_switched:
                                                     dq_auto_active_preset = "clip_rate_high"
                                                     dq_auto_adaptive_state = "CALIB"
-                                                    dq_auto_adaptive_qerr_ema_state = None
                                                     dq_auto_adaptive_qerr_samples = []
                                                     dq_auto_adaptive_qerr_diffs = []
                                                     dq_auto_adaptive_qerr_base = None

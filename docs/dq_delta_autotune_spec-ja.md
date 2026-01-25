@@ -233,7 +233,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 - hard 判定: `QuantErrRatioEMA > 0.30` が 3 回で即切替。
 - soft 判定: ベース + マージン（abs/rel）で閾値を作り、**レベル**と**上昇レート**のどちらかが一定回数に達したら切替。
 - レート閾値は CALIB 中の差分の MAD（中央値絶対偏差）から算出する。
-- warmup 中は判定を進めない。bits 切替時は状態をリセット（既に default へ切替済みなら維持）。
+- warmup 中は判定を進めない。bits 切替時は **CALIB に戻す**（既に default へ切替済みなら維持）。QuantErrRatioEMA は継続する。
 - adaptive の閾値は **内部固定定数**（CLI からは変更不可）。
 
 固定定数:
