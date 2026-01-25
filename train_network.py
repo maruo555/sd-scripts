@@ -2304,16 +2304,22 @@ class NetworkTrainer:
                                 soft_hi_t_value = None
 
                                 if dq_auto_adaptive_enabled and dq_stats["do_log"] and accelerator.is_main_process:
-                                    adaptive_acc = _dq_merge_acc(
-                                        accum_by_scope["unet"],
-                                        accum_by_scope["te"],
-                                        collect_full,
-                                        collect_zero,
-                                        collect_near_zero,
-                                    )
-                                    adaptive_metrics = _dq_compute_metrics(
-                                        adaptive_acc, qmax, collect_full, collect_zero, collect_near_zero
-                                    )
+                                    adaptive_scope = dq_stats.get("log_scope", "both")
+                                    if adaptive_scope == "unet":
+                                        adaptive_metrics = metrics["unet"]
+                                    elif adaptive_scope == "te":
+                                        adaptive_metrics = metrics["te"]
+                                    else:
+                                        adaptive_acc = _dq_merge_acc(
+                                            accum_by_scope["unet"],
+                                            accum_by_scope["te"],
+                                            collect_full,
+                                            collect_zero,
+                                            collect_near_zero,
+                                        )
+                                        adaptive_metrics = _dq_compute_metrics(
+                                            adaptive_acc, qmax, collect_full, collect_zero, collect_near_zero
+                                        )
                                     adaptive_ratio_raw = (
                                         adaptive_metrics["quant_err_ratio"] if adaptive_metrics is not None else None
                                     )

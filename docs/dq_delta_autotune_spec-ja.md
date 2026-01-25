@@ -223,7 +223,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 
 補足（adaptive）:
 - 意図: `clip_rate_high` で「薄まり」方向に行くデータを、`QuantErrRatio` の跳ね上がりを安全弁として検知し、暴走を止める。`ClipRate` は「何個クリップしたか」、`QuantErr` は「どれだけ歪んだか」を見る指標。
-- 判定は LogStep の **merge（unet+te 合算）** を使う。
+- 判定は LogStep の **log_scope** に従う（`unet`/`te`/`both`）。`both` の場合は unet+te 合算。
 - 状態は `CALIB`（基準づくり）/`MONITOR`（監視）/`LOCKED`（固定）。
 - CALIB は **warmup 末尾の LogStep サンプル 10 件**を優先し、足りない場合は warmup 後の LogStep で補完する。
 - `qerr_base` は CALIB 中の QuantErrRatioEMA の **中央値**。
