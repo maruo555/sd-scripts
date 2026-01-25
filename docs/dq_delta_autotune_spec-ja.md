@@ -213,7 +213,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 | --- | --- | --- | --- | --- | --- |
 | `default` | 0.0005 | 0.003 | args | args | 安全汎用。特徴が薄まりやすい。 |
 | `clip_rate_high` | 0.003 | 0.005 | args | args | キャラクター学習向け。clip_rate 高めを狙う。 |
-| `clip_rate_high_narrow` | 0.0038 | 0.0046 | args | args | キャラクター学習向け2。狭い範囲を狙う。 |
+| `clip_rate_high_narrow` | 0.0038 | 0.0048 | args | args | キャラクター学習向け2。狭い範囲を狙う。 |
 | `clip_rate_low` | 0.0005 | 0.0022 | args | args | defaultより安定方向に振る。 |
 
 ### 発動条件（重要）

@@ -259,7 +259,7 @@ DQ_DELTA_AUTO_PRESETS = {
     },
     "clip_rate_high_narrow": {
         "clip_low": 0.0038,
-        "clip_high": 0.0046,
+        "clip_high": 0.0048,
     },
     "clip_rate_low": {
         "clip_low": 0.0005,
