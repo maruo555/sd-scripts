@@ -252,14 +252,18 @@ DQ_DELTA_AUTO_PRESETS = {
     "default": {
         "clip_low": 0.0005,
         "clip_high": 0.003,
-        "mul_up": 1.07,
-        "mul_down": 0.97,
     },
     "clip_rate_high": {
         "clip_low": 0.003,
         "clip_high": 0.005,
-        "mul_up": 1.01,
-        "mul_down": 0.995,
+    },
+    "clip_rate_high_narrow": {
+        "clip_low": 0.0038,
+        "clip_high": 0.0048,
+    },
+    "clip_rate_low": {
+        "clip_low": 0.0005,
+        "clip_high": 0.0022,
     },
 }
 
@@ -270,13 +274,13 @@ def resolve_dq_delta_auto_settings(args):
         preset = DQ_DELTA_AUTO_PRESETS[auto_preset]
         dq_auto_clip_low = preset["clip_low"]
         dq_auto_clip_high = preset["clip_high"]
-        dq_auto_mul_up = preset["mul_up"]
-        dq_auto_mul_down = preset["mul_down"]
+        dq_auto_mul_up = float(getattr(args, "dq_delta_auto_mul_up", 1.01))
+        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.995))
     else:
         dq_auto_clip_low = float(getattr(args, "dq_delta_auto_clip_low", 0.0005))
         dq_auto_clip_high = float(getattr(args, "dq_delta_auto_clip_high", 0.003))
-        dq_auto_mul_up = float(getattr(args, "dq_delta_auto_mul_up", 1.07))
-        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.97))
+        dq_auto_mul_up = float(getattr(args, "dq_delta_auto_mul_up", 1.01))
+        dq_auto_mul_down = float(getattr(args, "dq_delta_auto_mul_down", 0.995))
     return auto_preset, dq_auto_clip_low, dq_auto_clip_high, dq_auto_mul_up, dq_auto_mul_down
 
 
@@ -702,6 +706,7 @@ class NetworkTrainer:
         dq_auto_min = float(getattr(args, "dq_delta_auto_min", 1.0))
         dq_auto_max = float(getattr(args, "dq_delta_auto_max", 6.0))
         dq_auto_ema = float(getattr(args, "dq_delta_auto_ema", 0.95))
+        dq_auto_use_raw = bool(getattr(args, "dq_delta_auto_use_raw", False))
         dq_auto_warmup_enabled = dq_auto_enabled and bool(getattr(args, "dq_delta_auto_warmup", True))
         dq_auto_warmup_updates = 0
         if dq_auto_warmup_enabled:
@@ -2302,10 +2307,24 @@ class NetworkTrainer:
                                                     dq_auto_warmup_remaining = 0
                                                 auto_reason = "warmup"
                                             else:
-                                                if clip_rate_ema > dq_auto_clip_high:
+                                                if dq_auto_use_raw:
+                                                    clip_high_hit = (
+                                                        clip_rate_raw is not None
+                                                        and clip_rate_ema > dq_auto_clip_high
+                                                        and clip_rate_raw > dq_auto_clip_high
+                                                    )
+                                                    clip_low_hit = (
+                                                        clip_rate_raw is not None
+                                                        and clip_rate_ema < dq_auto_clip_low
+                                                        and clip_rate_raw < dq_auto_clip_low
+                                                    )
+                                                else:
+                                                    clip_high_hit = clip_rate_ema > dq_auto_clip_high
+                                                    clip_low_hit = clip_rate_ema < dq_auto_clip_low
+                                                if clip_high_hit:
                                                     range_mul_after = range_mul_before * dq_auto_mul_up
                                                     auto_reason = "clip_high"
-                                                elif clip_rate_ema < dq_auto_clip_low:
+                                                elif clip_low_hit:
                                                     range_mul_after = range_mul_before * dq_auto_mul_down
                                                     auto_reason = "clip_low"
                                                 else:
@@ -2920,10 +2939,10 @@ def setup_parser() -> argparse.ArgumentParser:
         "--dq_delta_auto_preset",
         type=str,
         default=None,
-        choices=["default", "clip_rate_high"],
+        choices=["default", "clip_rate_high", "clip_rate_high_narrow", "clip_rate_low"],
         help=(
-            "Preset for auto range_mul tuning (overrides clip_low/high, mul_up/down) / "
-            "auto range_mul 調整プリセット（clip_low/high, mul_up/down を上書き）"
+            "Preset for auto range_mul tuning (overrides clip_low/high only) / "
+            "auto range_mul 調整プリセット（clip_low/high のみ上書き）"
         ),
     )
     parser.add_argument(
@@ -2947,13 +2966,13 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dq_delta_auto_mul_up",
         type=float,
-        default=1.07,
+        default=1.01,
         help="Auto range_mul increase factor / range_mul 上げ係数",
     )
     parser.add_argument(
         "--dq_delta_auto_mul_down",
         type=float,
-        default=0.97,
+        default=0.995,
         help="Auto range_mul decrease factor / range_mul 下げ係数",
     )
     parser.add_argument(
@@ -2973,6 +2992,11 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.95,
         help="Auto clip_rate EMA / clip_rate EMA 係数",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_use_raw",
+        action="store_true",
+        help="Include clip_rate_raw in auto checks / auto判定にclip_rate_rawも使う",
     )
     parser.add_argument(
         "--dq_delta_auto_warmup",
