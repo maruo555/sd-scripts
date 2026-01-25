@@ -104,12 +104,13 @@
 - **LogStep のみ**で **full stats**（`sumsq_sum/absmax/scale_*` など）を計測する。
   LogStep 以外の AutoStep は最小統計に限定する。
 - `quant_err_*` は full stats の一部として **LogStep のみ**で計算する。
+- `adaptive` は `QuantErrRatioEMA` を使うため **`--dq_delta_log` 必須**。
 
 ### 出力例（summary）
 
 ```
-Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason,AutoPreset,PresetSwitchApplied
-2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high,clip_rate_high,0
+Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason,AutoPreset,PresetSwitchApplied,AdaptiveState,QErrBase,QErrSoftHi,QErrHardHi,QErrRateHi,SoftLevelCount,SoftRateCount,HardCount,PresetSwitchReason
+2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high,clip_rate_high,0,MONITOR,0.12,0.20,0.30,0.002,2,1,0,
 ```
 
 ## ログの見方（初心者向け）
@@ -152,6 +153,15 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | AutoReason | 判定理由 | `warmup`/`clip_high`/`clip_low`/`in_band`。 |
 | AutoPreset | 現在のプリセット | `default`/`clip_rate_high`。adaptive の場合は現在の実効プリセット。 |
 | PresetSwitchApplied | プリセット切替 | adaptive で切替が起きた LogStep の行だけ 1。 |
+| AdaptiveState | adaptive状態 | `CALIB`/`MONITOR`/`LOCKED`。adaptive 無効時は空欄。 |
+| QErrBase | 基準値 | CALIB で求めた QuantErrRatioEMA の基準。 |
+| QErrSoftHi | soft上限 | soft判定の上限値。 |
+| QErrHardHi | hard上限 | hard判定の固定上限。 |
+| QErrRateHi | rate上限 | 上昇レート判定の上限。 |
+| SoftLevelCount | softレベル回数 | `qerr > soft_hi`で増加、`qerr < soft_lo`で減少。 |
+| SoftRateCount | softレート回数 | `qerr_rate > rate_hi`で増加、`qerr_rate < rate_lo`で減少。 |
+| HardCount | hard回数 | `qerr > hard_hi` の連続回数。 |
+| PresetSwitchReason | 切替理由 | `hard`/`soft_level`/`soft_rate`/`deadline_lock`。 |
 
 補足（読み解きの目安）:
 - `ClipRate` が低いのに `QuantErrRatio` が高い場合、**レンジが広く刻みが粗い**可能性がある（`range_mul` 高め / `bits` 低め）。
@@ -211,13 +221,36 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 | --- | --- | --- | --- | --- | --- |
 | `default` | 0.0005 | 0.003 | 1.01 | 0.995 | 安全汎用。特徴が薄まりやすい。 |
 | `clip_rate_high` | 0.003 | 0.005 | 1.01 | 0.995 | キャラクター学習向け。clip_rate 高め＋mul_up/mul_down を細かくして急変動を回避。 |
-| `adaptive` | 0.003 | 0.005 | 1.01 | 0.995 | `clip_rate_high` で開始し、LogStep の `QuantErrRatioEMA > 0.30` が 5 連続で起きたら `default` に切替。`--dq_delta_log` 必須。 |
+| `adaptive` | 0.003 | 0.005 | 1.01 | 0.995 | `clip_rate_high` で開始し、CALIB/MONITOR で `QuantErrRatioEMA` を監視して `default` に切替。`--dq_delta_log` 必須。 |
 
 補足（adaptive）:
 - 意図: `clip_rate_high` で「薄まり」方向に行くデータを、`QuantErrRatio` の跳ね上がりを安全弁として検知し、暴走を止める。`ClipRate` は「何個クリップしたか」、`QuantErr` は「どれだけ歪んだか」を見る指標。
 - 判定は LogStep の **merge（unet+te 合算）** を使う。
-- warmup 中は連続判定を進めない。
-- warmup 開始時は連続カウントをリセットする。
+- 状態は `CALIB`（基準づくり）/`MONITOR`（監視）/`LOCKED`（固定）。
+- CALIB は **warmup 最後の10回**を優先し、足りない場合は warmup 後の最初の10回で補完する。
+- `qerr_base` は CALIB 中の QuantErrRatioEMA の **中央値**。
+- MONITOR は 30 回まで監視し、期限内に切替が起きなければ `LOCKED`（`clip_rate_high` 固定）。
+- hard 判定: `QuantErrRatioEMA > 0.30` が 3 回で即切替。
+- soft 判定: ベース + マージン（abs/rel）で閾値を作り、**レベル**と**上昇レート**のどちらかが一定回数に達したら切替。
+- レート閾値は CALIB 中の差分の MAD（中央値絶対偏差）から算出する。
+- warmup 中は判定を進めない。bits 切替時は状態をリセット（既に default へ切替済みなら維持）。
+- adaptive の閾値は **内部固定定数**（CLI からは変更不可）。
+
+固定定数:
+```
+adaptive_calib_steps = 10
+adaptive_monitor_steps = 30
+qerr_hard_hi = 0.30
+qerr_hard_count = 3
+qerr_soft_margin_abs = 0.08
+qerr_soft_margin_rel = 0.6
+qerr_soft_floor = 0.0
+qerr_soft_hysteresis = 0.01
+qerr_soft_count = 5
+qerr_rate_k = 3.0
+qerr_rate_min_abs = 0.0015
+qerr_rate_count = 5
+```
 
 ### 発動条件（重要）
 
@@ -238,10 +271,12 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 - EMA で平滑化し、次のルールで更新
 
 ```
-if clip_rate_ema > clip_high: range_mul *= mul_up
-elif clip_rate_ema < clip_low: range_mul *= mul_down
+if clip_rate_ema > clip_high and clip_rate_raw > clip_high: range_mul *= mul_up
+elif clip_rate_ema < clip_low and clip_rate_raw < clip_low: range_mul *= mul_down
 range_mul = clamp(range_mul, auto_min, auto_max)
 ```
+
+- Raw ガード: EMA の惰性だけで range_mul が動かないよう、**Raw も同じ方向に超過/不足した時のみ**更新する。
 
 - 更新後の range_mul は **dq_delta_scope に含まれる全モジュールに反映**
 - `--dq_quantize_z` 使用時も同様（対象テンソルが z になるだけ）
