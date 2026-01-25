@@ -241,10 +241,10 @@ adaptive_calib_steps = 10
 adaptive_monitor_steps = 30
 qerr_hard_hi = 0.30
 qerr_hard_count = 3
-qerr_soft_margin_start = 0.02
+qerr_soft_margin_start = 0.03
 qerr_soft_margin_end = 0.08
 qerr_soft_hysteresis = 0.01
-qerr_soft_count = 5
+qerr_soft_count = 3
 ```
 
 ### 発動条件（重要）
