@@ -2446,16 +2446,6 @@ class NetworkTrainer:
                                                 if dq_auto_warmup_enabled:
                                                     dq_auto_warmup_remaining = dq_auto_warmup_updates
                                                     dq_auto_warmup_inband_streak = 0
-                                                if dq_auto_adaptive_enabled and not dq_auto_adaptive_switched:
-                                                    dq_auto_active_preset = "clip_rate_high"
-                                                    dq_auto_adaptive_state = "CALIB"
-                                                    dq_auto_adaptive_qerr_samples = deque(maxlen=adaptive_calib_steps)
-                                                    dq_auto_adaptive_warmup_samples = deque(maxlen=adaptive_calib_steps)
-                                                    dq_auto_adaptive_qerr_base = None
-                                                    dq_auto_adaptive_calib_steps = 0
-                                                    dq_auto_adaptive_monitor_steps = 0
-                                                    dq_auto_adaptive_hard_count = 0
-                                                    dq_auto_adaptive_soft_level_count = 0
                                             else:
                                                 if dq_auto_ema_state is None:
                                                     dq_auto_ema_state = clip_rate_raw

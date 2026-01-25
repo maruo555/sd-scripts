@@ -232,7 +232,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 - soft 判定: `soft_hi_t` を MONITOR 進行で ramp（`margin_start=0.02` → `margin_end=0.08`）し、`soft_lo_t = soft_hi_t - 0.01`。
 - soft_count: `qerr > soft_hi_t` で +1、`qerr < soft_lo_t` で減衰。`soft_count >= 5` で切替。
 - deadline 判定: 期限到達時に `soft_count > 0` または `hard_count > 0` なら fail（defaultへ切替、`deadline_peak_fail`）。どちらも 0 なら pass（`deadline_pass`）。
-- warmup 中は判定を進めない。bits 切替時は **CALIB に戻す**（既に default へ切替済みなら維持）。QuantErrRatioEMA は継続する。
+- warmup 中は判定を進めない。bits 切替時も **状態は維持**（CALIB/MONITOR/LOCKED）。QuantErrRatioEMA は継続する。
 - adaptive の閾値は **内部固定定数**（CLI からは変更不可）。
 
 固定定数:
