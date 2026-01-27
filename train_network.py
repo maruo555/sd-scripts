@@ -709,8 +709,14 @@ class NetworkTrainer:
         dq_auto_use_raw = bool(getattr(args, "dq_delta_auto_use_raw", False))
         dq_auto_warmup_enabled = dq_auto_enabled and bool(getattr(args, "dq_delta_auto_warmup", True))
         dq_auto_warmup_updates = 0
+        dq_auto_warmup_override = getattr(args, "dq_delta_auto_warmup_updates", None)
         if dq_auto_warmup_enabled:
-            if 0.0 < dq_auto_ema < 1.0:
+            if dq_auto_warmup_override is not None:
+                dq_auto_warmup_updates = int(dq_auto_warmup_override)
+                if dq_auto_warmup_updates < 0:
+                    logger.warning("dq_delta_auto_warmup_updates is negative; warmup will be disabled.")
+                    dq_auto_warmup_updates = 0
+            elif 0.0 < dq_auto_ema < 1.0:
                 dq_auto_warmup_updates = int(math.ceil(2.0 / (1.0 - dq_auto_ema)))
             else:
                 dq_auto_warmup_enabled = False
@@ -3003,6 +3009,15 @@ def setup_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable warmup for auto range_mul (EMA/log only) / auto range_mul のウォームアップを有効化（EMA/ログのみ更新）",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_warmup_updates",
+        type=int,
+        default=None,
+        help=(
+            "Warmup length in AutoSteps (overrides EMA-derived default) / "
+            "warmup 回数（AutoStep 単位、EMA 由来の既定値を上書き）"
+        ),
     )
     parser.add_argument(
         "--dq_delta_auto_log_file",

@@ -201,6 +201,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 - `--dq_delta_auto_ema <float>` : clip_rate の EMA 係数（デフォルト 0.95）
 - `--dq_delta_auto_use_raw` : auto 判定に clip_rate_raw も使う（既定 OFF）。mul の変化をよりなだらかにする。
 - `--dq_delta_auto_warmup` / `--no-dq_delta_auto_warmup` : warmup 期間は range_mul を変更しない（auto 有効時のみ、既定 ON）
+- `--dq_delta_auto_warmup_updates <int>` : warmup 回数（AutoStep 単位、EMA 由来の既定値を上書き）
 - `--dq_delta_auto_log_file <path>` : 省略時は `--output_dir/dq_delta_auto+<output_name>.txt`（auto イベントのみ記録）
 - `--dq_delta_auto_log_format {minimal,full_schema}` : auto ログの列形式（デフォルト minimal）
 
@@ -256,13 +257,14 @@ range_mul = clamp(range_mul, auto_min, auto_max)
 
 - warmup は **AutoStep の回数**で進行する（optimizer step そのものではない）
 - AutoStep が skip されて呼ばれない場合、warmup も進行しない
-- warmup 回数は EMA 係数から自動決定し、追加パラメータは持たない
+- warmup 回数は EMA 係数から自動決定するのが既定（`--dq_delta_auto_warmup_updates` 指定で上書き）
 
 ```
 warmup_updates = ceil(2 / (1 - dq_delta_auto_ema))
 ```
 
 例: `dq_delta_auto_ema=0.95` -> 40 回、`0.90` -> 20 回、`0.98` -> 100 回
+※ `--dq_delta_auto_warmup_updates` 指定時は上記の自動計算を使わず、その値を優先する
 
 ※ `1/(1-ema)` は **EMA の実効履歴長**の目安であり、warmup 回数とは別概念。
 
