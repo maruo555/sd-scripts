@@ -708,30 +708,18 @@ class NetworkTrainer:
         dq_auto_ema = float(getattr(args, "dq_delta_auto_ema", 0.95))
         dq_auto_use_raw = bool(getattr(args, "dq_delta_auto_use_raw", False))
         dq_auto_warmup_enabled = dq_auto_enabled and bool(getattr(args, "dq_delta_auto_warmup", True))
-        dq_auto_warmup_until_in_band = dq_auto_enabled and bool(
-            getattr(args, "dq_delta_auto_warmup_until_in_band", False)
-        )
-        dq_auto_warmup_max_updates = int(getattr(args, "dq_delta_auto_warmup_max_updates", 0))
+        dq_auto_warmup_updates_override = int(getattr(args, "dq_delta_auto_warmup_updates", 0))
         dq_auto_warmup_updates = 0
-        dq_auto_warmup_timeout_updates = 0
         if dq_auto_warmup_enabled:
-            if 0.0 < dq_auto_ema < 1.0:
+            if dq_auto_warmup_updates_override > 0:
+                dq_auto_warmup_updates = dq_auto_warmup_updates_override
+            elif 0.0 < dq_auto_ema < 1.0:
                 dq_auto_warmup_updates = int(math.ceil(2.0 / (1.0 - dq_auto_ema)))
-                if dq_auto_warmup_until_in_band:
-                    if dq_auto_warmup_max_updates > 0:
-                        dq_auto_warmup_timeout_updates = dq_auto_warmup_max_updates
-                    else:
-                        dq_auto_warmup_timeout_updates = int(3 * math.ceil(1.0 / (1.0 - dq_auto_ema)))
-                    if dq_auto_warmup_timeout_updates < 1:
-                        dq_auto_warmup_timeout_updates = 1
             else:
                 dq_auto_warmup_enabled = False
-                dq_auto_warmup_until_in_band = False
                 logger.warning(
                     "dq_delta_auto_warmup is enabled but dq_delta_auto_ema is not in (0,1); warmup will be disabled."
                 )
-        else:
-            dq_auto_warmup_until_in_band = False
         dq_auto_log_format = getattr(args, "dq_delta_auto_log_format", "minimal")
         dq_auto_init_applied = 0
         dq_auto_init_value = None
@@ -2019,12 +2007,10 @@ class NetworkTrainer:
         dq_quant_err_rms_ema_state = None
         dq_quant_err_ratio_ema_state = None
         dq_bits_changed_since_auto = False
-        dq_auto_warmup_reset_updates = (
-            dq_auto_warmup_timeout_updates if dq_auto_warmup_until_in_band else dq_auto_warmup_updates
-        )
+        dq_auto_warmup_reset_updates = dq_auto_warmup_updates
         dq_auto_warmup_remaining = dq_auto_warmup_reset_updates
         dq_auto_warmup_inband_streak = 0
-        if dq_auto_enabled and dq_auto_log_path:
+        if dq_auto_enabled and dq_auto_log_path and accelerator.is_main_process:
             include_near_zero = "near_zero_rate" in dq_log_extra
             header = _dq_auto_log_header(dq_auto_log_format == "full_schema", include_near_zero)
             cols = header.split(",")
@@ -2379,29 +2365,14 @@ class NetworkTrainer:
 
                                             warmup_step_active = dq_auto_warmup_enabled and dq_auto_warmup_remaining > 0
                                             if warmup_step_active:
-                                                in_band = dq_auto_clip_low <= clip_rate_ema <= dq_auto_clip_high
-                                                if dq_auto_warmup_until_in_band:
-                                                    if in_band:
-                                                        dq_auto_warmup_inband_streak += 1
-                                                    else:
-                                                        dq_auto_warmup_inband_streak = 0
-                                                    dq_auto_warmup_remaining = max(0, dq_auto_warmup_remaining - 1)
-                                                    warmup_end_reason = ""
-                                                    if dq_auto_warmup_inband_streak >= 3:
-                                                        dq_auto_warmup_remaining = 0
-                                                        warmup_end_reason = "warmup_in_band"
-                                                    elif dq_auto_warmup_remaining == 0:
-                                                        warmup_end_reason = "warmup_timeout"
-                                                    auto_reason = warmup_end_reason or "warmup"
+                                                if dq_auto_clip_low <= clip_rate_ema <= dq_auto_clip_high:
+                                                    dq_auto_warmup_inband_streak += 1
                                                 else:
-                                                    if in_band:
-                                                        dq_auto_warmup_inband_streak += 1
-                                                    else:
-                                                        dq_auto_warmup_inband_streak = 0
-                                                    dq_auto_warmup_remaining = max(0, dq_auto_warmup_remaining - 1)
-                                                    if dq_auto_warmup_inband_streak >= 3:
-                                                        dq_auto_warmup_remaining = 0
-                                                    auto_reason = "warmup"
+                                                    dq_auto_warmup_inband_streak = 0
+                                                dq_auto_warmup_remaining = max(0, dq_auto_warmup_remaining - 1)
+                                                if dq_auto_warmup_inband_streak >= 3:
+                                                    dq_auto_warmup_remaining = 0
+                                                auto_reason = "warmup"
                                             else:
                                                 if dq_auto_use_raw:
                                                     clip_high_hit = (
@@ -3118,15 +3089,10 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Enable warmup for auto range_mul (EMA/log only) / auto range_mul のウォームアップを有効化（EMA/ログのみ更新）",
     )
     parser.add_argument(
-        "--dq_delta_auto_warmup_until_in_band",
-        action="store_true",
-        help="Keep warmup until ClipRateEMA is in band / ClipRateEMA が in_band になるまで warmup を継続",
-    )
-    parser.add_argument(
-        "--dq_delta_auto_warmup_max_updates",
+        "--dq_delta_auto_warmup_updates",
         type=int,
         default=0,
-        help="Max warmup updates (0=auto) / warmup の最大更新回数（0=内部デフォルト）",
+        help="Warmup updates override (0=auto) / warmup 回数の上書き（0=内部デフォルト）",
     )
     parser.add_argument(
         "--dq_delta_auto_log_file",
