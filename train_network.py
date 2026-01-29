@@ -708,9 +708,12 @@ class NetworkTrainer:
         dq_auto_ema = float(getattr(args, "dq_delta_auto_ema", 0.95))
         dq_auto_use_raw = bool(getattr(args, "dq_delta_auto_use_raw", False))
         dq_auto_warmup_enabled = dq_auto_enabled and bool(getattr(args, "dq_delta_auto_warmup", True))
+        dq_auto_warmup_updates_override = int(getattr(args, "dq_delta_auto_warmup_updates", 0))
         dq_auto_warmup_updates = 0
         if dq_auto_warmup_enabled:
-            if 0.0 < dq_auto_ema < 1.0:
+            if dq_auto_warmup_updates_override > 0:
+                dq_auto_warmup_updates = dq_auto_warmup_updates_override
+            elif 0.0 < dq_auto_ema < 1.0:
                 dq_auto_warmup_updates = int(math.ceil(2.0 / (1.0 - dq_auto_ema)))
             else:
                 dq_auto_warmup_enabled = False
@@ -718,6 +721,40 @@ class NetworkTrainer:
                     "dq_delta_auto_warmup is enabled but dq_delta_auto_ema is not in (0,1); warmup will be disabled."
                 )
         dq_auto_log_format = getattr(args, "dq_delta_auto_log_format", "minimal")
+        dq_auto_init_applied = 0
+        dq_auto_init_value = None
+        dq_auto_init_clip_target = None
+        if dq_auto_enabled and bool(getattr(args, "dq_delta_auto_init_range_mul_from_band", False)):
+            if args.dq_delta_stat != "rms":
+                logger.warning(
+                    "dq_delta_auto_init_range_mul_from_band is enabled but dq_delta_stat is not rms; init will be skipped."
+                )
+            else:
+                clip_target = (dq_auto_clip_low + dq_auto_clip_high) / 2.0
+                p = 1.0 - (clip_target / 2.0)
+                try:
+                    range_mul_init = math.sqrt(2.0) * torch.erfinv(torch.tensor(2.0 * p - 1.0)).item()
+                    if math.isfinite(range_mul_init):
+                        range_mul_init = max(dq_auto_min, min(dq_auto_max, range_mul_init))
+                        args.dq_delta_range_mul = range_mul_init
+                        dq_auto_init_applied = 1
+                        dq_auto_init_value = range_mul_init
+                        dq_auto_init_clip_target = clip_target
+                        logger.info(
+                            "dq_delta_auto_init_range_mul_from_band applied: clip_target=%.6g, range_mul=%.6g",
+                            clip_target,
+                            range_mul_init,
+                        )
+                    else:
+                        logger.warning(
+                            "dq_delta_auto_init_range_mul_from_band produced non-finite value (clip_target=%.6g); init will be skipped.",
+                            clip_target,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "dq_delta_auto_init_range_mul_from_band failed: %s",
+                        str(exc),
+                    )
 
         dq_log_path = None
         dq_auto_log_path = None
@@ -802,7 +839,18 @@ class NetworkTrainer:
             ]
             if include_near_zero:
                 cols.append("NearZeroRate")
-            cols += ["Numel", "AutoApplied", "RangeMulBefore", "RangeMulAfter", "WarmupActive", "WarmupRemain", "AutoReason"]
+            cols += [
+                "Numel",
+                "AutoApplied",
+                "RangeMulBefore",
+                "RangeMulAfter",
+                "WarmupActive",
+                "WarmupRemain",
+                "AutoReason",
+                "AutoInitMulApplied",
+                "AutoInitMulValue",
+                "AutoInitClipTarget",
+            ]
             return ",".join(cols)
 
         def _dq_auto_log_header(full_schema: bool, include_near_zero: bool):
@@ -810,7 +858,7 @@ class NetworkTrainer:
                 return _dq_log_header("summary", include_near_zero)
             return (
                 "TrainStep,Scope,Target,Bits,ClipRateRaw,ClipRateEMA,RangeMulBefore,RangeMulAfter,AutoApplied,"
-                "WarmupActive,WarmupRemain,AutoReason"
+                "WarmupActive,WarmupRemain,AutoReason,AutoInitMulApplied,AutoInitMulValue,AutoInitClipTarget"
             )
 
         def _dq_reduce_stats(accum_by_scope, collect_full: bool, collect_zero: bool, collect_near_zero: bool):
@@ -1959,8 +2007,27 @@ class NetworkTrainer:
         dq_quant_err_rms_ema_state = None
         dq_quant_err_ratio_ema_state = None
         dq_bits_changed_since_auto = False
-        dq_auto_warmup_remaining = dq_auto_warmup_updates
+        dq_auto_warmup_reset_updates = dq_auto_warmup_updates
+        dq_auto_warmup_remaining = dq_auto_warmup_reset_updates
         dq_auto_warmup_inband_streak = 0
+        if dq_auto_enabled and dq_auto_log_path and accelerator.is_main_process:
+            include_near_zero = "near_zero_rate" in dq_log_extra
+            header = _dq_auto_log_header(dq_auto_log_format == "full_schema", include_near_zero)
+            cols = header.split(",")
+            row = ["" for _ in cols]
+            col_idx = {name: idx for idx, name in enumerate(cols)}
+            if "TrainStep" in col_idx:
+                row[col_idx["TrainStep"]] = 0
+            if "AutoInitMulApplied" in col_idx:
+                row[col_idx["AutoInitMulApplied"]] = dq_auto_init_applied
+            if "AutoInitMulValue" in col_idx:
+                row[col_idx["AutoInitMulValue"]] = dq_auto_init_value if dq_auto_init_value is not None else ""
+            if "AutoInitClipTarget" in col_idx:
+                row[col_idx["AutoInitClipTarget"]] = (
+                    dq_auto_init_clip_target if dq_auto_init_clip_target is not None else ""
+                )
+            _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
+
         def _dq_bits_for_progress(progress_frac: float, default_bits: Optional[int]):
             if not dq_bits_sched:
                 return default_bits
@@ -2283,7 +2350,7 @@ class NetworkTrainer:
                                                 dq_auto_ema_state = clip_rate_raw
                                                 dq_bits_changed_since_auto = False
                                                 if dq_auto_warmup_enabled:
-                                                    dq_auto_warmup_remaining = dq_auto_warmup_updates
+                                                    dq_auto_warmup_remaining = dq_auto_warmup_reset_updates
                                                     dq_auto_warmup_inband_streak = 0
                                             else:
                                                 if dq_auto_ema_state is None:
@@ -2458,6 +2525,9 @@ class NetworkTrainer:
                                                     warmup_active,
                                                     warmup_remain,
                                                     auto_reason,
+                                                    dq_auto_init_applied,
+                                                    dq_auto_init_value if dq_auto_init_value is not None else "",
+                                                    dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
                                                 ]
                                                 _write_csv(dq_log_path, header, ",".join(_dq_format_value(v) for v in row))
                                         else:
@@ -2487,6 +2557,9 @@ class NetworkTrainer:
                                                 warmup_active,
                                                 warmup_remain,
                                                 auto_reason,
+                                                dq_auto_init_applied,
+                                                dq_auto_init_value if dq_auto_init_value is not None else "",
+                                                dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
                                             ]
                                             _write_csv(dq_log_path, header, ",".join(_dq_format_value(v) for v in row))
 
@@ -2530,6 +2603,9 @@ class NetworkTrainer:
                                             warmup_active,
                                             warmup_remain,
                                             auto_reason,
+                                            dq_auto_init_applied,
+                                            dq_auto_init_value if dq_auto_init_value is not None else "",
+                                            dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
                                         ]
                                         _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
                                     else:
@@ -2546,6 +2622,9 @@ class NetworkTrainer:
                                             warmup_active,
                                             warmup_remain,
                                             auto_reason,
+                                            dq_auto_init_applied,
+                                            dq_auto_init_value if dq_auto_init_value is not None else "",
+                                            dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
                                         ]
                                         _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
                     self.sample_images(accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
@@ -2999,10 +3078,21 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Include clip_rate_raw in auto checks / auto判定にclip_rate_rawも使う",
     )
     parser.add_argument(
+        "--dq_delta_auto_init_range_mul_from_band",
+        action="store_true",
+        help="Auto-init range_mul from clip band center / clip帯中心からrange_mul初期値を自動算出",
+    )
+    parser.add_argument(
         "--dq_delta_auto_warmup",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable warmup for auto range_mul (EMA/log only) / auto range_mul のウォームアップを有効化（EMA/ログのみ更新）",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_warmup_updates",
+        type=int,
+        default=0,
+        help="Warmup updates override (0=auto) / warmup 回数の上書き（0=内部デフォルト）",
     )
     parser.add_argument(
         "--dq_delta_auto_log_file",

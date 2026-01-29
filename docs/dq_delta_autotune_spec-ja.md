@@ -61,6 +61,9 @@
 - `warmup_active` : warmup 中は 1、それ以外は 0
 - `warmup_remain` : warmup の残り AutoStep 回数（0 なら warmup 終了）
 - `auto_reason` : `warmup` / `clip_high` / `clip_low` / `in_band`
+- `auto_init_mul_applied` : 初期 range_mul の自動上書きが行われた場合は 1
+- `auto_init_mul_value` : 自動算出された初期 range_mul
+- `auto_init_clip_target` : `(clip_low + clip_high) / 2`
 
 ※ `range = scale * qmax`、`scale_*` は bits モード時に有効。step モードは `range/scale_*/qmax` を空欄扱い。  
 ※ `granularity=channel` の場合、`scale_*` は `min/mean/max` を記録する（tensor の場合は同値）。
@@ -108,8 +111,8 @@
 ### 出力例（summary）
 
 ```
-Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason
-2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high
+Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason,AutoInitMulApplied,AutoInitMulValue,AutoInitClipTarget
+2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high,1,3.0,0.004
 ```
 
 ## ログの見方（初心者向け）
@@ -150,6 +153,9 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | WarmupActive | warmup中 | 1なら range_mul は固定。 |
 | WarmupRemain | warmup残り | 0なら warmup終了。 |
 | AutoReason | 判定理由 | `warmup`/`clip_high`/`clip_low`/`in_band`。 |
+| AutoInitMulApplied | 初期化適用 | 1なら初期 range_mul 上書きが行われた。 |
+| AutoInitMulValue | 初期 range_mul | 自動算出された初期値（適用時）。 |
+| AutoInitClipTarget | 初期 clip_target | `(clip_low+clip_high)/2`。 |
 
 補足（読み解きの目安）:
 - `ClipRate` が低いのに `QuantErrRatio` が高い場合、**レンジが広く刻みが粗い**可能性がある（`range_mul` 高め / `bits` 低め）。
@@ -180,6 +186,9 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | WarmupActive | warmup中 | 1なら range_mul は固定。 |
 | WarmupRemain | warmup残り | 0なら warmup終了。 |
 | AutoReason | 判定理由 | `warmup`/`clip_high`/`clip_low`/`in_band`。 |
+| AutoInitMulApplied | 初期化適用 | 1なら初期 range_mul 上書きが行われた。 |
+| AutoInitMulValue | 初期 range_mul | 自動算出された初期値（適用時）。 |
+| AutoInitClipTarget | 初期 clip_target | `(clip_low+clip_high)/2`。 |
 
 ### auto（`--dq_delta_auto_log_file`）: full_schema
 
@@ -200,7 +209,9 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 - `--dq_delta_auto_max <float>` : range_mul 上限（デフォルト 6.0）
 - `--dq_delta_auto_ema <float>` : clip_rate の EMA 係数（デフォルト 0.95）
 - `--dq_delta_auto_use_raw` : auto 判定に clip_rate_raw も使う（既定 OFF）。mul の変化をよりなだらかにする。
+- `--dq_delta_auto_init_range_mul_from_band` : clip帯中心から range_mul 初期値を自動算出（auto有効時、`stat=rms` のみ）
 - `--dq_delta_auto_warmup` / `--no-dq_delta_auto_warmup` : warmup 期間は range_mul を変更しない（auto 有効時のみ、既定 ON）
+- `--dq_delta_auto_warmup_updates <int>` : warmup 回数の上書き（0=内部デフォルト）
 - `--dq_delta_auto_log_file <path>` : 省略時は `--output_dir/dq_delta_auto+<output_name>.txt`（auto イベントのみ記録）
 - `--dq_delta_auto_log_format {minimal,full_schema}` : auto ログの列形式（デフォルト minimal）
 
@@ -252,14 +263,27 @@ range_mul = clamp(range_mul, auto_min, auto_max)
 - bits 切替時は warmup もリセット（残り回数と連続 in-band 回数を初期化）
 - DDP/複数プロセス時は **main process のみ**が range_mul を更新し、**broadcast** で共有する
 
+### 初期 range_mul の自動算出（任意）
+
+`--dq_delta_auto_init_range_mul_from_band` を指定すると、学習開始前に **clip帯中心**から range_mul を機械的に初期化する。
+
+- `clip_target = (clip_low + clip_high) / 2`
+- `range_mul_init = inv_norm_cdf(1 - clip_target/2)`
+  - `inv_norm_cdf` は標準正規の逆CDF
+  - 実装は `Φ^{-1}(p) = sqrt(2) * erfinv(2p-1)`
+- `--dq_delta_stat=rms` のときのみ有効（それ以外は警告してスキップ）
+- 計算後に `dq_delta_auto_min/max` で clamp
+- dq_delta_auto ログに `AutoInitMulApplied/AutoInitMulValue/AutoInitClipTarget` を開始時に出力
+
 ### ウォームアップ（range_mul 変更の抑制）
 
 - warmup は **AutoStep の回数**で進行する（optimizer step そのものではない）
 - AutoStep が skip されて呼ばれない場合、warmup も進行しない
-- warmup 回数は EMA 係数から自動決定し、追加パラメータは持たない
+- warmup は `--dq_delta_auto_warmup` が有効なときのみ機能
+- warmup 回数は `--dq_delta_auto_warmup_updates` で上書き可能（0 なら内部デフォルト）
 
 ```
-warmup_updates = ceil(2 / (1 - dq_delta_auto_ema))
+warmup_updates = ceil(2 / (1 - dq_delta_auto_ema))  # 未指定時のデフォルト
 ```
 
 例: `dq_delta_auto_ema=0.95` -> 40 回、`0.90` -> 20 回、`0.98` -> 100 回
@@ -328,9 +352,9 @@ auto_every | auto_ema | 実効履歴(更新回) | 実効履歴(optimizer step)
 - 変更が発生した時のみ `logger.info` で 1 行出力
   - `dq_delta_log` が無効でも、変更時は `logger.info` だけ出す
 - `dq_delta_auto_log_file` が指定されている場合は **AutoStep のみ**を CSV で追記する（ログOFF時の追跡用）
-  - 最小列: `TrainStep,scope,target,bits,clip_rate_raw,clip_rate_ema,range_mul_before,range_mul_after,auto_applied,warmup_active,warmup_remain,auto_reason`
-  - `full_schema` 指定時は **main log と同じ列構成**で出力し、LogStep 以外の列は空欄（NA）とする  
-    追加統計は計算しない
+  - 最小列: `TrainStep,scope,target,bits,clip_rate_raw,clip_rate_ema,range_mul_before,range_mul_after,auto_applied,warmup_active,warmup_remain,auto_reason,auto_init_mul_applied,auto_init_mul_value,auto_init_clip_target`
+  - `full_schema` 指定時は **main log と同じ列構成**で出力する  
+    LogStep 以外の列は空欄（NA）で、追加統計は計算しない
 
 ## 既存オプションとの組み合わせ
 
