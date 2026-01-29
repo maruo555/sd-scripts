@@ -669,6 +669,25 @@ class NetworkTrainer:
             return items
 
         dq_bits_sched = _parse_bits_sched(getattr(args, "dq_delta_bits_sched", None))
+        def _parse_dropout_sched(spec: str):
+            items = []
+            if not spec:
+                return items
+            for part in spec.split(","):
+                if not part:
+                    continue
+                k, v = part.split(":")
+                p = float(k)
+                coeff = float(v)
+                assert 0.0 <= p <= 1.0, "progress must be in [0,1]"
+                items.append((p, coeff))
+            items.sort(key=lambda x: x[0])
+            return items
+
+        dropout_sched = _parse_dropout_sched(getattr(args, "dropout_sched", None))
+        dropout_log_every = int(getattr(args, "dropout_sched_log_every", 0) or 0)
+        if dropout_log_every < 0:
+            dropout_log_every = 0
 
         if ((getattr(args, "dq_delta_step", None) is not None and args.dq_delta_step and args.dq_delta_step > 0)
             or (getattr(args, "dq_delta_bits", None) is not None and args.dq_delta_bits) or dq_bits_sched):
@@ -767,8 +786,14 @@ class NetworkTrainer:
             if dq_auto_log_path is None:
                 dq_auto_log_path = os.path.join(args.output_dir, f"dq_delta_auto+{args.output_name}.txt")
 
+        dropout_log_path = None
+        if dropout_log_every > 0:
+            model_name = train_util.default_if_none(args.output_name, train_util.DEFAULT_LAST_OUTPUT_NAME)
+            dropout_log_path = os.path.join(args.output_dir, f"dropout_sched+{model_name}.txt")
+
         dq_log_header_written = False
         dq_auto_log_header_written = False
+        dropout_log_header_written = False
 
         def _write_csv(path: str, header: str, line: str):
             nonlocal dq_log_header_written, dq_auto_log_header_written
@@ -789,6 +814,33 @@ class NetworkTrainer:
                 else:
                     dq_auto_log_header_written = True
             with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+        def _dropout_format_value(v):
+            if v is None:
+                return ""
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            if isinstance(v, (float, int)):
+                return f"{v:.6g}"
+            return str(v)
+
+        def _write_dropout_log(step_idx, coeff, dropout_val, rank_val, module_val):
+            nonlocal dropout_log_header_written
+            if not dropout_log_path:
+                return
+            dirpath = os.path.dirname(dropout_log_path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+            if not dropout_log_header_written:
+                header = "TrainStep,Coeff,network_dropout,rank_dropout,module_dropout"
+                with open(dropout_log_path, "w", encoding="utf-8") as f:
+                    f.write(header + "\n")
+                dropout_log_header_written = True
+            line = ",".join(
+                _dropout_format_value(v) for v in (step_idx, coeff, dropout_val, rank_val, module_val)
+            )
+            with open(dropout_log_path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
 
         if dq_auto_enabled:
@@ -1518,6 +1570,11 @@ class NetworkTrainer:
         del t_enc
 
         accelerator.unwrap_model(network).prepare_grad_etc(text_encoder, unet)
+        unwrapped_network = accelerator.unwrap_model(network)
+        dropout_base = getattr(unwrapped_network, "dropout", None)
+        rank_dropout_base = getattr(unwrapped_network, "rank_dropout", None)
+        module_dropout_base = getattr(unwrapped_network, "module_dropout", None)
+        last_dropout_coeff = None
 
         if not cache_latents:  # キャッシュしない場合はVAEを使うのでVAEを準備する
             vae.requires_grad_(False)
@@ -2039,6 +2096,21 @@ class NetworkTrainer:
                     break
             return cur_bits
 
+        def _dropout_coeff_for_progress(progress_frac: float):
+            if not dropout_sched:
+                return 1.0
+            if progress_frac <= dropout_sched[0][0]:
+                return dropout_sched[0][1]
+            for i in range(1, len(dropout_sched)):
+                p0, v0 = dropout_sched[i - 1]
+                p1, v1 = dropout_sched[i]
+                if progress_frac <= p1:
+                    if p1 == p0:
+                        return v1
+                    t = (progress_frac - p0) / (p1 - p0)
+                    return v0 + (v1 - v0) * t
+            return dropout_sched[-1][1]
+
         # initialize last_applied_bits from args (avoid per-epoch reset)
         last_applied_bits = getattr(args, "dq_delta_bits", None)
         dq_bits_force_apply = bool(dq_bits_sched and last_applied_bits is None)
@@ -2136,6 +2208,28 @@ class NetworkTrainer:
                                 auto_scope=getattr(args, "dq_delta_scope", "both"),
                                 target=target,
                             )
+
+                    if dropout_sched or dropout_log_every > 0:
+                        progress_frac = (global_step / float(args.max_train_steps)) if args.max_train_steps > 0 else 1.0
+                        coeff = _dropout_coeff_for_progress(progress_frac)
+                        cur_dropout = dropout_base * coeff if dropout_base is not None else None
+                        cur_rank_dropout = rank_dropout_base * coeff if rank_dropout_base is not None else None
+                        cur_module_dropout = module_dropout_base * coeff if module_dropout_base is not None else None
+                        if last_dropout_coeff is None or coeff != last_dropout_coeff:
+                            if hasattr(unwrapped_network, "set_dropout_values"):
+                                unwrapped_network.set_dropout_values(cur_dropout, cur_rank_dropout, cur_module_dropout)
+                            else:
+                                if hasattr(unwrapped_network, "dropout"):
+                                    unwrapped_network.dropout = cur_dropout
+                                if hasattr(unwrapped_network, "rank_dropout"):
+                                    unwrapped_network.rank_dropout = cur_rank_dropout
+                                if hasattr(unwrapped_network, "module_dropout"):
+                                    unwrapped_network.module_dropout = cur_module_dropout
+                            last_dropout_coeff = coeff
+                        if dropout_log_path and dropout_log_every > 0 and accelerator.sync_gradients:
+                            step_idx = global_step + 1
+                            if step_idx % dropout_log_every == 0:
+                                _write_dropout_log(step_idx, coeff, cur_dropout, cur_rank_dropout, cur_module_dropout)
 
                     on_step_start(text_encoder, unet)
 
@@ -2819,6 +2913,23 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Drops neurons out of training every step (0 or None is default behavior (no dropout), 1 would drop all neurons) / 訓練時に毎ステップでニューロンをdropする（0またはNoneはdropoutなし、1は全ニューロンをdropout）",
+    )
+    parser.add_argument(
+        "--dropout_sched",
+        type=str,
+        default=None,
+        help=(
+            "Schedule dropout coefficient by progress fraction, e.g. '0.0:0,0.3:0.2,0.8:1.0'. "
+            "Applies to network/rank/module dropout base values if set; segments are linearly interpolated and held at the last value. "
+            "/ dropout係数を進行率でスケジュール（例: '0.0:0,0.3:0.2,0.8:1.0'）。"
+            "network/rank/module の指定済みdropoutに係数を掛ける。区間は線形補間し、最後は固定。"
+        ),
+    )
+    parser.add_argument(
+        "--dropout_sched_log_every",
+        type=int,
+        default=0,
+        help="Log dropout schedule every N optimizer steps (0 disables) / dropoutスケジュールのログ間隔（optimizer step、0で無効）",
     )
     parser.add_argument(
         "--network_args",
