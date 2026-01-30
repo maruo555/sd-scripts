@@ -261,6 +261,10 @@ DQ_DELTA_AUTO_PRESETS = {
         "clip_low": 0.0038,
         "clip_high": 0.0048,
     },
+    "clip_rate_mid": {
+        "clip_low": 0.002,
+        "clip_high": 0.004,
+    },
     "clip_rate_low": {
         "clip_low": 0.0005,
         "clip_high": 0.0022,
@@ -3018,7 +3022,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--dq_delta_auto_preset",
         type=str,
         default=None,
-        choices=["default", "clip_rate_high", "clip_rate_high_narrow", "clip_rate_low"],
+        choices=["default", "clip_rate_high", "clip_rate_high_narrow", "clip_rate_mid", "clip_rate_low"],
         help=(
             "Preset for auto range_mul tuning (overrides clip_low/high only) / "
             "auto range_mul 調整プリセット（clip_low/high のみ上書き）"

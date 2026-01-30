@@ -199,7 +199,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 ### 有効化オプション
 
 - `--dq_delta_auto_range_mul` : range_mul の自動調整を有効化（デフォルト無効）
-- `--dq_delta_auto_preset {default,clip_rate_high,clip_rate_high_narrow,clip_rate_low}` : auto range_mul のプリセット（指定時は clip_low/high のみ上書き）
+- `--dq_delta_auto_preset {default,clip_rate_high,clip_rate_high_narrow,clip_rate_mid,clip_rate_low}` : auto range_mul のプリセット（指定時は clip_low/high のみ上書き）
 - `--dq_delta_auto_every <int>` : 調整間隔（optimizer step 単位、デフォルト 50）
 - `--dq_delta_auto_clip_low <float>` : clip_rate 下限（デフォルト 0.0005 = 0.05%）
 - `--dq_delta_auto_clip_high <float>` : clip_rate 上限（デフォルト 0.003 = 0.3%）
@@ -225,6 +225,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 | `default` | 0.0005 | 0.003 | args | args | 安全汎用。特徴が薄まりやすい。 |
 | `clip_rate_high` | 0.003 | 0.005 | args | args | キャラクター学習向け。clip_rate 高めを狙う。 |
 | `clip_rate_high_narrow` | 0.0038 | 0.0048 | args | args | キャラクター学習向け2。狭い範囲を狙う。 |
+| `clip_rate_mid` | 0.002 | 0.004 | args | args | 中間帯の clip_rate を狙う。 |
 | `clip_rate_low` | 0.0005 | 0.0022 | args | args | defaultより安定方向に振る。 |
 
 ### 発動条件（重要）
