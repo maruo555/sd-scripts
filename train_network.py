@@ -655,6 +655,15 @@ class NetworkTrainer:
         except ValueError as exc:
             logger.error(str(exc))
             raise
+        dq_begin_after_lr_warmup = bool(getattr(args, "dq_delta_begin_after_lr_warmup", False))
+        if dq_begin_after_lr_warmup:
+            lr_warmup_steps = getattr(args, "lr_warmup_steps", 0)
+            if lr_warmup_steps is None or (isinstance(lr_warmup_steps, (int, float)) and lr_warmup_steps <= 0):
+                logger.error(
+                    "dq_delta_begin_after_lr_warmup is enabled but lr_warmup_steps is not specified (>0 required). / "
+                    "dq_delta_begin_after_lr_warmup が有効ですが lr_warmup_steps が指定されていません（>0 が必要）。"
+                )
+                raise ValueError("dq_delta_begin_after_lr_warmup requires lr_warmup_steps > 0")
         # parse bits schedule if provided
         def _parse_bits_sched(spec: str):
             items = []
@@ -676,10 +685,13 @@ class NetworkTrainer:
 
         if ((getattr(args, "dq_delta_step", None) is not None and args.dq_delta_step and args.dq_delta_step > 0)
             or (getattr(args, "dq_delta_bits", None) is not None and args.dq_delta_bits) or dq_bits_sched):
+            dq_begin_info = f"begin={args.dq_delta_begin}"
+            if dq_begin_after_lr_warmup:
+                dq_begin_info = f"begin_after_lr_warmup={getattr(args,'lr_warmup_steps',None)}"
             logger.info(
                 f"lora fake-quant: target={'z' if getattr(args,'dq_quantize_z', False) else 'delta'}, "
                 f"step={getattr(args,'dq_delta_step',None)}, bits={getattr(args,'dq_delta_bits',None)}, "
-                f"mode={args.dq_delta_mode}, begin={args.dq_delta_begin}, granularity={getattr(args,'dq_delta_granularity',None)}, "
+                f"mode={args.dq_delta_mode}, {dq_begin_info}, granularity={getattr(args,'dq_delta_granularity',None)}, "
                 f"stat={getattr(args,'dq_delta_stat',None)}, range_mul={getattr(args,'dq_delta_range_mul',None)}, bits_sched={dq_bits_sched}"
             )
 
@@ -1436,6 +1448,26 @@ class NetworkTrainer:
         # lr schedulerを用意する
         lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
+        dq_delta_begin_step = None
+        if dq_begin_after_lr_warmup:
+            if isinstance(args.lr_warmup_steps, float):
+                if args.max_train_steps is None or args.max_train_steps <= 0:
+                    logger.error(
+                        "dq_delta_begin_after_lr_warmup requires positive max_train_steps when lr_warmup_steps is float. / "
+                        "dq_delta_begin_after_lr_warmup では lr_warmup_steps が float の場合、max_train_steps が正の値である必要があります。"
+                    )
+                    raise ValueError("dq_delta_begin_after_lr_warmup requires max_train_steps > 0 for float lr_warmup_steps")
+                num_training_steps = args.max_train_steps * accelerator.num_processes
+                dq_delta_begin_step = int(args.lr_warmup_steps * num_training_steps)
+            else:
+                dq_delta_begin_step = int(args.lr_warmup_steps)
+            dq_delta_begin_step = max(0, dq_delta_begin_step)
+            logger.info(
+                "dq_delta_begin_after_lr_warmup enabled: begin_step=%d (lr_warmup_steps=%s)",
+                dq_delta_begin_step,
+                args.lr_warmup_steps,
+            )
+
         # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
         if args.full_fp16:
             assert (
@@ -2047,6 +2079,11 @@ class NetworkTrainer:
         last_applied_bits = getattr(args, "dq_delta_bits", None)
         dq_bits_force_apply = bool(dq_bits_sched and last_applied_bits is None)
 
+        def _dq_delta_quant_enabled(progress_frac: float, global_step: int) -> bool:
+            if dq_delta_begin_step is not None:
+                return global_step >= dq_delta_begin_step
+            return progress_frac >= args.dq_delta_begin
+
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
@@ -2086,9 +2123,12 @@ class NetworkTrainer:
                             or (getattr(args, "dq_delta_bits", None) is not None and args.dq_delta_bits)
                             or bool(dq_bits_sched)
                         )
+                        quant_enabled = False
+                        progress_frac = 1.0
                         if dq_configured:
                             progress_frac = (global_step / float(args.max_train_steps)) if args.max_train_steps > 0 else 1.0
-                            accelerator.unwrap_model(network).set_delta_quant_enabled(progress_frac >= args.dq_delta_begin)
+                            quant_enabled = _dq_delta_quant_enabled(progress_frac, global_step)
+                            accelerator.unwrap_model(network).set_delta_quant_enabled(quant_enabled)
 
                             # Apply bits scheduling if specified
                             if dq_bits_sched:
@@ -2116,7 +2156,6 @@ class NetworkTrainer:
                         # dq_delta stats collection control (LogStep / AutoStep)
                         if hasattr(accelerator.unwrap_model(network), "set_dq_stats_state"):
                             step_idx = global_step + 1
-                            quant_enabled = dq_configured and (progress_frac >= args.dq_delta_begin)
                             do_log = dq_log_enabled and quant_enabled and (step_idx % dq_log_every == 0)
                             auto_eligible = dq_auto_enabled and quant_enabled and (
                                 (getattr(args, "dq_delta_bits", None) is not None and args.dq_delta_bits) or bool(dq_bits_sched)
@@ -2929,6 +2968,14 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Enable fake-quant after this fraction of total steps [0-1] / 学習進行率がこの割合を超えてから有効化 [0-1]",
+    )
+    parser.add_argument(
+        "--dq_delta_begin_after_lr_warmup",
+        action="store_true",
+        help=(
+            "Begin dq_delta after lr warmup steps (overrides dq_delta_begin) / "
+            "lrウォームアップ後にdq_deltaを開始（dq_delta_beginより優先）"
+        ),
     )
     parser.add_argument(
         "--dq_delta_scope",

@@ -42,6 +42,7 @@
 | `--dq_delta_bits <int>` | Nビットの等間隔量子化を模擬（推奨: 8）。`stat` と `range_mul` からスケール算出し、`[-Qmax, Qmax]` にクランプ（`Qmax=2^(N-1)-1`）。 |
 | `--dq_delta_mode {det,stoch}` | `det`=最近傍、`stoch`=確率的丸め。 |
 | `--dq_delta_begin <0-1>` | 学習進行率。この割合以降のみ有効化。 |
+| `--dq_delta_begin_after_lr_warmup` | lrウォームアップ後に dq_delta を開始（`--dq_delta_begin` より優先）。例: `--lr_scheduler constant_with_warmup --lr_warmup_steps 1000` と併用し、**lr_warmup 後に量子化を開始して学習を安定化させる**狙い。 |
 | `--dq_delta_scope {unet,te,both}` | 適用対象の限定（U-Netのみ/Text Encoderのみ/両方）。 |
 | `--dq_delta_granularity {tensor,channel}` | 粒度（テンソル全体/チャネル別）。 |
 | `--dq_delta_stat {rms,absmax,none}` | bits/step のスケール基準（per-channel時はチャネルごとに計算）。 |
