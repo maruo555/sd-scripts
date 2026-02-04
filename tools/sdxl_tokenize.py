@@ -95,6 +95,30 @@ def _search_candidates(
     require_both: bool,
 ):
     candidates = []
+    if min_add == 0:
+        # include the core itself if it already satisfies the condition
+        t1_core = _tokenize(tokenizer1, core, add_special_tokens)
+        t2_core = _tokenize(tokenizer2, core, add_special_tokens)
+        t1_tokens, _, t1_pieces, _ = t1_core
+        t2_tokens, _, t2_pieces, _ = t2_core
+
+        t1_ok = (len(t1_tokens) >= 2) and (not _has_single_char_piece(t1_pieces))
+        t2_ok = (len(t2_tokens) >= 2) and (not _has_single_char_piece(t2_pieces))
+
+        if (t1_ok and t2_ok) if require_both else (t1_ok or t2_ok):
+            candidates.append(
+                {
+                    "text": core,
+                    "direction": "none",
+                    "addon": "",
+                    "addon_len": 0,
+                    "t1_tokens": t1_tokens,
+                    "t1_pieces": t1_pieces,
+                    "t2_tokens": t2_tokens,
+                    "t2_pieces": t2_pieces,
+                }
+            )
+
     additions = list(_iter_additions(alphabet, min_add, max_add))
     for add in additions:
         texts = []
