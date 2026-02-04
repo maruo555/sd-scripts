@@ -69,11 +69,14 @@ def _has_single_char_piece(pieces: List[str]) -> bool:
 
 
 def _iter_additions(alphabet: str, min_add: int, max_add: int) -> Iterable[str]:
-    if min_add < 1 or max_add < min_add:
+    if max_add < min_add:
         return []
+    if max_add < 1:
+        return []
+    start_len = 1 if min_add < 1 else min_add
 
     def _recurse(prefix: str, depth: int):
-        if depth >= min_add:
+        if depth >= start_len:
             yield prefix
         if depth == max_add:
             return
