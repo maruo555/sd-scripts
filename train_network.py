@@ -867,6 +867,23 @@ class NetworkTrainer:
                 "AutoInitMulValue",
                 "AutoInitClipTarget",
             ]
+            if log_mode == "summary":
+                cols += [
+                    "RankDim",
+                    "RankSatWMean",
+                    "RankSatP50",
+                    "RankSatP95",
+                    "RankSatMax",
+                    "RankTop1P95",
+                    "RankEnergySum",
+                ]
+            else:
+                cols += [
+                    "RankDim",
+                    "RankSat",
+                    "RankTop1",
+                    "RankEnergy",
+                ]
             return ",".join(cols)
 
         def _dq_auto_log_header(full_schema: bool, include_near_zero: bool):
@@ -2471,6 +2488,18 @@ class NetworkTrainer:
                                     include_near_zero = "near_zero_rate" in dq_log_extra
                                     header = _dq_log_header(dq_log_mode, include_near_zero)
                                     log_scopes = ["unet", "te"] if dq_stats["log_scope"] == "both" else [dq_stats["log_scope"]]
+                                    rank_stats = None
+                                    rank_by_module = None
+                                    if "unet" in log_scopes:
+                                        unwrapped = accelerator.unwrap_model(network)
+                                        if hasattr(unwrapped, "compute_rank_stats"):
+                                            try:
+                                                rank_stats = unwrapped.compute_rank_stats(scope="unet")
+                                            except Exception as exc:
+                                                logger.warning("failed to compute rank stats: %s", str(exc))
+                                                rank_stats = None
+                                            if rank_stats is not None:
+                                                rank_by_module = rank_stats.get("by_module")
                                     quant_err_rms_ema = dq_quant_err_rms_ema_state
                                     quant_err_ratio_ema = dq_quant_err_ratio_ema_state
                                     if dq_stats["log_scope"] == "both":
@@ -2572,6 +2601,20 @@ class NetworkTrainer:
                                                     dq_auto_init_value if dq_auto_init_value is not None else "",
                                                     dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
                                                 ]
+                                                rank_dim = rank_sat = rank_top1 = rank_energy = None
+                                                if scope == "unet" and rank_by_module is not None:
+                                                    rank_item = rank_by_module.get(item["module"])
+                                                    if rank_item is not None:
+                                                        rank_dim = rank_item.get("r")
+                                                        rank_sat = rank_item.get("sat")
+                                                        rank_top1 = rank_item.get("top1")
+                                                        rank_energy = rank_item.get("energy")
+                                                row += [
+                                                    rank_dim,
+                                                    rank_sat,
+                                                    rank_top1,
+                                                    rank_energy,
+                                                ]
                                                 _write_csv(dq_log_path, header, ",".join(_dq_format_value(v) for v in row))
                                         else:
                                             row = values + [
@@ -2603,6 +2646,24 @@ class NetworkTrainer:
                                                 dq_auto_init_applied,
                                                 dq_auto_init_value if dq_auto_init_value is not None else "",
                                                 dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
+                                            ]
+                                            rank_dim = rank_sat_wmean = rank_sat_p50 = rank_sat_p95 = rank_sat_max = rank_top1_p95 = rank_energy_sum = None
+                                            if scope == "unet" and rank_stats is not None:
+                                                rank_dim = rank_stats.get("rank_dim")
+                                                rank_sat_wmean = rank_stats.get("sat_wmean")
+                                                rank_sat_p50 = rank_stats.get("sat_p50")
+                                                rank_sat_p95 = rank_stats.get("sat_p95")
+                                                rank_sat_max = rank_stats.get("sat_max")
+                                                rank_top1_p95 = rank_stats.get("top1_p95")
+                                                rank_energy_sum = rank_stats.get("energy_sum")
+                                            row += [
+                                                rank_dim,
+                                                rank_sat_wmean,
+                                                rank_sat_p50,
+                                                rank_sat_p95,
+                                                rank_sat_max,
+                                                rank_top1_p95,
+                                                rank_energy_sum,
                                             ]
                                             _write_csv(dq_log_path, header, ",".join(_dq_format_value(v) for v in row))
 
@@ -2649,6 +2710,15 @@ class NetworkTrainer:
                                             dq_auto_init_applied,
                                             dq_auto_init_value if dq_auto_init_value is not None else "",
                                             dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
+                                        ]
+                                        row += [
+                                            "",
+                                            "",
+                                            "",
+                                            "",
+                                            "",
+                                            "",
+                                            "",
                                         ]
                                         _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
                                     else:

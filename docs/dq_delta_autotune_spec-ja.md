@@ -111,8 +111,8 @@
 ### 出力例（summary）
 
 ```
-Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason,AutoInitMulApplied,AutoInitMulValue,AutoInitClipTarget
-2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high,1,3.0,0.004
+Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,AbsMax,Range,ScaleMin,ScaleMean,ScaleMax,Qmax,ClipRateRaw,ClipRateEMA,ZeroRate,QuantErrRMSRaw,QuantErrRMSEMA,QuantErrRatioRaw,QuantErrRatioEMA,Numel,AutoApplied,RangeMulBefore,RangeMulAfter,WarmupActive,WarmupRemain,AutoReason,AutoInitMulApplied,AutoInitMulValue,AutoInitClipTarget,RankDim,RankSatWMean,RankSatP50,RankSatP95,RankSatMax,RankTop1P95,RankEnergySum
+2,3400,unet,delta,8,,3.0,rms,channel,stoch,0.0123,0.0912,0.0369,0.00020,0.00029,0.00041,127,0.0008,0.0007,0.034,0.0015,0.0014,0.12,0.11,12345678,1,3.0,3.21,0,0,clip_high,1,3.0,0.004,16,0.83,0.81,0.93,0.98,0.89,12.34
 ```
 
 ## ログの見方（初心者向け）
@@ -156,10 +156,18 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | AutoInitMulApplied | 初期化適用 | 1なら初期 range_mul 上書きが行われた。 |
 | AutoInitMulValue | 初期 range_mul | 自動算出された初期値（適用時）。 |
 | AutoInitClipTarget | 初期 clip_target | `(clip_low+clip_high)/2`。 |
+| RankDim | rank次元 | すべて同一なら r を表示、混在時は空欄。 |
+| RankSatWMean | 飽和度の重み付き平均 | エネルギー（更新量）で重み付けした飽和度。 |
+| RankSatP50 | 飽和度の中央値 | 層の典型的な詰まり具合。 |
+| RankSatP95 | 飽和度の95%点 | 一部層の詰まり具合の早期警戒。 |
+| RankSatMax | 飽和度の最大 | 最も詰まっている層。 |
+| RankTop1P95 | top1エネルギーの95%点 | 上位成分の支配度合い。 |
+| RankEnergySum | エネルギー合計 | `||ΔW||_F^2` の総量（スケール含む）。 |
 
 補足（読み解きの目安）:
 - `ClipRate` が低いのに `QuantErrRatio` が高い場合、**レンジが広く刻みが粗い**可能性がある（`range_mul` 高め / `bits` 低め）。
 - `QuantErrRatio` が低いのに `ClipRate` が高い場合、**クリップ歪み**が支配的な可能性がある。
+※ Rank 系は現状 `unet` のみ集計。`te` 行は空欄。
 
 ### logs（`--dq_delta_log`）: per_module
 
@@ -168,7 +176,7 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | Module | LoRAモジュール名 | どの層の統計か。 |
 | Shape | テンソル形状 | 層の規模感の目安。 |
 
-※ per_module は上記 summary の列に `Module/Shape` が追加されます。
+※ per_module は上記 summary の列に `Module/Shape` が追加され、さらに `RankDim/RankSat/RankTop1/RankEnergy` が追加されます（`unet` のみ、`te` は空欄）。
 
 ### auto（`--dq_delta_auto_log_file`）: minimal
 
