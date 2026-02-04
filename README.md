@@ -44,6 +44,11 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 1. **まずは Preset B** で学習曲線とログを観察し、`norm` が *skip* されずに推移していることを確認。  
 2. キャラクターの再現度が足りなければ **Preset A** に切り替え、当たり／破綻のリスクをトレードオフ。  
 
+**ツール一覧**
+| ツール名 | 概要 | 説明 |
+|---|---|---|
+| `sdxl_tokenize.py` | SDXLのTE1/TE2トークン分割の表示と候補探索 | [docs/sdxl_tokenize_tool-ja.md](docs/sdxl_tokenize_tool-ja.md) |
+
 ---
 
 ## 以下、公式のまま
