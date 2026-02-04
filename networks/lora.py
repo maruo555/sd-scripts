@@ -274,6 +274,73 @@ class DQStatsManager:
         }
 
 
+def _compute_lora_effective_rank_stats(lora, eps: float = 1e-12):
+    w_down = getattr(lora, "lora_down", None)
+    w_up = getattr(lora, "lora_up", None)
+    if w_down is None or w_up is None:
+        return None
+    w_down = w_down.weight
+    w_up = w_up.weight
+    if w_down is None or w_up is None:
+        return None
+
+    with torch.no_grad():
+        a = w_down.to(dtype=torch.float32)
+        b = w_up.to(dtype=torch.float32)
+        if a.dim() == 4:
+            a = a.reshape(a.shape[0], -1)
+        if b.dim() == 4:
+            b = b.reshape(b.shape[0], b.shape[1])
+        r = a.shape[0]
+        if r <= 0:
+            return None
+
+        p = b.transpose(0, 1) @ b
+        q = a @ a.transpose(0, 1)
+
+        eye = torch.eye(r, device=q.device, dtype=q.dtype)
+        diag_mean = torch.mean(torch.diag(q)) if r > 0 else torch.tensor(0.0, device=q.device, dtype=q.dtype)
+        jitter = eps * (diag_mean.abs() + 1.0)
+        l, info = torch.linalg.cholesky_ex(q + jitter * eye)
+        if int(info.item()) != 0:
+            eigvals, eigvecs = torch.linalg.eigh(q)
+            eigvals = torch.clamp(eigvals, min=0.0)
+            sqrt_q = eigvecs @ torch.diag(torch.sqrt(eigvals)) @ eigvecs.transpose(0, 1)
+            s = sqrt_q @ p @ sqrt_q
+        else:
+            s = l.transpose(0, 1) @ p @ l
+
+        s = (s + s.transpose(0, 1)) * 0.5
+        eigvals = torch.linalg.eigvalsh(s)
+        eigvals = torch.clamp(eigvals, min=0.0)
+        energy = eigvals.sum()
+        energy_val = float(energy.item())
+        scale = float(getattr(lora, "scale", 1.0))
+        mult = float(getattr(lora, "multiplier", 1.0))
+        energy_val *= (scale * mult) ** 2
+        if energy_val <= eps:
+            return {
+                "module": lora.lora_name,
+                "r": int(r),
+                "sat": 0.0,
+                "top1": 0.0,
+                "energy": energy_val,
+            }
+
+        w = eigvals / (energy + eps)
+        entropy = -(w * torch.log(w + eps)).sum()
+        r_eff = torch.exp(entropy)
+        sat = float(r_eff.item()) / float(r)
+        top1 = float(torch.max(w).item())
+        return {
+            "module": lora.lora_name,
+            "r": int(r),
+            "sat": sat,
+            "top1": top1,
+            "energy": energy_val,
+        }
+
+
 class LoRAModule(torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
@@ -1586,6 +1653,62 @@ class LoRANetwork(torch.nn.Module):
         if self.dq_stats_manager is None:
             return None
         return self.dq_stats_manager.export()
+
+    def compute_rank_stats(self, scope: str = "unet", eps: float = 1e-12):
+        if scope != "unet":
+            return None
+        loras = self.unet_loras
+        if not loras:
+            return None
+
+        per_module = []
+        with torch.no_grad():
+            for lora in loras:
+                stats = _compute_lora_effective_rank_stats(lora, eps=eps)
+                if stats is not None:
+                    per_module.append(stats)
+
+        if not per_module:
+            return None
+
+        energy_sum = float(sum(item["energy"] for item in per_module))
+        active = [item for item in per_module if item["energy"] > eps]
+        if active:
+            sat_values = [item["sat"] for item in active]
+            top1_values = [item["top1"] for item in active]
+        else:
+            sat_values = [item["sat"] for item in per_module]
+            top1_values = [item["top1"] for item in per_module]
+
+        def _quantile(values, q):
+            if not values:
+                return None
+            return float(np.quantile(np.asarray(values, dtype=np.float64), q))
+
+        sat_p50 = _quantile(sat_values, 0.5)
+        sat_p95 = _quantile(sat_values, 0.95)
+        sat_max = float(max(sat_values)) if sat_values else None
+        top1_p95 = _quantile(top1_values, 0.95)
+        sat_wmean = None
+        if energy_sum > eps:
+            sat_wmean = float(sum(item["energy"] * item["sat"] for item in per_module) / energy_sum)
+        else:
+            sat_wmean = 0.0
+
+        r_values = {item["r"] for item in per_module}
+        rank_dim = next(iter(r_values)) if len(r_values) == 1 else None
+
+        return {
+            "per_module": per_module,
+            "by_module": {item["module"]: item for item in per_module},
+            "rank_dim": rank_dim,
+            "sat_wmean": sat_wmean,
+            "sat_p50": sat_p50,
+            "sat_p95": sat_p95,
+            "sat_max": sat_max,
+            "top1_p95": top1_p95,
+            "energy_sum": energy_sum,
+        }
 
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
