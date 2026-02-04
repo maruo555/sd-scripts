@@ -169,6 +169,7 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 - `QuantErrRatio` が低いのに `ClipRate` が高い場合、**クリップ歪み**が支配的な可能性がある。
 - `RankSat*` は **高いほど rank を使い切っている**ため、値が高止まりするほど **rank 不足の兆候**。低いほど余裕がある。
 - `RankTop1P95` が高いほど **実質 rank1 に偏っている**可能性が高い。
+- `RankEnergySum` は **LoRA 更新量の総量**。大きいほど LoRA の寄与が強い。
 ※ Rank 系は現状 `unet` のみ集計。`te` 行は空欄。
 
 ### logs（`--dq_delta_log`）: per_module
