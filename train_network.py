@@ -2071,6 +2071,9 @@ class NetworkTrainer:
         group_loss_epoch_log_path = None
         group_loss_step_header_written = False
         group_loss_epoch_header_written = False
+        group_loss_step_header = "global_step,epoch,group,subset_index,loss,ema_loss_group,count_group,timestep,bucket_reso"
+        group_loss_step_log_buffer: List[str] = []
+        group_loss_last_flush_step = 0
 
         def _group_csv_escape(value):
             if value is None:
@@ -2110,6 +2113,36 @@ class NetworkTrainer:
 
             with open(path, "a", encoding="utf-8") as f:
                 f.write(",".join(_group_csv_format(v) for v in row) + "\n")
+
+        def _group_flush_step_buffer(force: bool = False, current_global_step: Optional[int] = None):
+            nonlocal group_loss_step_header_written, group_loss_last_flush_step
+            if not group_loss_log_enabled or not accelerator.is_main_process:
+                return
+            if group_loss_step_log_path is None:
+                return
+            if not force:
+                if current_global_step is None:
+                    return
+                if current_global_step - group_loss_last_flush_step < group_loss_log_every_n_steps:
+                    return
+                group_loss_last_flush_step = current_global_step
+            elif current_global_step is not None:
+                group_loss_last_flush_step = current_global_step
+
+            if len(group_loss_step_log_buffer) == 0:
+                return
+
+            dirpath = os.path.dirname(group_loss_step_log_path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+            if not group_loss_step_header_written:
+                with open(group_loss_step_log_path, "w", encoding="utf-8") as f:
+                    f.write(group_loss_step_header + "\n")
+                group_loss_step_header_written = True
+
+            with open(group_loss_step_log_path, "a", encoding="utf-8") as f:
+                f.writelines(line + "\n" for line in group_loss_step_log_buffer)
+            group_loss_step_log_buffer.clear()
 
         def _extract_first(value):
             if value is None:
@@ -2498,7 +2531,7 @@ class NetworkTrainer:
                         and math.isfinite(current_loss)
                     ):
                         ema_loss_group, count_group = group_loss_tracker.update(step_group, current_loss)
-                        if accelerator.is_main_process and global_step % group_loss_log_every_n_steps == 0:
+                        if accelerator.is_main_process:
                             bucket_reso_value = ""
                             if isinstance(step_bucket_reso, (list, tuple)) and len(step_bucket_reso) == 2:
                                 bucket_reso_value = f"{step_bucket_reso[0]}x{step_bucket_reso[1]}"
@@ -2513,12 +2546,8 @@ class NetworkTrainer:
                                 step_timestep,
                                 bucket_reso_value,
                             ]
-                            _group_write_csv(
-                                group_loss_step_log_path,
-                                "global_step,epoch,group,subset_index,loss,ema_loss_group,count_group,timestep,bucket_reso",
-                                row,
-                                epoch_log=False,
-                            )
+                            group_loss_step_log_buffer.append(",".join(_group_csv_format(v) for v in row))
+                    _group_flush_step_buffer(force=False, current_global_step=global_step)
                     if hasattr(accelerator.unwrap_model(network), "export_dq_stats"):
                         step_idx = global_step
                         if skip_step_flag:
@@ -2949,6 +2978,8 @@ class NetworkTrainer:
                 logs = {"loss/epoch": loss_recorder.moving_average}
                 accelerator.log(logs, step=epoch + 1)
 
+            _group_flush_step_buffer(force=True, current_global_step=global_step)
+
             if group_loss_log_enabled and group_loss_epoch_summary and group_loss_tracker is not None:
                 if accelerator.is_main_process:
                     for group, ema_loss_end, count_epoch, mean_loss_epoch in group_loss_tracker.get_epoch_summary():
@@ -3007,6 +3038,7 @@ class NetworkTrainer:
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())
+        _group_flush_step_buffer(force=True, current_global_step=global_step)
 
         if log_grad_norm and grad_norm_guardian is not None and len(grad_norm_guardian.log_buffer) > 0:
             with open(log_file_path, "a") as f:
@@ -3448,7 +3480,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--group_loss_log_every_n_steps",
         type=int,
         default=100,
-        help="log group-wise loss every N global steps / グループ別lossログの出力間隔（global step）",
+        help="flush buffered group-wise loss logs every N global steps / グループ別lossログのバッファを書き出す間隔（global step）",
     )
     parser.add_argument(
         "--group_loss_epoch_summary",

@@ -8,7 +8,7 @@
   - 複数キャラ同時学習時に、キャラごとの学習進み具合の偏りを観測する
 - 機能:
   - subsetごとに設定した `group` で、学習lossのオンラインEMAを集計
-  - stepログCSV（間引き可）とepochサマリCSVを出力
+  - stepログCSV（全step記録）とepochサマリCSVを出力
 - 将来拡張:
   - `group_adjust` はPhase1では未使用（将来の自動配分調整向けに保持のみ）
 
@@ -52,7 +52,7 @@
 |---|---:|---|
 | `--group_loss_log` | `False` | グループ別Loss(EMA)ログ機能を有効化 |
 | `--group_loss_ema_beta <float>` | `0.98` | EMA係数（`ema = ema*beta + loss*(1-beta)`） |
-| `--group_loss_log_every_n_steps <int>` | `100` | stepログCSVの出力間隔（global step） |
+| `--group_loss_log_every_n_steps <int>` | `100` | stepログCSVのバッファを書き出す間隔（global step）。記録自体は全stepで行う |
 | `--group_loss_epoch_summary` | `False` | epoch末サマリCSVを追記出力 |
 
 ## 出力ファイル
@@ -104,7 +104,7 @@ accelerate launch sdxl_train_network.py \
   --group_loss_log
 ```
 
-### 100stepごとのstepログ + epochサマリ
+### 全step記録 + 100stepごとにflush + epochサマリ
 
 ```bash
 accelerate launch sdxl_train_network.py \
