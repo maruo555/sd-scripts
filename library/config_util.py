@@ -78,6 +78,8 @@ class BaseSubsetParams:
     caption_tag_dropout_rate: float = 0.0
     token_warmup_min: int = 1
     token_warmup_step: float = 0
+    group: Optional[str] = None
+    group_adjust: bool = True
 
 
 @dataclass
@@ -199,6 +201,8 @@ class ConfigSanitizer:
         "token_warmup_step": Any(float, int),
         "caption_prefix": str,
         "caption_suffix": str,
+        "group": str,
+        "group_adjust": bool,
     }
     # DO means DropOut
     DO_SUBSET_ASCENDABLE_SCHEMA = {
@@ -487,6 +491,13 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
         dataset = dataset_klass(subsets=subsets, **asdict(dataset_blueprint.params))
         datasets.append(dataset)
 
+    # assign globally unique subset index across datasets
+    global_subset_index = 0
+    for dataset in datasets:
+        for subset in dataset.subsets:
+            subset.subset_index = global_subset_index
+            global_subset_index += 1
+
     # print info
     info = ""
     for i, dataset in enumerate(datasets):
@@ -522,9 +533,12 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                 dedent(
                     f"""\
         [Subset {j} of Dataset {i}]
+          subset_index: {subset.subset_index}
           image_dir: "{subset.image_dir}"
           image_count: {subset.img_count}
           num_repeats: {subset.num_repeats}
+          group: {subset.group}
+          group_adjust: {subset.group_adjust}
           shuffle_caption: {subset.shuffle_caption}
           keep_tokens: {subset.keep_tokens}
           keep_tokens_separator: {subset.keep_tokens_separator}
