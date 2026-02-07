@@ -1613,6 +1613,20 @@ class LoRANetwork(torch.nn.Module):
         for l in self.text_encoder_loras + self.unet_loras:
             l.delta_q_enabled = enabled
 
+    def set_dropout_values(
+        self,
+        dropout: Optional[float],
+        rank_dropout: Optional[float],
+        module_dropout: Optional[float],
+    ):
+        self.dropout = dropout
+        self.rank_dropout = rank_dropout
+        self.module_dropout = module_dropout
+        for l in self.text_encoder_loras + self.unet_loras:
+            l.dropout = dropout
+            l.rank_dropout = rank_dropout
+            l.module_dropout = module_dropout
+
     def set_dq_stats_state(
         self,
         *,

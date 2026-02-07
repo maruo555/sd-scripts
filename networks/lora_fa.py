@@ -961,6 +961,20 @@ class LoRANetwork(torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.multiplier = self.multiplier
 
+    def set_dropout_values(
+        self,
+        dropout: Optional[float],
+        rank_dropout: Optional[float],
+        module_dropout: Optional[float],
+    ):
+        self.dropout = dropout
+        self.rank_dropout = rank_dropout
+        self.module_dropout = module_dropout
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.dropout = dropout
+            lora.rank_dropout = rank_dropout
+            lora.module_dropout = module_dropout
+
     def load_weights(self, file):
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import load_file
