@@ -1,4 +1,4 @@
-# グループ別Loss(EMA)ログ機能（Phase1）
+# グループ別Loss(EMA)ログ機能
 
 `sdxl_train_network.py`（`train_network.py` 共通ループ）に追加された、学習中の `loss` をグループ単位で可視化する機能です。
 
@@ -24,6 +24,7 @@
   - `--group_loss_log` と `--group_loss_epoch_summary` を同時指定
   - `gradient_accumulation_steps = 1`
   - 単一process実行（multi-process/DDP不可）
+- `--save_state` / `--resume` を使う場合、`group_lr_auto` の倍率状態（groupごとのscale）は `train_state.json` に保存・復元されます。
 
 ## dataset_config.toml 拡張
 
@@ -49,12 +50,19 @@
 
 ## CLIオプション一覧
 
+### ログ出力オプション
+
 | オプション | 既定値 | 説明 |
 |---|---:|---|
 | `--group_loss_log` | `False` | グループ別Loss(EMA)ログ機能を有効化 |
 | `--group_loss_ema_beta <float>` | `0.98` | EMA係数（`ema = ema*beta + loss*(1-beta)`） |
 | `--group_loss_log_every_n_steps <int>` | `100` | stepログCSVのバッファを書き出す間隔（global step）。記録自体は全stepで行う |
 | `--group_loss_epoch_summary` | `False` | epoch末サマリCSVを追記出力 |
+
+### LR自動調整オプション
+
+| オプション | 既定値 | 説明 |
+|---|---:|---|
 | `--group_lr_auto` | `False` | group別LR自動補正（boost-only）を有効化 |
 | `--group_lr_auto_warmup_epochs <int>` | `3` | warmup中は全group scale=1.0固定 |
 | `--group_lr_auto_min_count <int>` | `20` | epoch更新対象にする最小 `count_epoch` |

@@ -252,6 +252,38 @@ class GroupLRAutoTuner:
     def get_scale(self, group: str) -> float:
         return self.group_scale_auto.get(group, 1.0)
 
+    def export_scales(self) -> Dict[str, float]:
+        exported: Dict[str, float] = {}
+        for group, scale in self.group_scale_auto.items():
+            if scale is None:
+                continue
+            scale_float = float(scale)
+            if not math.isfinite(scale_float):
+                continue
+            exported[str(group)] = scale_float
+        return exported
+
+    def import_scales(self, scales: Optional[Dict[str, float]]) -> int:
+        if not isinstance(scales, dict):
+            return 0
+
+        restored: Dict[str, float] = {}
+        for group, scale in scales.items():
+            if group is None:
+                continue
+            try:
+                scale_float = float(scale)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(scale_float):
+                continue
+            # keep boost-only and clamp into current configuration range
+            scale_float = max(1.0, min(self.max_scale, scale_float))
+            restored[str(group)] = scale_float
+
+        self.group_scale_auto = restored
+        return len(restored)
+
     def update_from_epoch_summary(self, epoch_no: int, summaries: List[tuple]) -> Dict[str, float]:
         # Ensure every observed group has an explicit state entry.
         for group, _, _, _ in summaries:
@@ -261,7 +293,7 @@ class GroupLRAutoTuner:
         if len(self.group_scale_auto) == 0:
             return {}
 
-        if epoch_no <= self.warmup_epochs:
+        if epoch_no < self.warmup_epochs:
             for group in list(self.group_scale_auto.keys()):
                 self.group_scale_auto[group] = 1.0
             return dict(self.group_scale_auto)
@@ -1717,6 +1749,9 @@ class NetworkTrainer:
         if args.full_fp16:
             train_util.patch_accelerator_for_fp16_training(accelerator)
 
+        group_lr_auto_resume_scales = None
+        group_lr_auto_tuner = None
+
         # before resuming make hook for saving/loading to save/load the network weights only
         def save_model_hook(models, weights, output_dir):
             # pop weights of other models than network to save only network weights
@@ -1745,6 +1780,8 @@ class NetworkTrainer:
                     "applied_step": self._te_lr_after_cfg.get("applied_step"),
                     "threshold_step": self._te_lr_after_cfg.get("threshold_step"),
                 }
+            if group_lr_auto_tuner is not None:
+                train_state["group_lr_auto_scales"] = group_lr_auto_tuner.export_scales()
             with open(train_state_file, "w", encoding="utf-8") as f:
                 json.dump(train_state, f)
 
@@ -1761,7 +1798,7 @@ class NetworkTrainer:
             # print(f"load model hook: {len(models)} models will be loaded")
 
             # load current epoch and step to
-            nonlocal steps_from_state
+            nonlocal steps_from_state, group_lr_auto_resume_scales
             train_state_file = os.path.join(input_dir, "train_state.json")
             if os.path.exists(train_state_file):
                 with open(train_state_file, "r", encoding="utf-8") as f:
@@ -1775,6 +1812,7 @@ class NetworkTrainer:
                 self._te_lr_after_resumed = True
                 self._te_lr_after_resume_state = data.get("te_lr_after")
                 self._te_lr_after_resume_step = steps_from_state_local
+                group_lr_auto_resume_scales = data.get("group_lr_auto_scales")
                 logger.info(f"load train state from {train_state_file}: {data}")
             elif getattr(args, "resume", False):
                 self._te_lr_after_resumed = True
@@ -2188,7 +2226,7 @@ class NetworkTrainer:
         group_loss_log_every_n_steps = 100
         group_loss_epoch_summary = group_loss_epoch_summary_requested
         group_lr_auto_enabled = group_lr_auto_requested
-        group_lr_auto_tuner: Optional[GroupLRAutoTuner] = None
+        group_lr_auto_tuner = None
         group_loss_step_log_path = None
         group_loss_epoch_log_path = None
         group_loss_step_header_written = False
@@ -2302,6 +2340,12 @@ class NetworkTrainer:
                     max_scale=float(getattr(args, "group_lr_auto_max_scale", 1.20)),
                     max_change=float(getattr(args, "group_lr_auto_max_change", 0.05)),
                 )
+                restored_count = group_lr_auto_tuner.import_scales(group_lr_auto_resume_scales)
+                if restored_count > 0:
+                    logger.info(
+                        f"restored group_lr_auto scales from resume state: {restored_count} groups "
+                        f"/ resume stateから group_lr_auto の倍率を復元しました: {restored_count} グループ"
+                    )
 
         # callback for step start
         if hasattr(accelerator.unwrap_model(network), "on_step_start"):
