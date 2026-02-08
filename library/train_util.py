@@ -385,6 +385,8 @@ class BaseSubset:
         caption_suffix: Optional[str],
         token_warmup_min: int,
         token_warmup_step: Union[float, int],
+        group: Optional[str] = None,
+        group_adjust: bool = True,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -407,6 +409,10 @@ class BaseSubset:
 
         self.token_warmup_min = token_warmup_min  # step=0におけるタグの数
         self.token_warmup_step = token_warmup_step  # N（N<1ならN*max_train_steps）ステップ目でタグの数が最大になる
+
+        self.group = group if group is None else str(group).strip() or None
+        self.group_adjust = bool(group_adjust)
+        self.subset_index = -1
 
         self.img_count = 0
 
@@ -438,6 +444,8 @@ class DreamBoothSubset(BaseSubset):
         caption_suffix,
         token_warmup_min,
         token_warmup_step,
+        group=None,
+        group_adjust=True,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -462,6 +470,8 @@ class DreamBoothSubset(BaseSubset):
             caption_suffix,
             token_warmup_min,
             token_warmup_step,
+            group,
+            group_adjust,
         )
 
         self.is_reg = is_reg
@@ -501,6 +511,8 @@ class FineTuningSubset(BaseSubset):
         caption_suffix,
         token_warmup_min,
         token_warmup_step,
+        group=None,
+        group_adjust=True,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -525,6 +537,8 @@ class FineTuningSubset(BaseSubset):
             caption_suffix,
             token_warmup_min,
             token_warmup_step,
+            group,
+            group_adjust,
         )
 
         self.metadata_file = metadata_file
@@ -560,6 +574,8 @@ class ControlNetSubset(BaseSubset):
         caption_suffix,
         token_warmup_min,
         token_warmup_step,
+        group=None,
+        group_adjust=True,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -584,6 +600,8 @@ class ControlNetSubset(BaseSubset):
             caption_suffix,
             token_warmup_min,
             token_warmup_step,
+            group,
+            group_adjust,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
@@ -726,6 +744,13 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
+
+    @staticmethod
+    def normalize_group_name(group: Optional[str]) -> str:
+        if group is None:
+            return "__ungrouped__"
+        normalized = str(group).strip()
+        return normalized if normalized else "__ungrouped__"
 
     def process_caption(self, subset: BaseSubset, caption):
         # caption に prefix/suffix を付ける
@@ -1245,6 +1270,10 @@ class BaseDataset(torch.utils.data.Dataset):
         crop_top_lefts = []
         target_sizes_hw = []
         flippeds = []  # 変数名が微妙
+        subset_indices = []
+        groups = []
+        group_adjusts = []
+        bucket_resos = []
         text_encoder_outputs1_list = []
         text_encoder_outputs2_list = []
         text_encoder_pool2_list = []
@@ -1252,6 +1281,10 @@ class BaseDataset(torch.utils.data.Dataset):
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
+            subset_indices.append(getattr(subset, "subset_index", -1))
+            groups.append(self.normalize_group_name(getattr(subset, "group", None)))
+            group_adjusts.append(bool(getattr(subset, "group_adjust", True)))
+            bucket_resos.append(image_info.bucket_reso)
             loss_weights.append(
                 self.prior_loss_weight if image_info.is_reg else 1.0
             )  # in case of fine tuning, is_reg is always False
@@ -1462,6 +1495,10 @@ class BaseDataset(torch.utils.data.Dataset):
         example["flippeds"] = flippeds
 
         example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
+        example["subset_indices"] = subset_indices
+        example["groups"] = groups
+        example["group_adjusts"] = group_adjusts
+        example["bucket_resos"] = bucket_resos
 
         if self.debug_dataset:
             example["image_keys"] = bucket[image_index : image_index + self.batch_size]
@@ -2031,6 +2068,8 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_suffix,
                 subset.token_warmup_min,
                 subset.token_warmup_step,
+                subset.group,
+                subset.group_adjust,
             )
             db_subsets.append(db_subset)
 
