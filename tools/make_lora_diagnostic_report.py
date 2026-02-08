@@ -530,6 +530,8 @@ def parse_group_loss_logs(
         ema_loss_end = safe_float(row.get("ema_loss_end"))
         count_epoch = safe_int(row.get("count_epoch"))
         mean_loss_epoch = safe_float(row.get("mean_loss_epoch"))
+        group_scale_auto = safe_float(row.get("group_scale_auto"))
+        group_scale_applied = safe_float(row.get("group_scale_applied"))
         if epoch is None:
             continue
         epoch_rows.append(
@@ -539,6 +541,8 @@ def parse_group_loss_logs(
                 "ema_loss_end": ema_loss_end,
                 "count_epoch": count_epoch,
                 "mean_loss_epoch": mean_loss_epoch,
+                "group_scale_auto": group_scale_auto,
+                "group_scale_applied": group_scale_applied,
             }
         )
 
@@ -1162,12 +1166,15 @@ def build_chart_payload(
         epoch_rows = group_loss_data.get("epoch_rows", []) or []
         if epoch_rows:
             group_to_points: Dict[str, List[Tuple[int, Optional[float]]]] = defaultdict(list)
+            group_to_scale_points: Dict[str, List[Tuple[int, Optional[float]]]] = defaultdict(list)
             for row in epoch_rows:
                 epoch = row.get("epoch")
                 group = row.get("group")
                 value = row.get("ema_loss_end")
+                scale_applied = row.get("group_scale_applied")
                 if isinstance(epoch, int) and isinstance(group, str):
                     group_to_points[group].append((epoch, value))
+                    group_to_scale_points[group].append((epoch, scale_applied))
 
             group_names = list(group_to_points.keys())
             series = []
@@ -1199,6 +1206,48 @@ def build_chart_payload(
                         "y_min_fixed": 0.0,
                         "legend_max_rows": 4,
                         "series": series,
+                    }
+                )
+
+            scale_group_names = [
+                group
+                for group, points in group_to_scale_points.items()
+                if any(value is not None for _, value in points)
+            ]
+            scale_series = []
+            for idx, group in enumerate(scale_group_names):
+                points = sorted(group_to_scale_points[group], key=lambda item: item[0])
+                scale_series.append(
+                    {
+                        "name": group,
+                        "color": color_for_index(idx, len(scale_group_names)),
+                        "x": [pt[0] for pt in points],
+                        "y": [pt[1] for pt in points],
+                    }
+                )
+
+            if scale_series:
+                scale_epochs = sorted(
+                    {
+                        epoch
+                        for point_list in group_to_scale_points.values()
+                        for epoch, value in point_list
+                        if value is not None
+                    }
+                )
+                scale_markers = [{"x": epoch, "label": f"E{epoch}"} for epoch in scale_epochs]
+                payload["group_loss"].append(
+                    {
+                        "id": "group_scale_applied_epoch",
+                        "title": "Group Scale Applied (epoch)",
+                        "x_label": "Epoch",
+                        "markers": scale_markers,
+                        "x": scale_epochs,
+                        "y_min_floor": 1.0,
+                        "y_tick_step": 0.05,
+                        "y_tick_precision": 2,
+                        "legend_max_rows": 4,
+                        "series": scale_series,
                     }
                 )
 

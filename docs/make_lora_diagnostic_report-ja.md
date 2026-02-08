@@ -60,5 +60,6 @@ python tools\make_lora_diagnostic_report.py --base_name loraname --input_dir ..\
 - `group_loss_logs` がある場合: `global_step` をX軸に `ema_loss_group` をgroup別系列で表示  
 - `group_loss_epoch` がある場合: `epoch` をX軸に `ema_loss_end` をgroup別系列で表示  
 両方ある場合は、それぞれ別グラフとして表示します。
+- `group_loss_epoch` に `group_scale_applied` 列がある場合: `epoch` をX軸に `group_scale_applied` をgroup別系列で追加表示
 
 LoRAチェックポイント（`.safetensors`）が無い場合は、LoRA重み解析セクションのみ警告表示になり、レポート生成は続行します。
