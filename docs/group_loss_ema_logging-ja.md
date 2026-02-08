@@ -9,8 +9,7 @@
 - 機能:
   - subsetごとに設定した `group` で、学習lossのオンラインEMAを集計
   - stepログCSV（全step記録）とepochサマリCSVを出力
-- 将来拡張:
-  - `group_adjust` はPhase1では未使用（将来の自動配分調整向けに保持のみ）
+  - 任意で、epoch境界で group別LR自動補正（boost-only）を適用
 
 ## 制約条件
 
@@ -21,6 +20,10 @@
 - 分散学習時（DDP）は **main process のみCSV出力**します（rank0のローカルバッチに基づくログ）。
 - `skip_grad_norm` で更新がスキップされたstepは、EMA集計にもCSVにも含みません。
 - `loss` が `NaN` / `inf` のstepは、EMA集計にもCSVにも含みません。
+- `--group_lr_auto` は以下を満たさないとエラーで停止します。
+  - `--group_loss_log` と `--group_loss_epoch_summary` を同時指定
+  - `gradient_accumulation_steps = 1`
+  - 単一process実行（multi-process/DDP不可）
 
 ## dataset_config.toml 拡張
 
@@ -28,8 +31,6 @@
 
 - `group = "hyuzu"`
   - グループ識別子（文字列）
-- `group_adjust = true`
-  - 将来の自動調整対象フラグ（Phase1では未使用）
 
 `group` 未指定（または空文字）のsubsetは、ログ上 `__ungrouped__` として扱われます。
 
@@ -54,6 +55,13 @@
 | `--group_loss_ema_beta <float>` | `0.98` | EMA係数（`ema = ema*beta + loss*(1-beta)`） |
 | `--group_loss_log_every_n_steps <int>` | `100` | stepログCSVのバッファを書き出す間隔（global step）。記録自体は全stepで行う |
 | `--group_loss_epoch_summary` | `False` | epoch末サマリCSVを追記出力 |
+| `--group_lr_auto` | `False` | group別LR自動補正（boost-only）を有効化 |
+| `--group_lr_auto_warmup_epochs <int>` | `3` | warmup中は全group scale=1.0固定 |
+| `--group_lr_auto_min_count <int>` | `20` | epoch更新対象にする最小 `count_epoch` |
+| `--group_lr_auto_deadband <float>` | `0.05` | `ratio <= 1+deadband` を補正なし（1.0）とみなす |
+| `--group_lr_auto_power <float>` | `0.5` | `ratio**power` の指数 |
+| `--group_lr_auto_max_scale <float>` | `1.2` | scale上限 |
+| `--group_lr_auto_max_change <float>` | `0.05` | 1epochあたりのscale変化率上限（上下両方向） |
 
 ## 出力ファイル
 
@@ -70,7 +78,7 @@
 
 ヘッダ:
 
-`global_step,epoch,group,subset_index,loss,ema_loss_group,count_group,timestep,bucket_reso`
+`global_step,epoch,group,subset_index,loss,ema_loss_group,count_group,timestep,bucket_reso,group_scale_auto,group_scale_applied`
 
 - `global_step`: optimizer更新単位のstep
 - `epoch`: 1始まり
@@ -81,16 +89,20 @@
 - `count_group`: そのgroupの有効step累計
 - `timestep`: diffusion timestep
 - `bucket_reso`: バケット解像度（`WxH`）
+- `group_scale_auto`: そのstepのgroupに対する自動補正倍率
+- `group_scale_applied`: そのstepで実際に適用した倍率（MVPでは `group_scale_auto` と同値）
 
 ### epochサマリCSV
 
 ヘッダ:
 
-`epoch,group,ema_loss_end,count_epoch,mean_loss_epoch`
+`epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,group_scale_auto,group_scale_applied`
 
 - `ema_loss_end`: そのepoch終了時点のEMA
 - `count_epoch`: そのepoch内の有効step数
 - `mean_loss_epoch`: そのepoch内のgroup平均loss
+- `group_scale_auto`: そのepochログ時点の自動補正倍率
+- `group_scale_applied`: そのepochでの適用倍率（MVPでは同値）
 
 ## CLI指定例
 
@@ -117,6 +129,24 @@ accelerate launch sdxl_train_network.py \
   --group_loss_epoch_summary
 ```
 
+### group別LR自動補正を有効化（boost-only）
+
+```bash
+accelerate launch sdxl_train_network.py \
+  --dataset_config /path/to/dataset.toml \
+  --output_dir /path/to/out \
+  --output_name sample_lora \
+  --group_loss_log \
+  --group_loss_epoch_summary \
+  --group_lr_auto \
+  --group_lr_auto_warmup_epochs 3 \
+  --group_lr_auto_min_count 20 \
+  --group_lr_auto_deadband 0.05 \
+  --group_lr_auto_power 0.5 \
+  --group_lr_auto_max_scale 1.2 \
+  --group_lr_auto_max_change 0.05
+```
+
 ## dataset toml 記載例
 
 ### 1) キャラごとにgroupを付与
@@ -134,7 +164,6 @@ batch_size = 1
   class_tokens = "hyuzu"
   num_repeats = 20
   group = "hyuzu"
-  group_adjust = true
 
   [[datasets.subsets]]
   image_dir = "D:\train_data\ieimi"

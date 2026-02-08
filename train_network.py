@@ -6,6 +6,7 @@ import sys
 import random
 import time
 import json
+import statistics
 from dataclasses import dataclass
 from multiprocessing import Value
 import toml
@@ -215,6 +216,105 @@ class GroupLossTracker:
     def reset_epoch(self):
         self.epoch_count_by_group.clear()
         self.epoch_loss_sum_by_group.clear()
+
+
+class GroupLRAutoTuner:
+    def __init__(
+        self,
+        warmup_epochs: int,
+        min_count: int,
+        deadband: float,
+        power: float,
+        max_scale: float,
+        max_change: float,
+    ):
+        if warmup_epochs < 0:
+            raise ValueError("group_lr_auto_warmup_epochs must be >= 0")
+        if min_count < 1:
+            raise ValueError("group_lr_auto_min_count must be >= 1")
+        if deadband < 0.0:
+            raise ValueError("group_lr_auto_deadband must be >= 0")
+        if power <= 0.0:
+            raise ValueError("group_lr_auto_power must be > 0")
+        if max_scale < 1.0:
+            raise ValueError("group_lr_auto_max_scale must be >= 1.0")
+        if max_change <= 0.0 or max_change >= 1.0:
+            raise ValueError("group_lr_auto_max_change must be in (0,1)")
+
+        self.warmup_epochs = warmup_epochs
+        self.min_count = min_count
+        self.deadband = deadband
+        self.power = power
+        self.max_scale = max_scale
+        self.max_change = max_change
+        self.group_scale_auto: Dict[str, float] = {}
+
+    def get_scale(self, group: str) -> float:
+        return self.group_scale_auto.get(group, 1.0)
+
+    def update_from_epoch_summary(self, epoch_no: int, summaries: List[tuple]) -> Dict[str, float]:
+        # Ensure every observed group has an explicit state entry.
+        for group, _, _, _ in summaries:
+            if group not in self.group_scale_auto:
+                self.group_scale_auto[group] = 1.0
+
+        if len(self.group_scale_auto) == 0:
+            return {}
+
+        if epoch_no <= self.warmup_epochs:
+            for group in list(self.group_scale_auto.keys()):
+                self.group_scale_auto[group] = 1.0
+            return dict(self.group_scale_auto)
+
+        valid_losses: Dict[str, float] = {}
+        for group, ema_loss_end, count_epoch, _ in summaries:
+            if count_epoch < self.min_count:
+                continue
+            if ema_loss_end is None:
+                continue
+            if not math.isfinite(ema_loss_end):
+                continue
+            if ema_loss_end <= 0.0:
+                continue
+            valid_losses[group] = float(ema_loss_end)
+
+        if len(valid_losses) <= 1:
+            for group in list(self.group_scale_auto.keys()):
+                self.group_scale_auto[group] = 1.0
+            return dict(self.group_scale_auto)
+
+        if len(valid_losses) == 2:
+            ref_loss = min(valid_losses.values())
+        else:
+            ref_loss = float(statistics.median(valid_losses.values()))
+
+        if not math.isfinite(ref_loss) or ref_loss <= 0.0:
+            for group in list(self.group_scale_auto.keys()):
+                self.group_scale_auto[group] = 1.0
+            return dict(self.group_scale_auto)
+
+        prev_scales = dict(self.group_scale_auto)
+        next_scales: Dict[str, float] = {}
+        for group, prev in prev_scales.items():
+            if group in valid_losses:
+                ratio = valid_losses[group] / ref_loss
+                if ratio <= 1.0 + self.deadband:
+                    scale_candidate = 1.0
+                else:
+                    scale_candidate = min(self.max_scale, ratio**self.power)
+            else:
+                # If this epoch lacks enough samples for a group, keep the previous value.
+                scale_candidate = prev
+
+            lower = prev * (1.0 - self.max_change)
+            upper = prev * (1.0 + self.max_change)
+            scale_next = min(max(scale_candidate, lower), upper)
+            scale_next = max(1.0, scale_next)
+            scale_next = min(self.max_scale, scale_next)
+            next_scales[group] = float(scale_next)
+
+        self.group_scale_auto = next_scales
+        return dict(self.group_scale_auto)
 
 
 GRAD_NORM_PRESETS = {
@@ -1714,12 +1814,33 @@ class NetworkTrainer:
         accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
-        if bool(getattr(args, "group_loss_log", False)):
+        group_loss_log_requested = bool(getattr(args, "group_loss_log", False))
+        group_loss_epoch_summary_requested = bool(getattr(args, "group_loss_epoch_summary", False))
+        group_lr_auto_requested = bool(getattr(args, "group_lr_auto", False))
+
+        if group_loss_log_requested:
             dataset_batch_sizes = [int(getattr(d, "batch_size", -1)) for d in train_dataset_group.datasets]
             if any(bs != 1 for bs in dataset_batch_sizes):
                 raise ValueError(
                     f"group_loss_log supports only batch_size=1 datasets. found: {dataset_batch_sizes} / "
                     f"group_loss_log は batch_size=1 のデータセットのみ対応です。検出値: {dataset_batch_sizes}"
+                )
+
+        if group_lr_auto_requested:
+            if not group_loss_log_requested or not group_loss_epoch_summary_requested:
+                raise ValueError(
+                    "group_lr_auto requires --group_loss_log and --group_loss_epoch_summary / "
+                    "group_lr_auto には --group_loss_log と --group_loss_epoch_summary が必要です"
+                )
+            if args.gradient_accumulation_steps != 1:
+                raise ValueError(
+                    "group_lr_auto supports only gradient_accumulation_steps=1 / "
+                    "group_lr_auto は gradient_accumulation_steps=1 のみ対応です"
+                )
+            if accelerator.num_processes != 1:
+                raise ValueError(
+                    "group_lr_auto supports only single-process training / "
+                    "group_lr_auto は単一process学習のみ対応です"
                 )
 
         # TODO refactor metadata creation and move to util
@@ -1807,7 +1928,6 @@ class NetworkTrainer:
                         "subset_index": getattr(subset, "subset_index", -1),
                         "num_repeats": subset.num_repeats,
                         "group": getattr(subset, "group", None),
-                        "group_adjust": bool(getattr(subset, "group_adjust", True)),
                         "color_aug": bool(subset.color_aug),
                         "flip_aug": bool(subset.flip_aug),
                         "random_crop": bool(subset.random_crop),
@@ -2063,15 +2183,20 @@ class NetworkTrainer:
             def check_gradients_and_skip_update(model, epoch, step, loss_val):
                 return False
 
-        group_loss_log_enabled = bool(getattr(args, "group_loss_log", False))
+        group_loss_log_enabled = group_loss_log_requested
         group_loss_tracker: Optional[GroupLossTracker] = None
         group_loss_log_every_n_steps = 100
-        group_loss_epoch_summary = bool(getattr(args, "group_loss_epoch_summary", False))
+        group_loss_epoch_summary = group_loss_epoch_summary_requested
+        group_lr_auto_enabled = group_lr_auto_requested
+        group_lr_auto_tuner: Optional[GroupLRAutoTuner] = None
         group_loss_step_log_path = None
         group_loss_epoch_log_path = None
         group_loss_step_header_written = False
         group_loss_epoch_header_written = False
-        group_loss_step_header = "global_step,epoch,group,subset_index,loss,ema_loss_group,count_group,timestep,bucket_reso"
+        group_loss_step_header = (
+            "global_step,epoch,group,subset_index,loss,ema_loss_group,count_group,timestep,bucket_reso,"
+            "group_scale_auto,group_scale_applied"
+        )
         group_loss_step_log_buffer: List[str] = []
         group_loss_last_flush_step = 0
 
@@ -2168,6 +2293,15 @@ class NetworkTrainer:
             group_loss_step_log_path = os.path.join(args.output_dir, f"group_loss_logs+{model_name_for_logs}.csv")
             if group_loss_epoch_summary:
                 group_loss_epoch_log_path = os.path.join(args.output_dir, f"group_loss_epoch+{model_name_for_logs}.csv")
+            if group_lr_auto_enabled:
+                group_lr_auto_tuner = GroupLRAutoTuner(
+                    warmup_epochs=int(getattr(args, "group_lr_auto_warmup_epochs", 3)),
+                    min_count=int(getattr(args, "group_lr_auto_min_count", 20)),
+                    deadband=float(getattr(args, "group_lr_auto_deadband", 0.05)),
+                    power=float(getattr(args, "group_lr_auto_power", 0.5)),
+                    max_scale=float(getattr(args, "group_lr_auto_max_scale", 1.20)),
+                    max_change=float(getattr(args, "group_lr_auto_max_change", 0.05)),
+                )
 
         # callback for step start
         if hasattr(accelerator.unwrap_model(network), "on_step_start"):
@@ -2300,6 +2434,11 @@ class NetworkTrainer:
                 step_subset_index = _extract_first(batch.get("subset_indices"))
                 step_bucket_reso = _extract_first(batch.get("bucket_resos"))
                 step_timestep = None
+                step_group_scale_auto = 1.0
+                step_group_scale_applied = 1.0
+                if group_lr_auto_enabled and group_lr_auto_tuner is not None:
+                    step_group_scale_auto = group_lr_auto_tuner.get_scale(step_group)
+                    step_group_scale_applied = step_group_scale_auto
                 with accelerator.accumulate(training_model):
                     dq_bits_changed_this_step = False
                     # Toggle delta fake-quantization based on training progress
@@ -2489,7 +2628,16 @@ class NetworkTrainer:
                                 params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                                 accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                        original_lrs = None
+                        if accelerator.sync_gradients and group_lr_auto_enabled and step_group_scale_applied != 1.0:
+                            original_lrs = [group.get("lr", 0.0) for group in optimizer.param_groups]
+                            for param_group in optimizer.param_groups:
+                                param_group["lr"] = param_group["lr"] * step_group_scale_applied
+
                         optimizer.step()
+                        if original_lrs is not None:
+                            for param_group, lr in zip(optimizer.param_groups, original_lrs):
+                                param_group["lr"] = lr
                         lr_scheduler.step()
                         self._apply_te_lr_after_if_ready(optimizer, lr_scheduler, global_step + 1)
                         optimizer.zero_grad(set_to_none=True)
@@ -2545,6 +2693,8 @@ class NetworkTrainer:
                                 count_group,
                                 step_timestep,
                                 bucket_reso_value,
+                                step_group_scale_auto,
+                                step_group_scale_applied,
                             ]
                             group_loss_step_log_buffer.append(",".join(_group_csv_format(v) for v in row))
                     _group_flush_step_buffer(force=False, current_global_step=global_step)
@@ -2983,13 +3133,18 @@ class NetworkTrainer:
             if group_loss_log_enabled and group_loss_epoch_summary and group_loss_tracker is not None:
                 if accelerator.is_main_process:
                     for group, ema_loss_end, count_epoch, mean_loss_epoch in group_loss_tracker.get_epoch_summary():
-                        row = [epoch + 1, group, ema_loss_end, count_epoch, mean_loss_epoch]
+                        epoch_group_scale = 1.0
+                        if group_lr_auto_enabled and group_lr_auto_tuner is not None:
+                            epoch_group_scale = group_lr_auto_tuner.get_scale(group)
+                        row = [epoch + 1, group, ema_loss_end, count_epoch, mean_loss_epoch, epoch_group_scale, epoch_group_scale]
                         _group_write_csv(
                             group_loss_epoch_log_path,
-                            "epoch,group,ema_loss_end,count_epoch,mean_loss_epoch",
+                            "epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,group_scale_auto,group_scale_applied",
                             row,
                             epoch_log=True,
                         )
+                if group_lr_auto_enabled and group_lr_auto_tuner is not None:
+                    group_lr_auto_tuner.update_from_epoch_summary(epoch + 1, group_loss_tracker.get_epoch_summary())
                 group_loss_tracker.reset_epoch()
 
             accelerator.wait_for_everyone()
@@ -3486,6 +3641,47 @@ def setup_parser() -> argparse.ArgumentParser:
         "--group_loss_epoch_summary",
         action="store_true",
         help="append group-wise epoch summary CSV / グループ別のepochサマリCSVを追記出力",
+    )
+    parser.add_argument(
+        "--group_lr_auto",
+        action="store_true",
+        help="enable group-wise LR auto scaling (boost-only) / グループ別LR自動補正（boost-only）を有効化",
+    )
+    parser.add_argument(
+        "--group_lr_auto_warmup_epochs",
+        type=int,
+        default=3,
+        help="warmup epochs for group_lr_auto / group_lr_auto のウォームアップepoch数",
+    )
+    parser.add_argument(
+        "--group_lr_auto_min_count",
+        type=int,
+        default=20,
+        help="minimum count_epoch for group_lr_auto update / group_lr_auto 更新に必要な最小count_epoch",
+    )
+    parser.add_argument(
+        "--group_lr_auto_deadband",
+        type=float,
+        default=0.05,
+        help="deadband for group_lr_auto ratio / group_lr_auto のratioデッドバンド",
+    )
+    parser.add_argument(
+        "--group_lr_auto_power",
+        type=float,
+        default=0.5,
+        help="power for group_lr_auto boost curve / group_lr_auto のboostカーブ指数",
+    )
+    parser.add_argument(
+        "--group_lr_auto_max_scale",
+        type=float,
+        default=1.2,
+        help="upper bound of group_lr_auto scale / group_lr_auto の倍率上限",
+    )
+    parser.add_argument(
+        "--group_lr_auto_max_change",
+        type=float,
+        default=0.05,
+        help="maximum relative scale change per epoch / 1epochあたりの倍率変化上限（相対値）",
     )
     # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
     # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")
