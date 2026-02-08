@@ -5,6 +5,7 @@
 
 - `grad_norm` ログ可視化
 - `dq_delta` ログ可視化
+- `group_loss` ログ可視化（任意）
 - LoRA重みの統計（任意）
 - LoRA情報密度のエポック推移（任意）
 
@@ -16,6 +17,8 @@
 - `gradient_logs+<base_name>.txt`
 - `dq_delta_logs+<base_name>.txt`
 - `dq_delta_auto+<base_name>.txt`
+- `group_loss_logs+<base_name>.csv`（任意）
+- `group_loss_epoch+<base_name>.csv`（任意）
 
 LoRAチェックポイントは `--input_dir/<base_name>.safetensors` を使用します。  
 `--lora_epoch_trend`オプション指定時は`--input_dir/<base_name>-000001.safetensors`などの途中のチェックポイントも使用します。
@@ -52,5 +55,10 @@ python tools\make_lora_diagnostic_report.py --base_name loraname --input_dir ..\
 
 - `dq_delta_auto+<base_name>.txt` が無い  
   auto系の解析だけ省略し、HTML/JSONは生成されます。
+
+`group_loss_logs` / `group_loss_epoch` も任意です。存在する場合のみ `Group Loss Dashboard` が追加されます。  
+- `group_loss_logs` がある場合: `global_step` をX軸に `ema_loss_group` をgroup別系列で表示  
+- `group_loss_epoch` がある場合: `epoch` をX軸に `ema_loss_end` をgroup別系列で表示  
+両方ある場合は、それぞれ別グラフとして表示します。
 
 LoRAチェックポイント（`.safetensors`）が無い場合は、LoRA重み解析セクションのみ警告表示になり、レポート生成は続行します。

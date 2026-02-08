@@ -466,6 +466,102 @@ def parse_dq_logs(
     }
 
 
+def parse_group_loss_logs(
+    group_step_log_path: Optional[str],
+    group_epoch_log_path: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    step_rows_raw = read_csv_rows(group_step_log_path) if group_step_log_path and os.path.exists(group_step_log_path) else []
+    epoch_rows_raw = read_csv_rows(group_epoch_log_path) if group_epoch_log_path and os.path.exists(group_epoch_log_path) else []
+
+    step_rows: List[Dict[str, Any]] = []
+    first_step_by_epoch: Dict[int, int] = {}
+    group_order: List[str] = []
+    group_seen = set()
+    group_points: Dict[str, List[Tuple[int, Optional[float]]]] = defaultdict(list)
+
+    for row in step_rows_raw:
+        global_step = safe_int(row.get("global_step"))
+        if global_step is None:
+            continue
+        epoch = safe_int(row.get("epoch"))
+        group = (row.get("group") or "").strip() or "__ungrouped__"
+        ema_loss_group = safe_float(row.get("ema_loss_group"))
+        loss = safe_float(row.get("loss"))
+        step_rows.append(
+            {
+                "global_step": global_step,
+                "epoch": epoch,
+                "group": group,
+                "ema_loss_group": ema_loss_group,
+                "loss": loss,
+            }
+        )
+
+        if epoch is not None and epoch not in first_step_by_epoch:
+            first_step_by_epoch[epoch] = global_step
+        if group not in group_seen:
+            group_seen.add(group)
+            group_order.append(group)
+        group_points[group].append((global_step, ema_loss_group))
+
+    step_rows.sort(key=lambda item: item["global_step"])
+
+    x_values = [row["global_step"] for row in step_rows]
+    group_series: List[Dict[str, Any]] = []
+    if x_values and group_order:
+        color_map = {group: color_for_index(idx, len(group_order)) for idx, group in enumerate(group_order)}
+        for group in group_order:
+            points = sorted(group_points.get(group, []), key=lambda item: item[0])
+            group_series.append(
+                {
+                    "name": group,
+                    "color": color_map[group],
+                    "x": [pt[0] for pt in points],
+                    "y": [pt[1] for pt in points],
+                }
+            )
+
+    markers = [{"x": step_value, "label": f"E{epoch}"} for epoch, step_value in sorted(first_step_by_epoch.items())]
+
+    epoch_rows: List[Dict[str, Any]] = []
+    for row in epoch_rows_raw:
+        epoch = safe_int(row.get("epoch"))
+        group = (row.get("group") or "").strip() or "__ungrouped__"
+        ema_loss_end = safe_float(row.get("ema_loss_end"))
+        count_epoch = safe_int(row.get("count_epoch"))
+        mean_loss_epoch = safe_float(row.get("mean_loss_epoch"))
+        if epoch is None:
+            continue
+        epoch_rows.append(
+            {
+                "epoch": epoch,
+                "group": group,
+                "ema_loss_end": ema_loss_end,
+                "count_epoch": count_epoch,
+                "mean_loss_epoch": mean_loss_epoch,
+            }
+        )
+
+    if not step_rows and not epoch_rows:
+        return None
+
+    return {
+        "step_path": group_step_log_path,
+        "epoch_path": group_epoch_log_path,
+        "step_rows": step_rows,
+        "epoch_rows": epoch_rows,
+        "x": x_values,
+        "markers": markers,
+        "series": group_series,
+        "summary": {
+            "step_rows": len(step_rows),
+            "epoch_rows": len(epoch_rows),
+            "group_count": len(group_order),
+            "groups": group_order,
+        },
+    }
+
+
 def analyze_lora_checkpoint(model_path: str, bins: int) -> Dict[str, Any]:
     collect_single_analysis, _, _ = import_lora_analysis_tools()
     report = collect_single_analysis(model_path, bins)
@@ -817,9 +913,10 @@ def sanitize_json(value: Any) -> Any:
 def build_chart_payload(
     grad_data: Optional[Dict[str, Any]],
     dq_data: Optional[Dict[str, Any]],
+    group_loss_data: Optional[Dict[str, Any]],
     lora_trend_data: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"grad": [], "dq": [], "lora_trend": []}
+    payload: Dict[str, Any] = {"grad": [], "dq": [], "group_loss": [], "lora_trend": []}
 
     if grad_data:
         x = grad_data.get("x", [])
@@ -1043,6 +1140,67 @@ def build_chart_payload(
                 "series": series_for([("RankEnergySum", "RankEnergySum", ColorPalette[7])]),
             },
         ]
+
+    if group_loss_data:
+        step_x = group_loss_data.get("x", []) or []
+        step_markers = group_loss_data.get("markers", []) or []
+        step_series = group_loss_data.get("series", []) or []
+        if step_x and step_series:
+            payload["group_loss"].append(
+                {
+                    "id": "group_loss_ema_step",
+                    "title": "Group Loss EMA (step)",
+                    "x_label": "GlobalStep",
+                    "markers": step_markers,
+                    "x": step_x,
+                    "y_min_fixed": 0.0,
+                    "legend_max_rows": 4,
+                    "series": step_series,
+                }
+            )
+
+        epoch_rows = group_loss_data.get("epoch_rows", []) or []
+        if epoch_rows:
+            group_to_points: Dict[str, List[Tuple[int, Optional[float]]]] = defaultdict(list)
+            for row in epoch_rows:
+                epoch = row.get("epoch")
+                group = row.get("group")
+                value = row.get("ema_loss_end")
+                if isinstance(epoch, int) and isinstance(group, str):
+                    group_to_points[group].append((epoch, value))
+
+            group_names = list(group_to_points.keys())
+            series = []
+            for idx, group in enumerate(group_names):
+                points = sorted(group_to_points[group], key=lambda item: item[0])
+                series.append(
+                    {
+                        "name": group,
+                        "color": color_for_index(idx, len(group_names)),
+                        "x": [pt[0] for pt in points],
+                        "y": [pt[1] for pt in points],
+                    }
+                )
+
+            if series:
+                epoch_markers = []
+                unique_epochs = sorted(
+                    {epoch for point_list in group_to_points.values() for epoch, _ in point_list}
+                )
+                if unique_epochs:
+                    epoch_markers = [{"x": epoch, "label": f"E{epoch}"} for epoch in unique_epochs]
+                payload["group_loss"].append(
+                    {
+                        "id": "group_loss_ema_epoch",
+                        "title": "Group Loss EMA (epoch summary)",
+                        "x_label": "Epoch",
+                        "markers": epoch_markers,
+                        "x": unique_epochs,
+                        "y_min_fixed": 0.0,
+                        "legend_max_rows": 4,
+                        "series": series,
+                    }
+                )
 
     if lora_trend_data:
         checkpoints = lora_trend_data.get("checkpoints", []) or []
@@ -1421,6 +1579,12 @@ td.num {{
     </section>
 
     <section class="panel">
+      <h2>Group Loss Dashboard</h2>
+      <p class="sub">`group_loss_logs+*.csv` を検出した場合に、groupごとのEMA loss推移を表示します。</p>
+      <div id="groupLossCharts" class="chart-grid"></div>
+    </section>
+
+    <section class="panel">
       <h2>LoRA Checkpoint Analysis</h2>
       {lora_error_html}
       <div class="grid cards">
@@ -1501,6 +1665,8 @@ td.num {{
         <div>Grad Log: <code>{(report.get("grad") or {}).get("path", "-")}</code></div>
         <div>DQ Log: <code>{(report.get("dq") or {}).get("path", "-")}</code></div>
         <div>DQ Auto Log: <code>{(report.get("dq") or {}).get("auto_path", "-")}</code></div>
+        <div>Group Loss Step Log: <code>{(report.get("group_loss") or {}).get("step_path", "-")}</code></div>
+        <div>Group Loss Epoch Log: <code>{(report.get("group_loss") or {}).get("epoch_path", "-")}</code></div>
         <div>LoRA Final Checkpoint: <code>{(report.get("lora") or {}).get("path", "-")}</code></div>
       </div>
     </section>
@@ -1887,6 +2053,7 @@ function mountCharts(containerId, charts) {{
 
 mountCharts('gradCharts', ((reportData.charts || {{}}).grad || []));
 mountCharts('dqCharts', ((reportData.charts || {{}}).dq || []));
+mountCharts('groupLossCharts', ((reportData.charts || {{}}).group_loss || []));
 mountCharts('loraTrendCharts', ((reportData.charts || {{}}).lora_trend || []));
 </script>
 </body>
@@ -1901,9 +2068,18 @@ def resolve_paths(args: argparse.Namespace) -> Dict[str, Optional[str]]:
     grad_log = os.path.join(input_dir, f"gradient_logs+{base_name}.txt")
     dq_log = os.path.join(input_dir, f"dq_delta_logs+{base_name}.txt")
     dq_auto_log = os.path.join(input_dir, f"dq_delta_auto+{base_name}.txt")
+    group_loss_step_log = os.path.join(input_dir, f"group_loss_logs+{base_name}.csv")
+    group_loss_epoch_log = os.path.join(input_dir, f"group_loss_epoch+{base_name}.csv")
     model = os.path.join(input_dir, f"{base_name}.safetensors")
 
-    return {"grad_log": grad_log, "dq_log": dq_log, "dq_auto_log": dq_auto_log, "model": model}
+    return {
+        "grad_log": grad_log,
+        "dq_log": dq_log,
+        "dq_auto_log": dq_auto_log,
+        "group_loss_step_log": group_loss_step_log,
+        "group_loss_epoch_log": group_loss_epoch_log,
+        "model": model,
+    }
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -1912,7 +2088,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input_dir",
         default=".",
-        help="ログとモデルがあるディレクトリ（ログ名は gradient_logs+/dq_delta_logs+/dq_delta_auto+ の固定形式）",
+        help="ログとモデルがあるディレクトリ（固定名: gradient_logs+/dq_delta_logs+/dq_delta_auto+、任意で group_loss_logs+/group_loss_epoch+）",
     )
     parser.add_argument("--loss_ma_window", type=int, default=100, help="Loss移動平均の窓サイズ")
     parser.add_argument("--lora_bins", type=int, default=128, help="LoRA重み解析のヒストグラムビン数")
@@ -1936,6 +2112,8 @@ def main() -> None:
     grad_log_path = paths["grad_log"]
     dq_log_path = paths["dq_log"]
     dq_auto_log_path = paths["dq_auto_log"]
+    group_loss_step_log_path = paths["group_loss_step_log"]
+    group_loss_epoch_log_path = paths["group_loss_epoch_log"]
     model_path = paths["model"]
 
     if not grad_log_path or not os.path.exists(grad_log_path):
@@ -1944,9 +2122,14 @@ def main() -> None:
         raise FileNotFoundError(f"dq log が見つかりません: {dq_log_path}")
     if dq_auto_log_path and not os.path.exists(dq_auto_log_path):
         dq_auto_log_path = None
+    if group_loss_step_log_path and not os.path.exists(group_loss_step_log_path):
+        group_loss_step_log_path = None
+    if group_loss_epoch_log_path and not os.path.exists(group_loss_epoch_log_path):
+        group_loss_epoch_log_path = None
 
     grad_data = parse_grad_log(grad_log_path, args.loss_ma_window)
     dq_data = parse_dq_logs(dq_log_path, dq_auto_log_path, grad_data)
+    group_loss_data = parse_group_loss_logs(group_loss_step_log_path, group_loss_epoch_log_path)
 
     lora_data = None
     lora_error = None
@@ -1974,13 +2157,14 @@ def main() -> None:
         lora_trend_error = "--skip_lora_analysis 指定時は --lora_epoch_trend を実行できません。"
 
     diagnostics = build_diagnostics(grad_data, dq_data, lora_data)
-    charts = build_chart_payload(grad_data, dq_data, lora_trend_data)
+    charts = build_chart_payload(grad_data, dq_data, group_loss_data, lora_trend_data)
 
     report = {
         "base_name": args.base_name,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "grad": grad_data,
         "dq": dq_data,
+        "group_loss": group_loss_data,
         "lora": lora_data,
         "lora_error": lora_error,
         "lora_trend": lora_trend_data,
