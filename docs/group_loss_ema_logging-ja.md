@@ -71,6 +71,69 @@
 | `--group_lr_auto_max_scale <float>` | `1.2` | scale上限 |
 | `--group_lr_auto_max_change <float>` | `0.05` | 1epochあたりのscale変化率上限（上下両方向） |
 
+## group別LR自動調整の仕組みと仕様
+
+### 1) 基本方針
+
+- 補正対象は「stepで実際に学習されたgroup」
+- 補正は **boost-only**（`scale >= 1.0`）で、LRを1.0未満には下げません
+- epoch内ではscale固定、epoch境界でのみ更新します
+
+### 2) 更新タイミング
+
+- 更新は各epoch末に行い、**次epoch** の学習stepから反映されます
+- `warmup_epochs` の間は全group `scale=1.0` 固定です
+  - 例: `warmup_epochs=3` の場合、epoch 1-3 は固定、epoch 4 から自動補正開始
+
+### 3) 更新に使う統計
+
+- 指標は epochサマリの `ema_loss_end`
+- `count_epoch < min_count` のgroupは、そのepochの更新計算から除外
+- `ema_loss_end` が非finiteまたは0以下のgroupも除外
+
+### 4) 基準loss（ref_loss）の決め方
+
+- 有効group集合 `L = {ema_loss_end[g]}`、その要素数を `N` とします
+- `N >= 3`: `ref_loss = median(L)`
+- `N == 2`: `ref_loss = min(L)`
+- `N <= 1`: 更新しない（全group `scale=1.0`）
+
+### 5) scale計算
+
+group `g` ごとに以下を計算します。
+
+- `ratio = ema_loss_end[g] / ref_loss`
+- `ratio <= 1 + deadband` の場合: `scale_candidate = 1.0`
+- `ratio > 1 + deadband` の場合: `scale_candidate = min(max_scale, ratio ** power)`
+
+次に、急変を抑えるため1epochあたりの変化率制限を適用します。
+
+- `lower = prev_scale * (1 - max_change)`
+- `upper = prev_scale * (1 + max_change)`
+- `scale_next = clamp(scale_candidate, lower, upper)`
+- 最後に boost-only 制約と上限制約を再適用します
+  - `scale_next = max(1.0, min(max_scale, scale_next))`
+
+`min_count` 未満で更新対象外だったgroupは、そのepochでは `prev_scale` を維持します。
+
+### 6) 実学習への適用方法
+
+- schedulerが算出したbase LRを壊さないため、以下の順序で適用します
+  1. `optimizer.step()` 直前に、当該stepのgroupのscaleをparam_group LRに乗算
+  2. `optimizer.step()` 実行
+  3. LRを元の値に復元
+  4. `lr_scheduler.step()` 実行
+- これにより scheduler の進行ロジックと整合を保ちます
+
+### 7) ログとの対応
+
+- stepログ:
+  - `group_scale_auto`: そのstep時点の自動補正値
+  - `group_scale_applied`: 実際に適用した値（現仕様では同値）
+- epochサマリ:
+  - `group_scale_auto`, `group_scale_applied` を記録
+  - 補正値の推移をepoch単位で追跡できます
+
 ## 出力ファイル
 
 `output_dir` 配下に出力されます。`output_name` 未指定時は `last` が使われます。
