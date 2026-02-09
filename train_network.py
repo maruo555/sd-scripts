@@ -13,7 +13,7 @@ import toml
 from collections import deque
 import numpy as np
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
@@ -227,6 +227,7 @@ class GroupLRAutoTuner:
         power: float,
         max_scale: float,
         max_change: float,
+        top_k: int,
     ):
         if warmup_epochs < 0:
             raise ValueError("group_lr_auto_warmup_epochs must be >= 0")
@@ -240,6 +241,8 @@ class GroupLRAutoTuner:
             raise ValueError("group_lr_auto_max_scale must be >= 1.0")
         if max_change <= 0.0 or max_change >= 1.0:
             raise ValueError("group_lr_auto_max_change must be in (0,1)")
+        if top_k < 1:
+            raise ValueError("group_lr_auto_top_k must be >= 1")
 
         self.warmup_epochs = warmup_epochs
         self.min_count = min_count
@@ -247,42 +250,63 @@ class GroupLRAutoTuner:
         self.power = power
         self.max_scale = max_scale
         self.max_change = max_change
+        self.top_k = top_k
         self.group_scale_auto: Dict[str, float] = {}
+        self.baseline_loss_end: Dict[str, float] = {}
+        self._last_epoch_debug: Dict[str, Dict[str, Optional[float]]] = {}
 
     def get_scale(self, group: str) -> float:
         return self.group_scale_auto.get(group, 1.0)
 
-    def export_scales(self) -> Dict[str, float]:
-        exported: Dict[str, float] = {}
-        for group, scale in self.group_scale_auto.items():
-            if scale is None:
-                continue
-            scale_float = float(scale)
-            if not math.isfinite(scale_float):
-                continue
-            exported[str(group)] = scale_float
-        return exported
-
-    def import_scales(self, scales: Optional[Dict[str, float]]) -> int:
-        if not isinstance(scales, dict):
-            return 0
-
+    @staticmethod
+    def _sanitize_float_dict(data: Optional[Dict[str, float]]) -> Dict[str, float]:
+        if not isinstance(data, dict):
+            return {}
         restored: Dict[str, float] = {}
-        for group, scale in scales.items():
+        for group, value in data.items():
             if group is None:
                 continue
             try:
-                scale_float = float(scale)
+                value_float = float(value)
             except (TypeError, ValueError):
                 continue
-            if not math.isfinite(scale_float):
+            if not math.isfinite(value_float):
                 continue
-            # keep boost-only and clamp into current configuration range
-            scale_float = max(1.0, min(self.max_scale, scale_float))
-            restored[str(group)] = scale_float
+            restored[str(group)] = value_float
+        return restored
 
-        self.group_scale_auto = restored
-        return len(restored)
+    def export_state(self) -> Dict[str, Dict[str, float]]:
+        return {
+            "scales": {
+                group: max(1.0, min(self.max_scale, float(scale)))
+                for group, scale in self._sanitize_float_dict(self.group_scale_auto).items()
+            },
+            "baseline_loss_end": {
+                group: float(value) for group, value in self._sanitize_float_dict(self.baseline_loss_end).items() if value > 0.0
+            },
+        }
+
+    def import_state(
+        self,
+        state: Optional[Dict[str, Dict[str, float]]],
+        legacy_scales: Optional[Dict[str, float]] = None,
+    ) -> Tuple[int, int]:
+        restored_scales: Dict[str, float] = {}
+        restored_baselines: Dict[str, float] = {}
+        if isinstance(state, dict):
+            restored_scales = self._sanitize_float_dict(state.get("scales"))
+            restored_baselines = self._sanitize_float_dict(state.get("baseline_loss_end"))
+        elif isinstance(legacy_scales, dict):
+            restored_scales = self._sanitize_float_dict(legacy_scales)
+
+        self.group_scale_auto = {
+            group: max(1.0, min(self.max_scale, value)) for group, value in restored_scales.items()
+        }
+        self.baseline_loss_end = {group: value for group, value in restored_baselines.items() if value > 0.0}
+        return len(self.group_scale_auto), len(self.baseline_loss_end)
+
+    def get_last_epoch_debug(self) -> Dict[str, Dict[str, Optional[float]]]:
+        return dict(self._last_epoch_debug)
 
     def update_from_epoch_summary(self, epoch_no: int, summaries: List[tuple]) -> Dict[str, float]:
         # Ensure every observed group has an explicit state entry.
@@ -291,11 +315,22 @@ class GroupLRAutoTuner:
                 self.group_scale_auto[group] = 1.0
 
         if len(self.group_scale_auto) == 0:
+            self._last_epoch_debug = {}
             return {}
 
-        if epoch_no < self.warmup_epochs:
+        if epoch_no <= self.warmup_epochs:
             for group in list(self.group_scale_auto.keys()):
                 self.group_scale_auto[group] = 1.0
+            self._last_epoch_debug = {
+                group: {
+                    "baseline_loss_end": self.baseline_loss_end.get(group),
+                    "progress": None,
+                    "ref_progress": None,
+                    "ratio": None,
+                    "selected_for_boost": 0.0,
+                }
+                for group in self.group_scale_auto.keys()
+            }
             return dict(self.group_scale_auto)
 
         valid_losses: Dict[str, float] = {}
@@ -308,35 +343,70 @@ class GroupLRAutoTuner:
                 continue
             if ema_loss_end <= 0.0:
                 continue
-            valid_losses[group] = float(ema_loss_end)
+            ema_loss_end = float(ema_loss_end)
+            valid_losses[group] = ema_loss_end
+            if group not in self.baseline_loss_end and epoch_no >= (self.warmup_epochs + 1):
+                self.baseline_loss_end[group] = ema_loss_end
 
-        if len(valid_losses) <= 1:
+        progress_by_group: Dict[str, float] = {}
+        for group, loss_value in valid_losses.items():
+            baseline = self.baseline_loss_end.get(group)
+            if baseline is None or not math.isfinite(baseline) or baseline <= 0.0:
+                continue
+            progress_by_group[group] = loss_value / baseline
+
+        if len(progress_by_group) <= 1:
             for group in list(self.group_scale_auto.keys()):
                 self.group_scale_auto[group] = 1.0
+            self._last_epoch_debug = {
+                group: {
+                    "baseline_loss_end": self.baseline_loss_end.get(group),
+                    "progress": progress_by_group.get(group),
+                    "ref_progress": None,
+                    "ratio": None,
+                    "selected_for_boost": 0.0,
+                }
+                for group in self.group_scale_auto.keys()
+            }
             return dict(self.group_scale_auto)
 
-        if len(valid_losses) == 2:
-            ref_loss = min(valid_losses.values())
+        if len(progress_by_group) == 2:
+            ref_progress = min(progress_by_group.values())
         else:
-            ref_loss = float(statistics.median(valid_losses.values()))
+            ref_progress = float(statistics.median(progress_by_group.values()))
 
-        if not math.isfinite(ref_loss) or ref_loss <= 0.0:
+        if not math.isfinite(ref_progress) or ref_progress <= 0.0:
             for group in list(self.group_scale_auto.keys()):
                 self.group_scale_auto[group] = 1.0
+            self._last_epoch_debug = {
+                group: {
+                    "baseline_loss_end": self.baseline_loss_end.get(group),
+                    "progress": progress_by_group.get(group),
+                    "ref_progress": None,
+                    "ratio": None,
+                    "selected_for_boost": 0.0,
+                }
+                for group in self.group_scale_auto.keys()
+            }
             return dict(self.group_scale_auto)
+
+        ratio_by_group: Dict[str, float] = {
+            group: progress / ref_progress for group, progress in progress_by_group.items()
+        }
+        candidate_groups = [group for group, ratio in ratio_by_group.items() if ratio > 1.0 + self.deadband]
+        candidate_groups.sort(key=lambda group: ratio_by_group[group], reverse=True)
+        selected_groups = set(candidate_groups[: self.top_k])
 
         prev_scales = dict(self.group_scale_auto)
         next_scales: Dict[str, float] = {}
+        debug_rows: Dict[str, Dict[str, Optional[float]]] = {}
         for group, prev in prev_scales.items():
-            if group in valid_losses:
-                ratio = valid_losses[group] / ref_loss
-                if ratio <= 1.0 + self.deadband:
-                    scale_candidate = 1.0
-                else:
-                    scale_candidate = min(self.max_scale, ratio**self.power)
+            ratio = ratio_by_group.get(group)
+            selected_for_boost = group in selected_groups
+            if ratio is not None and selected_for_boost:
+                scale_candidate = min(self.max_scale, max(1.0, ratio**self.power))
             else:
-                # If this epoch lacks enough samples for a group, keep the previous value.
-                scale_candidate = prev
+                scale_candidate = 1.0
 
             lower = prev * (1.0 - self.max_change)
             upper = prev * (1.0 + self.max_change)
@@ -344,8 +414,16 @@ class GroupLRAutoTuner:
             scale_next = max(1.0, scale_next)
             scale_next = min(self.max_scale, scale_next)
             next_scales[group] = float(scale_next)
+            debug_rows[group] = {
+                "baseline_loss_end": self.baseline_loss_end.get(group),
+                "progress": progress_by_group.get(group),
+                "ref_progress": ref_progress,
+                "ratio": ratio,
+                "selected_for_boost": 1.0 if selected_for_boost else 0.0,
+            }
 
         self.group_scale_auto = next_scales
+        self._last_epoch_debug = debug_rows
         return dict(self.group_scale_auto)
 
 
@@ -1749,6 +1827,7 @@ class NetworkTrainer:
         if args.full_fp16:
             train_util.patch_accelerator_for_fp16_training(accelerator)
 
+        group_lr_auto_resume_state = None
         group_lr_auto_resume_scales = None
         group_lr_auto_tuner = None
 
@@ -1781,7 +1860,7 @@ class NetworkTrainer:
                     "threshold_step": self._te_lr_after_cfg.get("threshold_step"),
                 }
             if group_lr_auto_tuner is not None:
-                train_state["group_lr_auto_scales"] = group_lr_auto_tuner.export_scales()
+                train_state["group_lr_auto_state"] = group_lr_auto_tuner.export_state()
             with open(train_state_file, "w", encoding="utf-8") as f:
                 json.dump(train_state, f)
 
@@ -1798,7 +1877,7 @@ class NetworkTrainer:
             # print(f"load model hook: {len(models)} models will be loaded")
 
             # load current epoch and step to
-            nonlocal steps_from_state, group_lr_auto_resume_scales
+            nonlocal steps_from_state, group_lr_auto_resume_state, group_lr_auto_resume_scales
             train_state_file = os.path.join(input_dir, "train_state.json")
             if os.path.exists(train_state_file):
                 with open(train_state_file, "r", encoding="utf-8") as f:
@@ -1812,6 +1891,7 @@ class NetworkTrainer:
                 self._te_lr_after_resumed = True
                 self._te_lr_after_resume_state = data.get("te_lr_after")
                 self._te_lr_after_resume_step = steps_from_state_local
+                group_lr_auto_resume_state = data.get("group_lr_auto_state")
                 group_lr_auto_resume_scales = data.get("group_lr_auto_scales")
                 logger.info(f"load train state from {train_state_file}: {data}")
             elif getattr(args, "resume", False):
@@ -2339,12 +2419,15 @@ class NetworkTrainer:
                     power=float(getattr(args, "group_lr_auto_power", 0.5)),
                     max_scale=float(getattr(args, "group_lr_auto_max_scale", 1.20)),
                     max_change=float(getattr(args, "group_lr_auto_max_change", 0.05)),
+                    top_k=int(getattr(args, "group_lr_auto_top_k", 1)),
                 )
-                restored_count = group_lr_auto_tuner.import_scales(group_lr_auto_resume_scales)
-                if restored_count > 0:
+                restored_scale_count, restored_baseline_count = group_lr_auto_tuner.import_state(
+                    group_lr_auto_resume_state, group_lr_auto_resume_scales
+                )
+                if restored_scale_count > 0 or restored_baseline_count > 0:
                     logger.info(
-                        f"restored group_lr_auto scales from resume state: {restored_count} groups "
-                        f"/ resume stateから group_lr_auto の倍率を復元しました: {restored_count} グループ"
+                        f"restored group_lr_auto state from resume: scales={restored_scale_count}, baselines={restored_baseline_count} "
+                        f"/ resume stateから group_lr_auto を復元しました: 倍率={restored_scale_count}, baseline={restored_baseline_count}"
                     )
 
         # callback for step start
@@ -3175,20 +3258,44 @@ class NetworkTrainer:
             _group_flush_step_buffer(force=True, current_global_step=global_step)
 
             if group_loss_log_enabled and group_loss_epoch_summary and group_loss_tracker is not None:
+                epoch_summaries = group_loss_tracker.get_epoch_summary()
+                epoch_debug_by_group: Dict[str, Dict[str, Optional[float]]] = {}
+                epoch_applied_scales: Dict[str, float] = {}
+                if group_lr_auto_enabled and group_lr_auto_tuner is not None:
+                    # Snapshot scales used in the just-finished epoch before updating for next epoch.
+                    epoch_applied_scales = {
+                        group: group_lr_auto_tuner.get_scale(group) for group, _, _, _ in epoch_summaries
+                    }
+                    group_lr_auto_tuner.update_from_epoch_summary(epoch + 1, epoch_summaries)
+                    epoch_debug_by_group = group_lr_auto_tuner.get_last_epoch_debug()
                 if accelerator.is_main_process:
-                    for group, ema_loss_end, count_epoch, mean_loss_epoch in group_loss_tracker.get_epoch_summary():
+                    for group, ema_loss_end, count_epoch, mean_loss_epoch in epoch_summaries:
                         epoch_group_scale = 1.0
                         if group_lr_auto_enabled and group_lr_auto_tuner is not None:
-                            epoch_group_scale = group_lr_auto_tuner.get_scale(group)
-                        row = [epoch + 1, group, ema_loss_end, count_epoch, mean_loss_epoch, epoch_group_scale, epoch_group_scale]
+                            epoch_group_scale = epoch_applied_scales.get(group, 1.0)
+                        debug = epoch_debug_by_group.get(group, {})
+                        row = [
+                            epoch + 1,
+                            group,
+                            ema_loss_end,
+                            count_epoch,
+                            mean_loss_epoch,
+                            debug.get("baseline_loss_end"),
+                            debug.get("progress"),
+                            debug.get("ref_progress"),
+                            debug.get("ratio"),
+                            int(bool(debug.get("selected_for_boost"))),
+                            epoch_group_scale,
+                            epoch_group_scale,
+                        ]
                         _group_write_csv(
                             group_loss_epoch_log_path,
-                            "epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,group_scale_auto,group_scale_applied",
+                            "epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,"
+                            "baseline_loss_end,progress,ref_progress,ratio,selected_for_boost,"
+                            "group_scale_auto,group_scale_applied",
                             row,
                             epoch_log=True,
                         )
-                if group_lr_auto_enabled and group_lr_auto_tuner is not None:
-                    group_lr_auto_tuner.update_from_epoch_summary(epoch + 1, group_loss_tracker.get_epoch_summary())
                 group_loss_tracker.reset_epoch()
 
             accelerator.wait_for_everyone()
@@ -3726,6 +3833,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.05,
         help="maximum relative scale change per epoch / 1epochあたりの倍率変化上限（相対値）",
+    )
+    parser.add_argument(
+        "--group_lr_auto_top_k",
+        type=int,
+        default=1,
+        help="maximum number of groups to boost each epoch / 各epochでブースト対象にするgroup数の上限",
     )
     # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
     # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")

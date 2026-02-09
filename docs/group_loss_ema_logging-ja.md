@@ -24,7 +24,7 @@
   - `--group_loss_log` と `--group_loss_epoch_summary` を同時指定
   - `gradient_accumulation_steps = 1`
   - 単一process実行（multi-process/DDP不可）
-- `--save_state` / `--resume` を使う場合、`group_lr_auto` の倍率状態（groupごとのscale）は `train_state.json` に保存・復元されます。
+- `--save_state` / `--resume` を使う場合、`group_lr_auto` の状態（groupごとのscale / baseline）は `train_state.json` に保存・復元されます。
 
 ## dataset_config.toml 拡張
 
@@ -70,6 +70,7 @@
 | `--group_lr_auto_power <float>` | `0.5` | `ratio**power` の指数 |
 | `--group_lr_auto_max_scale <float>` | `1.2` | scale上限 |
 | `--group_lr_auto_max_change <float>` | `0.05` | 1epochあたりのscale変化率上限（上下両方向） |
+| `--group_lr_auto_top_k <int>` | `1` | 1epochでブースト対象にするgroup数の上限（ratio降順） |
 
 ## group別LR自動調整の仕組みと仕様
 
@@ -83,30 +84,44 @@
 
 - 更新は各epoch末に行い、**次epoch** の学習stepから反映されます
 - `warmup_epochs` の間は全group `scale=1.0` 固定です
-  - 例: `warmup_epochs=3` の場合、epoch 1-3 は固定、epoch 4 から自動補正開始
+  - 例: `warmup_epochs=3` の場合
+    - epoch 1-3 は固定（`scale=1.0`）
+    - epoch 4 で baseline 確定
+    - epoch 5 で進捗比の判定
+    - その判定結果が実stepへ反映されるのは epoch 6 から（epoch境界更新のため）
 
 ### 3) 更新に使う統計
 
-- 指標は epochサマリの `ema_loss_end`
+- 指標は epochサマリの `ema_loss_end` から作る「進捗（改善率）」
 - `count_epoch < min_count` のgroupは、そのepochの更新計算から除外
 - `ema_loss_end` が非finiteまたは0以下のgroupも除外
+- baseline は `baseline_loss_end[g]` として保持し、
+  - warmup終了後、`count_epoch >= min_count` を満たした最初のepochで確定
+  - `progress[g] = ema_loss_end[g] / baseline_loss_end[g]`
+  - 値が大きいほど改善が遅く、ブースト対象になりやすい
 
-### 4) 基準loss（ref_loss）の決め方
+### 4) 基準進捗（ref_progress）の決め方
 
-- 有効group集合 `L = {ema_loss_end[g]}`、その要素数を `N` とします
-- `N >= 3`: `ref_loss = median(L)`
-- `N == 2`: `ref_loss = min(L)`
+- 有効group集合 `L = {progress[g]}`、その要素数を `N` とします
+- `N >= 3`: `ref_progress = median(L)`
+- `N == 2`: `ref_progress = min(L)`
 - `N <= 1`: 更新しない（全group `scale=1.0`）
 
 ### 5) scale計算
 
 group `g` ごとに以下を計算します。
 
-- `ratio = ema_loss_end[g] / ref_loss`
+- `ratio = progress[g] / ref_progress`
 - `ratio <= 1 + deadband` の場合: `scale_candidate = 1.0`
 - `ratio > 1 + deadband` の場合: `scale_candidate = min(max_scale, ratio ** power)`
 
-次に、急変を抑えるため1epochあたりの変化率制限を適用します。
+次に、同時ブースト数を制限します（top-k）。
+
+- 候補: `ratio > 1 + deadband` のgroup
+- `ratio` 降順で上位 `top_k` のみ boost 候補として採用
+- それ以外は `scale_candidate = 1.0`
+
+最後に、急変を抑えるため1epochあたりの変化率制限を適用します（上げ下げ両方向）。
 
 - `lower = prev_scale * (1 - max_change)`
 - `upper = prev_scale * (1 + max_change)`
@@ -114,7 +129,7 @@ group `g` ごとに以下を計算します。
 - 最後に boost-only 制約と上限制約を再適用します
   - `scale_next = max(1.0, min(max_scale, scale_next))`
 
-`min_count` 未満で更新対象外だったgroupは、そのepochでは `prev_scale` を維持します。
+`min_count` 未満で更新対象外、または baseline 未確定のgroupは、そのepochでは `scale_candidate=1.0`（max_change制限後の値）として扱います。
 
 ### 6) 実学習への適用方法
 
@@ -167,11 +182,16 @@ group `g` ごとに以下を計算します。
 
 ヘッダ:
 
-`epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,group_scale_auto,group_scale_applied`
+`epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,baseline_loss_end,progress,ref_progress,ratio,selected_for_boost,group_scale_auto,group_scale_applied`
 
 - `ema_loss_end`: そのepoch終了時点のEMA
 - `count_epoch`: そのepoch内の有効step数
 - `mean_loss_epoch`: そのepoch内のgroup平均loss
+- `baseline_loss_end`: 進捗判定に使うbaseline（未確定時は空）
+- `progress`: `ema_loss_end / baseline_loss_end`（未確定時は空）
+- `ref_progress`: そのepochの基準進捗（未計算時は空）
+- `ratio`: `progress / ref_progress`（未計算時は空）
+- `selected_for_boost`: top-k 選抜に入ったら `1`、それ以外は `0`
 - `group_scale_auto`: そのepochログ時点の自動補正倍率
 - `group_scale_applied`: そのepochでの適用倍率（MVPでは同値）
 
@@ -215,7 +235,8 @@ accelerate launch sdxl_train_network.py \
   --group_lr_auto_deadband 0.05 \
   --group_lr_auto_power 0.5 \
   --group_lr_auto_max_scale 1.2 \
-  --group_lr_auto_max_change 0.05
+  --group_lr_auto_max_change 0.05 \
+  --group_lr_auto_top_k 1
 ```
 
 ## dataset toml 記載例
