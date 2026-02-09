@@ -184,16 +184,20 @@ group `g` ごとに以下を計算します。
 
 `epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,baseline_loss_end,progress,ref_progress,ratio,selected_for_boost,group_scale_auto,group_scale_applied`
 
-- `ema_loss_end`: そのepoch終了時点のEMA
-- `count_epoch`: そのepoch内の有効step数
-- `mean_loss_epoch`: そのepoch内のgroup平均loss
-- `baseline_loss_end`: 進捗判定に使うbaseline（未確定時は空）
-- `progress`: `ema_loss_end / baseline_loss_end`（未確定時は空）
-- `ref_progress`: そのepochの基準進捗（未計算時は空）
-- `ratio`: `progress / ref_progress`（未計算時は空）
-- `selected_for_boost`: top-k 選抜に入ったら `1`、それ以外は `0`
-- `group_scale_auto`: そのepochログ時点の自動補正倍率
-- `group_scale_applied`: そのepochでの適用倍率（MVPでは同値）
+補足: epochサマリ行は「epoch終了時」に1回書き出されます。  
+このため列には、当該epochの実績値と、epoch末に計算した次epoch向け判定値が混在します。
+
+- `epoch`: 対象の **終了したepoch番号**
+- `ema_loss_end`: **当該epoch終了時点** のEMA（実績値）
+- `count_epoch`: **当該epoch内** の有効step数（実績値）
+- `mean_loss_epoch`: **当該epoch内** のgroup平均loss（実績値）
+- `baseline_loss_end`: epoch末計算時点で保持しているbaseline（未確定時は空）
+- `progress`: epoch末計算値 `ema_loss_end / baseline_loss_end`（未確定時は空）
+- `ref_progress`: epoch末計算値（そのepochの有効groupから算出、未計算時は空）
+- `ratio`: epoch末計算値 `progress / ref_progress`（未計算時は空）
+- `selected_for_boost`: epoch末判定で **次epoch向けブースト候補** に選ばれたら `1`、それ以外は `0`
+- `group_scale_auto`: **当該epochのstepで実際に適用された** 自動補正倍率
+- `group_scale_applied`: **当該epochのstepで実際に適用された** 倍率（現仕様では `group_scale_auto` と同値）
 
 ## CLI指定例
 
