@@ -223,36 +223,37 @@ class GroupLRAutoTuner:
         self,
         warmup_epochs: int,
         min_count: int,
-        deadband: float,
+        ratio_ema_beta: float,
         power: float,
         max_scale: float,
         max_change: float,
-        top_k: int,
+        boost_threshold: float = 1.10,
     ):
         if warmup_epochs < 0:
             raise ValueError("group_lr_auto_warmup_epochs must be >= 0")
         if min_count < 1:
             raise ValueError("group_lr_auto_min_count must be >= 1")
-        if deadband < 0.0:
-            raise ValueError("group_lr_auto_deadband must be >= 0")
+        if ratio_ema_beta < 0.0 or ratio_ema_beta >= 1.0:
+            raise ValueError("group_lr_auto_ratio_ema_beta must be in [0,1)")
         if power <= 0.0:
             raise ValueError("group_lr_auto_power must be > 0")
         if max_scale < 1.0:
             raise ValueError("group_lr_auto_max_scale must be >= 1.0")
         if max_change <= 0.0 or max_change >= 1.0:
             raise ValueError("group_lr_auto_max_change must be in (0,1)")
-        if top_k < 1:
-            raise ValueError("group_lr_auto_top_k must be >= 1")
+        if boost_threshold < 1.0:
+            raise ValueError("group_lr_auto_boost_threshold must be >= 1.0")
 
         self.warmup_epochs = warmup_epochs
         self.min_count = min_count
-        self.deadband = deadband
+        self.ratio_ema_beta = ratio_ema_beta
         self.power = power
         self.max_scale = max_scale
         self.max_change = max_change
-        self.top_k = top_k
+        self.boost_threshold = boost_threshold
         self.group_scale_auto: Dict[str, float] = {}
         self.baseline_loss_end: Dict[str, float] = {}
+        self.ratio_ema: Dict[str, float] = {}
         self._last_epoch_debug: Dict[str, Dict[str, Optional[float]]] = {}
 
     def get_scale(self, group: str) -> float:
@@ -284,18 +285,23 @@ class GroupLRAutoTuner:
             "baseline_loss_end": {
                 group: float(value) for group, value in self._sanitize_float_dict(self.baseline_loss_end).items() if value > 0.0
             },
+            "ratio_ema": {
+                group: float(value) for group, value in self._sanitize_float_dict(self.ratio_ema).items() if value > 0.0
+            },
         }
 
     def import_state(
         self,
         state: Optional[Dict[str, Dict[str, float]]],
         legacy_scales: Optional[Dict[str, float]] = None,
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, int, int]:
         restored_scales: Dict[str, float] = {}
         restored_baselines: Dict[str, float] = {}
+        restored_ratio_ema: Dict[str, float] = {}
         if isinstance(state, dict):
             restored_scales = self._sanitize_float_dict(state.get("scales"))
             restored_baselines = self._sanitize_float_dict(state.get("baseline_loss_end"))
+            restored_ratio_ema = self._sanitize_float_dict(state.get("ratio_ema"))
         elif isinstance(legacy_scales, dict):
             restored_scales = self._sanitize_float_dict(legacy_scales)
 
@@ -303,7 +309,8 @@ class GroupLRAutoTuner:
             group: max(1.0, min(self.max_scale, value)) for group, value in restored_scales.items()
         }
         self.baseline_loss_end = {group: value for group, value in restored_baselines.items() if value > 0.0}
-        return len(self.group_scale_auto), len(self.baseline_loss_end)
+        self.ratio_ema = {group: value for group, value in restored_ratio_ema.items() if value > 0.0}
+        return len(self.group_scale_auto), len(self.baseline_loss_end), len(self.ratio_ema)
 
     def get_last_epoch_debug(self) -> Dict[str, Dict[str, Optional[float]]]:
         return dict(self._last_epoch_debug)
@@ -327,6 +334,7 @@ class GroupLRAutoTuner:
                     "progress": None,
                     "ref_progress": None,
                     "ratio": None,
+                    "ratio_ema": None,
                     "selected_for_boost": 0.0,
                 }
                 for group in self.group_scale_auto.keys()
@@ -364,16 +372,14 @@ class GroupLRAutoTuner:
                     "progress": progress_by_group.get(group),
                     "ref_progress": None,
                     "ratio": None,
+                    "ratio_ema": None,
                     "selected_for_boost": 0.0,
                 }
                 for group in self.group_scale_auto.keys()
             }
             return dict(self.group_scale_auto)
 
-        if len(progress_by_group) == 2:
-            ref_progress = min(progress_by_group.values())
-        else:
-            ref_progress = float(statistics.median(progress_by_group.values()))
+        ref_progress = float(statistics.median(progress_by_group.values()))
 
         if not math.isfinite(ref_progress) or ref_progress <= 0.0:
             for group in list(self.group_scale_auto.keys()):
@@ -384,6 +390,7 @@ class GroupLRAutoTuner:
                     "progress": progress_by_group.get(group),
                     "ref_progress": None,
                     "ratio": None,
+                    "ratio_ema": None,
                     "selected_for_boost": 0.0,
                 }
                 for group in self.group_scale_auto.keys()
@@ -393,18 +400,25 @@ class GroupLRAutoTuner:
         ratio_by_group: Dict[str, float] = {
             group: progress / ref_progress for group, progress in progress_by_group.items()
         }
-        candidate_groups = [group for group, ratio in ratio_by_group.items() if ratio > 1.0 + self.deadband]
-        candidate_groups.sort(key=lambda group: ratio_by_group[group], reverse=True)
-        selected_groups = set(candidate_groups[: self.top_k])
+        ratio_ema_by_group: Dict[str, float] = {}
+        for group, ratio in ratio_by_group.items():
+            prev_ratio_ema = self.ratio_ema.get(group)
+            if prev_ratio_ema is None or not math.isfinite(prev_ratio_ema) or prev_ratio_ema <= 0.0:
+                ratio_ema_value = float(ratio)
+            else:
+                ratio_ema_value = self.ratio_ema_beta * prev_ratio_ema + (1.0 - self.ratio_ema_beta) * float(ratio)
+            self.ratio_ema[group] = float(ratio_ema_value)
+            ratio_ema_by_group[group] = float(ratio_ema_value)
 
         prev_scales = dict(self.group_scale_auto)
         next_scales: Dict[str, float] = {}
         debug_rows: Dict[str, Dict[str, Optional[float]]] = {}
         for group, prev in prev_scales.items():
             ratio = ratio_by_group.get(group)
-            selected_for_boost = group in selected_groups
-            if ratio is not None and selected_for_boost:
-                scale_candidate = min(self.max_scale, max(1.0, ratio**self.power))
+            ratio_ema = ratio_ema_by_group.get(group)
+            selected_for_boost = ratio_ema is not None and ratio_ema >= self.boost_threshold
+            if selected_for_boost:
+                scale_candidate = min(self.max_scale, max(1.0, ratio_ema**self.power))
             else:
                 scale_candidate = 1.0
 
@@ -419,6 +433,7 @@ class GroupLRAutoTuner:
                 "progress": progress_by_group.get(group),
                 "ref_progress": ref_progress,
                 "ratio": ratio,
+                "ratio_ema": ratio_ema,
                 "selected_for_boost": 1.0 if selected_for_boost else 0.0,
             }
 
@@ -1960,6 +1975,34 @@ class NetworkTrainer:
                     "group_lr_auto supports only single-process training / "
                     "group_lr_auto は単一process学習のみ対応です"
                 )
+            none_lr_groups = [idx for idx, group in enumerate(optimizer.param_groups) if group.get("lr", None) is None]
+            if none_lr_groups:
+                raise ValueError(
+                    "group_lr_auto requires explicit numeric lr in all optimizer param groups, "
+                    f"but found lr=None in groups {none_lr_groups} (e.g. Adafactor relative_step=True). "
+                    "Please disable group_lr_auto or use an optimizer/config with explicit lr / "
+                    "group_lr_auto は全param_groupで数値のlrが必要ですが、lr=Noneが検出されました "
+                    f"(group index: {none_lr_groups}, 例: Adafactor relative_step=True)。"
+                    "group_lr_autoを無効化するか、明示lrを使うoptimizer設定に変更してください"
+                )
+            blocked_state_options = []
+            if bool(getattr(args, "resume", None)):
+                blocked_state_options.append("--resume")
+            if bool(getattr(args, "save_state", False)):
+                blocked_state_options.append("--save_state")
+            if bool(getattr(args, "save_state_on_train_end", False)):
+                blocked_state_options.append("--save_state_on_train_end")
+            if bool(getattr(args, "resume_from_huggingface", False)):
+                blocked_state_options.append("--resume_from_huggingface")
+            if bool(getattr(args, "save_state_to_huggingface", False)):
+                blocked_state_options.append("--save_state_to_huggingface")
+            if blocked_state_options:
+                raise ValueError(
+                    "group_lr_auto does not support resume/state-save options yet: "
+                    + ", ".join(blocked_state_options)
+                    + " / group_lr_auto は resume/state 保存系オプションに未対応です: "
+                    + ", ".join(blocked_state_options)
+                )
 
         # TODO refactor metadata creation and move to util
         metadata = {
@@ -2415,19 +2458,19 @@ class NetworkTrainer:
                 group_lr_auto_tuner = GroupLRAutoTuner(
                     warmup_epochs=int(getattr(args, "group_lr_auto_warmup_epochs", 3)),
                     min_count=int(getattr(args, "group_lr_auto_min_count", 20)),
-                    deadband=float(getattr(args, "group_lr_auto_deadband", 0.05)),
+                    ratio_ema_beta=float(getattr(args, "group_lr_auto_ratio_ema_beta", 0.85)),
                     power=float(getattr(args, "group_lr_auto_power", 0.5)),
                     max_scale=float(getattr(args, "group_lr_auto_max_scale", 1.20)),
                     max_change=float(getattr(args, "group_lr_auto_max_change", 0.05)),
-                    top_k=int(getattr(args, "group_lr_auto_top_k", 1)),
+                    boost_threshold=float(getattr(args, "group_lr_auto_boost_threshold", 1.10)),
                 )
-                restored_scale_count, restored_baseline_count = group_lr_auto_tuner.import_state(
+                restored_scale_count, restored_baseline_count, restored_ratio_ema_count = group_lr_auto_tuner.import_state(
                     group_lr_auto_resume_state, group_lr_auto_resume_scales
                 )
-                if restored_scale_count > 0 or restored_baseline_count > 0:
+                if restored_scale_count > 0 or restored_baseline_count > 0 or restored_ratio_ema_count > 0:
                     logger.info(
-                        f"restored group_lr_auto state from resume: scales={restored_scale_count}, baselines={restored_baseline_count} "
-                        f"/ resume stateから group_lr_auto を復元しました: 倍率={restored_scale_count}, baseline={restored_baseline_count}"
+                        f"restored group_lr_auto state from resume: scales={restored_scale_count}, baselines={restored_baseline_count}, ratio_ema={restored_ratio_ema_count} "
+                        f"/ resume stateから group_lr_auto を復元しました: 倍率={restored_scale_count}, baseline={restored_baseline_count}, ratio_ema={restored_ratio_ema_count}"
                     )
 
         # callback for step start
@@ -3280,19 +3323,19 @@ class NetworkTrainer:
                             ema_loss_end,
                             count_epoch,
                             mean_loss_epoch,
+                            epoch_group_scale,
+                            epoch_group_scale,
                             debug.get("baseline_loss_end"),
                             debug.get("progress"),
                             debug.get("ref_progress"),
                             debug.get("ratio"),
+                            debug.get("ratio_ema"),
                             int(bool(debug.get("selected_for_boost"))),
-                            epoch_group_scale,
-                            epoch_group_scale,
                         ]
                         _group_write_csv(
                             group_loss_epoch_log_path,
-                            "epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,"
-                            "baseline_loss_end,progress,ref_progress,ratio,selected_for_boost,"
-                            "group_scale_auto,group_scale_applied",
+                            "epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,group_scale_auto,group_scale_applied,"
+                            "baseline_loss_end,progress,ref_progress,ratio,ratio_ema,selected_for_boost",
                             row,
                             epoch_log=True,
                         )
@@ -3811,16 +3854,22 @@ def setup_parser() -> argparse.ArgumentParser:
         help="minimum count_epoch for group_lr_auto update / group_lr_auto 更新に必要な最小count_epoch",
     )
     parser.add_argument(
-        "--group_lr_auto_deadband",
+        "--group_lr_auto_ratio_ema_beta",
         type=float,
-        default=0.05,
-        help="deadband for group_lr_auto ratio / group_lr_auto のratioデッドバンド",
+        default=0.85,
+        help="EMA beta for group_lr_auto ratio smoothing / group_lr_auto の ratio EMA 平滑化 beta",
     )
     parser.add_argument(
         "--group_lr_auto_power",
         type=float,
         default=0.5,
         help="power for group_lr_auto boost curve / group_lr_auto のboostカーブ指数",
+    )
+    parser.add_argument(
+        "--group_lr_auto_boost_threshold",
+        type=float,
+        default=1.10,
+        help="boost threshold for ratio_ema (>= threshold) / ratio_ema のブースト閾値（以上で補正）",
     )
     parser.add_argument(
         "--group_lr_auto_max_scale",
@@ -3833,12 +3882,6 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.05,
         help="maximum relative scale change per epoch / 1epochあたりの倍率変化上限（相対値）",
-    )
-    parser.add_argument(
-        "--group_lr_auto_top_k",
-        type=int,
-        default=1,
-        help="maximum number of groups to boost each epoch / 各epochでブースト対象にするgroup数の上限",
     )
     # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
     # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")

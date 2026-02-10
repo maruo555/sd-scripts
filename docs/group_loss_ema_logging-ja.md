@@ -24,7 +24,14 @@
   - `--group_loss_log` と `--group_loss_epoch_summary` を同時指定
   - `gradient_accumulation_steps = 1`
   - 単一process実行（multi-process/DDP不可）
-- `--save_state` / `--resume` を使う場合、`group_lr_auto` の状態（groupごとのscale / baseline）は `train_state.json` に保存・復元されます。
+  - optimizerの全 `param_group["lr"]` が数値であること（`lr=None` は非対応）
+    - 例: Adafactor の既定（`relative_step=True`）は `lr=None` になるため非対応
+- `--group_lr_auto` は resume/state保存系オプションと併用できません（指定時はエラー）。
+  - `--resume`
+  - `--save_state`
+  - `--save_state_on_train_end`
+  - `--resume_from_huggingface`
+  - `--save_state_to_huggingface`
 
 ## dataset_config.toml 拡張
 
@@ -66,11 +73,11 @@
 | `--group_lr_auto` | `False` | group別LR自動補正（boost-only）を有効化 |
 | `--group_lr_auto_warmup_epochs <int>` | `3` | warmup中は全group scale=1.0固定 |
 | `--group_lr_auto_min_count <int>` | `20` | epoch更新対象にする最小 `count_epoch` |
-| `--group_lr_auto_deadband <float>` | `0.05` | `ratio <= 1+deadband` を補正なし（1.0）とみなす |
-| `--group_lr_auto_power <float>` | `0.5` | `ratio**power` の指数 |
+| `--group_lr_auto_ratio_ema_beta <float>` | `0.85` | `ratio_ema` 平滑化のEMA係数 |
+| `--group_lr_auto_power <float>` | `0.5` | `ratio_ema**power` の指数 |
+| `--group_lr_auto_boost_threshold <float>` | `1.10` | `ratio_ema` の補正判定閾値（以上で補正） |
 | `--group_lr_auto_max_scale <float>` | `1.2` | scale上限 |
 | `--group_lr_auto_max_change <float>` | `0.05` | 1epochあたりのscale変化率上限（上下両方向） |
-| `--group_lr_auto_top_k <int>` | `1` | 1epochでブースト対象にするgroup数の上限（ratio降順） |
 
 ## group別LR自動調整の仕組みと仕様
 
@@ -103,8 +110,8 @@
 ### 4) 基準進捗（ref_progress）の決め方
 
 - 有効group集合 `L = {progress[g]}`、その要素数を `N` とします
-- `N >= 3`: `ref_progress = median(L)`
-- `N == 2`: `ref_progress = min(L)`
+- `N >= 2`: `ref_progress = median(L)`
+  - `N == 2` のときも、2値の平均（一般的なmedian定義）を使います
 - `N <= 1`: 更新しない（全group `scale=1.0`）
 
 ### 5) scale計算
@@ -112,14 +119,17 @@
 group `g` ごとに以下を計算します。
 
 - `ratio = progress[g] / ref_progress`
-- `ratio <= 1 + deadband` の場合: `scale_candidate = 1.0`
-- `ratio > 1 + deadband` の場合: `scale_candidate = min(max_scale, ratio ** power)`
-
-次に、同時ブースト数を制限します（top-k）。
-
-- 候補: `ratio > 1 + deadband` のgroup
-- `ratio` 降順で上位 `top_k` のみ boost 候補として採用
-- それ以外は `scale_candidate = 1.0`
+- `ratio_ema` を epoch境界で更新します
+  - 初回: `ratio_ema[g] = ratio[g]`
+  - 以後: `ratio_ema[g] = beta * ratio_ema[g] + (1-beta) * ratio[g]`
+  - `beta` は `--group_lr_auto_ratio_ema_beta`（既定 `0.85`）
+  - warmup中 / baseline未確定 / `min_count` 未満のgroupは `ratio_ema` を更新しません（そのepochでは未定義扱い）
+- 判定は固定閾値方式です
+  - `ratio_ema[g] >= threshold` のgroupのみ補正対象
+  - `ratio_ema[g] < threshold` は補正しません（`scale_candidate=1.0`）
+  - `threshold` は `--group_lr_auto_boost_threshold`（既定 `1.10`）
+- 補正対象の計算:
+  - `scale_candidate = min(max_scale, ratio_ema[g] ** power)`
 
 最後に、急変を抑えるため1epochあたりの変化率制限を適用します（上げ下げ両方向）。
 
@@ -182,7 +192,7 @@ group `g` ごとに以下を計算します。
 
 ヘッダ:
 
-`epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,baseline_loss_end,progress,ref_progress,ratio,selected_for_boost,group_scale_auto,group_scale_applied`
+`epoch,group,ema_loss_end,count_epoch,mean_loss_epoch,group_scale_auto,group_scale_applied,baseline_loss_end,progress,ref_progress,ratio,ratio_ema,selected_for_boost`
 
 補足: epochサマリ行は「epoch終了時」に1回書き出されます。  
 このため列には、当該epochの実績値と、epoch末に計算した次epoch向け判定値が混在します。
@@ -191,13 +201,14 @@ group `g` ごとに以下を計算します。
 - `ema_loss_end`: **当該epoch終了時点** のEMA（実績値）
 - `count_epoch`: **当該epoch内** の有効step数（実績値）
 - `mean_loss_epoch`: **当該epoch内** のgroup平均loss（実績値）
+- `group_scale_auto`: **当該epochのstepで実際に適用された** 自動補正倍率
+- `group_scale_applied`: **当該epochのstepで実際に適用された** 倍率（現仕様では `group_scale_auto` と同値）
 - `baseline_loss_end`: epoch末計算時点で保持しているbaseline（未確定時は空）
 - `progress`: epoch末計算値 `ema_loss_end / baseline_loss_end`（未確定時は空）
 - `ref_progress`: epoch末計算値（そのepochの有効groupから算出、未計算時は空）
 - `ratio`: epoch末計算値 `progress / ref_progress`（未計算時は空）
-- `selected_for_boost`: epoch末判定で **次epoch向けブースト候補** に選ばれたら `1`、それ以外は `0`
-- `group_scale_auto`: **当該epochのstepで実際に適用された** 自動補正倍率
-- `group_scale_applied`: **当該epochのstepで実際に適用された** 倍率（現仕様では `group_scale_auto` と同値）
+- `ratio_ema`: epoch末計算値。`ratio` をEMA平滑化した値（未定義時は空）
+- `selected_for_boost`: epoch末判定で **次epoch向けブースト候補**（`ratio_ema >= threshold`）に選ばれたら `1`、それ以外は `0`（`threshold` の既定値は `1.10`）
 
 ## CLI指定例
 
@@ -236,11 +247,11 @@ accelerate launch sdxl_train_network.py \
   --group_lr_auto \
   --group_lr_auto_warmup_epochs 3 \
   --group_lr_auto_min_count 20 \
-  --group_lr_auto_deadband 0.05 \
+  --group_lr_auto_ratio_ema_beta 0.85 \
   --group_lr_auto_power 0.5 \
+  --group_lr_auto_boost_threshold 1.10 \
   --group_lr_auto_max_scale 1.2 \
-  --group_lr_auto_max_change 0.05 \
-  --group_lr_auto_top_k 1
+  --group_lr_auto_max_change 0.05
 ```
 
 ## dataset toml 記載例
