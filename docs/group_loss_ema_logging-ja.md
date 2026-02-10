@@ -73,7 +73,7 @@
 | `--group_lr_auto` | `False` | group別LR自動補正（boost-only）を有効化 |
 | `--group_lr_auto_warmup_epochs <int>` | `2` | warmup中は全group scale=1.0固定 |
 | `--group_lr_auto_min_count <int>` | `20` | epoch更新対象にする最小 `count_epoch` |
-| `--group_lr_auto_ratio_ema_beta <float>` | `0.85` | `ratio_ema` 平滑化のEMA係数 |
+| `--group_lr_auto_ratio_ema_beta <float>` | `0.8` | `ratio_ema` 平滑化のEMA係数 |
 | `--group_lr_auto_power <float>` | `0.5` | `ratio_ema**power` の指数 |
 | `--group_lr_auto_boost_threshold <float>` | `1.10` | `ratio_ema` の補正判定閾値（以上で補正） |
 | `--group_lr_auto_max_scale <float>` | `1.2` | scale上限 |
@@ -122,7 +122,7 @@ group `g` ごとに以下を計算します。
 - `ratio_ema` を epoch境界で更新します
   - 初回: `ratio_ema[g] = ratio[g]`
   - 以後: `ratio_ema[g] = beta * ratio_ema[g] + (1-beta) * ratio[g]`
-  - `beta` は `--group_lr_auto_ratio_ema_beta`（既定 `0.85`）
+  - `beta` は `--group_lr_auto_ratio_ema_beta`（既定 `0.8`）
   - warmup中 / baseline未確定 / `min_count` 未満のgroupは `ratio_ema` を更新しません（そのepochでは未定義扱い）
 - 判定は固定閾値方式です
   - `ratio_ema[g] >= threshold` のgroupのみ補正対象
@@ -247,7 +247,7 @@ accelerate launch sdxl_train_network.py \
   --group_lr_auto \
   --group_lr_auto_warmup_epochs 2 \
   --group_lr_auto_min_count 20 \
-  --group_lr_auto_ratio_ema_beta 0.85 \
+  --group_lr_auto_ratio_ema_beta 0.8 \
   --group_lr_auto_power 0.5 \
   --group_lr_auto_boost_threshold 1.10 \
   --group_lr_auto_max_scale 1.2 \

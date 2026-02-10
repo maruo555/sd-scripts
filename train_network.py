@@ -2458,7 +2458,7 @@ class NetworkTrainer:
                 group_lr_auto_tuner = GroupLRAutoTuner(
                     warmup_epochs=int(getattr(args, "group_lr_auto_warmup_epochs", 2)),
                     min_count=int(getattr(args, "group_lr_auto_min_count", 20)),
-                    ratio_ema_beta=float(getattr(args, "group_lr_auto_ratio_ema_beta", 0.85)),
+                    ratio_ema_beta=float(getattr(args, "group_lr_auto_ratio_ema_beta", 0.8)),
                     power=float(getattr(args, "group_lr_auto_power", 0.5)),
                     max_scale=float(getattr(args, "group_lr_auto_max_scale", 1.20)),
                     max_change=float(getattr(args, "group_lr_auto_max_change", 0.05)),
@@ -3856,7 +3856,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--group_lr_auto_ratio_ema_beta",
         type=float,
-        default=0.85,
+        default=0.8,
         help="EMA beta for group_lr_auto ratio smoothing / group_lr_auto の ratio EMA 平滑化 beta",
     )
     parser.add_argument(
