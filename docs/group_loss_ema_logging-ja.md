@@ -71,7 +71,7 @@
 | オプション | 既定値 | 説明 |
 |---|---:|---|
 | `--group_lr_auto` | `False` | group別LR自動補正（boost-only）を有効化 |
-| `--group_lr_auto_warmup_epochs <int>` | `3` | warmup中は全group scale=1.0固定 |
+| `--group_lr_auto_warmup_epochs <int>` | `2` | warmup中は全group scale=1.0固定 |
 | `--group_lr_auto_min_count <int>` | `20` | epoch更新対象にする最小 `count_epoch` |
 | `--group_lr_auto_ratio_ema_beta <float>` | `0.85` | `ratio_ema` 平滑化のEMA係数 |
 | `--group_lr_auto_power <float>` | `0.5` | `ratio_ema**power` の指数 |
@@ -91,11 +91,11 @@
 
 - 更新は各epoch末に行い、**次epoch** の学習stepから反映されます
 - `warmup_epochs` の間は全group `scale=1.0` 固定です
-  - 例: `warmup_epochs=3` の場合
-    - epoch 1-3 は固定（`scale=1.0`）
-    - epoch 4 で baseline 確定
-    - epoch 5 で進捗比の判定
-    - その判定結果が実stepへ反映されるのは epoch 6 から（epoch境界更新のため）
+  - 例: `warmup_epochs=2` の場合
+    - epoch 1-2 は固定（`scale=1.0`）
+    - epoch 3 で baseline 確定
+    - epoch 4 で進捗比の判定
+    - その判定結果が実stepへ反映されるのは epoch 5 から（epoch境界更新のため）
 
 ### 3) 更新に使う統計
 
@@ -245,7 +245,7 @@ accelerate launch sdxl_train_network.py \
   --group_loss_log \
   --group_loss_epoch_summary \
   --group_lr_auto \
-  --group_lr_auto_warmup_epochs 3 \
+  --group_lr_auto_warmup_epochs 2 \
   --group_lr_auto_min_count 20 \
   --group_lr_auto_ratio_ema_beta 0.85 \
   --group_lr_auto_power 0.5 \

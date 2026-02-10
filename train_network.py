@@ -2456,7 +2456,7 @@ class NetworkTrainer:
                 group_loss_epoch_log_path = os.path.join(args.output_dir, f"group_loss_epoch+{model_name_for_logs}.csv")
             if group_lr_auto_enabled:
                 group_lr_auto_tuner = GroupLRAutoTuner(
-                    warmup_epochs=int(getattr(args, "group_lr_auto_warmup_epochs", 3)),
+                    warmup_epochs=int(getattr(args, "group_lr_auto_warmup_epochs", 2)),
                     min_count=int(getattr(args, "group_lr_auto_min_count", 20)),
                     ratio_ema_beta=float(getattr(args, "group_lr_auto_ratio_ema_beta", 0.85)),
                     power=float(getattr(args, "group_lr_auto_power", 0.5)),
@@ -3844,7 +3844,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--group_lr_auto_warmup_epochs",
         type=int,
-        default=3,
+        default=2,
         help="warmup epochs for group_lr_auto / group_lr_auto のウォームアップepoch数",
     )
     parser.add_argument(
