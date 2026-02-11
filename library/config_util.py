@@ -79,7 +79,6 @@ class BaseSubsetParams:
     token_warmup_min: int = 1
     token_warmup_step: float = 0
     group: Optional[str] = None
-    group_adjust: bool = True
 
 
 @dataclass
@@ -202,7 +201,6 @@ class ConfigSanitizer:
         "caption_prefix": str,
         "caption_suffix": str,
         "group": str,
-        "group_adjust": bool,
     }
     # DO means DropOut
     DO_SUBSET_ASCENDABLE_SCHEMA = {
@@ -538,7 +536,6 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
           image_count: {subset.img_count}
           num_repeats: {subset.num_repeats}
           group: {subset.group}
-          group_adjust: {subset.group_adjust}
           shuffle_caption: {subset.shuffle_caption}
           keep_tokens: {subset.keep_tokens}
           keep_tokens_separator: {subset.keep_tokens_separator}

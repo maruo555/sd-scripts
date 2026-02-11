@@ -9,8 +9,6 @@
 - 機能:
   - subsetごとに設定した `group` で、学習lossのオンラインEMAを集計
   - stepログCSV（全step記録）とepochサマリCSVを出力
-- 将来拡張:
-  - `group_adjust` はPhase1では未使用（将来の自動配分調整向けに保持のみ）
 
 ## 制約条件
 
@@ -28,8 +26,6 @@
 
 - `group = "hyuzu"`
   - グループ識別子（文字列）
-- `group_adjust = true`
-  - 将来の自動調整対象フラグ（Phase1では未使用）
 
 `group` 未指定（または空文字）のsubsetは、ログ上 `__ungrouped__` として扱われます。
 
@@ -134,7 +130,6 @@ batch_size = 1
   class_tokens = "hyuzu"
   num_repeats = 20
   group = "hyuzu"
-  group_adjust = true
 
   [[datasets.subsets]]
   image_dir = "D:\train_data\ieimi"
