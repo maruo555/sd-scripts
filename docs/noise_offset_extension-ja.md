@@ -3,6 +3,19 @@
 このドキュメントは、`--noise_offset_random_strength` の振る舞いを拡張する追加オプションの仕様をまとめたものです。
 対象は `train_network.py` ベースの学習系（`sdxl_train_network.py` 含む）です。
 
+## 対応範囲（重要）
+
+この拡張（`--noise_offset_random_min_ratio_sched` / `--noise_offset_random_max_ratio_sched` を含む）は、
+`train_network.py` 系の学習フロー向けです。
+
+以下の既存学習スクリプトでは、進行率連動スケジュールは現時点で対応していません。
+
+- `train_db.py`
+- `fine_tune.py`
+- `sdxl_train.py`
+- `train_textual_inversion.py`
+- `train_textual_inversion_XTI.py`
+
 ## 1. 既存オプション（拡張前から存在）
 
 以下は既存のオプションです。
