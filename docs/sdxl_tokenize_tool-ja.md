@@ -48,6 +48,6 @@ TE1/TE2 どちらかだけ条件を満たせば良い場合は `--search-either`
 
 ## 使い方の例3: `--search-min-tokens` で条件を変更
 ```bash
-python tools/sdxl_tokenize.py --search-core "yuzu" --search-side both --search-min-add 0 --search-max-add 4 --search-min-tokens 3
+python tools/sdxl_tokenize.py --search-core "yuzu" --search-side both --search-min-add 0 --search-max-add 3 --search-min-tokens 3
 ```
 `yuzu` の前後に付与した文字列で、`2` ではなく `3` トークン以上かつ単文字トークンを含まない候補を探索します。
