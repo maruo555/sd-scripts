@@ -3432,6 +3432,30 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="use random strength between 0~noise_offset for noise offset. / noise offsetにおいて、0からnoise_offsetの間でランダムな強度を使用します。",
     )
     parser.add_argument(
+        "--noise_offset_random_min_ratio",
+        type=float,
+        default=0.0,
+        help="minimum ratio for random noise offset strength (0~1). only used with --noise_offset_random_strength / noise offsetのランダム強度の最小比率（0~1）。--noise_offset_random_strength指定時のみ有効",
+    )
+    parser.add_argument(
+        "--noise_offset_random_max_ratio",
+        type=float,
+        default=1.0,
+        help="maximum ratio for random noise offset strength (0~1). only used with --noise_offset_random_strength / noise offsetのランダム強度の最大比率（0~1）。--noise_offset_random_strength指定時のみ有効",
+    )
+    parser.add_argument(
+        "--noise_offset_random_min_ratio_sched",
+        type=str,
+        default=None,
+        help="schedule min ratio by progress fraction, e.g. '0.0:0.8,0.5:0.6,1.0:0.75'. only used with --noise_offset_random_strength / 学習進行率に応じたnoise offsetランダム強度の最小比率スケジュール（例: '0.0:0.8,0.5:0.6,1.0:0.75'）。--noise_offset_random_strength指定時のみ有効",
+    )
+    parser.add_argument(
+        "--noise_offset_random_max_ratio_sched",
+        type=str,
+        default=None,
+        help="schedule max ratio by progress fraction, e.g. '0.0:1.0,0.7:0.8'. only used with --noise_offset_random_strength / 学習進行率に応じたnoise offsetランダム強度の最大比率スケジュール（例: '0.0:1.0,0.7:0.8'）。--noise_offset_random_strength指定時のみ有効",
+    )
+    parser.add_argument(
         "--multires_noise_iterations",
         type=int,
         default=None,
@@ -3752,6 +3776,35 @@ def verify_training_args(args: argparse.Namespace):
 
     if args.adaptive_noise_scale is not None and args.noise_offset is None:
         raise ValueError("adaptive_noise_scale requires noise_offset / adaptive_noise_scaleを使用するにはnoise_offsetが必要です")
+    if not (0.0 <= args.noise_offset_random_min_ratio <= 1.0):
+        raise ValueError(
+            "noise_offset_random_min_ratio must be in [0,1] / noise_offset_random_min_ratioは0以上1以下である必要があります"
+        )
+    if not (0.0 <= args.noise_offset_random_max_ratio <= 1.0):
+        raise ValueError(
+            "noise_offset_random_max_ratio must be in [0,1] / noise_offset_random_max_ratioは0以上1以下である必要があります"
+        )
+    if args.noise_offset_random_min_ratio > args.noise_offset_random_max_ratio:
+        raise ValueError(
+            "noise_offset_random_min_ratio must be <= noise_offset_random_max_ratio / noise_offset_random_min_ratioはnoise_offset_random_max_ratio以下である必要があります"
+        )
+
+    args.noise_offset_random_min_ratio_sched_parsed = _parse_progress_ratio_sched(args.noise_offset_random_min_ratio_sched)
+    args.noise_offset_random_max_ratio_sched_parsed = _parse_progress_ratio_sched(args.noise_offset_random_max_ratio_sched)
+
+    min_sched = args.noise_offset_random_min_ratio_sched_parsed
+    max_sched = args.noise_offset_random_max_ratio_sched_parsed
+    check_points = {0.0, 1.0}
+    check_points.update(p for p, _ in min_sched)
+    check_points.update(p for p, _ in max_sched)
+    for p in sorted(check_points):
+        cur_min = _get_progress_scheduled_ratio(p, min_sched, args.noise_offset_random_min_ratio)
+        cur_max = _get_progress_scheduled_ratio(p, max_sched, args.noise_offset_random_max_ratio)
+        if cur_min > cur_max:
+            raise ValueError(
+                "noise_offset random ratio schedule produced min_ratio > max_ratio / "
+                "noise_offset random比率スケジュールでmin_ratio > max_ratioになっています"
+            )
 
     if args.scale_v_pred_loss_like_noise_pred and not args.v_parameterization:
         raise ValueError(
@@ -5250,12 +5303,92 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
     return timesteps, huber_c
 
 
-def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
+def _parse_progress_ratio_sched(spec: Optional[str]):
+    items = []
+    if not spec:
+        return items
+
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(
+                "noise_offset_random_max_ratio_sched must be 'progress:ratio,...' / "
+                "noise_offset_random_max_ratio_schedは'progress:ratio,...'形式で指定してください"
+            )
+        k, v = part.split(":", 1)
+        p = float(k)
+        ratio = float(v)
+        if not (0.0 <= p <= 1.0):
+            raise ValueError(
+                "progress in noise_offset_random_max_ratio_sched must be in [0,1] / "
+                "noise_offset_random_max_ratio_schedのprogressは0以上1以下である必要があります"
+            )
+        if not (0.0 <= ratio <= 1.0):
+            raise ValueError(
+                "ratio in noise_offset_random_max_ratio_sched must be in [0,1] / "
+                "noise_offset_random_max_ratio_schedのratioは0以上1以下である必要があります"
+            )
+        items.append((p, ratio))
+
+    items.sort(key=lambda x: x[0])
+    return items
+
+
+def _get_progress_scheduled_ratio(progress_frac: Optional[float], sched, fallback_ratio: float):
+    if not sched:
+        return fallback_ratio
+
+    if progress_frac is None or not math.isfinite(progress_frac):
+        p = 1.0
+    else:
+        p = max(0.0, min(1.0, float(progress_frac)))
+
+    if p <= sched[0][0]:
+        return sched[0][1]
+    if p >= sched[-1][0]:
+        return sched[-1][1]
+
+    for i in range(1, len(sched)):
+        p0, r0 = sched[i - 1]
+        p1, r1 = sched[i]
+        if p <= p1:
+            if p1 == p0:
+                return r1
+            t = (p - p0) / (p1 - p0)
+            return r0 + (r1 - r0) * t
+
+    return sched[-1][1]
+
+
+def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, progress_frac: Optional[float] = None):
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
         if args.noise_offset_random_strength:
-            noise_offset = torch.rand(1, device=latents.device) * args.noise_offset
+            min_sched = getattr(args, "noise_offset_random_min_ratio_sched_parsed", None)
+            max_sched = getattr(args, "noise_offset_random_max_ratio_sched_parsed", None)
+            if min_sched is None:
+                min_sched = _parse_progress_ratio_sched(args.noise_offset_random_min_ratio_sched)
+            if max_sched is None:
+                max_sched = _parse_progress_ratio_sched(args.noise_offset_random_max_ratio_sched)
+            if progress_frac is None and (len(min_sched) > 0 or len(max_sched) > 0):
+                raise ValueError(
+                    "noise_offset_random_*_ratio_sched requires progress-aware training loop (train_network.py family). "
+                    "This script does not provide progress_frac for noise scheduling. / "
+                    "noise_offset_random_*_ratio_sched は進行率を渡す学習ループ（train_network.py系）が必要です。"
+                    "このスクリプトはnoiseスケジューリング用のprogress_fracを渡していません。"
+                )
+
+            min_ratio = _get_progress_scheduled_ratio(progress_frac, min_sched, args.noise_offset_random_min_ratio)
+            max_ratio = _get_progress_scheduled_ratio(progress_frac, max_sched, args.noise_offset_random_max_ratio)
+
+            low = args.noise_offset * min_ratio
+            high = args.noise_offset * max_ratio
+            if high < low:
+                low, high = high, low
+            noise_offset = torch.empty(1, device=latents.device).uniform_(low, high)
         else:
             noise_offset = args.noise_offset
         noise = custom_train_functions.apply_noise_offset(latents, noise, noise_offset, args.adaptive_noise_scale)
