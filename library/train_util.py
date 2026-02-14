@@ -5373,6 +5373,13 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, progre
                 min_sched = _parse_progress_ratio_sched(args.noise_offset_random_min_ratio_sched)
             if max_sched is None:
                 max_sched = _parse_progress_ratio_sched(args.noise_offset_random_max_ratio_sched)
+            if progress_frac is None and (len(min_sched) > 0 or len(max_sched) > 0):
+                raise ValueError(
+                    "noise_offset_random_*_ratio_sched requires progress-aware training loop (train_network.py family). "
+                    "This script does not provide progress_frac for noise scheduling. / "
+                    "noise_offset_random_*_ratio_sched は進行率を渡す学習ループ（train_network.py系）が必要です。"
+                    "このスクリプトはnoiseスケジューリング用のprogress_fracを渡していません。"
+                )
 
             min_ratio = _get_progress_scheduled_ratio(progress_frac, min_sched, args.noise_offset_random_min_ratio)
             max_ratio = _get_progress_scheduled_ratio(progress_frac, max_sched, args.noise_offset_random_max_ratio)
