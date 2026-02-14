@@ -96,6 +96,7 @@ def _search_candidates(
     tokenizer2: CLIPTokenizer,
     add_special_tokens: bool,
     require_both: bool,
+    min_tokens: int,
 ):
     candidates = []
     if min_add == 0:
@@ -105,8 +106,8 @@ def _search_candidates(
         t1_tokens, _, t1_pieces, _ = t1_core
         t2_tokens, _, t2_pieces, _ = t2_core
 
-        t1_ok = (len(t1_tokens) >= 2) and (not _has_single_char_piece(t1_pieces))
-        t2_ok = (len(t2_tokens) >= 2) and (not _has_single_char_piece(t2_pieces))
+        t1_ok = (len(t1_tokens) >= min_tokens) and (not _has_single_char_piece(t1_pieces))
+        t2_ok = (len(t2_tokens) >= min_tokens) and (not _has_single_char_piece(t2_pieces))
 
         if (t1_ok and t2_ok) if require_both else (t1_ok or t2_ok):
             candidates.append(
@@ -136,8 +137,8 @@ def _search_candidates(
             t1_tokens, _, t1_pieces, _ = t1
             t2_tokens, _, t2_pieces, _ = t2
 
-            t1_ok = (len(t1_tokens) >= 2) and (not _has_single_char_piece(t1_pieces))
-            t2_ok = (len(t2_tokens) >= 2) and (not _has_single_char_piece(t2_pieces))
+            t1_ok = (len(t1_tokens) >= min_tokens) and (not _has_single_char_piece(t1_pieces))
+            t2_ok = (len(t2_tokens) >= min_tokens) and (not _has_single_char_piece(t2_pieces))
 
             if require_both:
                 ok = t1_ok and t2_ok
@@ -201,6 +202,12 @@ def main() -> None:
         help="Maximum number of chars to add.",
     )
     parser.add_argument(
+        "--search-min-tokens",
+        type=int,
+        default=2,
+        help="Minimum number of tokens required (default: 2).",
+    )
+    parser.add_argument(
         "--search-alphabet",
         default="abcdefghijklmnopqrstuvwxyz",
         help="Alphabet to use when generating additions.",
@@ -232,6 +239,7 @@ def main() -> None:
             tokenizer2=tokenizer2,
             add_special_tokens=args.add_special_tokens,
             require_both=not args.search_either,
+            min_tokens=args.search_min_tokens,
         )
 
         if not candidates:
@@ -251,6 +259,7 @@ def main() -> None:
         print(f"side: {args.search_side}")
         print(f"alphabet: {args.search_alphabet}")
         print(f"add_range: {args.search_min_add}..{args.search_max_add}")
+        print(f"min_tokens: {args.search_min_tokens}")
         print(f"require_both: {not args.search_either}")
         print("")
         print(f"best_candidates: {min(len(filtered), args.search_limit)}")
