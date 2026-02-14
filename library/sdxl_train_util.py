@@ -345,8 +345,8 @@ def add_sdxl_training_arguments(parser: argparse.ArgumentParser):
         "--grad_norm_mode",
         type=str,
         default=None,
-        choices=["stable", "gamble"],
-        help="preset for skip_grad_norm options: stable or gamble / skip_grad_norm関連のプリセット指定（stable または gamble）",
+        choices=["stable", "stable_no_threshoff", "gamble"],
+        help="preset for skip_grad_norm options: stable, stable_no_threshoff or gamble / skip_grad_norm関連のプリセット指定（stable / stable_no_threshoff / gamble）",
     )
     parser.add_argument(
         "--skip_grad_norm",
