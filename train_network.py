@@ -228,6 +228,16 @@ GRAD_NORM_PRESETS = {
         "skip_nan_immediate": False,
         "skip_inf_immediate": False,
     },
+    "stable_no_threshoff": {
+        "skip_grad_norm": True,
+        "log_grad_norm": True,
+        "log_grad_cosine": True,
+        "skip_grad_norm_max": 200000.0,
+        "nan_to_window": False,
+        "inf_to_window": False,
+        "skip_nan_immediate": False,
+        "skip_inf_immediate": False,
+    },
     "gamble": {
         "skip_grad_norm": True,
         "log_grad_norm": True,

@@ -13,8 +13,9 @@
 
 ## リファクタリング計画（判定結果は不変）
 1. **プリセット選択式の導入**
-   - 新オプション: `--grad_norm_mode {stable,gamble}`。
+   - 新オプション: `--grad_norm_mode {stable,stable_no_threshoff,gamble}`。
    - `stable` は現行「基本設定」（`--skip_grad_norm --grad_norm_log --grad_cosine_log --skip_grad_norm_max 200000 --nan_to_window --inf_to_window --no-skip_nan_immediate --no-skip_inf_immediate`）。
+   - `stable_no_threshoff` は `stable` 派生で、`--nan_to_window --inf_to_window` を使わず `ThreshOff` 区間を抑制する設定（`--skip_grad_norm --grad_norm_log --grad_cosine_log --skip_grad_norm_max 200000 --no-skip_nan_immediate --no-skip_inf_immediate`）。
    - `gamble` は現行「博打設定」（`--skip_grad_norm --grad_norm_log --grad_cosine_log`）。
    - 既存オプションは **後方互換のため残すが、プリセット指定時は否定フラグのみ上書き可**にする。
 
