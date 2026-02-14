@@ -1771,6 +1771,10 @@ class NetworkTrainer:
             "ss_ip_noise_gamma": args.ip_noise_gamma,
             "ss_debiased_estimation": bool(args.debiased_estimation_loss),
             "ss_noise_offset_random_strength": args.noise_offset_random_strength,
+            "ss_noise_offset_random_min_ratio": args.noise_offset_random_min_ratio,
+            "ss_noise_offset_random_max_ratio": args.noise_offset_random_max_ratio,
+            "ss_noise_offset_random_min_ratio_sched": args.noise_offset_random_min_ratio_sched,
+            "ss_noise_offset_random_max_ratio_sched": args.noise_offset_random_max_ratio_sched,
             "ss_ip_noise_gamma_random_strength": args.ip_noise_gamma_random_strength,
             "ss_loss_type": args.loss_type,
             "ss_huber_schedule": args.huber_schedule,
@@ -2418,8 +2422,10 @@ class NetworkTrainer:
 
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
+                    progress_frac_for_noise = (global_step / float(args.max_train_steps)) if args.max_train_steps > 0 else 1.0
+                    progress_frac_for_noise = max(0.0, min(1.0, progress_frac_for_noise))
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                        args, noise_scheduler, latents
+                        args, noise_scheduler, latents, progress_frac=progress_frac_for_noise
                     )
                     step_timestep = _extract_first(timesteps)
 
