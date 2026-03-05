@@ -2204,6 +2204,47 @@ class NetworkTrainer:
                 return value[0]
             return value
 
+        def _infer_group_loss_batch_size(batch):
+            preferred_keys = (
+                "loss_weights",
+                "latents",
+                "images",
+                "input_ids",
+                "input_ids2",
+                "network_multipliers",
+                "captions",
+                "alpha_masks",
+                "original_sizes_hw",
+                "crop_top_lefts",
+                "target_sizes_hw",
+                "groups",
+                "subset_indices",
+                "bucket_resos",
+            )
+
+            def _candidate_size(value):
+                if isinstance(value, torch.Tensor):
+                    if value.ndim == 0:
+                        return None
+                    return int(value.shape[0])
+                if isinstance(value, list):
+                    return len(value)
+                return None
+
+            for key in preferred_keys:
+                if key not in batch:
+                    continue
+                size = _candidate_size(batch.get(key))
+                if size is not None:
+                    return size, key
+
+            for key, value in batch.items():
+                size = _candidate_size(value)
+                if size is not None:
+                    return size, key
+
+            return None, None
+
         if group_loss_log_enabled:
             group_loss_ema_beta = float(getattr(args, "group_loss_ema_beta", 0.98))
             if not (0.0 <= group_loss_ema_beta < 1.0):
@@ -2332,16 +2373,18 @@ class NetworkTrainer:
                     progress_bar_started = True
                 skip_step_flag = False
                 if group_loss_log_enabled:
-                    step_batch_size = None
-                    loss_weights_for_check = batch.get("loss_weights")
-                    if isinstance(loss_weights_for_check, torch.Tensor):
-                        step_batch_size = int(loss_weights_for_check.shape[0])
-                    elif isinstance(loss_weights_for_check, (list, tuple)):
-                        step_batch_size = len(loss_weights_for_check)
-                    if step_batch_size is not None and step_batch_size != 1:
+                    step_batch_size, batch_size_source = _infer_group_loss_batch_size(batch)
+                    if step_batch_size is None:
                         raise ValueError(
-                            f"group_loss_log supports only batch_size=1. got batch size {step_batch_size} at step {step} / "
-                            f"group_loss_log は batch_size=1 のみ対応です。step {step} で batch size={step_batch_size} を検出しました"
+                            "group_loss_log could not infer batch_size from the runtime batch; "
+                            "disable group_loss_log or make the batch expose a batched tensor/list field / "
+                            "group_loss_log は実行時バッチから batch_size を推定できませんでした。"
+                            "group_loss_log を無効化するか、バッチにバッチ軸を持つ tensor/list フィールドを含めてください"
+                        )
+                    if step_batch_size != 1:
+                        raise ValueError(
+                            f"group_loss_log supports only batch_size=1. got batch size {step_batch_size} from `{batch_size_source}` at step {step} / "
+                            f"group_loss_log は batch_size=1 のみ対応です。step {step} で `{batch_size_source}` から batch size={step_batch_size} を検出しました"
                         )
                 step_group = train_util.BaseDataset.normalize_group_name(_extract_first(batch.get("groups")))
                 step_subset_index = _extract_first(batch.get("subset_indices"))
