@@ -746,6 +746,9 @@ class NetworkTrainer:
         dq_log_scope = getattr(args, "dq_delta_log_scope", None) or getattr(args, "dq_delta_scope", "both")
         dq_log_mode = getattr(args, "dq_delta_log_mode", "summary")
         dq_log_extra = set(getattr(args, "dq_delta_log_extra", []) or [])
+        rank_log_enabled = bool(getattr(args, "rank_log", False))
+        rank_log_every = max(1, int(getattr(args, "rank_log_every", 100)))
+        rank_log_mode = getattr(args, "rank_log_mode", "summary")
 
         dq_auto_enabled = bool(getattr(args, "dq_delta_auto_range_mul", False))
         (
@@ -820,6 +823,7 @@ class NetworkTrainer:
 
         dq_log_path = None
         dq_auto_log_path = None
+        rank_log_path = None
         if dq_log_enabled:
             dq_log_path = getattr(args, "dq_delta_log_file", None)
             if dq_log_path is None:
@@ -828,12 +832,17 @@ class NetworkTrainer:
             dq_auto_log_path = getattr(args, "dq_delta_auto_log_file", None)
             if dq_auto_log_path is None:
                 dq_auto_log_path = os.path.join(args.output_dir, f"dq_delta_auto+{args.output_name}.txt")
+        if rank_log_enabled:
+            rank_log_path = getattr(args, "rank_log_file", None)
+            if rank_log_path is None:
+                rank_log_path = os.path.join(args.output_dir, f"rank_logs+{args.output_name}.txt")
 
         dq_log_header_written = False
         dq_auto_log_header_written = False
+        rank_log_header_written = False
 
         def _write_csv(path: str, header: str, line: str):
-            nonlocal dq_log_header_written, dq_auto_log_header_written
+            nonlocal dq_log_header_written, dq_auto_log_header_written, rank_log_header_written
             if not path:
                 return
             dirpath = os.path.dirname(path)
@@ -841,15 +850,19 @@ class NetworkTrainer:
                 os.makedirs(dirpath, exist_ok=True)
             if path == dq_log_path:
                 header_written = dq_log_header_written
-            else:
+            elif path == dq_auto_log_path:
                 header_written = dq_auto_log_header_written
+            else:
+                header_written = rank_log_header_written
             if not header_written:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(header + "\n")
                 if path == dq_log_path:
                     dq_log_header_written = True
-                else:
+                elif path == dq_auto_log_path:
                     dq_auto_log_header_written = True
+                else:
+                    rank_log_header_written = True
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
 
@@ -913,6 +926,14 @@ class NetworkTrainer:
                 "AutoInitMulValue",
                 "AutoInitClipTarget",
             ]
+            return ",".join(cols)
+
+        def _rank_log_header(log_mode: str):
+            cols = [
+                "Epoch",
+                "TrainStep",
+                "Scope",
+            ]
             if log_mode == "summary":
                 cols += [
                     "RankDim",
@@ -925,6 +946,7 @@ class NetworkTrainer:
                 ]
             else:
                 cols += [
+                    "Module",
                     "RankDim",
                     "RankSat",
                     "RankTop1",
@@ -1484,7 +1506,6 @@ class NetworkTrainer:
                     labels = [f"TE{idx + 1}" for idx in sorted(self._te_lr_after_cfg.get("target_indices", []))]
                 mult = self._te_lr_after_cfg["mult"]
                 ratio = self._te_lr_after_cfg["ratio"]
-                self._handle_te_lr_after_resume()
                 status = "applied" if self._te_lr_after_cfg.get("applied") else "pending"
                 applied_step = self._te_lr_after_cfg.get("applied_step")
                 status_detail = f"{status}"
@@ -1694,6 +1715,9 @@ class NetworkTrainer:
 
         # resumeする
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+        if self._te_lr_after_cfg:
+            # load_model_hook で復元された情報を反映する（resume前には未取得）
+            self._handle_te_lr_after_resume()
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1725,11 +1749,20 @@ class NetworkTrainer:
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
         if bool(getattr(args, "group_loss_log", False)):
-            dataset_batch_sizes = [int(getattr(d, "batch_size", -1)) for d in train_dataset_group.datasets]
-            if any(bs != 1 for bs in dataset_batch_sizes):
-                raise ValueError(
-                    f"group_loss_log supports only batch_size=1 datasets. found: {dataset_batch_sizes} / "
-                    f"group_loss_log は batch_size=1 のデータセットのみ対応です。検出値: {dataset_batch_sizes}"
+            datasets_for_check = getattr(train_dataset_group, "datasets", None)
+            if isinstance(datasets_for_check, (list, tuple)) and len(datasets_for_check) > 0:
+                dataset_batch_sizes = [int(getattr(d, "batch_size", -1)) for d in datasets_for_check]
+                if any(bs != 1 for bs in dataset_batch_sizes):
+                    raise ValueError(
+                        f"group_loss_log supports only batch_size=1 datasets. found: {dataset_batch_sizes} / "
+                        f"group_loss_log は batch_size=1 のデータセットのみ対応です。検出値: {dataset_batch_sizes}"
+                    )
+            else:
+                logger.info(
+                    "group_loss_log: dataset-level batch_size check is skipped because dataset_class does not expose `.datasets`; "
+                    "batch_size will be validated at runtime / "
+                    "group_loss_log: dataset_class が `.datasets` を持たないため事前のbatch_size検証をスキップします。"
+                    "batch_size は実行時に検証します"
                 )
 
         # TODO refactor metadata creation and move to util
@@ -2700,18 +2733,6 @@ class NetworkTrainer:
                                     include_near_zero = "near_zero_rate" in dq_log_extra
                                     header = _dq_log_header(dq_log_mode, include_near_zero)
                                     log_scopes = ["unet", "te"] if dq_stats["log_scope"] == "both" else [dq_stats["log_scope"]]
-                                    rank_stats = None
-                                    rank_by_module = None
-                                    if "unet" in log_scopes:
-                                        unwrapped = accelerator.unwrap_model(network)
-                                        if hasattr(unwrapped, "compute_rank_stats"):
-                                            try:
-                                                rank_stats = unwrapped.compute_rank_stats(scope="unet")
-                                            except Exception as exc:
-                                                logger.warning("failed to compute rank stats: %s", str(exc))
-                                                rank_stats = None
-                                            if rank_stats is not None:
-                                                rank_by_module = rank_stats.get("by_module")
                                     quant_err_rms_ema = dq_quant_err_rms_ema_state
                                     quant_err_ratio_ema = dq_quant_err_ratio_ema_state
                                     if dq_stats["log_scope"] == "both":
@@ -2813,20 +2834,6 @@ class NetworkTrainer:
                                                     dq_auto_init_value if dq_auto_init_value is not None else "",
                                                     dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
                                                 ]
-                                                rank_dim = rank_sat = rank_top1 = rank_energy = None
-                                                if scope == "unet" and rank_by_module is not None:
-                                                    rank_item = rank_by_module.get(item["module"])
-                                                    if rank_item is not None:
-                                                        rank_dim = rank_item.get("r")
-                                                        rank_sat = rank_item.get("sat")
-                                                        rank_top1 = rank_item.get("top1")
-                                                        rank_energy = rank_item.get("energy")
-                                                row += [
-                                                    rank_dim,
-                                                    rank_sat,
-                                                    rank_top1,
-                                                    rank_energy,
-                                                ]
                                                 _write_csv(dq_log_path, header, ",".join(_dq_format_value(v) for v in row))
                                         else:
                                             row = values + [
@@ -2858,24 +2865,6 @@ class NetworkTrainer:
                                                 dq_auto_init_applied,
                                                 dq_auto_init_value if dq_auto_init_value is not None else "",
                                                 dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
-                                            ]
-                                            rank_dim = rank_sat_wmean = rank_sat_p50 = rank_sat_p95 = rank_sat_max = rank_top1_p95 = rank_energy_sum = None
-                                            if scope == "unet" and rank_stats is not None:
-                                                rank_dim = rank_stats.get("rank_dim")
-                                                rank_sat_wmean = rank_stats.get("sat_wmean")
-                                                rank_sat_p50 = rank_stats.get("sat_p50")
-                                                rank_sat_p95 = rank_stats.get("sat_p95")
-                                                rank_sat_max = rank_stats.get("sat_max")
-                                                rank_top1_p95 = rank_stats.get("top1_p95")
-                                                rank_energy_sum = rank_stats.get("energy_sum")
-                                            row += [
-                                                rank_dim,
-                                                rank_sat_wmean,
-                                                rank_sat_p50,
-                                                rank_sat_p95,
-                                                rank_sat_max,
-                                                rank_top1_p95,
-                                                rank_energy_sum,
                                             ]
                                             _write_csv(dq_log_path, header, ",".join(_dq_format_value(v) for v in row))
 
@@ -2923,15 +2912,6 @@ class NetworkTrainer:
                                             dq_auto_init_value if dq_auto_init_value is not None else "",
                                             dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
                                         ]
-                                        row += [
-                                            "",
-                                            "",
-                                            "",
-                                            "",
-                                            "",
-                                            "",
-                                            "",
-                                        ]
                                         _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
                                     else:
                                         row = [
@@ -2952,6 +2932,45 @@ class NetworkTrainer:
                                             dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
                                         ]
                                         _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
+                    if rank_log_enabled and accelerator.is_main_process and rank_log_path and (not skip_step_flag):
+                        step_idx = global_step
+                        if step_idx % rank_log_every == 0:
+                            unwrapped = accelerator.unwrap_model(network)
+                            if hasattr(unwrapped, "compute_rank_stats"):
+                                rank_stats = None
+                                try:
+                                    rank_stats = unwrapped.compute_rank_stats(scope="unet")
+                                except Exception as exc:
+                                    logger.warning("failed to compute rank stats: %s", str(exc))
+                                if rank_stats is not None:
+                                    header = _rank_log_header(rank_log_mode)
+                                    if rank_log_mode == "per_module":
+                                        for item in rank_stats.get("per_module", []):
+                                            row = [
+                                                epoch + 1,
+                                                step_idx,
+                                                "unet",
+                                                item.get("module"),
+                                                item.get("r"),
+                                                item.get("sat"),
+                                                item.get("top1"),
+                                                item.get("energy"),
+                                            ]
+                                            _write_csv(rank_log_path, header, ",".join(_dq_format_value(v) for v in row))
+                                    else:
+                                        row = [
+                                            epoch + 1,
+                                            step_idx,
+                                            "unet",
+                                            rank_stats.get("rank_dim"),
+                                            rank_stats.get("sat_wmean"),
+                                            rank_stats.get("sat_p50"),
+                                            rank_stats.get("sat_p95"),
+                                            rank_stats.get("sat_max"),
+                                            rank_stats.get("top1_p95"),
+                                            rank_stats.get("energy_sum"),
+                                        ]
+                                        _write_csv(rank_log_path, header, ",".join(_dq_format_value(v) for v in row))
                     self.sample_images(accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
                     # 指定ステップごとにモデルを保存
@@ -3355,6 +3374,30 @@ def setup_parser() -> argparse.ArgumentParser:
         default=[],
         choices=["near_zero_rate"],
         help="Extra dq_delta log fields / dq_delta 追加ログ項目",
+    )
+    parser.add_argument(
+        "--rank_log",
+        action="store_true",
+        help="Enable rank saturation logging / rank飽和ログを有効化",
+    )
+    parser.add_argument(
+        "--rank_log_every",
+        type=int,
+        default=100,
+        help="Log rank stats every N optimizer steps / rankログ間隔（optimizer step）",
+    )
+    parser.add_argument(
+        "--rank_log_mode",
+        type=str,
+        default="summary",
+        choices=["summary", "per_module"],
+        help="rank log mode: summary or per_module / rankログ粒度（summary/per_module）",
+    )
+    parser.add_argument(
+        "--rank_log_file",
+        type=str,
+        default=None,
+        help="Path for rank log file / rankログ出力先",
     )
     parser.add_argument(
         "--dq_delta_auto_range_mul",

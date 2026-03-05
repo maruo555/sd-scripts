@@ -325,11 +325,11 @@ def infer_epoch_from_step(train_step: int, grad_data: Optional[Dict[str, Any]]) 
 
 
 def parse_dq_logs(
-    dq_log_path: str,
+    dq_log_path: Optional[str],
     dq_auto_path: Optional[str],
     grad_data: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    rows = read_csv_rows(dq_log_path)
+    rows = read_csv_rows(dq_log_path) if dq_log_path else []
     parsed_rows: List[Dict[str, Any]] = []
     for row in rows:
         train_step = safe_int(row.get("TrainStep"))
@@ -354,13 +354,6 @@ def parse_dq_logs(
                 "ZeroRate": safe_float(row.get("ZeroRate")),
                 "AbsMax": safe_float(row.get("AbsMax")),
                 "Range": safe_float(row.get("Range")),
-                "RankDim": safe_float(row.get("RankDim")),
-                "RankSatWMean": safe_float(row.get("RankSatWMean")),
-                "RankSatP50": safe_float(row.get("RankSatP50")),
-                "RankSatP95": safe_float(row.get("RankSatP95")),
-                "RankSatMax": safe_float(row.get("RankSatMax")),
-                "RankTop1P95": safe_float(row.get("RankTop1P95")),
-                "RankEnergySum": safe_float(row.get("RankEnergySum")),
                 "AutoReason": (row.get("AutoReason") or "").strip(),
             }
         )
@@ -399,7 +392,8 @@ def parse_dq_logs(
             markers.append({"x": item["TrainStep"], "label": f"E{epoch}"})
             last_epoch = epoch
 
-    bits_values = [item["Bits"] for item in parsed_rows if item["Bits"] is not None]
+    bits_source = parsed_rows if parsed_rows else auto_rows
+    bits_values = [item["Bits"] for item in bits_source if item.get("Bits") is not None]
     bit_switches = 0
     if bits_values:
         prev = bits_values[0]
@@ -428,8 +422,9 @@ def parse_dq_logs(
         if target is not None:
             clip_target_values.append(target)
 
-    latest = parsed_rows[-1] if parsed_rows else {}
-    clip_ema_values = [item["ClipRateEMA"] for item in parsed_rows if item["ClipRateEMA"] is not None]
+    latest = parsed_rows[-1] if parsed_rows else (auto_rows[-1] if auto_rows else {})
+    clip_source = parsed_rows if parsed_rows else auto_rows
+    clip_ema_values = [item["ClipRateEMA"] for item in clip_source if item.get("ClipRateEMA") is not None]
     clip_ema_cv = None
     if len(clip_ema_values) >= 8:
         tail = clip_ema_values[-max(8, len(clip_ema_values) // 4) :]
@@ -452,8 +447,6 @@ def parse_dq_logs(
         "final_quant_err_ratio_ema": latest.get("QuantErrRatioEMA"),
         "final_quant_err_rms_ema": latest.get("QuantErrRMSEMA"),
         "final_zero_rate": latest.get("ZeroRate"),
-        "final_rank_sat_p95": latest.get("RankSatP95"),
-        "final_rank_energy_sum": latest.get("RankEnergySum"),
     }
 
     return {
@@ -461,6 +454,175 @@ def parse_dq_logs(
         "auto_path": dq_auto_path,
         "rows": parsed_rows,
         "auto_rows": auto_rows,
+        "markers": markers,
+        "summary": summary,
+    }
+
+
+def parse_rank_logs(
+    rank_log_path: str,
+    grad_data: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    rows = read_csv_rows(rank_log_path)
+    if not rows:
+        return {
+            "path": rank_log_path,
+            "rows": [],
+            "markers": [],
+            "summary": {
+                "rows": 0,
+                "final_rank_sat_p95": None,
+                "final_rank_energy_sum": None,
+            },
+        }
+
+    def _quantile(values: List[float], q: float) -> Optional[float]:
+        if not values:
+            return None
+        if len(values) == 1:
+            return float(values[0])
+        sorted_values = sorted(values)
+        position = (len(sorted_values) - 1) * q
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return float(sorted_values[lower])
+        weight_upper = position - lower
+        weight_lower = 1.0 - weight_upper
+        return float(sorted_values[lower] * weight_lower + sorted_values[upper] * weight_upper)
+
+    first_columns = set(rows[0].keys())
+    is_per_module_schema = (
+        "RankSatWMean" not in first_columns
+        and {"RankSat", "RankTop1", "RankEnergy"}.issubset(first_columns)
+    )
+
+    parsed_rows: List[Dict[str, Any]] = []
+
+    if is_per_module_schema:
+        buckets: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        eps = 1e-12
+        for row in rows:
+            train_step = safe_int(row.get("TrainStep"))
+            if train_step is None:
+                continue
+            epoch = safe_int(row.get("Epoch"))
+            if epoch is None:
+                epoch = infer_epoch_from_step(train_step, grad_data)
+            scope = (row.get("Scope") or "").strip()
+            key = (train_step, scope)
+            if key not in buckets:
+                buckets[key] = {
+                    "TrainStep": train_step,
+                    "Epoch": epoch,
+                    "Scope": scope,
+                    "rank_dims": [],
+                    "sat_values": [],
+                    "top1_values": [],
+                    "sat_weighted": [],
+                    "top1_weighted": [],
+                    "energy_values": [],
+                }
+            bucket = buckets[key]
+            if bucket.get("Epoch") is None and epoch is not None:
+                bucket["Epoch"] = epoch
+
+            rank_dim = safe_float(row.get("RankDim"))
+            sat = safe_float(row.get("RankSat"))
+            top1 = safe_float(row.get("RankTop1"))
+            energy = safe_float(row.get("RankEnergy"))
+
+            if rank_dim is not None:
+                bucket["rank_dims"].append(rank_dim)
+            if sat is not None:
+                bucket["sat_values"].append(sat)
+            if top1 is not None:
+                bucket["top1_values"].append(top1)
+            if energy is not None:
+                bucket["energy_values"].append(energy)
+            if sat is not None and energy is not None:
+                bucket["sat_weighted"].append((sat, energy))
+            if top1 is not None and energy is not None:
+                bucket["top1_weighted"].append((top1, energy))
+
+        for bucket in buckets.values():
+            energy_sum = sum(bucket["energy_values"]) if bucket["energy_values"] else None
+            active_sat_values = [sat for sat, energy in bucket["sat_weighted"] if energy > eps]
+            active_top1_values = [top1 for top1, energy in bucket["top1_weighted"] if energy > eps]
+            sat_values = active_sat_values if active_sat_values else bucket["sat_values"]
+            top1_values = active_top1_values if active_top1_values else bucket["top1_values"]
+
+            sat_wmean = None
+            if bucket["sat_weighted"] and energy_sum is not None:
+                if energy_sum > eps:
+                    sat_wmean = sum(sat * energy for sat, energy in bucket["sat_weighted"]) / energy_sum
+                else:
+                    sat_wmean = 0.0
+
+            rank_dim = None
+            if bucket["rank_dims"]:
+                rank_dim_set = set(bucket["rank_dims"])
+                if len(rank_dim_set) == 1:
+                    rank_dim = next(iter(rank_dim_set))
+
+            parsed_rows.append(
+                {
+                    "TrainStep": bucket["TrainStep"],
+                    "Epoch": bucket.get("Epoch"),
+                    "Scope": bucket["Scope"],
+                    "RankDim": rank_dim,
+                    "RankSatWMean": sat_wmean,
+                    "RankSatP50": _quantile(sat_values, 0.5),
+                    "RankSatP95": _quantile(sat_values, 0.95),
+                    "RankSatMax": max(sat_values) if sat_values else None,
+                    "RankTop1P95": _quantile(top1_values, 0.95),
+                    "RankEnergySum": energy_sum,
+                }
+            )
+    else:
+        for row in rows:
+            train_step = safe_int(row.get("TrainStep"))
+            if train_step is None:
+                continue
+            epoch = safe_int(row.get("Epoch"))
+            if epoch is None:
+                epoch = infer_epoch_from_step(train_step, grad_data)
+            parsed_rows.append(
+                {
+                    "TrainStep": train_step,
+                    "Epoch": epoch,
+                    "Scope": (row.get("Scope") or "").strip(),
+                    "RankDim": safe_float(row.get("RankDim")),
+                    "RankSatWMean": safe_float(row.get("RankSatWMean")),
+                    "RankSatP50": safe_float(row.get("RankSatP50")),
+                    "RankSatP95": safe_float(row.get("RankSatP95")),
+                    "RankSatMax": safe_float(row.get("RankSatMax")),
+                    "RankTop1P95": safe_float(row.get("RankTop1P95")),
+                    "RankEnergySum": safe_float(row.get("RankEnergySum")),
+                }
+            )
+    parsed_rows.sort(key=lambda item: item["TrainStep"])
+
+    markers: List[Dict[str, Any]] = []
+    last_epoch: Optional[int] = None
+    for item in parsed_rows:
+        epoch = item.get("Epoch")
+        if epoch is None:
+            continue
+        if last_epoch != epoch:
+            markers.append({"x": item["TrainStep"], "label": f"E{epoch}"})
+            last_epoch = epoch
+
+    latest = parsed_rows[-1] if parsed_rows else {}
+    summary = {
+        "rows": len(parsed_rows),
+        "final_rank_sat_p95": latest.get("RankSatP95"),
+        "final_rank_energy_sum": latest.get("RankEnergySum"),
+    }
+
+    return {
+        "path": rank_log_path,
+        "rows": parsed_rows,
         "markers": markers,
         "summary": summary,
     }
@@ -674,6 +836,7 @@ def grade_metric(value: Optional[float], good_max: float, warn_max: float) -> Tu
 def build_diagnostics(
     grad_data: Optional[Dict[str, Any]],
     dq_data: Optional[Dict[str, Any]],
+    rank_data: Optional[Dict[str, Any]],
     lora_data: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     checks: List[Dict[str, str]] = []
@@ -776,18 +939,6 @@ def build_diagnostics(
             }
         )
 
-        rank_sat_p95 = dq_summary.get("final_rank_sat_p95")
-        level, text = grade_metric(rank_sat_p95, good_max=0.90, warn_max=0.97)
-        checks.append(
-            {
-                "section": "DQ",
-                "name": "最終 RankSatP95",
-                "value": fmt_float(rank_sat_p95, 4),
-                "status": level,
-                "note": text + " (高止まりはrank飽和の兆候)",
-            }
-        )
-
         clip_cv = dq_summary.get("clip_ema_cv")
         if clip_cv is None:
             status = "info"
@@ -808,6 +959,20 @@ def build_diagnostics(
                 "value": fmt_float(clip_cv, 4),
                 "status": status,
                 "note": note,
+            }
+        )
+
+    if rank_data:
+        rank_summary = rank_data.get("summary", {})
+        rank_sat_p95 = rank_summary.get("final_rank_sat_p95")
+        level, text = grade_metric(rank_sat_p95, good_max=0.90, warn_max=0.97)
+        checks.append(
+            {
+                "section": "Rank",
+                "name": "最終 RankSatP95",
+                "value": fmt_float(rank_sat_p95, 4),
+                "status": level,
+                "note": text + " (高止まりはrank飽和の兆候)",
             }
         )
 
@@ -875,10 +1040,11 @@ def sanitize_json(value: Any) -> Any:
 def build_chart_payload(
     grad_data: Optional[Dict[str, Any]],
     dq_data: Optional[Dict[str, Any]],
+    rank_data: Optional[Dict[str, Any]],
     group_loss_data: Optional[Dict[str, Any]],
     lora_trend_data: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"grad": [], "dq": [], "group_loss": [], "lora_trend": []}
+    payload: Dict[str, Any] = {"grad": [], "dq": [], "rank": [], "group_loss": [], "lora_trend": []}
 
     if grad_data:
         x = grad_data.get("x", [])
@@ -1059,8 +1225,15 @@ def build_chart_payload(
                 "y_tick_precision": 1,
                 "series": series_for([("Range", "Range", ColorPalette[5])]),
             },
+        ]
+
+    if rank_data:
+        rows = rank_data.get("rows", [])
+        x = [item.get("TrainStep") for item in rows]
+        markers = rank_data.get("markers", [])
+        payload["rank"] = [
             {
-                "id": "dq_rank_dim",
+                "id": "rank_dim",
                 "title": "RankDim",
                 "x_label": "TrainStep",
                 "markers": markers,
@@ -1068,10 +1241,10 @@ def build_chart_payload(
                 "y_tick_step": 1.0,
                 "y_tick_integer": True,
                 "y_min_floor": 0.0,
-                "series": series_for([("RankDim", "RankDim", ColorPalette[6])]),
+                "series": [{"name": "RankDim", "color": ColorPalette[6], "y": [item.get("RankDim") for item in rows]}],
             },
             {
-                "id": "dq_rank_sat",
+                "id": "rank_sat",
                 "title": "RankSatWMean / P50 / P95 / Max / Top1P95",
                 "x_label": "TrainStep",
                 "markers": markers,
@@ -1081,25 +1254,23 @@ def build_chart_payload(
                 "y_tick_step": 0.1,
                 "y_tick_precision": 1,
                 "legend_max_rows": 2,
-                "series": series_for(
-                    [
-                        ("RankSatWMean", "RankSatWMean", ColorPalette[0]),
-                        ("RankSatP50", "RankSatP50", ColorPalette[1]),
-                        ("RankSatP95", "RankSatP95", ColorPalette[2]),
-                        ("RankSatMax", "RankSatMax", ColorPalette[3]),
-                        ("RankTop1P95", "RankTop1P95", ColorPalette[4]),
-                    ]
-                ),
+                "series": [
+                    {"name": "RankSatWMean", "color": ColorPalette[0], "y": [item.get("RankSatWMean") for item in rows]},
+                    {"name": "RankSatP50", "color": ColorPalette[1], "y": [item.get("RankSatP50") for item in rows]},
+                    {"name": "RankSatP95", "color": ColorPalette[2], "y": [item.get("RankSatP95") for item in rows]},
+                    {"name": "RankSatMax", "color": ColorPalette[3], "y": [item.get("RankSatMax") for item in rows]},
+                    {"name": "RankTop1P95", "color": ColorPalette[4], "y": [item.get("RankTop1P95") for item in rows]},
+                ],
             },
             {
-                "id": "dq_rank_energy",
+                "id": "rank_energy",
                 "title": "RankEnergySum",
                 "x_label": "TrainStep",
                 "markers": markers,
                 "x": x,
                 "y_tick_nice_integer": True,
                 "y_min_fixed": 0.0,
-                "series": series_for([("RankEnergySum", "RankEnergySum", ColorPalette[7])]),
+                "series": [{"name": "RankEnergySum", "color": ColorPalette[7], "y": [item.get("RankEnergySum") for item in rows]}],
             },
         ]
 
@@ -1526,7 +1697,7 @@ td.num {{
         </div>
         <div class="card">
           <div class="title">最終 RankSatP95</div>
-          <div class="value">{fmt_float((((report.get("dq") or {}).get("summary") or {}).get("final_rank_sat_p95")), 4)}</div>
+          <div class="value">{fmt_float((((report.get("rank") or {}).get("summary") or {}).get("final_rank_sat_p95")), 4)}</div>
           <div class="caption">高すぎると rank 飽和の兆候</div>
         </div>
       </div>
@@ -1555,6 +1726,12 @@ td.num {{
       <h2>DQ Delta Dashboard</h2>
       <p class="sub">X軸は TrainStep。縦線ラベルで Epoch を表示します。</p>
       <div id="dqCharts" class="chart-grid"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Rank Dashboard</h2>
+      <p class="sub">LoRA重みから推定した rank 飽和指標の推移です。</p>
+      <div id="rankCharts" class="chart-grid"></div>
     </section>
 
     <section class="panel">
@@ -1644,6 +1821,7 @@ td.num {{
         <div>Grad Log: <code>{(report.get("grad") or {}).get("path", "-")}</code></div>
         <div>DQ Log: <code>{(report.get("dq") or {}).get("path", "-")}</code></div>
         <div>DQ Auto Log: <code>{(report.get("dq") or {}).get("auto_path", "-")}</code></div>
+        <div>Rank Log: <code>{(report.get("rank") or {}).get("path", "-")}</code></div>
         <div>Group Loss Step Log: <code>{(report.get("group_loss") or {}).get("step_path", "-")}</code></div>
         <div>Group Loss Epoch Log: <code>{(report.get("group_loss") or {}).get("epoch_path", "-")}</code></div>
         <div>LoRA Final Checkpoint: <code>{(report.get("lora") or {}).get("path", "-")}</code></div>
@@ -2032,6 +2210,7 @@ function mountCharts(containerId, charts) {{
 
 mountCharts('gradCharts', ((reportData.charts || {{}}).grad || []));
 mountCharts('dqCharts', ((reportData.charts || {{}}).dq || []));
+mountCharts('rankCharts', ((reportData.charts || {{}}).rank || []));
 mountCharts('groupLossCharts', ((reportData.charts || {{}}).group_loss || []));
 mountCharts('loraTrendCharts', ((reportData.charts || {{}}).lora_trend || []));
 </script>
@@ -2047,6 +2226,7 @@ def resolve_paths(args: argparse.Namespace) -> Dict[str, Optional[str]]:
     grad_log = os.path.join(input_dir, f"gradient_logs+{base_name}.txt")
     dq_log = os.path.join(input_dir, f"dq_delta_logs+{base_name}.txt")
     dq_auto_log = os.path.join(input_dir, f"dq_delta_auto+{base_name}.txt")
+    rank_log = os.path.join(input_dir, f"rank_logs+{base_name}.txt")
     group_loss_step_log = os.path.join(input_dir, f"group_loss_logs+{base_name}.csv")
     group_loss_epoch_log = os.path.join(input_dir, f"group_loss_epoch+{base_name}.csv")
     model = os.path.join(input_dir, f"{base_name}.safetensors")
@@ -2055,6 +2235,7 @@ def resolve_paths(args: argparse.Namespace) -> Dict[str, Optional[str]]:
         "grad_log": grad_log,
         "dq_log": dq_log,
         "dq_auto_log": dq_auto_log,
+        "rank_log": rank_log,
         "group_loss_step_log": group_loss_step_log,
         "group_loss_epoch_log": group_loss_epoch_log,
         "model": model,
@@ -2067,7 +2248,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input_dir",
         default=".",
-        help="ログとモデルがあるディレクトリ（ログ名は gradient_logs+/dq_delta_logs+/dq_delta_auto+ の固定形式）",
+        help="ログとモデルがあるディレクトリ（ログ名は gradient_logs+/dq_delta_logs+/dq_delta_auto+/rank_logs+ の固定形式）",
     )
     parser.add_argument("--loss_ma_window", type=int, default=100, help="Loss移動平均の窓サイズ")
     parser.add_argument("--lora_bins", type=int, default=128, help="LoRA重み解析のヒストグラムビン数")
@@ -2091,23 +2272,32 @@ def main() -> None:
     grad_log_path = paths["grad_log"]
     dq_log_path = paths["dq_log"]
     dq_auto_log_path = paths["dq_auto_log"]
+    rank_log_path = paths["rank_log"]
     group_loss_step_log_path = paths["group_loss_step_log"]
     group_loss_epoch_log_path = paths["group_loss_epoch_log"]
     model_path = paths["model"]
 
-    if not grad_log_path or not os.path.exists(grad_log_path):
-        raise FileNotFoundError(f"grad log が見つかりません: {grad_log_path}")
-    if not dq_log_path or not os.path.exists(dq_log_path):
-        raise FileNotFoundError(f"dq log が見つかりません: {dq_log_path}")
+    if grad_log_path and not os.path.exists(grad_log_path):
+        grad_log_path = None
+    if dq_log_path and not os.path.exists(dq_log_path):
+        dq_log_path = None
     if dq_auto_log_path and not os.path.exists(dq_auto_log_path):
         dq_auto_log_path = None
+    if rank_log_path and not os.path.exists(rank_log_path):
+        rank_log_path = None
     if group_loss_step_log_path and not os.path.exists(group_loss_step_log_path):
         group_loss_step_log_path = None
     if group_loss_epoch_log_path and not os.path.exists(group_loss_epoch_log_path):
         group_loss_epoch_log_path = None
 
-    grad_data = parse_grad_log(grad_log_path, args.loss_ma_window)
-    dq_data = parse_dq_logs(dq_log_path, dq_auto_log_path, grad_data)
+    if not any([grad_log_path, dq_log_path, dq_auto_log_path, rank_log_path, group_loss_step_log_path, group_loss_epoch_log_path]):
+        raise FileNotFoundError(
+            f"入力ログが見つかりません: {args.input_dir} (gradient_logs+/dq_delta_logs+/dq_delta_auto+/rank_logs+/group_loss_logs+/group_loss_epoch+)"
+        )
+
+    grad_data = parse_grad_log(grad_log_path, args.loss_ma_window) if grad_log_path else None
+    dq_data = parse_dq_logs(dq_log_path, dq_auto_log_path, grad_data) if (dq_log_path or dq_auto_log_path) else None
+    rank_data = parse_rank_logs(rank_log_path, grad_data) if rank_log_path else None
     group_loss_data = parse_group_loss_logs(group_loss_step_log_path, group_loss_epoch_log_path)
 
     lora_data = None
@@ -2135,14 +2325,15 @@ def main() -> None:
     elif args.lora_epoch_trend:
         lora_trend_error = "--skip_lora_analysis 指定時は --lora_epoch_trend を実行できません。"
 
-    diagnostics = build_diagnostics(grad_data, dq_data, lora_data)
-    charts = build_chart_payload(grad_data, dq_data, group_loss_data, lora_trend_data)
+    diagnostics = build_diagnostics(grad_data, dq_data, rank_data, lora_data)
+    charts = build_chart_payload(grad_data, dq_data, rank_data, group_loss_data, lora_trend_data)
 
     report = {
         "base_name": args.base_name,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "grad": grad_data,
         "dq": dq_data,
+        "rank": rank_data,
         "group_loss": group_loss_data,
         "lora": lora_data,
         "lora_error": lora_error,
