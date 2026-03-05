@@ -1000,6 +1000,22 @@ def build_diagnostics(
             }
         )
 
+    if not checks:
+        return {
+            "score": None,
+            "overall_status": "情報不足",
+            "overall_class": "info",
+            "checks": [
+                {
+                    "section": "診断",
+                    "name": "スコア算出可否",
+                    "value": "-",
+                    "status": "info",
+                    "note": "Grad/DQ/Rank/LoRA の診断対象データが不足しているため総合スコアを算出できません",
+                }
+            ],
+        }
+
     score = 100
     for check in checks:
         if check["status"] == "warn":
@@ -1468,6 +1484,8 @@ def render_check_rows(checks: List[Dict[str, str]]) -> str:
 def build_html(report: Dict[str, Any]) -> str:
     report_json = json.dumps(sanitize_json(report), ensure_ascii=False).replace("</", "<\\/")
     diagnostics = report.get("diagnostics", {})
+    score_value = diagnostics.get("score")
+    score_text = "-" if score_value is None else f"{score_value}点"
     lora_data = report.get("lora")
     lora_cards = {}
     module_rows = "<tr><td colspan='7' class='muted'>LoRA解析を実行していません</td></tr>"
@@ -1571,6 +1589,7 @@ h1, h2 {{
 .score.good {{ background: var(--good-bg); color: var(--good); }}
 .score.warn {{ background: var(--warn-bg); color: var(--warn); }}
 .score.bad {{ background: var(--bad-bg); color: var(--bad); }}
+.score.info {{ background: var(--info-bg); color: var(--info); }}
 table {{
   width: 100%;
   border-collapse: collapse;
@@ -1672,7 +1691,7 @@ td.num {{
     <section class="panel">
       <div class="overall">
         総合診断:
-        <span class="score {diagnostics.get("overall_class", "warn")}">{diagnostics.get("overall_status", "-")} ({diagnostics.get("score", 0)}点)</span>
+        <span class="score {diagnostics.get("overall_class", "info")}">{diagnostics.get("overall_status", "-")} ({score_text})</span>
       </div>
       <div class="grid cards" style="margin-top: 12px;">
         <div class="card">
