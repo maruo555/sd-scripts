@@ -8,14 +8,16 @@
 
 ## オプション
 - `--rank_log`
-  - rankログを有効化。
+  - rankログを有効化。既定値: `OFF`。
 - `--rank_log_every <int>`
   - 記録間隔（optimizer step）。既定値: `100`。
 - `--rank_log_mode {summary,per_module}`
+  - 既定値: `summary`。
   - `summary`: UNet全体の集約指標。
   - `per_module`: モジュールごとの指標。
 - `--rank_log_file <path>`
-  - 出力先。未指定時は `output_dir/rank_logs+<output_name>.txt`。
+  - 出力先。既定値: `None`。
+  - 未指定時は `output_dir/rank_logs+<output_name>.txt`。
 
 ## 出力スキーマ
 
