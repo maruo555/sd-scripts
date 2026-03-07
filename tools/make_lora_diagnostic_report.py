@@ -463,12 +463,25 @@ def parse_rank_logs(
     rank_log_path: str,
     grad_data: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    rank_lr_keys = [
+        "UnetLRMin",
+        "UnetLRMax",
+        "Te1LRMin",
+        "Te1LRMax",
+        "Te2LRMin",
+        "Te2LRMax",
+    ]
+    empty_grouped = {
+        "path": {"labels": [], "rows": []},
+        "role": {"labels": [], "rows": []},
+    }
     rows = read_csv_rows(rank_log_path)
     if not rows:
         return {
             "path": rank_log_path,
             "rows": [],
             "markers": [],
+            "grouped": empty_grouped,
             "summary": {
                 "rows": 0,
                 "final_rank_sat_p95": None,
@@ -491,6 +504,83 @@ def parse_rank_logs(
         weight_lower = 1.0 - weight_upper
         return float(sorted_values[lower] * weight_lower + sorted_values[upper] * weight_upper)
 
+    def _classify_path_group(module_name: str) -> str:
+        lowered = (module_name or "").lower()
+        if "down_blocks_" in lowered or "input_blocks_" in lowered:
+            return "down"
+        if "mid_block_" in lowered or "middle_block_" in lowered:
+            return "mid"
+        if "up_blocks_" in lowered or "output_blocks_" in lowered:
+            return "up"
+        return "other"
+
+    def _classify_role_group(module_name: str) -> str:
+        lowered = (module_name or "").lower()
+        if "_to_q" in lowered:
+            return "to_q"
+        if "_to_k" in lowered:
+            return "to_k"
+        if "_to_v" in lowered:
+            return "to_v"
+        if "_to_out" in lowered:
+            return "to_out"
+        if "ff_net" in lowered or "_ff_" in lowered:
+            return "ff"
+        if "resnets_" in lowered:
+            return "resnet"
+        if "upsamplers_" in lowered or "downsamplers_" in lowered:
+            return "sampler"
+        if "conv" in lowered:
+            return "conv"
+        return "other"
+
+    def _order_group_labels(group_name: str, labels: List[str]) -> List[str]:
+        preferred_orders = {
+            "path": ["down", "mid", "up", "other"],
+            "role": ["to_q", "to_k", "to_v", "to_out", "ff", "resnet", "sampler", "conv", "other"],
+        }
+        ordered = [label for label in preferred_orders.get(group_name, []) if label in labels]
+        ordered.extend(sorted(label for label in labels if label not in ordered))
+        return ordered
+
+    def _finalize_grouped_rows(group_name: str, group_buckets: Dict[Tuple[int, str], Dict[str, Any]], eps: float):
+        grouped_rows: List[Dict[str, Any]] = []
+        labels = set()
+        for bucket in group_buckets.values():
+            groups_out: Dict[str, Dict[str, Any]] = {}
+            total_energy = sum(info["energy_sum"] for info in bucket["groups"].values())
+            for label, info in bucket["groups"].items():
+                labels.add(label)
+                sat_wmean = None
+                if info["sat_weighted_energy"] > eps:
+                    sat_wmean = info["sat_weighted_sum"] / info["sat_weighted_energy"]
+                elif info["sat_values"]:
+                    sat_wmean = statistics.mean(info["sat_values"])
+                energy_share = None
+                if total_energy > eps:
+                    energy_share = info["energy_sum"] / total_energy
+                groups_out[label] = {
+                    "RankEnergySum": info["energy_sum"],
+                    "RankEnergyShare": energy_share,
+                    "RankSatWMean": sat_wmean,
+                }
+
+            row_out = {
+                "TrainStep": bucket["TrainStep"],
+                "Epoch": bucket.get("Epoch"),
+                "Scope": bucket["Scope"],
+                "groups": groups_out,
+            }
+            for lr_key in rank_lr_keys:
+                row_out[lr_key] = bucket.get(lr_key)
+            grouped_rows.append(row_out)
+
+        grouped_rows.sort(key=lambda item: item["TrainStep"])
+        return {
+            "labels": _order_group_labels(group_name, list(labels)),
+            "rows": grouped_rows,
+        }
+
     first_columns = set(rows[0].keys())
     is_per_module_schema = (
         "RankSatWMean" not in first_columns
@@ -498,10 +588,15 @@ def parse_rank_logs(
     )
 
     parsed_rows: List[Dict[str, Any]] = []
+    grouped = empty_grouped
 
     if is_per_module_schema:
         buckets: Dict[Tuple[int, str], Dict[str, Any]] = {}
         eps = 1e-12
+        grouped_buckets = {
+            "path": {},
+            "role": {},
+        }
         for row in rows:
             train_step = safe_int(row.get("TrainStep"))
             if train_step is None:
@@ -523,14 +618,22 @@ def parse_rank_logs(
                     "top1_weighted": [],
                     "energy_values": [],
                 }
+                for lr_key in rank_lr_keys:
+                    buckets[key][lr_key] = None
             bucket = buckets[key]
             if bucket.get("Epoch") is None and epoch is not None:
                 bucket["Epoch"] = epoch
+
+            lr_values = {lr_key: safe_float(row.get(lr_key)) for lr_key in rank_lr_keys}
+            for lr_key, lr_value in lr_values.items():
+                if bucket.get(lr_key) is None and lr_value is not None:
+                    bucket[lr_key] = lr_value
 
             rank_dim = safe_float(row.get("RankDim"))
             sat = safe_float(row.get("RankSat"))
             top1 = safe_float(row.get("RankTop1"))
             energy = safe_float(row.get("RankEnergy"))
+            module_name = (row.get("Module") or "").strip()
 
             if rank_dim is not None:
                 bucket["rank_dims"].append(rank_dim)
@@ -544,6 +647,44 @@ def parse_rank_logs(
                 bucket["sat_weighted"].append((sat, energy))
             if top1 is not None and energy is not None:
                 bucket["top1_weighted"].append((top1, energy))
+
+            group_names = {
+                "path": _classify_path_group(module_name),
+                "role": _classify_role_group(module_name),
+            }
+            for grouping_name, label in group_names.items():
+                grouping_buckets = grouped_buckets[grouping_name]
+                if key not in grouping_buckets:
+                    grouping_buckets[key] = {
+                        "TrainStep": train_step,
+                        "Epoch": epoch,
+                        "Scope": scope,
+                        "groups": {},
+                    }
+                    for lr_key in rank_lr_keys:
+                        grouping_buckets[key][lr_key] = None
+                grouped_bucket = grouping_buckets[key]
+                if grouped_bucket.get("Epoch") is None and epoch is not None:
+                    grouped_bucket["Epoch"] = epoch
+                for lr_key, lr_value in lr_values.items():
+                    if grouped_bucket.get(lr_key) is None and lr_value is not None:
+                        grouped_bucket[lr_key] = lr_value
+                if label not in grouped_bucket["groups"]:
+                    grouped_bucket["groups"][label] = {
+                        "energy_sum": 0.0,
+                        "sat_weighted_sum": 0.0,
+                        "sat_weighted_energy": 0.0,
+                        "sat_values": [],
+                    }
+                info = grouped_bucket["groups"][label]
+                if energy is not None:
+                    info["energy_sum"] += energy
+                if sat is not None:
+                    if energy is not None and energy > eps:
+                        info["sat_weighted_sum"] += sat * energy
+                        info["sat_weighted_energy"] += energy
+                    else:
+                        info["sat_values"].append(sat)
 
         for bucket in buckets.values():
             energy_sum = sum(bucket["energy_values"]) if bucket["energy_values"] else None
@@ -579,6 +720,13 @@ def parse_rank_logs(
                     "RankEnergySum": energy_sum,
                 }
             )
+            for lr_key in rank_lr_keys:
+                parsed_rows[-1][lr_key] = bucket.get(lr_key)
+
+        grouped = {
+            "path": _finalize_grouped_rows("path", grouped_buckets["path"], eps),
+            "role": _finalize_grouped_rows("role", grouped_buckets["role"], eps),
+        }
     else:
         for row in rows:
             train_step = safe_int(row.get("TrainStep"))
@@ -601,6 +749,8 @@ def parse_rank_logs(
                     "RankEnergySum": safe_float(row.get("RankEnergySum")),
                 }
             )
+            for lr_key in rank_lr_keys:
+                parsed_rows[-1][lr_key] = safe_float(row.get(lr_key))
     parsed_rows.sort(key=lambda item: item["TrainStep"])
 
     markers: List[Dict[str, Any]] = []
@@ -624,6 +774,7 @@ def parse_rank_logs(
         "path": rank_log_path,
         "rows": parsed_rows,
         "markers": markers,
+        "grouped": grouped,
         "summary": summary,
     }
 
@@ -1247,7 +1398,7 @@ def build_chart_payload(
         rows = rank_data.get("rows", [])
         x = [item.get("TrainStep") for item in rows]
         markers = rank_data.get("markers", [])
-        payload["rank"] = [
+        rank_charts = [
             {
                 "id": "rank_dim",
                 "title": "RankDim",
@@ -1289,6 +1440,174 @@ def build_chart_payload(
                 "series": [{"name": "RankEnergySum", "color": ColorPalette[7], "y": [item.get("RankEnergySum") for item in rows]}],
             },
         ]
+
+        lr_scope_specs = [
+            ("Unet", "UnetLRMin", "UnetLRMax"),
+            ("Te1", "Te1LRMin", "Te1LRMax"),
+            ("Te2", "Te2LRMin", "Te2LRMax"),
+        ]
+        lr_series = []
+        lr_color_index = 0
+        for scope_label, min_key, max_key in lr_scope_specs:
+            min_values = [item.get(min_key) for item in rows]
+            max_values = [item.get(max_key) for item in rows]
+            if not any(value is not None for value in min_values + max_values):
+                continue
+            if min_values == max_values:
+                lr_series.append(
+                    {
+                        "name": f"{scope_label}LR",
+                        "color": color_for_index(lr_color_index, 6),
+                        "y": max_values,
+                    }
+                )
+                lr_color_index += 1
+            else:
+                lr_series.append(
+                    {
+                        "name": f"{scope_label}LRMin",
+                        "color": color_for_index(lr_color_index, 6),
+                        "y": min_values,
+                    }
+                )
+                lr_color_index += 1
+                lr_series.append(
+                    {
+                        "name": f"{scope_label}LRMax",
+                        "color": color_for_index(lr_color_index, 6),
+                        "y": max_values,
+                    }
+                )
+                lr_color_index += 1
+
+        if lr_series:
+            rank_charts.append(
+                {
+                    "id": "rank_lr",
+                    "title": "Rank Log LR Snapshot",
+                    "x_label": "TrainStep",
+                    "markers": markers,
+                    "x": x,
+                    "legend_max_rows": 2,
+                    "series": lr_series,
+                }
+            )
+
+        grouped = rank_data.get("grouped") or {}
+        group_display_names = {
+            "path": {
+                "down": "Down",
+                "mid": "Mid",
+                "up": "Up",
+                "other": "Other",
+            },
+            "role": {
+                "to_q": "Q",
+                "to_k": "K",
+                "to_v": "V",
+                "to_out": "Out",
+                "ff": "FF",
+                "resnet": "ResNet",
+                "sampler": "Sampler",
+                "conv": "Conv",
+                "other": "Other",
+            },
+        }
+
+        def _append_grouped_rank_chart(
+            chart_id: str,
+            title: str,
+            group_kind: str,
+            metric_key: str,
+            *,
+            y_min_fixed: Optional[float] = None,
+            y_max_fixed: Optional[float] = None,
+            y_tick_step: Optional[float] = None,
+            y_tick_precision: Optional[int] = None,
+        ):
+            group_data = grouped.get(group_kind) or {}
+            group_rows = group_data.get("rows", []) or []
+            labels = group_data.get("labels", []) or []
+            if not group_rows or not labels:
+                return
+
+            group_x = [item.get("TrainStep") for item in group_rows]
+            series = []
+            for idx, label in enumerate(labels):
+                y = [((item.get("groups") or {}).get(label) or {}).get(metric_key) for item in group_rows]
+                if not any(value is not None for value in y):
+                    continue
+                series.append(
+                    {
+                        "name": group_display_names.get(group_kind, {}).get(label, label),
+                        "color": color_for_index(idx, max(1, len(labels))),
+                        "y": y,
+                    }
+                )
+            if not series:
+                return
+
+            chart = {
+                "id": chart_id,
+                "title": title,
+                "x_label": "TrainStep",
+                "markers": markers,
+                "x": group_x,
+                "legend_max_rows": 2,
+                "series": series,
+            }
+            if y_min_fixed is not None:
+                chart["y_min_fixed"] = y_min_fixed
+            if y_max_fixed is not None:
+                chart["y_max_fixed"] = y_max_fixed
+            if y_tick_step is not None:
+                chart["y_tick_step"] = y_tick_step
+            if y_tick_precision is not None:
+                chart["y_tick_precision"] = y_tick_precision
+            rank_charts.append(chart)
+
+        _append_grouped_rank_chart(
+            "rank_group_path_energy_share",
+            "Path Group Energy Share",
+            "path",
+            "RankEnergyShare",
+            y_min_fixed=0.0,
+            y_max_fixed=1.0,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+        _append_grouped_rank_chart(
+            "rank_group_path_sat",
+            "Path Group RankSatWMean",
+            "path",
+            "RankSatWMean",
+            y_min_fixed=0.0,
+            y_max_fixed=1.1,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+        _append_grouped_rank_chart(
+            "rank_group_role_energy_share",
+            "Role Group Energy Share",
+            "role",
+            "RankEnergyShare",
+            y_min_fixed=0.0,
+            y_max_fixed=1.0,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+        _append_grouped_rank_chart(
+            "rank_group_role_sat",
+            "Role Group RankSatWMean",
+            "role",
+            "RankSatWMean",
+            y_min_fixed=0.0,
+            y_max_fixed=1.1,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+
+        payload["rank"] = rank_charts
 
     if group_loss_data:
         step_rows = group_loss_data.get("step_rows", []) or []
