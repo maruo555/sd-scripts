@@ -1447,6 +1447,7 @@ def build_chart_payload(
             {
                 "id": "rank_dim",
                 "title": "RankDim",
+                "subtitle": "LoRA rank の設定値",
                 "x_label": "TrainStep",
                 "markers": markers,
                 "x": x,
@@ -1458,6 +1459,7 @@ def build_chart_payload(
             {
                 "id": "rank_sat",
                 "title": "RankSatWMean / P50 / P95 / Max / Top1P95",
+                "subtitle": "rank の使われ方の広さと偏りの要約",
                 "x_label": "TrainStep",
                 "markers": markers,
                 "x": x,
@@ -1477,6 +1479,7 @@ def build_chart_payload(
             {
                 "id": "rank_energy",
                 "title": "RankEnergySum",
+                "subtitle": "LoRA 重み量の総量",
                 "x_label": "TrainStep",
                 "markers": markers,
                 "x": x,
@@ -1530,6 +1533,7 @@ def build_chart_payload(
                 {
                     "id": "rank_lr",
                     "title": "Rank Log LR Snapshot",
+                    "subtitle": "学習率の推移",
                     "x_label": "TrainStep",
                     "markers": markers,
                     "x": x,
@@ -1562,6 +1566,7 @@ def build_chart_payload(
         def _append_grouped_rank_chart(
             chart_id: str,
             title: str,
+            subtitle: str,
             group_kind: str,
             metric_key: str,
             *,
@@ -1595,6 +1600,7 @@ def build_chart_payload(
             chart = {
                 "id": chart_id,
                 "title": title,
+                "subtitle": subtitle,
                 "x_label": "TrainStep",
                 "markers": markers,
                 "x": group_x,
@@ -1614,6 +1620,7 @@ def build_chart_payload(
         _append_grouped_rank_chart(
             "rank_group_path_energy_share",
             "Path Group Energy Share",
+            "ブロック位置ごとの重み量シェア（合計1.0）",
             "path",
             "RankEnergyShare",
             y_min_fixed=0.0,
@@ -1624,6 +1631,7 @@ def build_chart_payload(
         _append_grouped_rank_chart(
             "rank_group_path_energy_share_per_param",
             "Path Group Energy Share Per Param",
+            "ブロック位置ごとの正規化重み量シェア（合計1.0）",
             "path",
             "RankEnergySharePerParam",
             y_min_fixed=0.0,
@@ -1634,6 +1642,7 @@ def build_chart_payload(
         _append_grouped_rank_chart(
             "rank_group_path_sat",
             "Path Group RankSatWMean",
+            "ブロック位置ごとの rank の使われ方の広さ",
             "path",
             "RankSatWMean",
             y_min_fixed=0.0,
@@ -1644,6 +1653,7 @@ def build_chart_payload(
         _append_grouped_rank_chart(
             "rank_group_role_energy_share",
             "Role Group Energy Share",
+            "役割ごとの重み量シェア（合計1.0）",
             "role",
             "RankEnergyShare",
             y_min_fixed=0.0,
@@ -1654,6 +1664,7 @@ def build_chart_payload(
         _append_grouped_rank_chart(
             "rank_group_role_energy_share_per_param",
             "Role Group Energy Share Per Param",
+            "役割ごとの正規化重み量シェア（合計1.0）",
             "role",
             "RankEnergySharePerParam",
             y_min_fixed=0.0,
@@ -1664,6 +1675,7 @@ def build_chart_payload(
         _append_grouped_rank_chart(
             "rank_group_role_sat",
             "Role Group RankSatWMean",
+            "役割ごとの rank の使われ方の広さ",
             "role",
             "RankSatWMean",
             y_min_fixed=0.0,
@@ -1868,6 +1880,19 @@ def render_check_rows(checks: List[Dict[str, str]]) -> str:
 def build_html(report: Dict[str, Any]) -> str:
     report_json = json.dumps(sanitize_json(report), ensure_ascii=False).replace("</", "<\\/")
     diagnostics = report.get("diagnostics", {})
+    rank_charts = ((report.get("charts") or {}).get("rank") or [])
+    rank_chart_ids = {item.get("id") for item in rank_charts if isinstance(item, dict)}
+    has_rank_grouped_charts = any(
+        chart_id in rank_chart_ids
+        for chart_id in (
+            "rank_group_path_energy_share",
+            "rank_group_path_energy_share_per_param",
+            "rank_group_path_sat",
+            "rank_group_role_energy_share",
+            "rank_group_role_energy_share_per_param",
+            "rank_group_role_sat",
+        )
+    )
     score_value = diagnostics.get("score")
     score_text = "-" if score_value is None else f"{score_value}点"
     lora_data = report.get("lora")
@@ -1882,6 +1907,51 @@ def build_html(report: Dict[str, Any]) -> str:
     lora_error_html = f"<p class='sub' style='color: var(--bad);'>{lora_error}</p>" if lora_error else ""
     lora_trend_error = report.get("lora_trend_error")
     lora_trend_error_html = f"<p class='sub' style='color: var(--bad);'>{lora_trend_error}</p>" if lora_trend_error else ""
+    rank_grouped_help_html = ""
+    if has_rank_grouped_charts:
+        rank_grouped_help_html = """
+      <div class="callout" style="margin: 0 0 16px 0;">
+        <strong>重み量と rank の広がりの違い</strong>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `Energy Share` や `Energy Share Per Param` は、LoRA 重みがどれだけ大きく育っているかを見る指標です。
+          一方で `RankSatWMean` は、設定した rank の成分をどれだけ広く使っているかを見る指標です。
+        </p>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          この2つは一致するとは限りません。
+          重み量が大きくても、実際には少数の rank 成分に偏っていることがあります。
+          逆に、重み量はそれほど大きくなくても、複数の rank 成分を広く使っていることがあります。
+        </p>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          そのため、`重み量` と `rank の広がり` を並べて見ると、
+          「どこが強く学習しているか」と「どこで rank を広く使えているか」を分けて確認できます。
+        </p>
+      </div>
+      <div class="callout" style="margin: 0 0 16px 0;">
+        <strong>RankSat 要約グラフとの関係</strong>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `Path Group RankSatWMean` と `Role Group RankSatWMean` は、上の `RankSatWMean / P50 / P95 / Max / Top1P95` と同じく、
+          rank の使われ方の広さを見る指標です。
+          上のグラフが全体要約なのに対し、こちらは block 位置別・役割別の内訳を見ます。
+        </p>
+      </div>
+      <div class="callout" style="margin: 12px 0 16px 0;">
+        <strong>Path 系列の見方</strong>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `Down / Mid / Up` は、UNet のどの位置のブロックかを表します。
+          `Down` は入力側で細かい情報を取り込む前半、`Mid` は中央、`Up` は出力側で絵を組み立て直す後半です。
+          3つの Path グラフは同じ系列を共有しているので、どの位置が強く学習しているか、サイズ差を補正するとどう見えるか、rank を広く使えているかを並べて読めます。
+        </p>
+      </div>
+      <div class="callout" style="margin: 0 0 16px 0;">
+        <strong>Role 系列の見方</strong>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `Q / K / V / Out` は Attention の中の役割です。
+          `Q` は「何を見たいか」、`K` は「どんな特徴を持つか」、`V` は「実際に取り出して混ぜる中身」、`Out` は混ぜた結果を次へ渡す出口です。
+          `FF` は Attention の後ろにある特徴変換用の全結合層、`Other` はそのどちらにも素直に入らない周辺の層です。
+          3つの Role グラフは同じ系列を共有しているので、どの役割が主戦場か、サイズ差を除いても強いか、rank の使い方に偏りがあるかを比べてください。
+        </p>
+      </div>
+"""
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -2021,7 +2091,12 @@ td.num {{
 .chart-title {{
   font-size: 13px;
   color: #0f172a;
-  margin: 2px 2px 8px;
+  margin: 2px 2px 4px;
+}}
+.chart-subtitle {{
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 2px 8px;
 }}
 .chart-canvas {{
   width: 100%;
@@ -2134,6 +2209,29 @@ td.num {{
     <section class="panel">
       <h2>Rank Dashboard</h2>
       <p class="sub">LoRA重みから推定した rank 飽和指標の推移です。</p>
+      <div class="callout" style="margin: 12px 0 16px 0;">
+        <strong>RankSat グラフの見方</strong>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          このグラフは、LoRA の各モジュールが「設定した rank をどのくらい広く使えているか」をまとめて見せるものです。
+          値が高いほど、複数の rank 成分を使って学習しており、値が低いほど、少数の成分に偏って学習している傾向があります。
+        </p>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `RankSatWMean` は、値が小さいほど少数の rank 成分への偏りが強く、値が大きいほど複数の rank 成分を広く使っています。
+        </p>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `RankSatWMean` は全モジュールを重み付きで平均した代表値で、全体としての rank の使われ方を見ます。
+          `P50` は中央値で、典型的なモジュールがどの程度 rank を使っているかを見ます。
+          `P95` は上位 5% 側の値で、一部のモジュールが強く rank を使っていないかを見ます。
+          `Max` は最も高いモジュールの値で、局所的に rank を使い切っている層があるかを見ます。
+          `Top1P95` は「1つ目の成分への偏り」の強いモジュールがどの程度あるかを見る指標で、高いほど、実質的に少数成分へ寄っている可能性があります。
+        </p>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `WMean` や `P50` が高いと、全体として rank を広く使えている可能性があります。
+          `P95` や `Max` だけ高い場合は、一部のモジュールだけが強く rank を使っている可能性があります。
+          `Top1P95` も高い場合は、rank はあるが、実際には少数成分への偏りが強い可能性があります。
+        </p>
+      </div>
+      {rank_grouped_help_html}
       <div id="rankCharts" class="chart-grid"></div>
     </section>
 
@@ -2595,9 +2693,15 @@ function mountCharts(containerId, charts) {{
     const title = document.createElement('div');
     title.className = 'chart-title';
     title.textContent = chart.title || `Chart ${{idx + 1}}`;
+    const subtitle = document.createElement('div');
+    subtitle.className = 'chart-subtitle';
+    subtitle.textContent = chart.subtitle || '';
     const canvas = document.createElement('canvas');
     canvas.className = 'chart-canvas';
     card.appendChild(title);
+    if (chart.subtitle) {{
+      card.appendChild(subtitle);
+    }}
     card.appendChild(canvas);
     appendSeriesLegend(card, chart);
     container.appendChild(card);
