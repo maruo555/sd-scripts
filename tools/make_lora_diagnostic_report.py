@@ -63,6 +63,31 @@ def import_lora_analysis_tools() -> Tuple[Any, Any, Any]:
     return collect_single_analysis, find_checkpoint_series, build_checkpoint_history
 
 
+def load_lora_module_param_counts(model_path: str) -> Dict[str, int]:
+    try:
+        try:
+            from tools.analyze_lora_density import group_lora_layers, load_lora_state  # type: ignore
+        except Exception:
+            from analyze_lora_density import group_lora_layers, load_lora_state  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "analyze_lora_density.py の読み込みに失敗しました。torch/safetensors が必要です。"
+        ) from exc
+
+    state_dict = load_lora_state(model_path)
+    layers = group_lora_layers(state_dict)
+    param_counts: Dict[str, int] = {}
+    for name, layer in layers.items():
+        total = 0
+        if "down" in layer:
+            total += int(layer["down"].numel())
+        if "up" in layer:
+            total += int(layer["up"].numel())
+        if total > 0:
+            param_counts[name] = total
+    return param_counts
+
+
 def color_for_index(index: int, total: int) -> str:
     if total <= 0:
         return "#2563eb"
@@ -462,6 +487,7 @@ def parse_dq_logs(
 def parse_rank_logs(
     rank_log_path: str,
     grad_data: Optional[Dict[str, Any]],
+    module_param_counts: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     rank_lr_keys = [
         "UnetLRMin",
@@ -549,6 +575,11 @@ def parse_rank_logs(
         for bucket in group_buckets.values():
             groups_out: Dict[str, Dict[str, Any]] = {}
             total_energy = sum(info["energy_sum"] for info in bucket["groups"].values())
+            total_energy_per_param = 0.0
+            for info in bucket["groups"].values():
+                param_count = info.get("param_count_sum")
+                if param_count and param_count > 0:
+                    total_energy_per_param += info["energy_sum"] / param_count
             for label, info in bucket["groups"].items():
                 labels.add(label)
                 sat_wmean = None
@@ -559,10 +590,20 @@ def parse_rank_logs(
                 energy_share = None
                 if total_energy > eps:
                     energy_share = info["energy_sum"] / total_energy
+                energy_per_param = None
+                energy_share_per_param = None
+                param_count = info.get("param_count_sum")
+                if param_count and param_count > 0:
+                    energy_per_param = info["energy_sum"] / param_count
+                    if total_energy_per_param > eps:
+                        energy_share_per_param = energy_per_param / total_energy_per_param
                 groups_out[label] = {
                     "RankEnergySum": info["energy_sum"],
                     "RankEnergyShare": energy_share,
+                    "RankEnergyPerParam": energy_per_param,
+                    "RankEnergySharePerParam": energy_share_per_param,
                     "RankSatWMean": sat_wmean,
+                    "ParamCount": param_count,
                 }
 
             row_out = {
@@ -634,6 +675,7 @@ def parse_rank_logs(
             top1 = safe_float(row.get("RankTop1"))
             energy = safe_float(row.get("RankEnergy"))
             module_name = (row.get("Module") or "").strip()
+            module_param_count = module_param_counts.get(module_name) if module_param_counts is not None else None
 
             if rank_dim is not None:
                 bucket["rank_dims"].append(rank_dim)
@@ -675,10 +717,13 @@ def parse_rank_logs(
                         "sat_weighted_sum": 0.0,
                         "sat_weighted_energy": 0.0,
                         "sat_values": [],
+                        "param_count_sum": 0,
                     }
                 info = grouped_bucket["groups"][label]
                 if energy is not None:
                     info["energy_sum"] += energy
+                if module_param_count is not None:
+                    info["param_count_sum"] += int(module_param_count)
                 if sat is not None:
                     if energy is not None and energy > eps:
                         info["sat_weighted_sum"] += sat * energy
@@ -1577,6 +1622,16 @@ def build_chart_payload(
             y_tick_precision=1,
         )
         _append_grouped_rank_chart(
+            "rank_group_path_energy_share_per_param",
+            "Path Group Energy Share Per Param",
+            "path",
+            "RankEnergySharePerParam",
+            y_min_fixed=0.0,
+            y_max_fixed=1.0,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+        _append_grouped_rank_chart(
             "rank_group_path_sat",
             "Path Group RankSatWMean",
             "path",
@@ -1591,6 +1646,16 @@ def build_chart_payload(
             "Role Group Energy Share",
             "role",
             "RankEnergyShare",
+            y_min_fixed=0.0,
+            y_max_fixed=1.0,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+        _append_grouped_rank_chart(
+            "rank_group_role_energy_share_per_param",
+            "Role Group Energy Share Per Param",
+            "role",
+            "RankEnergySharePerParam",
             y_min_fixed=0.0,
             y_max_fixed=1.0,
             y_tick_step=0.1,
@@ -2635,7 +2700,13 @@ def main() -> None:
 
     grad_data = parse_grad_log(grad_log_path, args.loss_ma_window) if grad_log_path else None
     dq_data = parse_dq_logs(dq_log_path, dq_auto_log_path, grad_data) if (dq_log_path or dq_auto_log_path) else None
-    rank_data = parse_rank_logs(rank_log_path, grad_data) if rank_log_path else None
+    rank_module_param_counts = None
+    if rank_log_path and os.path.exists(model_path):
+        try:
+            rank_module_param_counts = load_lora_module_param_counts(model_path)
+        except Exception as exc:
+            print(f"[rank_norm] skip module param normalization: {exc}", flush=True)
+    rank_data = parse_rank_logs(rank_log_path, grad_data, module_param_counts=rank_module_param_counts) if rank_log_path else None
     group_loss_data = parse_group_loss_logs(group_loss_step_log_path, group_loss_epoch_log_path)
 
     lora_data = None
