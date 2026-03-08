@@ -501,6 +501,7 @@ def parse_rank_logs(
         "path": {"labels": [], "rows": []},
         "role": {"labels": [], "rows": []},
     }
+    empty_final_heatmaps = {}
     rows = read_csv_rows(rank_log_path)
     if not rows:
         return {
@@ -508,6 +509,7 @@ def parse_rank_logs(
             "rows": [],
             "markers": [],
             "grouped": empty_grouped,
+            "final_heatmaps": empty_final_heatmaps,
             "summary": {
                 "rows": 0,
                 "final_rank_sat_p95": None,
@@ -558,6 +560,11 @@ def parse_rank_logs(
             return "sampler"
         if "conv" in lowered:
             return "conv"
+        return "other"
+
+    def _collapse_heatmap_role_label(role_label: str) -> str:
+        if role_label in {"to_q", "to_k", "to_v", "to_out", "ff"}:
+            return role_label
         return "other"
 
     def _order_group_labels(group_name: str, labels: List[str]) -> List[str]:
@@ -630,6 +637,7 @@ def parse_rank_logs(
 
     parsed_rows: List[Dict[str, Any]] = []
     grouped = empty_grouped
+    final_heatmaps = empty_final_heatmaps
 
     if is_per_module_schema:
         buckets: Dict[Tuple[int, str], Dict[str, Any]] = {}
@@ -638,6 +646,7 @@ def parse_rank_logs(
             "path": {},
             "role": {},
         }
+        final_step_modules: List[Dict[str, Any]] = []
         for row in rows:
             train_step = safe_int(row.get("TrainStep"))
             if train_step is None:
@@ -731,6 +740,20 @@ def parse_rank_logs(
                     else:
                         info["sat_values"].append(sat)
 
+            final_step_modules.append(
+                {
+                    "TrainStep": train_step,
+                    "Epoch": epoch,
+                    "Scope": scope,
+                    "Module": module_name,
+                    "PathGroup": group_names["path"],
+                    "RoleGroup": _collapse_heatmap_role_label(group_names["role"]),
+                    "RankSat": sat,
+                    "RankEnergy": energy,
+                    "ParamCount": module_param_count,
+                }
+            )
+
         for bucket in buckets.values():
             energy_sum = sum(bucket["energy_values"]) if bucket["energy_values"] else None
             active_sat_values = [sat for sat, energy in bucket["sat_weighted"] if energy > eps]
@@ -772,6 +795,98 @@ def parse_rank_logs(
             "path": _finalize_grouped_rows("path", grouped_buckets["path"], eps),
             "role": _finalize_grouped_rows("role", grouped_buckets["role"], eps),
         }
+
+        if final_step_modules:
+            final_step = max(item["TrainStep"] for item in final_step_modules)
+            final_modules = [item for item in final_step_modules if item["TrainStep"] == final_step]
+            heatmap_path_labels = ["down", "mid", "up"]
+            heatmap_role_labels = ["to_q", "to_k", "to_v", "to_out", "ff", "other"]
+            cell_buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for path_label in heatmap_path_labels:
+                for role_label in heatmap_role_labels:
+                    cell_buckets[(path_label, role_label)] = {
+                        "energy_sum": 0.0,
+                        "sat_weighted_sum": 0.0,
+                        "sat_weighted_energy": 0.0,
+                        "sat_values": [],
+                        "param_count_sum": 0,
+                    }
+
+            final_epoch = None
+            final_scope = None
+            for item in final_modules:
+                path_label = item.get("PathGroup")
+                role_label = item.get("RoleGroup")
+                if path_label not in heatmap_path_labels or role_label not in heatmap_role_labels:
+                    continue
+                if final_epoch is None and item.get("Epoch") is not None:
+                    final_epoch = item.get("Epoch")
+                if final_scope is None and item.get("Scope"):
+                    final_scope = item.get("Scope")
+                info = cell_buckets[(path_label, role_label)]
+                energy = item.get("RankEnergy")
+                sat = item.get("RankSat")
+                param_count = item.get("ParamCount")
+                if energy is not None:
+                    info["energy_sum"] += energy
+                if param_count is not None:
+                    info["param_count_sum"] += int(param_count)
+                if sat is not None:
+                    if energy is not None and energy > eps:
+                        info["sat_weighted_sum"] += sat * energy
+                        info["sat_weighted_energy"] += energy
+                    else:
+                        info["sat_values"].append(sat)
+
+            total_energy_per_param = 0.0
+            for info in cell_buckets.values():
+                if info["param_count_sum"] > 0:
+                    total_energy_per_param += info["energy_sum"] / info["param_count_sum"]
+
+            def _build_heatmap(metric_key: str) -> Dict[str, Any]:
+                rows_out = []
+                max_value = 0.0
+                for path_label in heatmap_path_labels:
+                    cells = []
+                    for role_label in heatmap_role_labels:
+                        info = cell_buckets[(path_label, role_label)]
+                        value = None
+                        if metric_key == "RankEnergySharePerParam":
+                            if info["param_count_sum"] > 0:
+                                energy_per_param = info["energy_sum"] / info["param_count_sum"]
+                                if total_energy_per_param > eps:
+                                    value = energy_per_param / total_energy_per_param
+                        elif metric_key == "RankSatWMean":
+                            if info["sat_weighted_energy"] > eps:
+                                value = info["sat_weighted_sum"] / info["sat_weighted_energy"]
+                            elif info["sat_values"]:
+                                value = statistics.mean(info["sat_values"])
+                        if value is not None:
+                            max_value = max(max_value, value)
+                        cells.append(
+                            {
+                                "path": path_label,
+                                "role": role_label,
+                                "value": value,
+                                "RankEnergySum": info["energy_sum"],
+                                "ParamCount": info["param_count_sum"] or None,
+                            }
+                        )
+                    rows_out.append({"label": path_label, "cells": cells})
+                return {
+                    "rows": rows_out,
+                    "path_labels": heatmap_path_labels,
+                    "role_labels": heatmap_role_labels,
+                    "max_value": max_value if max_value > 0 else None,
+                    "TrainStep": final_step,
+                    "Epoch": final_epoch,
+                    "Scope": final_scope,
+                }
+
+            final_heatmaps = {
+                "energy_share_per_param": _build_heatmap("RankEnergySharePerParam"),
+                "rank_sat_wmean": _build_heatmap("RankSatWMean"),
+            }
     else:
         for row in rows:
             train_step = safe_int(row.get("TrainStep"))
@@ -820,6 +935,7 @@ def parse_rank_logs(
         "rows": parsed_rows,
         "markers": markers,
         "grouped": grouped,
+        "final_heatmaps": final_heatmaps,
         "summary": summary,
     }
 
@@ -1877,6 +1993,87 @@ def render_check_rows(checks: List[Dict[str, str]]) -> str:
     return "".join(rows)
 
 
+def heatmap_display_label(kind: str, label: str) -> str:
+    if kind == "path":
+        return {"down": "Down", "mid": "Mid", "up": "Up"}.get(label, label)
+    if kind == "role":
+        return {
+            "to_q": "Q",
+            "to_k": "K",
+            "to_v": "V",
+            "to_out": "Out",
+            "ff": "FF",
+            "other": "Other",
+        }.get(label, label)
+    return label
+
+
+def heatmap_cell_style(value: Optional[float], max_value: Optional[float], *, fixed_max: Optional[float] = None) -> str:
+    if value is None:
+        return "background: #f8fafc; color: #94a3b8;"
+    denom = fixed_max if fixed_max is not None else max_value
+    if not denom or denom <= 0:
+        ratio = 0.0
+    else:
+        ratio = max(0.0, min(1.0, value / denom))
+    hue = 210 - int(22 * ratio)
+    sat = 70
+    light = 98 - int(34 * ratio)
+    text_light = 18 if ratio >= 0.48 else 24
+    return f"background: hsl({hue} {sat}% {light}%); color: hsl(217 33% {text_light}%);"
+
+
+def render_rank_heatmap_card(
+    title: str,
+    subtitle: str,
+    heatmap: Optional[Dict[str, Any]],
+    *,
+    fixed_max: Optional[float] = None,
+) -> str:
+    if not heatmap or not (heatmap.get("rows") or []):
+        return ""
+    role_labels = heatmap.get("role_labels") or []
+    rows = heatmap.get("rows") or []
+    max_value = heatmap.get("max_value")
+    train_step = heatmap.get("TrainStep")
+    epoch = heatmap.get("Epoch")
+    header_cells = "".join(f"<th class='num'>{heatmap_display_label('role', label)}</th>" for label in role_labels)
+    body_rows: List[str] = []
+    for row in rows:
+        cells_html: List[str] = []
+        for cell in row.get("cells") or []:
+            value = cell.get("value")
+            text = fmt_float(value, 3) if value is not None else "-"
+            style = heatmap_cell_style(value, max_value, fixed_max=fixed_max)
+            cells_html.append(f"<td class='num heatmap-cell' style='{style}'>{text}</td>")
+        body_rows.append(
+            "<tr>"
+            f"<th>{heatmap_display_label('path', row.get('label', '-'))}</th>"
+            f"{''.join(cells_html)}"
+            "</tr>"
+        )
+    caption_bits = []
+    if epoch is not None:
+        caption_bits.append(f"Epoch {epoch}")
+    if train_step is not None:
+        caption_bits.append(f"TrainStep {train_step}")
+    caption = " / ".join(caption_bits)
+    caption_html = f"<p class='sub' style='margin: 0 0 8px 0;'>{caption}</p>" if caption else ""
+    return (
+        "<div class='heatmap-card'>"
+        f"<div class='chart-title'>{title}</div>"
+        f"<div class='chart-subtitle'>{subtitle}</div>"
+        f"{caption_html}"
+        "<table class='heatmap-table'>"
+        "<thead><tr><th></th>"
+        f"{header_cells}"
+        "</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
 def build_html(report: Dict[str, Any]) -> str:
     report_json = json.dumps(sanitize_json(report), ensure_ascii=False).replace("</", "<\\/")
     diagnostics = report.get("diagnostics", {})
@@ -1907,6 +2104,22 @@ def build_html(report: Dict[str, Any]) -> str:
     lora_error_html = f"<p class='sub' style='color: var(--bad);'>{lora_error}</p>" if lora_error else ""
     lora_trend_error = report.get("lora_trend_error")
     lora_trend_error_html = f"<p class='sub' style='color: var(--bad);'>{lora_trend_error}</p>" if lora_trend_error else ""
+    rank_final_heatmaps = ((report.get("rank") or {}).get("final_heatmaps") or {})
+    rank_heatmap_cards_html = ""
+    if has_rank_grouped_charts:
+        rank_heatmap_cards_html = (
+            render_rank_heatmap_card(
+                "Final Energy Share Per Param Heatmap",
+                "最終 step における、位置×役割ごとの正規化重み量シェア（合計1.0）",
+                rank_final_heatmaps.get("energy_share_per_param"),
+            )
+            + render_rank_heatmap_card(
+                "Final RankSatWMean Heatmap",
+                "最終 step における、位置×役割ごとの rank の使われ方の広さ",
+                rank_final_heatmaps.get("rank_sat_wmean"),
+                fixed_max=1.0,
+            )
+        )
     rank_grouped_help_html = ""
     if has_rank_grouped_charts:
         rank_grouped_help_html = """
@@ -2132,6 +2345,33 @@ td.num {{
   text-align: right;
   font-variant-numeric: tabular-nums;
 }}
+.heatmap-grid {{
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  margin-top: 16px;
+}}
+.heatmap-card {{
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 10px;
+}}
+.heatmap-table {{
+  margin-top: 0;
+}}
+.heatmap-table th,
+.heatmap-table td {{
+  text-align: center;
+  vertical-align: middle;
+}}
+.heatmap-table th.num,
+.heatmap-table td.num {{
+  text-align: center;
+}}
+.heatmap-cell {{
+  font-weight: 600;
+}}
 .file-list {{
   line-height: 1.8;
   font-size: 13px;
@@ -2233,6 +2473,7 @@ td.num {{
       </div>
       {rank_grouped_help_html}
       <div id="rankCharts" class="chart-grid"></div>
+      {"<div class='heatmap-grid'>" + rank_heatmap_cards_html + "</div>" if rank_heatmap_cards_html else ""}
     </section>
 
     <section class="panel">
