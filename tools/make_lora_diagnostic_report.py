@@ -63,6 +63,31 @@ def import_lora_analysis_tools() -> Tuple[Any, Any, Any]:
     return collect_single_analysis, find_checkpoint_series, build_checkpoint_history
 
 
+def load_lora_module_param_counts(model_path: str) -> Dict[str, int]:
+    try:
+        try:
+            from tools.analyze_lora_density import group_lora_layers, load_lora_state  # type: ignore
+        except Exception:
+            from analyze_lora_density import group_lora_layers, load_lora_state  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "analyze_lora_density.py の読み込みに失敗しました。torch/safetensors が必要です。"
+        ) from exc
+
+    state_dict = load_lora_state(model_path)
+    layers = group_lora_layers(state_dict)
+    param_counts: Dict[str, int] = {}
+    for name, layer in layers.items():
+        total = 0
+        if "down" in layer:
+            total += int(layer["down"].numel())
+        if "up" in layer:
+            total += int(layer["up"].numel())
+        if total > 0:
+            param_counts[name] = total
+    return param_counts
+
+
 def color_for_index(index: int, total: int) -> str:
     if total <= 0:
         return "#2563eb"
@@ -462,13 +487,29 @@ def parse_dq_logs(
 def parse_rank_logs(
     rank_log_path: str,
     grad_data: Optional[Dict[str, Any]],
+    module_param_counts: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
+    rank_lr_keys = [
+        "UnetLRMin",
+        "UnetLRMax",
+        "Te1LRMin",
+        "Te1LRMax",
+        "Te2LRMin",
+        "Te2LRMax",
+    ]
+    empty_grouped = {
+        "path": {"labels": [], "rows": []},
+        "role": {"labels": [], "rows": []},
+    }
+    empty_final_heatmaps = {}
     rows = read_csv_rows(rank_log_path)
     if not rows:
         return {
             "path": rank_log_path,
             "rows": [],
             "markers": [],
+            "grouped": empty_grouped,
+            "final_heatmaps": empty_final_heatmaps,
             "summary": {
                 "rows": 0,
                 "final_rank_sat_p95": None,
@@ -491,6 +532,103 @@ def parse_rank_logs(
         weight_lower = 1.0 - weight_upper
         return float(sorted_values[lower] * weight_lower + sorted_values[upper] * weight_upper)
 
+    def _classify_path_group(module_name: str) -> str:
+        lowered = (module_name or "").lower()
+        if "down_blocks_" in lowered or "input_blocks_" in lowered:
+            return "down"
+        if "mid_block_" in lowered or "middle_block_" in lowered:
+            return "mid"
+        if "up_blocks_" in lowered or "output_blocks_" in lowered:
+            return "up"
+        return "other"
+
+    def _classify_role_group(module_name: str) -> str:
+        lowered = (module_name or "").lower()
+        if "_to_q" in lowered:
+            return "to_q"
+        if "_to_k" in lowered:
+            return "to_k"
+        if "_to_v" in lowered:
+            return "to_v"
+        if "_to_out" in lowered:
+            return "to_out"
+        if "ff_net" in lowered or "_ff_" in lowered:
+            return "ff"
+        if "resnets_" in lowered:
+            return "resnet"
+        if "upsamplers_" in lowered or "downsamplers_" in lowered:
+            return "sampler"
+        if "conv" in lowered:
+            return "conv"
+        return "other"
+
+    def _collapse_heatmap_role_label(role_label: str) -> str:
+        if role_label in {"to_q", "to_k", "to_v", "to_out", "ff"}:
+            return role_label
+        return "other"
+
+    def _order_group_labels(group_name: str, labels: List[str]) -> List[str]:
+        preferred_orders = {
+            "path": ["down", "mid", "up", "other"],
+            "role": ["to_q", "to_k", "to_v", "to_out", "ff", "resnet", "sampler", "conv", "other"],
+        }
+        ordered = [label for label in preferred_orders.get(group_name, []) if label in labels]
+        ordered.extend(sorted(label for label in labels if label not in ordered))
+        return ordered
+
+    def _finalize_grouped_rows(group_name: str, group_buckets: Dict[Tuple[int, str], Dict[str, Any]], eps: float):
+        grouped_rows: List[Dict[str, Any]] = []
+        labels = set()
+        for bucket in group_buckets.values():
+            groups_out: Dict[str, Dict[str, Any]] = {}
+            total_energy = sum(info["energy_sum"] for info in bucket["groups"].values())
+            total_energy_per_param = 0.0
+            for info in bucket["groups"].values():
+                param_count = info.get("param_count_sum")
+                if param_count and param_count > 0:
+                    total_energy_per_param += info["energy_sum"] / param_count
+            for label, info in bucket["groups"].items():
+                labels.add(label)
+                sat_wmean = None
+                if info["sat_weighted_energy"] > eps:
+                    sat_wmean = info["sat_weighted_sum"] / info["sat_weighted_energy"]
+                elif info["sat_values"]:
+                    sat_wmean = statistics.mean(info["sat_values"])
+                energy_share = None
+                if total_energy > eps:
+                    energy_share = info["energy_sum"] / total_energy
+                energy_per_param = None
+                energy_share_per_param = None
+                param_count = info.get("param_count_sum")
+                if param_count and param_count > 0:
+                    energy_per_param = info["energy_sum"] / param_count
+                    if total_energy_per_param > eps:
+                        energy_share_per_param = energy_per_param / total_energy_per_param
+                groups_out[label] = {
+                    "RankEnergySum": info["energy_sum"],
+                    "RankEnergyShare": energy_share,
+                    "RankEnergyPerParam": energy_per_param,
+                    "RankEnergySharePerParam": energy_share_per_param,
+                    "RankSatWMean": sat_wmean,
+                    "ParamCount": param_count,
+                }
+
+            row_out = {
+                "TrainStep": bucket["TrainStep"],
+                "Epoch": bucket.get("Epoch"),
+                "Scope": bucket["Scope"],
+                "groups": groups_out,
+            }
+            for lr_key in rank_lr_keys:
+                row_out[lr_key] = bucket.get(lr_key)
+            grouped_rows.append(row_out)
+
+        grouped_rows.sort(key=lambda item: item["TrainStep"])
+        return {
+            "labels": _order_group_labels(group_name, list(labels)),
+            "rows": grouped_rows,
+        }
+
     first_columns = set(rows[0].keys())
     is_per_module_schema = (
         "RankSatWMean" not in first_columns
@@ -498,10 +636,17 @@ def parse_rank_logs(
     )
 
     parsed_rows: List[Dict[str, Any]] = []
+    grouped = empty_grouped
+    final_heatmaps = empty_final_heatmaps
 
     if is_per_module_schema:
         buckets: Dict[Tuple[int, str], Dict[str, Any]] = {}
         eps = 1e-12
+        grouped_buckets = {
+            "path": {},
+            "role": {},
+        }
+        final_step_modules: List[Dict[str, Any]] = []
         for row in rows:
             train_step = safe_int(row.get("TrainStep"))
             if train_step is None:
@@ -523,14 +668,23 @@ def parse_rank_logs(
                     "top1_weighted": [],
                     "energy_values": [],
                 }
+                for lr_key in rank_lr_keys:
+                    buckets[key][lr_key] = None
             bucket = buckets[key]
             if bucket.get("Epoch") is None and epoch is not None:
                 bucket["Epoch"] = epoch
+
+            lr_values = {lr_key: safe_float(row.get(lr_key)) for lr_key in rank_lr_keys}
+            for lr_key, lr_value in lr_values.items():
+                if bucket.get(lr_key) is None and lr_value is not None:
+                    bucket[lr_key] = lr_value
 
             rank_dim = safe_float(row.get("RankDim"))
             sat = safe_float(row.get("RankSat"))
             top1 = safe_float(row.get("RankTop1"))
             energy = safe_float(row.get("RankEnergy"))
+            module_name = (row.get("Module") or "").strip()
+            module_param_count = module_param_counts.get(module_name) if module_param_counts is not None else None
 
             if rank_dim is not None:
                 bucket["rank_dims"].append(rank_dim)
@@ -544,6 +698,61 @@ def parse_rank_logs(
                 bucket["sat_weighted"].append((sat, energy))
             if top1 is not None and energy is not None:
                 bucket["top1_weighted"].append((top1, energy))
+
+            group_names = {
+                "path": _classify_path_group(module_name),
+                "role": _classify_role_group(module_name),
+            }
+            for grouping_name, label in group_names.items():
+                grouping_buckets = grouped_buckets[grouping_name]
+                if key not in grouping_buckets:
+                    grouping_buckets[key] = {
+                        "TrainStep": train_step,
+                        "Epoch": epoch,
+                        "Scope": scope,
+                        "groups": {},
+                    }
+                    for lr_key in rank_lr_keys:
+                        grouping_buckets[key][lr_key] = None
+                grouped_bucket = grouping_buckets[key]
+                if grouped_bucket.get("Epoch") is None and epoch is not None:
+                    grouped_bucket["Epoch"] = epoch
+                for lr_key, lr_value in lr_values.items():
+                    if grouped_bucket.get(lr_key) is None and lr_value is not None:
+                        grouped_bucket[lr_key] = lr_value
+                if label not in grouped_bucket["groups"]:
+                    grouped_bucket["groups"][label] = {
+                        "energy_sum": 0.0,
+                        "sat_weighted_sum": 0.0,
+                        "sat_weighted_energy": 0.0,
+                        "sat_values": [],
+                        "param_count_sum": 0,
+                    }
+                info = grouped_bucket["groups"][label]
+                if energy is not None:
+                    info["energy_sum"] += energy
+                if module_param_count is not None:
+                    info["param_count_sum"] += int(module_param_count)
+                if sat is not None:
+                    if energy is not None and energy > eps:
+                        info["sat_weighted_sum"] += sat * energy
+                        info["sat_weighted_energy"] += energy
+                    else:
+                        info["sat_values"].append(sat)
+
+            final_step_modules.append(
+                {
+                    "TrainStep": train_step,
+                    "Epoch": epoch,
+                    "Scope": scope,
+                    "Module": module_name,
+                    "PathGroup": group_names["path"],
+                    "RoleGroup": _collapse_heatmap_role_label(group_names["role"]),
+                    "RankSat": sat,
+                    "RankEnergy": energy,
+                    "ParamCount": module_param_count,
+                }
+            )
 
         for bucket in buckets.values():
             energy_sum = sum(bucket["energy_values"]) if bucket["energy_values"] else None
@@ -579,6 +788,105 @@ def parse_rank_logs(
                     "RankEnergySum": energy_sum,
                 }
             )
+            for lr_key in rank_lr_keys:
+                parsed_rows[-1][lr_key] = bucket.get(lr_key)
+
+        grouped = {
+            "path": _finalize_grouped_rows("path", grouped_buckets["path"], eps),
+            "role": _finalize_grouped_rows("role", grouped_buckets["role"], eps),
+        }
+
+        if final_step_modules:
+            final_step = max(item["TrainStep"] for item in final_step_modules)
+            final_modules = [item for item in final_step_modules if item["TrainStep"] == final_step]
+            heatmap_path_labels = ["down", "mid", "up"]
+            heatmap_role_labels = ["to_q", "to_k", "to_v", "to_out", "ff", "other"]
+            cell_buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for path_label in heatmap_path_labels:
+                for role_label in heatmap_role_labels:
+                    cell_buckets[(path_label, role_label)] = {
+                        "energy_sum": 0.0,
+                        "sat_weighted_sum": 0.0,
+                        "sat_weighted_energy": 0.0,
+                        "sat_values": [],
+                        "param_count_sum": 0,
+                    }
+
+            final_epoch = None
+            final_scope = None
+            for item in final_modules:
+                path_label = item.get("PathGroup")
+                role_label = item.get("RoleGroup")
+                if path_label not in heatmap_path_labels or role_label not in heatmap_role_labels:
+                    continue
+                if final_epoch is None and item.get("Epoch") is not None:
+                    final_epoch = item.get("Epoch")
+                if final_scope is None and item.get("Scope"):
+                    final_scope = item.get("Scope")
+                info = cell_buckets[(path_label, role_label)]
+                energy = item.get("RankEnergy")
+                sat = item.get("RankSat")
+                param_count = item.get("ParamCount")
+                if energy is not None:
+                    info["energy_sum"] += energy
+                if param_count is not None:
+                    info["param_count_sum"] += int(param_count)
+                if sat is not None:
+                    if energy is not None and energy > eps:
+                        info["sat_weighted_sum"] += sat * energy
+                        info["sat_weighted_energy"] += energy
+                    else:
+                        info["sat_values"].append(sat)
+
+            total_energy_per_param = 0.0
+            for info in cell_buckets.values():
+                if info["param_count_sum"] > 0:
+                    total_energy_per_param += info["energy_sum"] / info["param_count_sum"]
+
+            def _build_heatmap(metric_key: str) -> Dict[str, Any]:
+                rows_out = []
+                max_value = 0.0
+                for path_label in heatmap_path_labels:
+                    cells = []
+                    for role_label in heatmap_role_labels:
+                        info = cell_buckets[(path_label, role_label)]
+                        value = None
+                        if metric_key == "RankEnergySharePerParam":
+                            if info["param_count_sum"] > 0:
+                                energy_per_param = info["energy_sum"] / info["param_count_sum"]
+                                if total_energy_per_param > eps:
+                                    value = energy_per_param / total_energy_per_param
+                        elif metric_key == "RankSatWMean":
+                            if info["sat_weighted_energy"] > eps:
+                                value = info["sat_weighted_sum"] / info["sat_weighted_energy"]
+                            elif info["sat_values"]:
+                                value = statistics.mean(info["sat_values"])
+                        if value is not None:
+                            max_value = max(max_value, value)
+                        cells.append(
+                            {
+                                "path": path_label,
+                                "role": role_label,
+                                "value": value,
+                                "RankEnergySum": info["energy_sum"],
+                                "ParamCount": info["param_count_sum"] or None,
+                            }
+                        )
+                    rows_out.append({"label": path_label, "cells": cells})
+                return {
+                    "rows": rows_out,
+                    "path_labels": heatmap_path_labels,
+                    "role_labels": heatmap_role_labels,
+                    "max_value": max_value if max_value > 0 else None,
+                    "TrainStep": final_step,
+                    "Epoch": final_epoch,
+                    "Scope": final_scope,
+                }
+
+            final_heatmaps = {
+                "energy_share_per_param": _build_heatmap("RankEnergySharePerParam"),
+                "rank_sat_wmean": _build_heatmap("RankSatWMean"),
+            }
     else:
         for row in rows:
             train_step = safe_int(row.get("TrainStep"))
@@ -601,6 +909,8 @@ def parse_rank_logs(
                     "RankEnergySum": safe_float(row.get("RankEnergySum")),
                 }
             )
+            for lr_key in rank_lr_keys:
+                parsed_rows[-1][lr_key] = safe_float(row.get(lr_key))
     parsed_rows.sort(key=lambda item: item["TrainStep"])
 
     markers: List[Dict[str, Any]] = []
@@ -624,6 +934,8 @@ def parse_rank_logs(
         "path": rank_log_path,
         "rows": parsed_rows,
         "markers": markers,
+        "grouped": grouped,
+        "final_heatmaps": final_heatmaps,
         "summary": summary,
     }
 
@@ -1247,10 +1559,11 @@ def build_chart_payload(
         rows = rank_data.get("rows", [])
         x = [item.get("TrainStep") for item in rows]
         markers = rank_data.get("markers", [])
-        payload["rank"] = [
+        rank_charts = [
             {
                 "id": "rank_dim",
                 "title": "RankDim",
+                "subtitle": "LoRA rank の設定値",
                 "x_label": "TrainStep",
                 "markers": markers,
                 "x": x,
@@ -1262,6 +1575,7 @@ def build_chart_payload(
             {
                 "id": "rank_sat",
                 "title": "RankSatWMean / P50 / P95 / Max / Top1P95",
+                "subtitle": "rank の使われ方の広さと偏りの要約",
                 "x_label": "TrainStep",
                 "markers": markers,
                 "x": x,
@@ -1281,6 +1595,7 @@ def build_chart_payload(
             {
                 "id": "rank_energy",
                 "title": "RankEnergySum",
+                "subtitle": "LoRA 重み量の総量",
                 "x_label": "TrainStep",
                 "markers": markers,
                 "x": x,
@@ -1289,6 +1604,203 @@ def build_chart_payload(
                 "series": [{"name": "RankEnergySum", "color": ColorPalette[7], "y": [item.get("RankEnergySum") for item in rows]}],
             },
         ]
+
+        lr_scope_specs = [
+            ("Unet", "UnetLRMin", "UnetLRMax"),
+            ("Te1", "Te1LRMin", "Te1LRMax"),
+            ("Te2", "Te2LRMin", "Te2LRMax"),
+        ]
+        lr_series = []
+        lr_color_index = 0
+        for scope_label, min_key, max_key in lr_scope_specs:
+            min_values = [item.get(min_key) for item in rows]
+            max_values = [item.get(max_key) for item in rows]
+            if not any(value is not None for value in min_values + max_values):
+                continue
+            if min_values == max_values:
+                lr_series.append(
+                    {
+                        "name": f"{scope_label}LR",
+                        "color": color_for_index(lr_color_index, 6),
+                        "y": max_values,
+                    }
+                )
+                lr_color_index += 1
+            else:
+                lr_series.append(
+                    {
+                        "name": f"{scope_label}LRMin",
+                        "color": color_for_index(lr_color_index, 6),
+                        "y": min_values,
+                    }
+                )
+                lr_color_index += 1
+                lr_series.append(
+                    {
+                        "name": f"{scope_label}LRMax",
+                        "color": color_for_index(lr_color_index, 6),
+                        "y": max_values,
+                    }
+                )
+                lr_color_index += 1
+
+        if lr_series:
+            rank_charts.append(
+                {
+                    "id": "rank_lr",
+                    "title": "Rank Log LR Snapshot",
+                    "subtitle": "学習率の推移",
+                    "x_label": "TrainStep",
+                    "markers": markers,
+                    "x": x,
+                    "legend_max_rows": 2,
+                    "series": lr_series,
+                }
+            )
+
+        grouped = rank_data.get("grouped") or {}
+        group_display_names = {
+            "path": {
+                "down": "Down",
+                "mid": "Mid",
+                "up": "Up",
+                "other": "Other",
+            },
+            "role": {
+                "to_q": "Q",
+                "to_k": "K",
+                "to_v": "V",
+                "to_out": "Out",
+                "ff": "FF",
+                "resnet": "ResNet",
+                "sampler": "Sampler",
+                "conv": "Conv",
+                "other": "Other",
+            },
+        }
+
+        def _append_grouped_rank_chart(
+            chart_id: str,
+            title: str,
+            subtitle: str,
+            group_kind: str,
+            metric_key: str,
+            *,
+            y_min_fixed: Optional[float] = None,
+            y_max_fixed: Optional[float] = None,
+            y_tick_step: Optional[float] = None,
+            y_tick_precision: Optional[int] = None,
+        ):
+            group_data = grouped.get(group_kind) or {}
+            group_rows = group_data.get("rows", []) or []
+            labels = group_data.get("labels", []) or []
+            if not group_rows or not labels:
+                return
+
+            group_x = [item.get("TrainStep") for item in group_rows]
+            series = []
+            for idx, label in enumerate(labels):
+                y = [((item.get("groups") or {}).get(label) or {}).get(metric_key) for item in group_rows]
+                if not any(value is not None for value in y):
+                    continue
+                series.append(
+                    {
+                        "name": group_display_names.get(group_kind, {}).get(label, label),
+                        "color": color_for_index(idx, max(1, len(labels))),
+                        "y": y,
+                    }
+                )
+            if not series:
+                return
+
+            chart = {
+                "id": chart_id,
+                "title": title,
+                "subtitle": subtitle,
+                "x_label": "TrainStep",
+                "markers": markers,
+                "x": group_x,
+                "legend_max_rows": 2,
+                "series": series,
+            }
+            if y_min_fixed is not None:
+                chart["y_min_fixed"] = y_min_fixed
+            if y_max_fixed is not None:
+                chart["y_max_fixed"] = y_max_fixed
+            if y_tick_step is not None:
+                chart["y_tick_step"] = y_tick_step
+            if y_tick_precision is not None:
+                chart["y_tick_precision"] = y_tick_precision
+            rank_charts.append(chart)
+
+        _append_grouped_rank_chart(
+            "rank_group_path_energy_share",
+            "Path Group Energy Share",
+            "ブロック位置ごとの重み量シェア（合計1.0）",
+            "path",
+            "RankEnergyShare",
+            y_min_fixed=0.0,
+            y_max_fixed=1.0,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+        _append_grouped_rank_chart(
+            "rank_group_path_energy_share_per_param",
+            "Path Group Energy Share Per Param",
+            "ブロック位置ごとの正規化重み量シェア（合計1.0）",
+            "path",
+            "RankEnergySharePerParam",
+            y_min_fixed=0.0,
+            y_max_fixed=1.0,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+        _append_grouped_rank_chart(
+            "rank_group_path_sat",
+            "Path Group RankSatWMean",
+            "ブロック位置ごとの rank の使われ方の広さ",
+            "path",
+            "RankSatWMean",
+            y_min_fixed=0.0,
+            y_max_fixed=1.1,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+        _append_grouped_rank_chart(
+            "rank_group_role_energy_share",
+            "Role Group Energy Share",
+            "役割ごとの重み量シェア（合計1.0）",
+            "role",
+            "RankEnergyShare",
+            y_min_fixed=0.0,
+            y_max_fixed=1.0,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+        _append_grouped_rank_chart(
+            "rank_group_role_energy_share_per_param",
+            "Role Group Energy Share Per Param",
+            "役割ごとの正規化重み量シェア（合計1.0）",
+            "role",
+            "RankEnergySharePerParam",
+            y_min_fixed=0.0,
+            y_max_fixed=1.0,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+        _append_grouped_rank_chart(
+            "rank_group_role_sat",
+            "Role Group RankSatWMean",
+            "役割ごとの rank の使われ方の広さ",
+            "role",
+            "RankSatWMean",
+            y_min_fixed=0.0,
+            y_max_fixed=1.1,
+            y_tick_step=0.1,
+            y_tick_precision=1,
+        )
+
+        payload["rank"] = rank_charts
 
     if group_loss_data:
         step_rows = group_loss_data.get("step_rows", []) or []
@@ -1481,9 +1993,103 @@ def render_check_rows(checks: List[Dict[str, str]]) -> str:
     return "".join(rows)
 
 
+def heatmap_display_label(kind: str, label: str) -> str:
+    if kind == "path":
+        return {"down": "Down", "mid": "Mid", "up": "Up"}.get(label, label)
+    if kind == "role":
+        return {
+            "to_q": "Q",
+            "to_k": "K",
+            "to_v": "V",
+            "to_out": "Out",
+            "ff": "FF",
+            "other": "Other",
+        }.get(label, label)
+    return label
+
+
+def heatmap_cell_style(value: Optional[float], max_value: Optional[float], *, fixed_max: Optional[float] = None) -> str:
+    if value is None:
+        return "background: #f8fafc; color: #94a3b8;"
+    denom = fixed_max if fixed_max is not None else max_value
+    if not denom or denom <= 0:
+        ratio = 0.0
+    else:
+        ratio = max(0.0, min(1.0, value / denom))
+    hue = 210 - int(22 * ratio)
+    sat = 70
+    light = 98 - int(34 * ratio)
+    text_light = 18 if ratio >= 0.48 else 24
+    return f"background: hsl({hue} {sat}% {light}%); color: hsl(217 33% {text_light}%);"
+
+
+def render_rank_heatmap_card(
+    title: str,
+    subtitle: str,
+    heatmap: Optional[Dict[str, Any]],
+    *,
+    fixed_max: Optional[float] = None,
+) -> str:
+    if not heatmap or not (heatmap.get("rows") or []):
+        return ""
+    role_labels = heatmap.get("role_labels") or []
+    rows = heatmap.get("rows") or []
+    max_value = heatmap.get("max_value")
+    train_step = heatmap.get("TrainStep")
+    epoch = heatmap.get("Epoch")
+    header_cells = "".join(f"<th class='num'>{heatmap_display_label('role', label)}</th>" for label in role_labels)
+    body_rows: List[str] = []
+    for row in rows:
+        cells_html: List[str] = []
+        for cell in row.get("cells") or []:
+            value = cell.get("value")
+            text = fmt_float(value, 3) if value is not None else "-"
+            style = heatmap_cell_style(value, max_value, fixed_max=fixed_max)
+            cells_html.append(f"<td class='num heatmap-cell' style='{style}'>{text}</td>")
+        body_rows.append(
+            "<tr>"
+            f"<th>{heatmap_display_label('path', row.get('label', '-'))}</th>"
+            f"{''.join(cells_html)}"
+            "</tr>"
+        )
+    caption_bits = []
+    if epoch is not None:
+        caption_bits.append(f"Epoch {epoch}")
+    if train_step is not None:
+        caption_bits.append(f"TrainStep {train_step}")
+    caption = " / ".join(caption_bits)
+    caption_html = f"<p class='sub' style='margin: 0 0 8px 0;'>{caption}</p>" if caption else ""
+    return (
+        "<div class='heatmap-card'>"
+        f"<div class='chart-title'>{title}</div>"
+        f"<div class='chart-subtitle'>{subtitle}</div>"
+        f"{caption_html}"
+        "<table class='heatmap-table'>"
+        "<thead><tr><th></th>"
+        f"{header_cells}"
+        "</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
 def build_html(report: Dict[str, Any]) -> str:
     report_json = json.dumps(sanitize_json(report), ensure_ascii=False).replace("</", "<\\/")
     diagnostics = report.get("diagnostics", {})
+    rank_charts = ((report.get("charts") or {}).get("rank") or [])
+    rank_chart_ids = {item.get("id") for item in rank_charts if isinstance(item, dict)}
+    has_rank_grouped_charts = any(
+        chart_id in rank_chart_ids
+        for chart_id in (
+            "rank_group_path_energy_share",
+            "rank_group_path_energy_share_per_param",
+            "rank_group_path_sat",
+            "rank_group_role_energy_share",
+            "rank_group_role_energy_share_per_param",
+            "rank_group_role_sat",
+        )
+    )
     score_value = diagnostics.get("score")
     score_text = "-" if score_value is None else f"{score_value}点"
     lora_data = report.get("lora")
@@ -1498,6 +2104,67 @@ def build_html(report: Dict[str, Any]) -> str:
     lora_error_html = f"<p class='sub' style='color: var(--bad);'>{lora_error}</p>" if lora_error else ""
     lora_trend_error = report.get("lora_trend_error")
     lora_trend_error_html = f"<p class='sub' style='color: var(--bad);'>{lora_trend_error}</p>" if lora_trend_error else ""
+    rank_final_heatmaps = ((report.get("rank") or {}).get("final_heatmaps") or {})
+    rank_heatmap_cards_html = ""
+    if has_rank_grouped_charts:
+        rank_heatmap_cards_html = (
+            render_rank_heatmap_card(
+                "Final Energy Share Per Param Heatmap",
+                "最終 step における、位置×役割ごとの正規化重み量シェア（合計1.0）",
+                rank_final_heatmaps.get("energy_share_per_param"),
+            )
+            + render_rank_heatmap_card(
+                "Final RankSatWMean Heatmap",
+                "最終 step における、位置×役割ごとの rank の使われ方の広さ",
+                rank_final_heatmaps.get("rank_sat_wmean"),
+                fixed_max=1.0,
+            )
+        )
+    rank_grouped_help_html = ""
+    if has_rank_grouped_charts:
+        rank_grouped_help_html = """
+      <div class="callout" style="margin: 0 0 16px 0;">
+        <strong>重み量と rank の広がりの違い</strong>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `Energy Share` や `Energy Share Per Param` は、LoRA 重みがどれだけ大きく育っているかを見る指標です。
+          一方で `RankSatWMean` は、設定した rank の成分をどれだけ広く使っているかを見る指標です。
+        </p>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          この2つは一致するとは限りません。
+          重み量が大きくても、実際には少数の rank 成分に偏っていることがあります。
+          逆に、重み量はそれほど大きくなくても、複数の rank 成分を広く使っていることがあります。
+        </p>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          そのため、`重み量` と `rank の広がり` を並べて見ると、
+          「どこが強く学習しているか」と「どこで rank を広く使えているか」を分けて確認できます。
+        </p>
+      </div>
+      <div class="callout" style="margin: 0 0 16px 0;">
+        <strong>RankSat 要約グラフとの関係</strong>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `Path Group RankSatWMean` と `Role Group RankSatWMean` は、上の `RankSatWMean / P50 / P95 / Max / Top1P95` と同じく、
+          rank の使われ方の広さを見る指標です。
+          上のグラフが全体要約なのに対し、こちらは block 位置別・役割別の内訳を見ます。
+        </p>
+      </div>
+      <div class="callout" style="margin: 12px 0 16px 0;">
+        <strong>Path 系列の見方</strong>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `Down / Mid / Up` は、UNet のどの位置のブロックかを表します。
+          `Down` は入力側で細かい情報を取り込む前半、`Mid` は中央、`Up` は出力側で絵を組み立て直す後半です。
+          3つの Path グラフは同じ系列を共有しているので、どの位置が強く学習しているか、サイズ差を補正するとどう見えるか、rank を広く使えているかを並べて読めます。
+        </p>
+      </div>
+      <div class="callout" style="margin: 0 0 16px 0;">
+        <strong>Role 系列の見方</strong>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `Q / K / V / Out` は Attention の中の役割です。
+          `Q` は「何を見たいか」、`K` は「どんな特徴を持つか」、`V` は「実際に取り出して混ぜる中身」、`Out` は混ぜた結果を次へ渡す出口です。
+          `FF` は Attention の後ろにある特徴変換用の全結合層、`Other` はそのどちらにも素直に入らない周辺の層です。
+          3つの Role グラフは同じ系列を共有しているので、どの役割が主戦場か、サイズ差を除いても強いか、rank の使い方に偏りがあるかを比べてください。
+        </p>
+      </div>
+"""
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -1637,7 +2304,12 @@ td.num {{
 .chart-title {{
   font-size: 13px;
   color: #0f172a;
-  margin: 2px 2px 8px;
+  margin: 2px 2px 4px;
+}}
+.chart-subtitle {{
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 2px 8px;
 }}
 .chart-canvas {{
   width: 100%;
@@ -1672,6 +2344,33 @@ td.num {{
 .series-row .num {{
   text-align: right;
   font-variant-numeric: tabular-nums;
+}}
+.heatmap-grid {{
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  margin-top: 16px;
+}}
+.heatmap-card {{
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 10px;
+}}
+.heatmap-table {{
+  margin-top: 0;
+}}
+.heatmap-table th,
+.heatmap-table td {{
+  text-align: center;
+  vertical-align: middle;
+}}
+.heatmap-table th.num,
+.heatmap-table td.num {{
+  text-align: center;
+}}
+.heatmap-cell {{
+  font-weight: 600;
 }}
 .file-list {{
   line-height: 1.8;
@@ -1750,7 +2449,31 @@ td.num {{
     <section class="panel">
       <h2>Rank Dashboard</h2>
       <p class="sub">LoRA重みから推定した rank 飽和指標の推移です。</p>
+      <div class="callout" style="margin: 12px 0 16px 0;">
+        <strong>RankSat グラフの見方</strong>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          このグラフは、LoRA の各モジュールが「設定した rank をどのくらい広く使えているか」をまとめて見せるものです。
+          値が高いほど、複数の rank 成分を使って学習しており、値が低いほど、少数の成分に偏って学習している傾向があります。
+        </p>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `RankSatWMean` は、値が小さいほど少数の rank 成分への偏りが強く、値が大きいほど複数の rank 成分を広く使っています。
+        </p>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `RankSatWMean` は全モジュールを重み付きで平均した代表値で、全体としての rank の使われ方を見ます。
+          `P50` は中央値で、典型的なモジュールがどの程度 rank を使っているかを見ます。
+          `P95` は上位 5% 側の値で、一部のモジュールが強く rank を使っていないかを見ます。
+          `Max` は最も高いモジュールの値で、局所的に rank を使い切っている層があるかを見ます。
+          `Top1P95` は「1つ目の成分への偏り」の強いモジュールがどの程度あるかを見る指標で、高いほど、実質的に少数成分へ寄っている可能性があります。
+        </p>
+        <p class="sub" style="margin: 8px 0 0 0;">
+          `WMean` や `P50` が高いと、全体として rank を広く使えている可能性があります。
+          `P95` や `Max` だけ高い場合は、一部のモジュールだけが強く rank を使っている可能性があります。
+          `Top1P95` も高い場合は、rank はあるが、実際には少数成分への偏りが強い可能性があります。
+        </p>
+      </div>
+      {rank_grouped_help_html}
       <div id="rankCharts" class="chart-grid"></div>
+      {"<div class='heatmap-grid'>" + rank_heatmap_cards_html + "</div>" if rank_heatmap_cards_html else ""}
     </section>
 
     <section class="panel">
@@ -2211,9 +2934,15 @@ function mountCharts(containerId, charts) {{
     const title = document.createElement('div');
     title.className = 'chart-title';
     title.textContent = chart.title || `Chart ${{idx + 1}}`;
+    const subtitle = document.createElement('div');
+    subtitle.className = 'chart-subtitle';
+    subtitle.textContent = chart.subtitle || '';
     const canvas = document.createElement('canvas');
     canvas.className = 'chart-canvas';
     card.appendChild(title);
+    if (chart.subtitle) {{
+      card.appendChild(subtitle);
+    }}
     card.appendChild(canvas);
     appendSeriesLegend(card, chart);
     container.appendChild(card);
@@ -2316,7 +3045,13 @@ def main() -> None:
 
     grad_data = parse_grad_log(grad_log_path, args.loss_ma_window) if grad_log_path else None
     dq_data = parse_dq_logs(dq_log_path, dq_auto_log_path, grad_data) if (dq_log_path or dq_auto_log_path) else None
-    rank_data = parse_rank_logs(rank_log_path, grad_data) if rank_log_path else None
+    rank_module_param_counts = None
+    if rank_log_path and os.path.exists(model_path):
+        try:
+            rank_module_param_counts = load_lora_module_param_counts(model_path)
+        except Exception as exc:
+            print(f"[rank_norm] skip module param normalization: {exc}", flush=True)
+    rank_data = parse_rank_logs(rank_log_path, grad_data, module_param_counts=rank_module_param_counts) if rank_log_path else None
     group_loss_data = parse_group_loss_logs(group_loss_step_log_path, group_loss_epoch_log_path)
 
     lora_data = None

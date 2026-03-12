@@ -362,6 +362,24 @@ class NetworkTrainer:
             logs["max_norm/average_key_norm"] = mean_norm
             logs["max_norm/max_key_norm"] = maximum_norm
 
+        for lr_desc, lr, i in self._get_lr_group_items(args, lr_scheduler, lr_descriptions):
+            logs[f"lr/{lr_desc}"] = lr
+
+            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
+                # tracking d*lr value
+                logs[f"lr/d*lr/{lr_desc}"] = (
+                    lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
+                )
+
+        return logs
+
+    def _get_lr_group_items(
+        self,
+        args: argparse.Namespace,
+        lr_scheduler,
+        lr_descriptions,
+    ):
+        items = []
         lrs = lr_scheduler.get_last_lr()
         for i, lr in enumerate(lrs):
             if lr_descriptions is not None:
@@ -375,16 +393,39 @@ class NetworkTrainer:
                         lr_desc = f"group{idx}"
                     else:
                         lr_desc = "unet"
+            items.append((lr_desc, lr, i))
+        return items
 
-            logs[f"lr/{lr_desc}"] = lr
+    def collect_rank_log_lr_snapshot(
+        self,
+        args: argparse.Namespace,
+        lr_scheduler,
+        lr_descriptions,
+    ):
+        scope_to_values = {
+            "unet": [],
+            "te1": [],
+            "te2": [],
+        }
 
-            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
-                # tracking d*lr value
-                logs[f"lr/d*lr/{lr_desc}"] = (
-                    lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
-                )
+        for lr_desc, lr, _ in self._get_lr_group_items(args, lr_scheduler, lr_descriptions):
+            base_desc = (lr_desc or "").split()[0].lower()
+            if base_desc.startswith("textencoder2"):
+                scope_to_values["te2"].append(float(lr))
+            elif base_desc.startswith("textencoder1") or base_desc == "textencoder":
+                scope_to_values["te1"].append(float(lr))
+            elif base_desc.startswith("unet"):
+                scope_to_values["unet"].append(float(lr))
 
-        return logs
+        snapshot = {}
+        for scope, values in scope_to_values.items():
+            if values:
+                snapshot[f"{scope}_lr_min"] = min(values)
+                snapshot[f"{scope}_lr_max"] = max(values)
+            else:
+                snapshot[f"{scope}_lr_min"] = None
+                snapshot[f"{scope}_lr_max"] = None
+        return snapshot
 
     def _parse_te_lr_after_option(self, raw_option):
         if raw_option is None:
@@ -933,6 +974,12 @@ class NetworkTrainer:
                 "Epoch",
                 "TrainStep",
                 "Scope",
+                "UnetLRMin",
+                "UnetLRMax",
+                "Te1LRMin",
+                "Te1LRMax",
+                "Te2LRMin",
+                "Te2LRMax",
             ]
             if log_mode == "summary":
                 cols += [
@@ -2987,12 +3034,19 @@ class NetworkTrainer:
                                     logger.warning("failed to compute rank stats: %s", str(exc))
                                 if rank_stats is not None:
                                     header = _rank_log_header(rank_log_mode)
+                                    lr_snapshot = self.collect_rank_log_lr_snapshot(args, lr_scheduler, lr_descriptions)
                                     if rank_log_mode == "per_module":
                                         for item in rank_stats.get("per_module", []):
                                             row = [
                                                 epoch + 1,
                                                 step_idx,
                                                 "unet",
+                                                lr_snapshot.get("unet_lr_min"),
+                                                lr_snapshot.get("unet_lr_max"),
+                                                lr_snapshot.get("te1_lr_min"),
+                                                lr_snapshot.get("te1_lr_max"),
+                                                lr_snapshot.get("te2_lr_min"),
+                                                lr_snapshot.get("te2_lr_max"),
                                                 item.get("module"),
                                                 item.get("r"),
                                                 item.get("sat"),
@@ -3005,6 +3059,12 @@ class NetworkTrainer:
                                             epoch + 1,
                                             step_idx,
                                             "unet",
+                                            lr_snapshot.get("unet_lr_min"),
+                                            lr_snapshot.get("unet_lr_max"),
+                                            lr_snapshot.get("te1_lr_min"),
+                                            lr_snapshot.get("te1_lr_max"),
+                                            lr_snapshot.get("te2_lr_min"),
+                                            lr_snapshot.get("te2_lr_max"),
                                             rank_stats.get("rank_dim"),
                                             rank_stats.get("sat_wmean"),
                                             rank_stats.get("sat_p50"),
