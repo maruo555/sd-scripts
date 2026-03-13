@@ -12,7 +12,7 @@ import toml
 from collections import deque
 import numpy as np
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from tqdm import tqdm
 
@@ -47,8 +47,9 @@ from library.custom_train_functions import (
 from library.avg_ckpt_util import (
     average_state_dicts,
     filter_lora_state_dict,
-    collect_last_checkpoints,
+    collect_last_checkpoints_with_epochs,
     load_lora_state_dict,
+    save_lora_state_dict,
 )
 from library.utils import setup_logging, add_logging_arguments
 from library.rounding_util import round_parameters
@@ -713,6 +714,81 @@ class NetworkTrainer:
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
 
+    def _set_network_multiplier_from_batch(self, network, batch):
+        if not hasattr(network, "set_multiplier") or "network_multipliers" not in batch or batch["network_multipliers"] is None:
+            return
+
+        multipliers = batch["network_multipliers"]
+        if isinstance(multipliers, torch.Tensor):
+            if torch.all(multipliers == multipliers[0]):
+                multipliers = multipliers.reshape(-1)[0].item()
+            else:
+                raise NotImplementedError("multipliers for each sample is not supported yet")
+        network.set_multiplier(multipliers)
+
+    def _get_text_conds_for_batch(self, args, accelerator, batch, tokenizers, text_encoders, weight_dtype, grad_enabled: bool):
+        with torch.set_grad_enabled(grad_enabled), accelerator.autocast():
+            if args.weighted_captions:
+                tokenizer_arg = tokenizers if len(tokenizers) != 1 else tokenizers[0]
+                text_encoder_arg = text_encoders if len(text_encoders) != 1 else text_encoders[0]
+                return get_weighted_text_embeddings(
+                    tokenizer_arg,
+                    text_encoder_arg,
+                    batch["captions"],
+                    accelerator.device,
+                    args.max_token_length // 75 if args.max_token_length else 1,
+                    clip_skip=args.clip_skip,
+                )
+            return self.get_text_cond(args, accelerator, batch, tokenizers, text_encoders, weight_dtype)
+
+    def _compute_batch_loss(
+        self,
+        args,
+        accelerator,
+        batch,
+        noise_scheduler,
+        unet,
+        text_encoder_conds,
+        noisy_latents,
+        timesteps,
+        target,
+        huber_c,
+        weight_dtype,
+        train_unet: bool,
+    ):
+        with accelerator.autocast():
+            noise_pred = self.call_unet(
+                args,
+                accelerator,
+                unet,
+                noisy_latents.requires_grad_(train_unet),
+                timesteps,
+                text_encoder_conds,
+                batch,
+                weight_dtype,
+            )
+
+        loss = train_util.conditional_loss(
+            noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+        )
+        if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+            loss = apply_masked_loss(loss, batch)
+        loss = loss.mean([1, 2, 3])
+
+        loss_weights = batch["loss_weights"]
+        loss = loss * loss_weights
+
+        if args.min_snr_gamma:
+            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
+        if args.scale_v_pred_loss_like_noise_pred:
+            loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
+        if args.v_pred_like_loss:
+            loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
+        if args.debiased_estimation_loss:
+            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
+
+        return loss.mean()
+
     def train(self, args):
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
@@ -1307,7 +1383,6 @@ class NetworkTrainer:
             )
         if network is None:
             return
-        network_has_multiplier = hasattr(network, "set_multiplier")
 
         if hasattr(network, "prepare_network"):
             network.prepare_network(args)
@@ -1772,12 +1847,23 @@ class NetworkTrainer:
         if (args.save_n_epoch_ratio is not None) and (args.save_n_epoch_ratio > 0):
             args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
+        shadow_mode = bool(args.avg_cp and getattr(args, "avg_cp_mode", "live") == "shadow")
+        if shadow_mode and getattr(args, "resume", False):
+            raise ValueError("avg_cp_mode=shadow does not support resume yet / avg_cp_mode=shadow は resume 未対応です")
+        if shadow_mode and accelerator.num_processes > 1:
+            raise ValueError(
+                "avg_cp_mode=shadow does not support multi-GPU or distributed training yet / "
+                "avg_cp_mode=shadow は複数GPU・分散学習に未対応です"
+            )
+
         cp_window = deque(maxlen=args.avg_window) if args.avg_cp else None
+        cp_window_epochs = deque(maxlen=args.avg_window) if args.avg_cp else None
         if args.avg_cp and args.resume:
             ext = "." + args.save_model_as
             model_name = train_util.default_if_none(args.output_name, train_util.DEFAULT_EPOCH_NAME)
-            for p in collect_last_checkpoints(args.output_dir, model_name, ext, args.avg_window):
+            for epoch_no, p in collect_last_checkpoints_with_epochs(args.output_dir, model_name, ext, args.avg_window):
                 cp_window.append(load_lora_state_dict(p))
+                cp_window_epochs.append(epoch_no)
 
         # 学習する
         # TODO: find a way to handle total batch size when there are multiple datasets
@@ -2168,6 +2254,15 @@ class NetworkTrainer:
         group_loss_step_header = "global_step,epoch,group,subset_index,loss,ema_loss_group,count_group,timestep,bucket_reso"
         group_loss_step_log_buffer: List[str] = []
         group_loss_last_flush_step = 0
+        if shadow_mode and args.avg_shadow_bank_size < 1:
+            raise ValueError("avg_shadow_bank_size must be >= 1 / avg_shadow_bank_size は 1 以上で指定してください")
+        shadow_log_jsonl = shadow_mode and bool(getattr(args, "avg_shadow_log_jsonl", True))
+        shadow_log_path = (
+            os.path.join(args.output_dir, f"avg_shadow+{model_name_for_logs}.jsonl") if shadow_log_jsonl else None
+        )
+        shadow_bank: List[Dict[str, Any]] = []
+        shadow_best_scores = {"raw": None, "center": None, "auto": None}
+        shadow_virtual_win_streak = 0
 
         def _group_csv_escape(value):
             if value is None:
@@ -2291,6 +2386,148 @@ class NetworkTrainer:
                     return size, key
 
             return None, None
+
+        def _shadow_to_cpu(value, compact_float: bool = False):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach().cpu().clone()
+                if compact_float and torch.is_floating_point(tensor):
+                    tensor = tensor.to(torch.float16)
+                return tensor
+            if isinstance(value, list):
+                return list(value)
+            if isinstance(value, tuple):
+                return list(value)
+            return value
+
+        def _collect_shadow_bank_item(batch, noisy_latents, target, timesteps, huber_c):
+            item: Dict[str, Any] = {
+                "noisy_latents": _shadow_to_cpu(noisy_latents, compact_float=True),
+                "target": _shadow_to_cpu(target, compact_float=True),
+                "timesteps": _shadow_to_cpu(timesteps),
+                "huber_c": _shadow_to_cpu(huber_c),
+                "loss_weights": _shadow_to_cpu(batch["loss_weights"]),
+            }
+            tensor_keys = (
+                "input_ids",
+                "input_ids2",
+                "network_multipliers",
+                "alpha_masks",
+                "original_sizes_hw",
+                "crop_top_lefts",
+                "target_sizes_hw",
+                "text_encoder_outputs1_list",
+                "text_encoder_outputs2_list",
+                "text_encoder_pool2_list",
+            )
+            compact_float_keys = {"alpha_masks", "text_encoder_outputs1_list", "text_encoder_outputs2_list", "text_encoder_pool2_list"}
+            for key in tensor_keys:
+                if key in batch and batch[key] is not None:
+                    item[key] = _shadow_to_cpu(batch[key], compact_float=(key in compact_float_keys))
+            if "captions" in batch and batch["captions"] is not None:
+                item["captions"] = list(batch["captions"])
+            return item
+
+        def _materialize_shadow_batch(item):
+            runtime_batch: Dict[str, Any] = {}
+            for key, value in item.items():
+                if key in ("noisy_latents", "target", "timesteps", "huber_c"):
+                    continue
+                if isinstance(value, torch.Tensor):
+                    runtime_batch[key] = value.to(accelerator.device)
+                elif isinstance(value, list):
+                    runtime_batch[key] = list(value)
+                else:
+                    runtime_batch[key] = value
+
+            noisy_latents = item["noisy_latents"].to(accelerator.device, dtype=weight_dtype)
+            target = item["target"].to(accelerator.device, dtype=weight_dtype)
+            timesteps = item["timesteps"].to(accelerator.device)
+            huber_c_value = item.get("huber_c")
+            huber_c_runtime = huber_c_value.to(accelerator.device, dtype=weight_dtype) if isinstance(huber_c_value, torch.Tensor) else huber_c_value
+            return runtime_batch, noisy_latents, target, timesteps, huber_c_runtime
+
+        def _write_shadow_log(payload: Dict[str, Any]):
+            if not shadow_log_jsonl or not accelerator.is_main_process or shadow_log_path is None:
+                return
+            dirpath = os.path.dirname(shadow_log_path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+            with open(shadow_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        def _save_shadow_best(kind: str, state_dict: Dict[str, torch.Tensor], score: float, epoch_no: int, steps: int):
+            if not accelerator.is_main_process:
+                return
+            os.makedirs(args.output_dir, exist_ok=True)
+            save_sd = {}
+            for key, value in state_dict.items():
+                tensor = value.detach().cpu()
+                if save_dtype is not None:
+                    tensor = tensor.to(save_dtype)
+                save_sd[key] = tensor
+            metadata["ss_training_finished_at"] = str(time.time())
+            metadata["ss_steps"] = str(steps)
+            metadata["ss_epoch"] = str(epoch_no)
+            metadata_to_save = dict(minimum_metadata if args.no_metadata else metadata)
+            metadata_to_save.update(train_util.get_sai_model_spec(None, args, self.is_sdxl, True, False))
+            metadata_to_save["ss_avg_shadow_variant"] = kind
+            metadata_to_save["ss_avg_shadow_proxy_loss"] = f"{score:.10g}"
+            model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(save_sd, metadata_to_save)
+            metadata_to_save["sshs_model_hash"] = model_hash
+            metadata_to_save["sshs_legacy_hash"] = legacy_hash
+            save_lora_state_dict(
+                os.path.join(args.output_dir, f"best_{kind}.safetensors"), save_sd, dtype=None, metadata=metadata_to_save
+            )
+
+        def _capture_torch_rng_state():
+            state = {"cpu": torch.get_rng_state()}
+            if accelerator.device.type == "cuda" and torch.cuda.is_available():
+                state["cuda"] = torch.cuda.get_rng_state(accelerator.device)
+            return state
+
+        def _restore_torch_rng_state(state):
+            torch.set_rng_state(state["cpu"])
+            if "cuda" in state:
+                torch.cuda.set_rng_state(state["cuda"], accelerator.device)
+
+        def _score_shadow_bank(unwrapped_network):
+            if len(shadow_bank) < args.avg_shadow_bank_size:
+                return None
+
+            total_loss = 0.0
+            total_weight = 0
+            with torch.no_grad():
+                for item in shadow_bank:
+                    runtime_batch, noisy_latents_rt, target_rt, timesteps_rt, huber_c_rt = _materialize_shadow_batch(item)
+                    self._set_network_multiplier_from_batch(unwrapped_network, runtime_batch)
+                    text_encoder_conds = self._get_text_conds_for_batch(
+                        args, accelerator, runtime_batch, tokenizers, text_encoders, weight_dtype, grad_enabled=False
+                    )
+                    loss = self._compute_batch_loss(
+                        args,
+                        accelerator,
+                        runtime_batch,
+                        noise_scheduler,
+                        unet,
+                        text_encoder_conds,
+                        noisy_latents_rt,
+                        timesteps_rt,
+                        target_rt,
+                        huber_c_rt,
+                        weight_dtype,
+                        train_unet=False,
+                    )
+                    batch_size_for_score = int(runtime_batch["loss_weights"].shape[0])
+                    total_loss += loss.detach().item() * batch_size_for_score
+                    total_weight += batch_size_for_score
+                    del runtime_batch, noisy_latents_rt, target_rt, timesteps_rt, huber_c_rt, text_encoder_conds, loss
+
+            clean_memory_on_device(accelerator.device)
+            if total_weight < 1:
+                return None
+            return total_loss / total_weight
 
         if group_loss_log_enabled:
             group_loss_ema_beta = float(getattr(args, "group_loss_ema_beta", 0.98))
@@ -2526,32 +2763,7 @@ class NetworkTrainer:
                             latents = torch.nan_to_num(latents, 0, out=latents)
                     latents = latents * self.vae_scale_factor
 
-                    # get multiplier for each sample
-                    if network_has_multiplier:
-                        multipliers = batch["network_multipliers"]
-                        # if all multipliers are same, use single multiplier
-                        if torch.all(multipliers == multipliers[0]):
-                            multipliers = multipliers[0].item()
-                        else:
-                            raise NotImplementedError("multipliers for each sample is not supported yet")
-                        # print(f"set multiplier: {multipliers}")
-                        accelerator.unwrap_model(network).set_multiplier(multipliers)
-
-                    with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
-                        # Get the text embedding for conditioning
-                        if args.weighted_captions:
-                            text_encoder_conds = get_weighted_text_embeddings(
-                                tokenizer,
-                                text_encoder,
-                                batch["captions"],
-                                accelerator.device,
-                                args.max_token_length // 75 if args.max_token_length else 1,
-                                clip_skip=args.clip_skip,
-                            )
-                        else:
-                            text_encoder_conds = self.get_text_cond(
-                                args, accelerator, batch, tokenizers, text_encoders, weight_dtype
-                            )
+                    self._set_network_multiplier_from_batch(accelerator.unwrap_model(network), batch)
 
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
@@ -2562,6 +2774,11 @@ class NetworkTrainer:
                     )
                     step_timestep = _extract_first(timesteps)
 
+                    with torch.set_grad_enabled(train_text_encoder):
+                        text_encoder_conds = self._get_text_conds_for_batch(
+                            args, accelerator, batch, tokenizers, text_encoders, weight_dtype, grad_enabled=train_text_encoder
+                        )
+
                     # ensure the hidden state will require grad
                     if args.gradient_checkpointing:
                         for x in noisy_latents:
@@ -2569,45 +2786,28 @@ class NetworkTrainer:
                         for t in text_encoder_conds:
                             t.requires_grad_(True)
 
-                    # Predict the noise residual
-                    with accelerator.autocast():
-                        noise_pred = self.call_unet(
-                            args,
-                            accelerator,
-                            unet,
-                            noisy_latents.requires_grad_(train_unet),
-                            timesteps,
-                            text_encoder_conds,
-                            batch,
-                            weight_dtype,
-                        )
-
                     if args.v_parameterization:
                         # v-parameterization training
                         target = noise_scheduler.get_velocity(latents, noise, timesteps)
                     else:
                         target = noise
+                    if shadow_mode and len(shadow_bank) < args.avg_shadow_bank_size and (epoch + 1) / num_train_epochs >= args.avg_begin:
+                        shadow_bank.append(_collect_shadow_bank_item(batch, noisy_latents, target, timesteps, huber_c))
 
-                    loss = train_util.conditional_loss(
-                        noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+                    loss = self._compute_batch_loss(
+                        args,
+                        accelerator,
+                        batch,
+                        noise_scheduler,
+                        unet,
+                        text_encoder_conds,
+                        noisy_latents,
+                        timesteps,
+                        target,
+                        huber_c,
+                        weight_dtype,
+                        train_unet=train_unet,
                     )
-                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                        loss = apply_masked_loss(loss, batch)
-                    loss = loss.mean([1, 2, 3])
-
-                    loss_weights = batch["loss_weights"]  # 各sampleごとのweight
-                    loss = loss * loss_weights
-
-                    if args.min_snr_gamma:
-                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
-                    if args.scale_v_pred_loss_like_noise_pred:
-                        loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
-                    if args.v_pred_like_loss:
-                        loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
-                    if args.debiased_estimation_loss:
-                        loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
-
-                    loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
                     accelerator.backward(loss)
                     loss_scalar = loss.detach().item()
@@ -3148,29 +3348,128 @@ class NetworkTrainer:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
+            if shadow_mode:
+                clean_memory_on_device(accelerator.device)
 
-            if args.avg_cp and (epoch + 1) / num_train_epochs >= args.avg_begin:
-                sd = filter_lora_state_dict(accelerator.unwrap_model(network).state_dict())
-                cp_window.append(sd)
-                if len(cp_window) == args.avg_window:
-                    start_ep = epoch - args.avg_window + 2
-                    if start_ep < 1:
-                        start_ep = 1
-                    logger.info(f"averaging checkpoints from epoch {start_ep} to {epoch + 1}")
-                    avg_sd = average_state_dicts(list(cp_window), args.avg_mode)
-                    accelerator.unwrap_model(network).load_state_dict(avg_sd, strict=False)
-                    if args.avg_reset_stats:
-                        for p_state in optimizer.state.values():
-                            p_state["step"] = p_state.get("step", 0)  # keep real count
-                            for buf in ("exp_avg", "exp_avg_sq", "exp_avg_max"):
-                                if buf in p_state and isinstance(p_state[buf], torch.Tensor):
-                                    p_state[buf].zero_()
-                    if accelerator.distributed_type != DistributedType.NO:
-                        sd = broadcast(accelerator.unwrap_model(network).state_dict())
-                        accelerator.unwrap_model(network).load_state_dict(sd, strict=False)
+            progress_ratio = (epoch + 1) / num_train_epochs
+            if args.avg_cp:
+                shadow_log_payload = None
+                if shadow_mode:
+                    shadow_log_payload = {
+                        "epoch": epoch + 1,
+                        "progress": round(progress_ratio, 6),
+                        "bank_ready": len(shadow_bank) >= args.avg_shadow_bank_size,
+                        "bank_size": len(shadow_bank),
+                        "avg_mode": args.avg_mode,
+                        "avg_window": args.avg_window,
+                        "raw_proxy_loss": None,
+                        "center_proxy_loss": None,
+                        "delta_abs": None,
+                        "delta_pct": None,
+                        "winner": None,
+                        "virtual_margin_ok": False,
+                        "virtual_win_streak": shadow_virtual_win_streak,
+                        "virtual_would_promote": False,
+                        "window_epochs": list(cp_window_epochs) if cp_window_epochs is not None else [],
+                        "status": "before_avg_begin" if progress_ratio < args.avg_begin else "pending",
+                    }
+
+                if progress_ratio >= args.avg_begin:
+                    unwrapped_network = accelerator.unwrap_model(network)
+                    raw_sd = filter_lora_state_dict(unwrapped_network.state_dict())
+                    cp_window.append(raw_sd)
+                    cp_window_epochs.append(epoch + 1)
+
+                    if shadow_mode:
+                        shadow_log_payload["window_epochs"] = list(cp_window_epochs)
+                        if len(shadow_bank) < args.avg_shadow_bank_size:
+                            shadow_log_payload["status"] = "bank_collecting"
+                        elif len(cp_window) < args.avg_window:
+                            shadow_log_payload["status"] = "waiting_window"
+                        elif accelerator.is_main_process:
+                            avg_sd = average_state_dicts(list(cp_window), args.avg_mode)
+                            rng_state = _capture_torch_rng_state()
+                            raw_score = None
+                            center_score = None
+                            try:
+                                raw_score = _score_shadow_bank(unwrapped_network)
+                                _restore_torch_rng_state(rng_state)
+                                unwrapped_network.load_state_dict(avg_sd, strict=False)
+                                center_score = _score_shadow_bank(unwrapped_network)
+                            finally:
+                                unwrapped_network.load_state_dict(raw_sd, strict=False)
+                                _restore_torch_rng_state(rng_state)
+                                clean_memory_on_device(accelerator.device)
+
+                            delta_abs = center_score - raw_score
+                            delta_pct = (delta_abs / raw_score * 100.0) if raw_score not in (None, 0.0) else None
+                            margin_ok = center_score < raw_score * (1.0 - args.avg_shadow_margin)
+                            winner = "center" if margin_ok else "raw"
+                            shadow_virtual_win_streak = shadow_virtual_win_streak + 1 if margin_ok else 0
+                            would_promote = shadow_virtual_win_streak >= args.avg_shadow_patience
+
+                            shadow_log_payload.update(
+                                {
+                                    "raw_proxy_loss": round(raw_score, 10),
+                                    "center_proxy_loss": round(center_score, 10),
+                                    "delta_abs": round(delta_abs, 10),
+                                    "delta_pct": round(delta_pct, 6) if delta_pct is not None else None,
+                                    "winner": winner,
+                                    "virtual_margin_ok": margin_ok,
+                                    "virtual_win_streak": shadow_virtual_win_streak,
+                                    "virtual_would_promote": would_promote,
+                                    "status": "scored",
+                                }
+                            )
+
+                            if shadow_best_scores["raw"] is None or raw_score < shadow_best_scores["raw"]:
+                                shadow_best_scores["raw"] = raw_score
+                                _save_shadow_best("raw", raw_sd, raw_score, epoch + 1, global_step)
+                            if shadow_best_scores["center"] is None or center_score < shadow_best_scores["center"]:
+                                shadow_best_scores["center"] = center_score
+                                _save_shadow_best("center", avg_sd, center_score, epoch + 1, global_step)
+
+                            auto_kind = "center" if center_score < raw_score else "raw"
+                            auto_state = avg_sd if auto_kind == "center" else raw_sd
+                            auto_score = center_score if auto_kind == "center" else raw_score
+                            if shadow_best_scores["auto"] is None or auto_score < shadow_best_scores["auto"]:
+                                shadow_best_scores["auto"] = auto_score
+                                _save_shadow_best("auto", auto_state, auto_score, epoch + 1, global_step)
+
+                            logger.info(
+                                "avg_cp shadow epoch %d: raw=%.6f center=%.6f winner=%s streak=%d window=%s",
+                                epoch + 1,
+                                raw_score,
+                                center_score,
+                                winner,
+                                shadow_virtual_win_streak,
+                                list(cp_window_epochs),
+                            )
+
                         accelerator.wait_for_everyone()
                     else:
-                        accelerator.wait_for_everyone()
+                        if len(cp_window) == args.avg_window:
+                            start_ep = epoch - args.avg_window + 2
+                            if start_ep < 1:
+                                start_ep = 1
+                            logger.info(f"averaging checkpoints from epoch {start_ep} to {epoch + 1}")
+                            avg_sd = average_state_dicts(list(cp_window), args.avg_mode)
+                            unwrapped_network.load_state_dict(avg_sd, strict=False)
+                            if args.avg_reset_stats:
+                                for p_state in optimizer.state.values():
+                                    p_state["step"] = p_state.get("step", 0)  # keep real count
+                                    for buf in ("exp_avg", "exp_avg_sq", "exp_avg_max"):
+                                        if buf in p_state and isinstance(p_state[buf], torch.Tensor):
+                                            p_state[buf].zero_()
+                            if accelerator.distributed_type != DistributedType.NO:
+                                sd = broadcast(unwrapped_network.state_dict())
+                                unwrapped_network.load_state_dict(sd, strict=False)
+                                accelerator.wait_for_everyone()
+                            else:
+                                accelerator.wait_for_everyone()
+
+                if shadow_mode:
+                    _write_shadow_log(shadow_log_payload)
 
             # end of epoch
 
@@ -3355,11 +3654,42 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--avg_window", type=int, default=4, help="number of checkpoints to average / 平均するチェックポイント数")
     parser.add_argument("--avg_begin", type=float, default=0.6, help="fraction of total epochs to start averaging / 学習の何割から平均を開始するか")
     parser.add_argument(
+        "--avg_cp_mode",
+        type=str,
+        default="live",
+        choices=["live", "shadow"],
+        help="avg_cp behavior: live applies averaged weights to training, shadow only scores and saves candidates / avg_cp の動作。live は平均重みを学習へ反映、shadow は採点と保存のみ",
+    )
+    parser.add_argument(
         "--avg_mode",
         type=str,
         default="ema",
         choices=["uniform", "ema", "metric"],
         help="averaging mode: uniform, ema or metric / 平均化モード",
+    )
+    parser.add_argument(
+        "--avg_shadow_bank_size",
+        type=int,
+        default=12,
+        help="number of train_proxy batches to retain on CPU for avg_cp shadow scoring / avg_cp shadow 採点用に CPU 保持する train_proxy バッチ数",
+    )
+    parser.add_argument(
+        "--avg_shadow_margin",
+        type=float,
+        default=0.003,
+        help="center wins only when center_score < raw_score * (1 - margin) in shadow mode / shadow で center 勝ちとみなす閾値",
+    )
+    parser.add_argument(
+        "--avg_shadow_patience",
+        type=int,
+        default=2,
+        help="virtual win streak threshold for shadow logging only; no actual promote is performed / shadow ログ用の仮想連勝閾値。実 promote は行わない",
+    )
+    parser.add_argument(
+        "--avg_shadow_log_jsonl",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write avg_cp shadow epoch logs to jsonl under output_dir / avg_cp shadow の epoch ログを output_dir 配下の jsonl に出力",
     )
     parser.add_argument(
         "--avg_reset_stats",
