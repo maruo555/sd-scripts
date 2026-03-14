@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass
 from multiprocessing import Value
 import toml
-from collections import deque
+from collections import Counter, deque
 import numpy as np
 
 from typing import Any, Dict, List, Optional
@@ -1855,7 +1855,6 @@ class NetworkTrainer:
                 "avg_cp_mode=shadow does not support multi-GPU or distributed training yet / "
                 "avg_cp_mode=shadow は複数GPU・分散学習に未対応です"
             )
-
         cp_window = deque(maxlen=args.avg_window) if args.avg_cp else None
         cp_window_epochs = deque(maxlen=args.avg_window) if args.avg_cp else None
         if args.avg_cp and args.resume:
@@ -1895,6 +1894,23 @@ class NetworkTrainer:
                     "group_loss_log: dataset-level batch_size check is skipped because dataset_class does not expose `.datasets`; "
                     "batch_size will be validated at runtime / "
                     "group_loss_log: dataset_class が `.datasets` を持たないため事前のbatch_size検証をスキップします。"
+                    "batch_size は実行時に検証します"
+                )
+
+        if shadow_mode:
+            datasets_for_check = getattr(train_dataset_group, "datasets", None)
+            if isinstance(datasets_for_check, (list, tuple)) and len(datasets_for_check) > 0:
+                dataset_batch_sizes = [int(getattr(d, "batch_size", -1)) for d in datasets_for_check]
+                if any(bs != 1 for bs in dataset_batch_sizes):
+                    raise ValueError(
+                        f"avg_cp_mode=shadow supports only batch_size=1 datasets. found: {dataset_batch_sizes} / "
+                        f"avg_cp_mode=shadow は batch_size=1 のデータセットのみ対応です。検出値: {dataset_batch_sizes}"
+                    )
+            else:
+                logger.info(
+                    "avg_cp_mode=shadow: dataset-level batch_size check is skipped because dataset_class does not expose `.datasets`; "
+                    "batch_size will be validated at runtime / "
+                    "avg_cp_mode=shadow: dataset_class が `.datasets` を持たないため事前のbatch_size検証をスキップします。"
                     "batch_size は実行時に検証します"
                 )
 
@@ -2260,6 +2276,9 @@ class NetworkTrainer:
         shadow_log_path = (
             os.path.join(args.output_dir, f"avg_shadow+{model_name_for_logs}.jsonl") if shadow_log_jsonl else None
         )
+        shadow_candidate_pool: List[Dict[str, Any]] = []
+        shadow_candidate_pool_target_size = max(args.avg_shadow_bank_size * 4, 32) if shadow_mode else 0
+        shadow_candidate_pool_final_size: Optional[int] = None
         shadow_bank: List[Dict[str, Any]] = []
         shadow_best_scores = {"raw": None, "center": None, "auto": None}
         shadow_virtual_win_streak = 0
@@ -2346,7 +2365,7 @@ class NetworkTrainer:
                 return value[0]
             return value
 
-        def _infer_group_loss_batch_size(batch):
+        def _infer_runtime_batch_size(batch):
             preferred_keys = (
                 "loss_weights",
                 "latents",
@@ -2401,6 +2420,30 @@ class NetworkTrainer:
                 return list(value)
             return value
 
+        def _shadow_normalize_labels(values):
+            if values is None:
+                return []
+            if not isinstance(values, (list, tuple)):
+                values = [values]
+            normalized = []
+            for value in values:
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text == "":
+                    continue
+                normalized.append(text)
+            return normalized
+
+        def _shadow_primary_label(values):
+            labels = _shadow_normalize_labels(values)
+            if len(labels) < 1:
+                return None
+            unique = list(dict.fromkeys(labels))
+            if len(unique) == 1:
+                return unique[0]
+            return "||".join(unique)
+
         def _collect_shadow_bank_item(batch, noisy_latents, target, timesteps, huber_c):
             item: Dict[str, Any] = {
                 "noisy_latents": _shadow_to_cpu(noisy_latents, compact_float=True),
@@ -2427,12 +2470,25 @@ class NetworkTrainer:
                     item[key] = _shadow_to_cpu(batch[key], compact_float=(key in compact_float_keys))
             if "captions" in batch and batch["captions"] is not None:
                 item["captions"] = list(batch["captions"])
+            if "image_keys" in batch and batch["image_keys"] is not None:
+                item["image_keys"] = list(batch["image_keys"])
+            if "class_tokens" in batch and batch["class_tokens"] is not None:
+                item["class_tokens"] = list(batch["class_tokens"])
+            item["shadow_primary_class_token"] = _shadow_primary_label(item.get("class_tokens"))
+            item["shadow_primary_image_key"] = _shadow_primary_label(item.get("image_keys"))
             return item
 
         def _materialize_shadow_batch(item):
             runtime_batch: Dict[str, Any] = {}
             for key, value in item.items():
-                if key in ("noisy_latents", "target", "timesteps", "huber_c"):
+                if key in (
+                    "noisy_latents",
+                    "target",
+                    "timesteps",
+                    "huber_c",
+                    "shadow_primary_class_token",
+                    "shadow_primary_image_key",
+                ):
                     continue
                 if isinstance(value, torch.Tensor):
                     runtime_batch[key] = value.to(accelerator.device)
@@ -2456,6 +2512,124 @@ class NetworkTrainer:
                 os.makedirs(dirpath, exist_ok=True)
             with open(shadow_log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        def _shadow_select_final_bank(candidate_pool: List[Dict[str, Any]]):
+            if len(candidate_pool) < args.avg_shadow_bank_size:
+                return []
+
+            grouped_candidates: Dict[str, List[Dict[str, Any]]] = {}
+            group_order: List[str] = []
+            for item in candidate_pool:
+                class_key = item.get("shadow_primary_class_token") or "__no_class_tokens__"
+                if class_key not in grouped_candidates:
+                    grouped_candidates[class_key] = []
+                    group_order.append(class_key)
+                grouped_candidates[class_key].append(item)
+
+            selected: List[Dict[str, Any]] = []
+            used_item_ids = set()
+            used_image_keys = set()
+
+            while len(selected) < args.avg_shadow_bank_size:
+                made_progress = False
+                for class_key in group_order:
+                    candidates = grouped_candidates[class_key]
+                    selected_item = None
+                    fallback_item = None
+                    for item in candidates:
+                        item_id = id(item)
+                        if item_id in used_item_ids:
+                            continue
+                        if fallback_item is None:
+                            fallback_item = item
+                        image_key = item.get("shadow_primary_image_key")
+                        if image_key is None or image_key not in used_image_keys:
+                            selected_item = item
+                            break
+                    if selected_item is None:
+                        selected_item = fallback_item
+                    if selected_item is None:
+                        continue
+
+                    item_id = id(selected_item)
+                    used_item_ids.add(item_id)
+                    image_key = selected_item.get("shadow_primary_image_key")
+                    if image_key is not None:
+                        used_image_keys.add(image_key)
+                    selected.append(selected_item)
+                    made_progress = True
+
+                    if len(selected) >= args.avg_shadow_bank_size:
+                        break
+
+                if not made_progress:
+                    break
+
+            if len(selected) < args.avg_shadow_bank_size:
+                for item in candidate_pool:
+                    item_id = id(item)
+                    if item_id in used_item_ids:
+                        continue
+                    selected.append(item)
+                    used_item_ids.add(item_id)
+                    if len(selected) >= args.avg_shadow_bank_size:
+                        break
+
+            return selected
+
+        def _shadow_timestep_bins(items: List[Dict[str, Any]]):
+            total_timesteps = int(noise_scheduler.config.num_train_timesteps)
+            low_cut = total_timesteps // 3
+            high_cut = (total_timesteps * 2) // 3
+            bins = {"low": 0, "mid": 0, "high": 0}
+            for item in items:
+                timesteps_tensor = item.get("timesteps")
+                if not isinstance(timesteps_tensor, torch.Tensor):
+                    continue
+                for timestep in timesteps_tensor.reshape(-1).tolist():
+                    timestep_value = int(timestep)
+                    if timestep_value < low_cut:
+                        bins["low"] += 1
+                    elif timestep_value < high_cut:
+                        bins["mid"] += 1
+                    else:
+                        bins["high"] += 1
+            return bins
+
+        def _shadow_bank_metadata(items: List[Dict[str, Any]]):
+            class_counter: Counter = Counter()
+            image_counter: Counter = Counter()
+            for item in items:
+                class_counter.update(_shadow_normalize_labels(item.get("class_tokens")))
+                image_counter.update(_shadow_normalize_labels(item.get("image_keys")))
+
+            return {
+                "bank_unique_class_tokens": len(class_counter),
+                "bank_max_per_class_tokens": max(class_counter.values()) if len(class_counter) > 0 else 0,
+                "bank_unique_image_keys": len(image_counter),
+                "bank_max_per_image_key": max(image_counter.values()) if len(image_counter) > 0 else 0,
+                "bank_timestep_bins": _shadow_timestep_bins(items),
+            }
+
+        def _shadow_candidate_pool_size_for_log():
+            if shadow_candidate_pool_final_size is not None:
+                return shadow_candidate_pool_final_size
+            return len(shadow_candidate_pool)
+
+        def _finalize_shadow_bank_if_ready(is_last_epoch: bool):
+            nonlocal shadow_candidate_pool_final_size
+            if len(shadow_bank) > 0:
+                return True
+            if len(shadow_candidate_pool) < args.avg_shadow_bank_size:
+                return False
+            if len(shadow_candidate_pool) < shadow_candidate_pool_target_size and not is_last_epoch:
+                return False
+
+            shadow_bank.extend(_shadow_select_final_bank(shadow_candidate_pool))
+            if len(shadow_bank) >= args.avg_shadow_bank_size:
+                shadow_candidate_pool_final_size = len(shadow_candidate_pool)
+                shadow_candidate_pool.clear()
+            return len(shadow_bank) >= args.avg_shadow_bank_size
 
         def _save_shadow_best(kind: str, state_dict: Dict[str, torch.Tensor], score: float, epoch_no: int, steps: int):
             if not accelerator.is_main_process:
@@ -2656,8 +2830,22 @@ class NetworkTrainer:
                     progress_bar.last_print_t = progress_bar.start_t
                     progress_bar_started = True
                 skip_step_flag = False
+                if shadow_mode:
+                    step_batch_size, batch_size_source = _infer_runtime_batch_size(batch)
+                    if step_batch_size is None:
+                        raise ValueError(
+                            "avg_cp_mode=shadow could not infer batch_size from the runtime batch; "
+                            "disable avg_cp_mode=shadow or make the batch expose a batched tensor/list field / "
+                            "avg_cp_mode=shadow は実行時バッチから batch_size を推定できませんでした。"
+                            "avg_cp_mode=shadow を無効化するか、バッチにバッチ軸を持つ tensor/list フィールドを含めてください"
+                        )
+                    if step_batch_size != 1:
+                        raise ValueError(
+                            f"avg_cp_mode=shadow supports only batch_size=1. got batch size {step_batch_size} from `{batch_size_source}` at step {step} / "
+                            f"avg_cp_mode=shadow は batch_size=1 のみ対応です。step {step} で `{batch_size_source}` から batch size={step_batch_size} を検出しました"
+                        )
                 if group_loss_log_enabled:
-                    step_batch_size, batch_size_source = _infer_group_loss_batch_size(batch)
+                    step_batch_size, batch_size_source = _infer_runtime_batch_size(batch)
                     if step_batch_size is None:
                         raise ValueError(
                             "group_loss_log could not infer batch_size from the runtime batch; "
@@ -2791,8 +2979,13 @@ class NetworkTrainer:
                         target = noise_scheduler.get_velocity(latents, noise, timesteps)
                     else:
                         target = noise
-                    if shadow_mode and len(shadow_bank) < args.avg_shadow_bank_size and (epoch + 1) / num_train_epochs >= args.avg_begin:
-                        shadow_bank.append(_collect_shadow_bank_item(batch, noisy_latents, target, timesteps, huber_c))
+                    if (
+                        shadow_mode
+                        and len(shadow_bank) < args.avg_shadow_bank_size
+                        and len(shadow_candidate_pool) < shadow_candidate_pool_target_size
+                        and (epoch + 1) / num_train_epochs >= args.avg_begin
+                    ):
+                        shadow_candidate_pool.append(_collect_shadow_bank_item(batch, noisy_latents, target, timesteps, huber_c))
 
                     loss = self._compute_batch_loss(
                         args,
@@ -3358,8 +3551,15 @@ class NetworkTrainer:
                     shadow_log_payload = {
                         "epoch": epoch + 1,
                         "progress": round(progress_ratio, 6),
+                        "construction_pool_size": _shadow_candidate_pool_size_for_log(),
+                        "construction_pool_target_size": shadow_candidate_pool_target_size,
                         "bank_ready": len(shadow_bank) >= args.avg_shadow_bank_size,
                         "bank_size": len(shadow_bank),
+                        "bank_unique_class_tokens": None,
+                        "bank_max_per_class_tokens": None,
+                        "bank_unique_image_keys": None,
+                        "bank_max_per_image_key": None,
+                        "bank_timestep_bins": None,
                         "avg_mode": args.avg_mode,
                         "avg_window": args.avg_window,
                         "raw_proxy_loss": None,
@@ -3382,8 +3582,15 @@ class NetworkTrainer:
 
                     if shadow_mode:
                         shadow_log_payload["window_epochs"] = list(cp_window_epochs)
-                        if len(shadow_bank) < args.avg_shadow_bank_size:
-                            shadow_log_payload["status"] = "bank_collecting"
+                        bank_ready = _finalize_shadow_bank_if_ready(is_last_epoch=((epoch + 1) >= num_train_epochs))
+                        shadow_log_payload["construction_pool_size"] = _shadow_candidate_pool_size_for_log()
+                        shadow_log_payload["bank_ready"] = bank_ready
+                        shadow_log_payload["bank_size"] = len(shadow_bank)
+                        if bank_ready:
+                            shadow_log_payload.update(_shadow_bank_metadata(shadow_bank))
+
+                        if not bank_ready:
+                            shadow_log_payload["status"] = "building_pool"
                         elif len(cp_window) < args.avg_window:
                             shadow_log_payload["status"] = "waiting_window"
                         elif accelerator.is_main_process:

@@ -156,13 +156,25 @@ epoch_t   : 0.400
 
 - `--avg_cp`
 - `--avg_cp_mode shadow`
+- `--train_batch_size 1`
 - `(epoch + 1) / num_train_epochs >= avg_begin`
-- まだ `avg_shadow_bank_size` に達していない
+- final bank がまだ未確定
 
 収集タイミング:
 
 - `target` 算出後
 - backward 前
+
+この実装では、bank はいきなり先着順で固定しない。まず **construction pool** を集め、その中から最終的な fixed bank を選ぶ。
+
+construction pool について:
+
+- CLI は増やさず、内部仕様として自動サイズを使う
+- target size は `max(avg_shadow_bank_size * 4, 32)`
+- 例: `avg_shadow_bank_size=12` のとき、construction pool の target は `48`
+- 現実装では **`train_batch_size=1` 専用**
+  - `class_tokens` / `image_keys` の多様性判定を 1 サンプル単位で扱う前提のため
+  - `avg_cp_mode=shadow` で `train_batch_size!=1` はエラーにする
 
 保持する情報:
 
@@ -182,18 +194,50 @@ epoch_t   : 0.400
 - `text_encoder_outputs2_list`
 - `text_encoder_pool2_list`
 - `captions`（weighted captions 経路で必要なとき）
+- `image_keys`
+- `class_tokens`
 
 実装上の保存方針:
 
-- bank は **CPU 保持のみ**
+- construction pool / final bank とも **CPU 保持のみ**
 - `noisy_latents` / `target` / `alpha_masks` / cached TE 出力は CPU `fp16` に圧縮
 - `timesteps` など整数テンソルはそのまま CPU に detach/clone
-- `avg_shadow_bank_size` に達した時点で **freeze** し、その後は更新しない
 - `clean latents` は保持しない
 - VAE 再実行もしない
 - ノイズの再サンプリングもしない
 
-#### 2. epoch end の raw snapshot / center 作成
+#### 2. construction pool の開始 / 終了 / final bank 確定
+
+開始タイミング:
+
+- `avg_begin` に到達した最初の epoch の学習 step から開始する
+
+終了タイミング:
+
+- construction pool のサイズが内部 target に達した時点で、以後の候補収集を止める
+- もし training end まで内部 target に達しなくても、`avg_shadow_bank_size` 以上の候補があれば最後に確定へ進む
+
+final bank を決定するタイミング:
+
+- epoch end で `avg_begin` 到達後
+- `cp_window` 更新と同じタイミングで判定する
+- construction pool が内部 target に達していれば、その epoch end で final bank を確定する
+- internal target 未達でも最終 epoch なら、候補数が `avg_shadow_bank_size` 以上ある限り、その時点の construction pool から final bank を確定する
+
+final bank の選び方:
+
+- まず `class_tokens` の偏りが小さくなるように round-robin 的に拾う
+- 同じ `class_tokens` の中では `image_key` が重ならない候補を優先する
+- `class_tokens` が存在しないデータ形式では `image_key` ベースで分散させる
+- final bank が一度確定したら **freeze** し、その後は最後まで同じ bank を使い続ける
+
+この設計の意図:
+
+- 少数画像・高 repeat のデータでは、先着順 freeze だと偏りやすい
+- しかし epoch ごとに評価 bank を変えると、score 比較の意味が崩れる
+- そのため「確定前だけ多様性を見る construction pool」と「確定後は固定の final bank」を分けている
+
+#### 3. epoch end の raw snapshot / center 作成
 
 epoch 終端の順番は以下:
 
@@ -210,9 +254,9 @@ epoch 終端の順番は以下:
   - `avg_reset_stats` も従来どおり有効
 - `avg_cp_mode=shadow`
   - **学習モデルは raw のまま**
-  - `cp_window` が `avg_window` に満ち、かつ bank 完成後のみ採点する
+  - `cp_window` が `avg_window` に満ち、かつ final bank 完成後のみ採点する
 
-#### 3. proxy scoring
+#### 4. proxy scoring
 
 shadow の採点は epoch 終端で行う。
 
@@ -238,7 +282,7 @@ VRAM 方針:
 - optimizer 更新なし
 - `torch.no_grad()` で forward-only 採点
 
-#### 4. score の定義
+#### 5. score の定義
 
 score は `train_proxy bank` 上の **mean loss**。
 
@@ -264,7 +308,7 @@ score は `train_proxy bank` 上の **mean loss**。
 
 - SDXL では `sdxl_train_network.py` の `get_text_cond()` が outer の grad mode を尊重するように修正されており、shadow scoring 中に不要な graph を強制生成しない
 
-#### 5. winner 判定
+#### 6. winner 判定
 
 - `center_score < raw_score * (1 - avg_shadow_margin)` のときだけ `winner = "center"`
 - それ以外は `winner = "raw"`
@@ -280,7 +324,7 @@ score は `train_proxy bank` 上の **mean loss**。
 - **actual promote は未実装**
 - 学習モデルを center に切り替えることはしない
 
-#### 6. 保存物
+#### 7. 保存物
 
 shadow では、score が更新されたときに以下を直接保存する:
 
@@ -301,7 +345,7 @@ shadow では、score が更新されたときに以下を直接保存する:
 - LoRA 部分だけを保存する
 - SAI metadata と safetensors hash metadata も付与する
 
-#### 7. JSONL logging
+#### 8. JSONL logging
 
 shadow 有効時は epoch ごとに 1 行の JSONL を出す。
 
@@ -309,8 +353,15 @@ shadow 有効時は epoch ごとに 1 行の JSONL を出す。
 
 - `epoch`
 - `progress`
+- `construction_pool_size`
+- `construction_pool_target_size`
 - `bank_ready`
 - `bank_size`
+- `bank_unique_class_tokens`
+- `bank_max_per_class_tokens`
+- `bank_unique_image_keys`
+- `bank_max_per_image_key`
+- `bank_timestep_bins`
 - `avg_mode`
 - `avg_window`
 - `raw_proxy_loss`
@@ -327,16 +378,45 @@ shadow 有効時は epoch ごとに 1 行の JSONL を出す。
 `status` の例:
 
 - `before_avg_begin`
-- `bank_collecting`
+- `building_pool`
 - `waiting_window`
 - `scored`
 
-#### 8. 実際の制約
+各項目の意味:
+
+- `construction_pool_size`
+  - 現時点までに集まっている construction pool の候補数
+- `construction_pool_target_size`
+  - 内部仕様で決まる construction pool の目標候補数
+- `bank_ready`
+  - final bank が確定済みかどうか
+- `bank_size`
+  - final bank に実際に入っている候補数
+- `bank_unique_class_tokens`
+  - final bank に含まれる `class_tokens` の種類数
+- `bank_max_per_class_tokens`
+  - 1つの `class_tokens` が final bank 内で最大何枠を占めたか
+- `bank_unique_image_keys`
+  - final bank に含まれる `image_key` の種類数
+- `bank_max_per_image_key`
+  - 1つの `image_key` が final bank 内で最大何枠を占めたか
+- `bank_timestep_bins`
+  - final bank に含まれる timestep を `low` / `mid` / `high` の粗い3ビンに分けた分布
+  - timestep の偏りが極端でないかを見るための指標
+
+`image_keys` の扱い:
+
+- `image_key` は batch 内部情報として常時持つ
+- これは shadow 以外を直接変えるためではなく、将来の bank 解析やデバッグにも使い回せる軽い識別情報として載せている
+- VRAM コストはほぼなく、CPU 側の文字列リストとして扱う
+
+#### 9. 実際の制約
 
 - 今回の実装で比較する center は **現在の `args.avg_mode` で作る 1 本だけ**
 - `val_bank` は未実装
 - `adaptive promote` は未実装
-- resume 時は `cp_window` を既存 epoch ckpt から復元するが、**shadow bank / best_* / streak は復元しない**
+- resume 時は `cp_window` を既存 epoch ckpt から復元するが、**construction pool / final bank / best_* / streak は復元しない**
+- `avg_cp_mode=shadow` は **`train_batch_size=1` のみ対応**
 - 分散学習では score/save/log は main process で行う
   - ただし bank の all-gather はしていないため、**proxy bank は main process の local shard ベース**
 

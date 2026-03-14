@@ -1264,6 +1264,7 @@ class BaseDataset(torch.utils.data.Dataset):
         flippeds = []  # 変数名が微妙
         subset_indices = []
         groups = []
+        class_tokens_list = []
         bucket_resos = []
         text_encoder_outputs1_list = []
         text_encoder_outputs2_list = []
@@ -1274,6 +1275,7 @@ class BaseDataset(torch.utils.data.Dataset):
             subset = self.image_to_subset[image_key]
             subset_indices.append(getattr(subset, "subset_index", -1))
             groups.append(self.normalize_group_name(getattr(subset, "group", None)))
+            class_tokens_list.append(getattr(subset, "class_tokens", None))
             bucket_resos.append(image_info.bucket_reso)
             loss_weights.append(
                 self.prior_loss_weight if image_info.is_reg else 1.0
@@ -1487,10 +1489,9 @@ class BaseDataset(torch.utils.data.Dataset):
         example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
         example["subset_indices"] = subset_indices
         example["groups"] = groups
+        example["class_tokens"] = class_tokens_list
         example["bucket_resos"] = bucket_resos
-
-        if self.debug_dataset:
-            example["image_keys"] = bucket[image_index : image_index + self.batch_size]
+        example["image_keys"] = bucket[image_index : image_index + bucket_batch_size]
         return example
 
     def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
