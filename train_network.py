@@ -1847,13 +1847,16 @@ class NetworkTrainer:
         if (args.save_n_epoch_ratio is not None) and (args.save_n_epoch_ratio > 0):
             args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
-        shadow_mode = bool(args.avg_cp and getattr(args, "avg_cp_mode", "live") == "shadow")
-        if shadow_mode and getattr(args, "resume", False):
-            raise ValueError("avg_cp_mode=shadow does not support resume yet / avg_cp_mode=shadow は resume 未対応です")
-        if shadow_mode and accelerator.num_processes > 1:
+        avg_cp_mode = getattr(args, "avg_cp_mode", "live")
+        shadow_mode = bool(args.avg_cp and avg_cp_mode == "shadow")
+        promote_mode = bool(args.avg_cp and avg_cp_mode == "promote")
+        proxy_scoring_mode = shadow_mode or promote_mode
+        if proxy_scoring_mode and getattr(args, "resume", False):
+            raise ValueError(f"avg_cp_mode={avg_cp_mode} does not support resume yet / avg_cp_mode={avg_cp_mode} は resume 未対応です")
+        if proxy_scoring_mode and accelerator.num_processes > 1:
             raise ValueError(
-                "avg_cp_mode=shadow does not support multi-GPU or distributed training yet / "
-                "avg_cp_mode=shadow は複数GPU・分散学習に未対応です"
+                f"avg_cp_mode={avg_cp_mode} does not support multi-GPU or distributed training yet / "
+                f"avg_cp_mode={avg_cp_mode} は複数GPU・分散学習に未対応です"
             )
         cp_window = deque(maxlen=args.avg_window) if args.avg_cp else None
         cp_window_epochs = deque(maxlen=args.avg_window) if args.avg_cp else None
@@ -1897,20 +1900,20 @@ class NetworkTrainer:
                     "batch_size は実行時に検証します"
                 )
 
-        if shadow_mode:
+        if proxy_scoring_mode:
             datasets_for_check = getattr(train_dataset_group, "datasets", None)
             if isinstance(datasets_for_check, (list, tuple)) and len(datasets_for_check) > 0:
                 dataset_batch_sizes = [int(getattr(d, "batch_size", -1)) for d in datasets_for_check]
                 if any(bs != 1 for bs in dataset_batch_sizes):
                     raise ValueError(
-                        f"avg_cp_mode=shadow supports only batch_size=1 datasets. found: {dataset_batch_sizes} / "
-                        f"avg_cp_mode=shadow は batch_size=1 のデータセットのみ対応です。検出値: {dataset_batch_sizes}"
+                        f"avg_cp_mode={avg_cp_mode} supports only batch_size=1 datasets. found: {dataset_batch_sizes} / "
+                        f"avg_cp_mode={avg_cp_mode} は batch_size=1 のデータセットのみ対応です。検出値: {dataset_batch_sizes}"
                     )
             else:
                 logger.info(
-                    "avg_cp_mode=shadow: dataset-level batch_size check is skipped because dataset_class does not expose `.datasets`; "
+                    f"avg_cp_mode={avg_cp_mode}: dataset-level batch_size check is skipped because dataset_class does not expose `.datasets`; "
                     "batch_size will be validated at runtime / "
-                    "avg_cp_mode=shadow: dataset_class が `.datasets` を持たないため事前のbatch_size検証をスキップします。"
+                    f"avg_cp_mode={avg_cp_mode}: dataset_class が `.datasets` を持たないため事前のbatch_size検証をスキップします。"
                     "batch_size は実行時に検証します"
                 )
 
@@ -2270,14 +2273,15 @@ class NetworkTrainer:
         group_loss_step_header = "global_step,epoch,group,subset_index,loss,ema_loss_group,count_group,timestep,bucket_reso"
         group_loss_step_log_buffer: List[str] = []
         group_loss_last_flush_step = 0
-        if shadow_mode and args.avg_shadow_bank_size < 1:
+        if proxy_scoring_mode and args.avg_shadow_bank_size < 1:
             raise ValueError("avg_shadow_bank_size must be >= 1 / avg_shadow_bank_size は 1 以上で指定してください")
-        shadow_log_jsonl = shadow_mode and bool(getattr(args, "avg_shadow_log_jsonl", True))
+        shadow_log_jsonl = proxy_scoring_mode and bool(getattr(args, "avg_shadow_log_jsonl", True))
+        shadow_log_prefix = "avg_shadow" if shadow_mode else "avg_promote"
         shadow_log_path = (
-            os.path.join(args.output_dir, f"avg_shadow+{model_name_for_logs}.jsonl") if shadow_log_jsonl else None
+            os.path.join(args.output_dir, f"{shadow_log_prefix}+{model_name_for_logs}.jsonl") if shadow_log_jsonl else None
         )
         shadow_candidate_pool: List[Dict[str, Any]] = []
-        shadow_candidate_pool_target_size = max(args.avg_shadow_bank_size * 4, 32) if shadow_mode else 0
+        shadow_candidate_pool_target_size = max(args.avg_shadow_bank_size * 4, 32) if proxy_scoring_mode else 0
         shadow_candidate_pool_final_size: Optional[int] = None
         shadow_bank: List[Dict[str, Any]] = []
         shadow_best_scores = {"raw": None, "center": None, "auto": None}
@@ -2631,6 +2635,13 @@ class NetworkTrainer:
                 shadow_candidate_pool.clear()
             return len(shadow_bank) >= args.avg_shadow_bank_size
 
+        def _reset_optimizer_avg_stats():
+            for p_state in optimizer.state.values():
+                p_state["step"] = p_state.get("step", 0)
+                for buf in ("exp_avg", "exp_avg_sq", "exp_avg_max"):
+                    if buf in p_state and isinstance(p_state[buf], torch.Tensor):
+                        p_state[buf].zero_()
+
         def _save_shadow_best(kind: str, state_dict: Dict[str, torch.Tensor], score: float, epoch_no: int, steps: int):
             if not accelerator.is_main_process:
                 return
@@ -2830,19 +2841,19 @@ class NetworkTrainer:
                     progress_bar.last_print_t = progress_bar.start_t
                     progress_bar_started = True
                 skip_step_flag = False
-                if shadow_mode:
+                if proxy_scoring_mode:
                     step_batch_size, batch_size_source = _infer_runtime_batch_size(batch)
                     if step_batch_size is None:
                         raise ValueError(
-                            "avg_cp_mode=shadow could not infer batch_size from the runtime batch; "
-                            "disable avg_cp_mode=shadow or make the batch expose a batched tensor/list field / "
-                            "avg_cp_mode=shadow は実行時バッチから batch_size を推定できませんでした。"
-                            "avg_cp_mode=shadow を無効化するか、バッチにバッチ軸を持つ tensor/list フィールドを含めてください"
+                            f"avg_cp_mode={avg_cp_mode} could not infer batch_size from the runtime batch; "
+                            f"disable avg_cp_mode={avg_cp_mode} or make the batch expose a batched tensor/list field / "
+                            f"avg_cp_mode={avg_cp_mode} は実行時バッチから batch_size を推定できませんでした。"
+                            f"avg_cp_mode={avg_cp_mode} を無効化するか、バッチにバッチ軸を持つ tensor/list フィールドを含めてください"
                         )
                     if step_batch_size != 1:
                         raise ValueError(
-                            f"avg_cp_mode=shadow supports only batch_size=1. got batch size {step_batch_size} from `{batch_size_source}` at step {step} / "
-                            f"avg_cp_mode=shadow は batch_size=1 のみ対応です。step {step} で `{batch_size_source}` から batch size={step_batch_size} を検出しました"
+                            f"avg_cp_mode={avg_cp_mode} supports only batch_size=1. got batch size {step_batch_size} from `{batch_size_source}` at step {step} / "
+                            f"avg_cp_mode={avg_cp_mode} は batch_size=1 のみ対応です。step {step} で `{batch_size_source}` から batch size={step_batch_size} を検出しました"
                         )
                 if group_loss_log_enabled:
                     step_batch_size, batch_size_source = _infer_runtime_batch_size(batch)
@@ -2980,7 +2991,7 @@ class NetworkTrainer:
                     else:
                         target = noise
                     if (
-                        shadow_mode
+                        proxy_scoring_mode
                         and len(shadow_bank) < args.avg_shadow_bank_size
                         and len(shadow_candidate_pool) < shadow_candidate_pool_target_size
                         and (epoch + 1) / num_train_epochs >= args.avg_begin
@@ -3541,13 +3552,13 @@ class NetworkTrainer:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
-            if shadow_mode:
+            if proxy_scoring_mode:
                 clean_memory_on_device(accelerator.device)
 
             progress_ratio = (epoch + 1) / num_train_epochs
             if args.avg_cp:
                 shadow_log_payload = None
-                if shadow_mode:
+                if proxy_scoring_mode:
                     shadow_log_payload = {
                         "epoch": epoch + 1,
                         "progress": round(progress_ratio, 6),
@@ -3570,6 +3581,11 @@ class NetworkTrainer:
                         "virtual_margin_ok": False,
                         "virtual_win_streak": shadow_virtual_win_streak,
                         "virtual_would_promote": False,
+                        "promote_mode": promote_mode,
+                        "promote_decision": None,
+                        "promote_applied": False,
+                        "next_epoch_source": "raw",
+                        "optimizer_reset_applied": False,
                         "window_epochs": list(cp_window_epochs) if cp_window_epochs is not None else [],
                         "status": "before_avg_begin" if progress_ratio < args.avg_begin else "pending",
                     }
@@ -3580,7 +3596,7 @@ class NetworkTrainer:
                     cp_window.append(raw_sd)
                     cp_window_epochs.append(epoch + 1)
 
-                    if shadow_mode:
+                    if proxy_scoring_mode:
                         shadow_log_payload["window_epochs"] = list(cp_window_epochs)
                         bank_ready = _finalize_shadow_bank_if_ready(is_last_epoch=((epoch + 1) >= num_train_epochs))
                         shadow_log_payload["construction_pool_size"] = _shadow_candidate_pool_size_for_log()
@@ -3614,6 +3630,9 @@ class NetworkTrainer:
                             winner = "center" if margin_ok else "raw"
                             shadow_virtual_win_streak = shadow_virtual_win_streak + 1 if margin_ok else 0
                             would_promote = shadow_virtual_win_streak >= args.avg_shadow_patience
+                            promote_applied = False
+                            optimizer_reset_applied = False
+                            next_epoch_source = "raw"
 
                             shadow_log_payload.update(
                                 {
@@ -3625,6 +3644,7 @@ class NetworkTrainer:
                                     "virtual_margin_ok": margin_ok,
                                     "virtual_win_streak": shadow_virtual_win_streak,
                                     "virtual_would_promote": would_promote,
+                                    "promote_decision": winner,
                                     "status": "scored",
                                 }
                             )
@@ -3643,13 +3663,31 @@ class NetworkTrainer:
                                 shadow_best_scores["auto"] = auto_score
                                 _save_shadow_best("auto", auto_state, auto_score, epoch + 1, global_step)
 
+                            if promote_mode and winner == "center" and would_promote:
+                                unwrapped_network.load_state_dict(avg_sd, strict=False)
+                                promote_applied = True
+                                next_epoch_source = "center"
+                                if args.avg_reset_stats:
+                                    _reset_optimizer_avg_stats()
+                                    optimizer_reset_applied = True
+
+                            shadow_log_payload.update(
+                                {
+                                    "promote_applied": promote_applied,
+                                    "next_epoch_source": next_epoch_source,
+                                    "optimizer_reset_applied": optimizer_reset_applied,
+                                }
+                            )
+
                             logger.info(
-                                "avg_cp shadow epoch %d: raw=%.6f center=%.6f winner=%s streak=%d window=%s",
+                                "avg_cp %s epoch %d: raw=%.6f center=%.6f winner=%s streak=%d promote=%s window=%s",
+                                avg_cp_mode,
                                 epoch + 1,
                                 raw_score,
                                 center_score,
                                 winner,
                                 shadow_virtual_win_streak,
+                                promote_applied,
                                 list(cp_window_epochs),
                             )
 
@@ -3663,11 +3701,7 @@ class NetworkTrainer:
                             avg_sd = average_state_dicts(list(cp_window), args.avg_mode)
                             unwrapped_network.load_state_dict(avg_sd, strict=False)
                             if args.avg_reset_stats:
-                                for p_state in optimizer.state.values():
-                                    p_state["step"] = p_state.get("step", 0)  # keep real count
-                                    for buf in ("exp_avg", "exp_avg_sq", "exp_avg_max"):
-                                        if buf in p_state and isinstance(p_state[buf], torch.Tensor):
-                                            p_state[buf].zero_()
+                                _reset_optimizer_avg_stats()
                             if accelerator.distributed_type != DistributedType.NO:
                                 sd = broadcast(unwrapped_network.state_dict())
                                 unwrapped_network.load_state_dict(sd, strict=False)
@@ -3675,7 +3709,7 @@ class NetworkTrainer:
                             else:
                                 accelerator.wait_for_everyone()
 
-                if shadow_mode:
+                if proxy_scoring_mode:
                     _write_shadow_log(shadow_log_payload)
 
             # end of epoch
@@ -3864,8 +3898,8 @@ def setup_parser() -> argparse.ArgumentParser:
         "--avg_cp_mode",
         type=str,
         default="live",
-        choices=["live", "shadow"],
-        help="avg_cp behavior: live applies averaged weights to training, shadow only scores and saves candidates / avg_cp の動作。live は平均重みを学習へ反映、shadow は採点と保存のみ",
+        choices=["live", "shadow", "promote"],
+        help="avg_cp behavior: live applies averaged weights immediately, shadow scores only, promote adopts center conditionally / avg_cp の動作。live は平均重みを即反映、shadow は採点のみ、promote は条件付きで center を採用",
     )
     parser.add_argument(
         "--avg_mode",
@@ -3884,19 +3918,19 @@ def setup_parser() -> argparse.ArgumentParser:
         "--avg_shadow_margin",
         type=float,
         default=0.003,
-        help="center wins only when center_score < raw_score * (1 - margin) in shadow mode / shadow で center 勝ちとみなす閾値",
+        help="center wins only when center_score < raw_score * (1 - margin) in shadow/promote mode / shadow/promote で center 勝ちとみなす閾値",
     )
     parser.add_argument(
         "--avg_shadow_patience",
         type=int,
         default=2,
-        help="virtual win streak threshold for shadow logging only; no actual promote is performed / shadow ログ用の仮想連勝閾値。実 promote は行わない",
+        help="win streak threshold used by shadow logging and promote gating / shadow ログと promote 判定に使う連勝閾値",
     )
     parser.add_argument(
         "--avg_shadow_log_jsonl",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="write avg_cp shadow epoch logs to jsonl under output_dir / avg_cp shadow の epoch ログを output_dir 配下の jsonl に出力",
+        help="write avg_cp shadow/promote epoch logs to jsonl under output_dir / avg_cp shadow/promote の epoch ログを output_dir 配下の jsonl に出力",
     )
     parser.add_argument(
         "--avg_reset_stats",

@@ -118,10 +118,10 @@ epoch_t   : 0.400
 
 将来的には、この観測結果が十分よさそうなら:
 
-- score の良い center を実際に学習モデルへ promote して次 epoch に進む
+- score の良い center を条件付きで実際に学習モデルへ promote して次 epoch に進む
 
-という拡張につなげる想定だが、今回の実装ではそこまでは行わない。  
-今回はあくまで **raw vs center を同条件で比較し、best を保存し、ログを取るところまで** を実装している。
+という拡張につなげるために、まず `shadow` で観測基盤を作り、その上に `promote` を追加した。  
+`shadow` は **raw vs center を同条件で比較し、best を保存し、ログを取る** モード、`promote` はその比較結果を条件付きで次 epoch に反映するモードである。
 
 ### 目的
 
@@ -131,10 +131,11 @@ epoch_t   : 0.400
 
 ### CLI
 
-- `--avg_cp_mode {live,shadow}`
+- `--avg_cp_mode {live,shadow,promote}`
   - 既定値は `live`
   - `live` は従来どおり、平均後重みをそのまま学習モデルにロードする
   - `shadow` は平均候補を**採点と保存にだけ使い、学習モデルにはロードしない**
+  - `promote` は平均候補を採点し、条件を満たしたときだけ次 epoch 開始点として center を採用する
 - `--avg_shadow_bank_size`
   - 既定値は `12`
   - train_proxy bank に保持する**学習バッチ数**
@@ -143,10 +144,11 @@ epoch_t   : 0.400
   - `center_score < raw_score * (1 - margin)` のときだけ `center` 勝ち
 - `--avg_shadow_patience`
   - 既定値は `2`
-  - virtual streak 計算用のみ。**actual promote はしない**
+  - `shadow` では virtual streak のログ計算に使う
+  - `promote` では center を本採用するための連勝条件にも使う
 - `--avg_shadow_log_jsonl`
   - 既定値は `True`
-  - `output_dir/avg_shadow+<output_name>.jsonl` に epoch ごとの JSONL を出す
+  - `shadow` では `output_dir/avg_shadow+<output_name>.jsonl`、`promote` では `output_dir/avg_promote+<output_name>.jsonl` に epoch ごとの JSONL を出す
 
 ### 実装フロー
 
@@ -155,7 +157,7 @@ epoch_t   : 0.400
 条件:
 
 - `--avg_cp`
-- `--avg_cp_mode shadow`
+- `--avg_cp_mode shadow` または `--avg_cp_mode promote`
 - `--train_batch_size 1`
 - `(epoch + 1) / num_train_epochs >= avg_begin`
 - final bank がまだ未確定
@@ -174,7 +176,7 @@ construction pool について:
 - 例: `avg_shadow_bank_size=12` のとき、construction pool の target は `48`
 - 現実装では **`train_batch_size=1` 専用**
   - `class_tokens` / `image_keys` の多様性判定を 1 サンプル単位で扱う前提のため
-  - `avg_cp_mode=shadow` で `train_batch_size!=1` はエラーにする
+  - `avg_cp_mode=shadow/promote` で `train_batch_size!=1` はエラーにする
 
 保持する情報:
 
@@ -255,6 +257,9 @@ epoch 終端の順番は以下:
 - `avg_cp_mode=shadow`
   - **学習モデルは raw のまま**
   - `cp_window` が `avg_window` に満ち、かつ final bank 完成後のみ採点する
+- `avg_cp_mode=promote`
+  - まず `shadow` と同じ手順で採点する
+  - `margin` と `patience` を満たしたときだけ center を次 epoch 開始点として採用する
 
 #### 4. proxy scoring
 
@@ -319,10 +324,13 @@ score は `train_proxy bank` 上の **mean loss**。
 - `virtual_win_streak`
 - `virtual_would_promote = (virtual_win_streak >= avg_shadow_patience)`
 
-ただし:
+モードごとの差:
 
-- **actual promote は未実装**
-- 学習モデルを center に切り替えることはしない
+- `shadow`
+  - これらは観測とログ専用
+  - 学習モデルを center に切り替えることはしない
+- `promote`
+  - `winner = "center"` かつ `virtual_would_promote = true` のとき、center を次 epoch 開始点として採用する
 
 #### 7. 保存物
 
@@ -416,7 +424,7 @@ shadow 有効時は epoch ごとに 1 行の JSONL を出す。
 - `val_bank` は未実装
 - `adaptive promote` は未実装
 - resume 時は `cp_window` を既存 epoch ckpt から復元するが、**construction pool / final bank / best_* / streak は復元しない**
-- `avg_cp_mode=shadow` は **`train_batch_size=1` のみ対応**
+- `avg_cp_mode=shadow` / `avg_cp_mode=promote` は **`train_batch_size=1` のみ対応**
 - 分散学習では score/save/log は main process で行う
   - ただし bank の all-gather はしていないため、**proxy bank は main process の local shard ベース**
 
@@ -426,3 +434,179 @@ shadow 有効時は epoch ごとに 1 行の JSONL を出す。
 - 判定 loss は学習と同じ helper 経路に寄せている
 - 常時増える VRAM はほぼなく、追加コストは CPU bank と epoch end forward に寄せている
 - `best_raw` / `best_center` / `best_auto` を **1 run から取得できる**
+
+## `avg_cp_mode=promote` の仕様
+
+### 目的
+
+`shadow` で観測していた `raw vs center` 比較を、条件付きで実際の学習継続に反映できるようにする。
+
+初版では複雑化を避け、次の方針に限定する。
+
+- 比較する center 候補は 1 本だけ
+  - つまり `current args.avg_mode` で `cp_window` から作る center のみ
+- promote 判定は fixed proxy bank 上の score に基づく
+- center が継続的に優勢と判断されたときだけ promote する
+- promote 後も averaging 用履歴には **raw endpoint** を使う
+- 複数候補比較、val_bank、adaptive rollback は初版では入れない
+
+### 推奨初期設定
+
+- `avg_window=4`
+- `avg_begin=0.6`
+- center 候補は 1 本のみ
+- proxy bank は既存の diversity-aware fixed bank を使う
+
+### 基本フロー
+
+各 epoch で区別する状態は 2 つある。
+
+- `raw endpoint`
+  - その epoch の実学習終了時点の LoRA state
+- `adopted model`
+  - 次 epoch の開始点として採用する state
+  - promote しなければ raw
+  - promote すれば center
+
+epoch end の流れ:
+
+1. その epoch の学習終了時点を `raw endpoint` として CPU に保持する
+2. `raw endpoint` を `cp_window` に追加する
+3. `cp_window` が `avg_window` 個揃っていれば center を 1 本作る
+4. fixed proxy bank 上で `raw_score` と `center_score` を比較する
+5. promote 条件を満たさなければ、次 epoch は raw で継続する
+6. promote 条件を満たせば、次 epoch は center をロードして開始する
+
+重要:
+
+- 学習継続には promote 済み center を使う
+- ただし averaging 用履歴に積むのは、毎 epoch の **raw endpoint**
+- promote 済み center 自身を履歴に直接積み続けない
+
+この設計により、平均済みモデルの再平均に偏りすぎるのを防ぎつつ、各 epoch の実際の着弾点から center を推定し続ける。
+
+### promote 条件
+
+初版では次の条件をすべて満たしたときだけ promote する。
+
+- `center_score < raw_score * (1 - avg_shadow_margin)`
+- `virtual_win_streak >= avg_shadow_patience`
+
+ここで:
+
+- `avg_shadow_margin`
+  - center がわずかに良いだけでは promote しないための安全弁
+- `avg_shadow_patience`
+  - 1 回勝っただけで採用せず、連続優勢を要求する安全弁
+
+実装では `shadow` と同じ margin / patience をそのまま流用する。
+
+### optimizer state
+
+初版では、promote 時に `avg_reset_stats` 相当を使うことを推奨する。
+
+理由:
+
+- promote は model weights の離散的な置き換えに近い
+- 古い optimizer moments をそのまま引きずると不安定になりやすい
+
+実装:
+
+- `avg_cp_mode=promote` で promote が実行されたときのみ
+  - `args.avg_reset_stats=True` なら optimizer state をリセットする
+- promote が起きなかった epoch では何もしない
+
+### score
+
+score 定義は shadow と同じ。
+
+- fixed proxy bank 上の mean loss
+- lower is better
+
+使用コードパスも shadow と同じにする。
+
+- `NetworkTrainer._get_text_conds_for_batch()`
+- `NetworkTrainer._compute_batch_loss()`
+
+### ログ
+
+JSONL は shadow と同じ形式をベースにしつつ、promote 用に以下の項目を追加する。
+
+- `promote_mode`
+  - promote 評価モードかどうか
+- `promote_decision`
+  - `"raw"` or `"center"`
+- `promote_applied`
+  - その epoch end で実際に center を採用したか
+- `next_epoch_source`
+  - 次 epoch が `raw` 起点か `center` 起点か
+- `optimizer_reset_applied`
+  - promote 時に optimizer reset を行ったか
+
+既存の
+
+- `winner`
+- `virtual_margin_ok`
+- `virtual_win_streak`
+- `virtual_would_promote`
+
+はそのまま残してよい。
+
+### 保存物
+
+初版でも既存の保存物は維持する。
+
+- `best_raw.safetensors`
+- `best_center.safetensors`
+- `best_auto.safetensors`
+
+必要なら将来:
+
+- `best_adopted.safetensors`
+
+を追加できるが、初版では必須ではない。
+
+### 後方互換
+
+- `avg_cp_mode=live` は既存挙動維持
+- `avg_cp_mode=shadow` は既存挙動維持
+- `avg_cp_mode=promote` を使わない限り新しい promote 挙動は走らない
+
+### 初版で入れないもの
+
+- 複数 center 候補の同時比較
+- `uniform/ema/metric` を同時に試して best を選ぶ機能
+- `val_bank`
+- promote 後に raw へ戻す rollback
+- promote 済み center をそのまま履歴 window に積む挙動
+- step 単位の全履歴近似 center
+- sub-epoch snapshot averaging
+
+### 将来拡張
+
+今後の拡張候補:
+
+1. `avg_begin` と `promote_begin` の分離
+2. step EMA center
+3. `val_bank`
+4. 複数候補比較
+
+### `live` との違い
+
+`avg_cp_mode=live` は、以前からある元祖の `avg_cp` 仕様であり、**promote で center を選び続けるのと同じではない**。
+
+主な違い:
+
+- `live`
+  - `avg_window` 到達後は毎回 center を作り、**無条件でそのまま学習モデルへロードする**
+  - `raw vs center` の score 比較をしない
+  - margin / patience を見ない
+  - その時点で学習モデルそのものが平均済み状態に置き換わる
+
+- `promote`
+  - 毎 epoch まず `raw endpoint` を保持し、それを履歴 `cp_window` に積む
+  - raw と center を proxy score で比較する
+  - margin と patience を満たしたときだけ center を採用する
+  - 学習継続には center を使っても、履歴には raw endpoint を使う
+
+つまり `live` は「常時平均を本線へ反映するモード」、`promote` は「score 条件を満たしたときだけ center を本採用するモード」であり、学習軌道も履歴の意味も異なる。
