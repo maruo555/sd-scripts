@@ -12,7 +12,7 @@ import toml
 from collections import Counter, deque
 import numpy as np
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
@@ -1848,6 +1848,7 @@ class NetworkTrainer:
             args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
         avg_cp_mode = getattr(args, "avg_cp_mode", "live")
+        avg_promote_pick = getattr(args, "avg_promote_pick", "fixed")
         shadow_mode = bool(args.avg_cp and avg_cp_mode == "shadow")
         promote_mode = bool(args.avg_cp and avg_cp_mode == "promote")
         proxy_scoring_mode = shadow_mode or promote_mode
@@ -3572,12 +3573,20 @@ class NetworkTrainer:
                         "bank_max_per_image_key": None,
                         "bank_timestep_bins": None,
                         "avg_mode": args.avg_mode,
+                        "avg_promote_pick": avg_promote_pick,
                         "avg_window": args.avg_window,
                         "raw_proxy_loss": None,
                         "center_proxy_loss": None,
+                        "ema_proxy_loss": None,
+                        "uniform_proxy_loss": None,
+                        "best_candidate_mode": None,
+                        "best_candidate_proxy_loss": None,
+                        "selected_candidate_mode": args.avg_mode,
+                        "selected_proxy_loss": None,
                         "delta_abs": None,
                         "delta_pct": None,
                         "winner": None,
+                        "winner_mode": None,
                         "virtual_margin_ok": False,
                         "virtual_win_streak": shadow_virtual_win_streak,
                         "virtual_would_promote": False,
@@ -3610,24 +3619,38 @@ class NetworkTrainer:
                         elif len(cp_window) < args.avg_window:
                             shadow_log_payload["status"] = "waiting_window"
                         elif accelerator.is_main_process:
-                            avg_sd = average_state_dicts(list(cp_window), args.avg_mode)
+                            candidate_state_dicts: Dict[str, Dict[str, torch.Tensor]] = {
+                                "ema": average_state_dicts(list(cp_window), "ema"),
+                                "uniform": average_state_dicts(list(cp_window), "uniform"),
+                            }
+                            if args.avg_mode not in candidate_state_dicts:
+                                candidate_state_dicts[args.avg_mode] = average_state_dicts(list(cp_window), args.avg_mode)
+
                             rng_state = _capture_torch_rng_state()
                             raw_score = None
-                            center_score = None
+                            candidate_scores: Dict[str, float] = {}
                             try:
                                 raw_score = _score_shadow_bank(unwrapped_network)
-                                _restore_torch_rng_state(rng_state)
-                                unwrapped_network.load_state_dict(avg_sd, strict=False)
-                                center_score = _score_shadow_bank(unwrapped_network)
+                                for candidate_mode, candidate_sd in candidate_state_dicts.items():
+                                    _restore_torch_rng_state(rng_state)
+                                    unwrapped_network.load_state_dict(candidate_sd, strict=False)
+                                    candidate_scores[candidate_mode] = _score_shadow_bank(unwrapped_network)
                             finally:
                                 unwrapped_network.load_state_dict(raw_sd, strict=False)
                                 _restore_torch_rng_state(rng_state)
                                 clean_memory_on_device(accelerator.device)
 
-                            delta_abs = center_score - raw_score
+                            center_score = candidate_scores[args.avg_mode]
+                            best_candidate_mode = min(("ema", "uniform"), key=lambda mode: candidate_scores[mode])
+                            best_candidate_score = candidate_scores[best_candidate_mode]
+                            selected_candidate_mode = args.avg_mode if avg_promote_pick == "fixed" else best_candidate_mode
+                            selected_sd = candidate_state_dicts[selected_candidate_mode]
+                            selected_score = candidate_scores[selected_candidate_mode]
+                            delta_abs = selected_score - raw_score
                             delta_pct = (delta_abs / raw_score * 100.0) if raw_score not in (None, 0.0) else None
-                            margin_ok = center_score < raw_score * (1.0 - args.avg_shadow_margin)
+                            margin_ok = selected_score < raw_score * (1.0 - args.avg_shadow_margin)
                             winner = "center" if margin_ok else "raw"
+                            winner_mode = selected_candidate_mode if margin_ok else "raw"
                             shadow_virtual_win_streak = shadow_virtual_win_streak + 1 if margin_ok else 0
                             would_promote = shadow_virtual_win_streak >= args.avg_shadow_patience
                             promote_applied = False
@@ -3638,13 +3661,20 @@ class NetworkTrainer:
                                 {
                                     "raw_proxy_loss": round(raw_score, 10),
                                     "center_proxy_loss": round(center_score, 10),
+                                    "ema_proxy_loss": round(candidate_scores["ema"], 10),
+                                    "uniform_proxy_loss": round(candidate_scores["uniform"], 10),
+                                    "best_candidate_mode": best_candidate_mode,
+                                    "best_candidate_proxy_loss": round(best_candidate_score, 10),
+                                    "selected_candidate_mode": selected_candidate_mode,
+                                    "selected_proxy_loss": round(selected_score, 10),
                                     "delta_abs": round(delta_abs, 10),
                                     "delta_pct": round(delta_pct, 6) if delta_pct is not None else None,
                                     "winner": winner,
+                                    "winner_mode": winner_mode,
                                     "virtual_margin_ok": margin_ok,
                                     "virtual_win_streak": shadow_virtual_win_streak,
                                     "virtual_would_promote": would_promote,
-                                    "promote_decision": winner,
+                                    "promote_decision": winner_mode,
                                     "status": "scored",
                                 }
                             )
@@ -3654,17 +3684,18 @@ class NetworkTrainer:
                                 _save_shadow_best("raw", raw_sd, raw_score, epoch + 1, global_step)
                             if shadow_best_scores["center"] is None or center_score < shadow_best_scores["center"]:
                                 shadow_best_scores["center"] = center_score
-                                _save_shadow_best("center", avg_sd, center_score, epoch + 1, global_step)
+                                _save_shadow_best("center", candidate_state_dicts[args.avg_mode], center_score, epoch + 1, global_step)
 
-                            auto_kind = "center" if center_score < raw_score else "raw"
-                            auto_state = avg_sd if auto_kind == "center" else raw_sd
-                            auto_score = center_score if auto_kind == "center" else raw_score
+                            auto_candidates: Dict[str, Tuple[Dict[str, torch.Tensor], float]] = {"raw": (raw_sd, raw_score)}
+                            for candidate_mode, candidate_sd in candidate_state_dicts.items():
+                                auto_candidates[candidate_mode] = (candidate_sd, candidate_scores[candidate_mode])
+                            _, (auto_state, auto_score) = min(auto_candidates.items(), key=lambda item: item[1][1])
                             if shadow_best_scores["auto"] is None or auto_score < shadow_best_scores["auto"]:
                                 shadow_best_scores["auto"] = auto_score
                                 _save_shadow_best("auto", auto_state, auto_score, epoch + 1, global_step)
 
                             if promote_mode and winner == "center" and would_promote:
-                                unwrapped_network.load_state_dict(avg_sd, strict=False)
+                                unwrapped_network.load_state_dict(selected_sd, strict=False)
                                 promote_applied = True
                                 next_epoch_source = "center"
                                 if args.avg_reset_stats:
@@ -3680,12 +3711,17 @@ class NetworkTrainer:
                             )
 
                             logger.info(
-                                "avg_cp %s epoch %d: raw=%.6f center=%.6f winner=%s streak=%d promote=%s window=%s",
+                                "avg_cp %s epoch %d: raw=%.6f center(%s)=%.6f ema=%.6f uniform=%.6f winner=%s promote_pick=%s selected=%s streak=%d promote=%s window=%s",
                                 avg_cp_mode,
                                 epoch + 1,
                                 raw_score,
+                                args.avg_mode,
                                 center_score,
-                                winner,
+                                candidate_scores["ema"],
+                                candidate_scores["uniform"],
+                                winner_mode,
+                                avg_promote_pick,
+                                selected_candidate_mode,
                                 shadow_virtual_win_streak,
                                 promote_applied,
                                 list(cp_window_epochs),
@@ -3907,6 +3943,13 @@ def setup_parser() -> argparse.ArgumentParser:
         default="ema",
         choices=["uniform", "ema", "metric"],
         help="averaging mode: uniform, ema or metric / 平均化モード",
+    )
+    parser.add_argument(
+        "--avg_promote_pick",
+        type=str,
+        default="fixed",
+        choices=["fixed", "best"],
+        help="promote candidate selection: fixed uses avg_mode, best picks the better of ema/uniform on proxy bank / promote 候補の選び方。fixed は avg_mode を使用、best は proxy bank 上で ema/uniform の良い方を使う",
     )
     parser.add_argument(
         "--avg_shadow_bank_size",
