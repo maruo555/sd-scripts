@@ -59,11 +59,16 @@
 | **安定化・平均化関連** |  |  |  |
 | `--grad_norm_mode`（独自） | stable または stable_no_threshoff | skip_grad_norm の推奨プリセット | スパイクとなるstepの学習をskipして安定重視の挙動に寄せる stableの設定がいいと思っていたが、stable_no_threshoff でもいいかもしれない |
 | `--rank_log`（独自） | 有効 | rank の変動や傾向を確認するためのログ出力 | 解析用のログを残すオプション 学習中の rank の挙動や偏りを後から見返したいときに役立つ |
+| `--rank_log_mode`（独自） | per_module | rank_log の集計粒度 | `per_module` はモジュールごとに記録する 詳しく傾向を見たいとき向け |
 | `--avg_cp`（独自） | 有効 | エポック平均（SWA/EMA 相当）を有効化 | LoRA 部分のみが対象 エポックを重みづけ平均しながら学習を進める(安定熟成狙い) |
+| `--avg_cp_mode`（独自） | promote | avg_cp の動作モード | `live` は従来どおり平均重みをそのまま学習へ反映 `shadow` は raw と center を比較してログと best 保存だけ行う `promote` は比較結果が良いときだけ center を次 epoch に採用 推奨は `promote` |
 | `--avg_window`（独自） | 4 | 平均に使う ckpt 数 | 窓サイズ |
 | `--avg_begin`（独自） | 0.6 | 平均を開始する進行率 | 進行率 60% 以降 |
 | `--avg_mode`（独自） | ema | 平均方法 | 直近ほど重くする EMA |
-| `--avg_reset_stats`（独自） | 有効 | 平均後に optimizer 統計をリセット | 発散抑制の安全策 |
+| `--avg_promote_pick`（独自） | fixed | promote 候補の選び方 | `fixed` は `avg_mode` で指定した候補を使う `best` は proxy bank 上で `ema` と `uniform` の良い方を選ぶ |
+| `--avg_shadow_bank_size`（独自） | 12 | proxy bank に保持するサンプル数 | 学習タグが多い場合は必要に応じて数を増やす |
+| `--avg_save_last_candidates`（独自） | 無効 | 最終 raw / center を追加保存 | `shadow` / `promote` 専用 `<output_name>_raw.safetensors` と `<output_name>_center.safetensors` を保存する |
+| `--avg_reset_stats`（独自） | `--no-avg_reset_stats` | 平均後に optimizer 統計をリセット | 推奨は `--no-avg_reset_stats` `promote` ではまず reset なしを試し、不安定なら戻す `live` も伸び鈍化が気になるなら reset なしを試す価値が高い |
 | `--fp16_safe_norms`（独自） | 有効 | fp16 + 小バッチで学習安定性を向上 | フェイク量子化とセットで運用 |
 | **学習率スケジュール** |  |  |  |
 | `--lr_scheduler` | constant_with_warmup | 学習率スケジューラ | 初期のみ 学習率をwarmup (最初に学習率0→指定値まで線形に上昇) |

@@ -1,9 +1,9 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import os
 import re
 import logging
 import torch
-from safetensors.torch import load_file as load_safetensors
+from safetensors.torch import load_file as load_safetensors, save_file as save_safetensors
 
 
 def filter_lora_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -47,7 +47,24 @@ def load_lora_state_dict(path: str) -> Dict[str, torch.Tensor]:
     return filter_lora_state_dict(sd)
 
 
-def collect_last_checkpoints(output_dir: str, model_name: str, ext: str, n: int) -> List[str]:
+def save_lora_state_dict(
+    path: str, state_dict: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None, metadata: Optional[Dict[str, str]] = None
+):
+    save_sd = {}
+    for key, value in state_dict.items():
+        tensor = value.detach().cpu()
+        if dtype is not None:
+            tensor = tensor.to(dtype)
+        save_sd[key] = tensor
+
+    ext = os.path.splitext(path)[1]
+    if ext == ".safetensors":
+        save_safetensors(save_sd, path, metadata=metadata)
+    else:
+        torch.save(save_sd, path)
+
+
+def collect_last_checkpoints_with_epochs(output_dir: str, model_name: str, ext: str, n: int) -> List[Tuple[int, str]]:
     pattern = re.compile(re.escape(model_name) + r"-(\d{6})" + re.escape(ext) + "$")
     files = []
     for f in os.listdir(output_dir):
@@ -55,4 +72,8 @@ def collect_last_checkpoints(output_dir: str, model_name: str, ext: str, n: int)
         if m:
             files.append((int(m.group(1)), os.path.join(output_dir, f)))
     files.sort()
-    return [p for _, p in files[-n:]]
+    return files[-n:]
+
+
+def collect_last_checkpoints(output_dir: str, model_name: str, ext: str, n: int) -> List[str]:
+    return [p for _, p in collect_last_checkpoints_with_epochs(output_dir, model_name, ext, n)]

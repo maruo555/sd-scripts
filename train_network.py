@@ -9,10 +9,10 @@ import json
 from dataclasses import dataclass
 from multiprocessing import Value
 import toml
-from collections import deque
+from collections import Counter, deque
 import numpy as np
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from tqdm import tqdm
 
@@ -47,8 +47,9 @@ from library.custom_train_functions import (
 from library.avg_ckpt_util import (
     average_state_dicts,
     filter_lora_state_dict,
-    collect_last_checkpoints,
+    collect_last_checkpoints_with_epochs,
     load_lora_state_dict,
+    save_lora_state_dict,
 )
 from library.utils import setup_logging, add_logging_arguments
 from library.rounding_util import round_parameters
@@ -713,6 +714,81 @@ class NetworkTrainer:
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
 
+    def _set_network_multiplier_from_batch(self, network, batch):
+        if not hasattr(network, "set_multiplier") or "network_multipliers" not in batch or batch["network_multipliers"] is None:
+            return
+
+        multipliers = batch["network_multipliers"]
+        if isinstance(multipliers, torch.Tensor):
+            if torch.all(multipliers == multipliers[0]):
+                multipliers = multipliers.reshape(-1)[0].item()
+            else:
+                raise NotImplementedError("multipliers for each sample is not supported yet")
+        network.set_multiplier(multipliers)
+
+    def _get_text_conds_for_batch(self, args, accelerator, batch, tokenizers, text_encoders, weight_dtype, grad_enabled: bool):
+        with torch.set_grad_enabled(grad_enabled), accelerator.autocast():
+            if args.weighted_captions:
+                tokenizer_arg = tokenizers if len(tokenizers) != 1 else tokenizers[0]
+                text_encoder_arg = text_encoders if len(text_encoders) != 1 else text_encoders[0]
+                return get_weighted_text_embeddings(
+                    tokenizer_arg,
+                    text_encoder_arg,
+                    batch["captions"],
+                    accelerator.device,
+                    args.max_token_length // 75 if args.max_token_length else 1,
+                    clip_skip=args.clip_skip,
+                )
+            return self.get_text_cond(args, accelerator, batch, tokenizers, text_encoders, weight_dtype)
+
+    def _compute_batch_loss(
+        self,
+        args,
+        accelerator,
+        batch,
+        noise_scheduler,
+        unet,
+        text_encoder_conds,
+        noisy_latents,
+        timesteps,
+        target,
+        huber_c,
+        weight_dtype,
+        train_unet: bool,
+    ):
+        with accelerator.autocast():
+            noise_pred = self.call_unet(
+                args,
+                accelerator,
+                unet,
+                noisy_latents.requires_grad_(train_unet),
+                timesteps,
+                text_encoder_conds,
+                batch,
+                weight_dtype,
+            )
+
+        loss = train_util.conditional_loss(
+            noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+        )
+        if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+            loss = apply_masked_loss(loss, batch)
+        loss = loss.mean([1, 2, 3])
+
+        loss_weights = batch["loss_weights"]
+        loss = loss * loss_weights
+
+        if args.min_snr_gamma:
+            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
+        if args.scale_v_pred_loss_like_noise_pred:
+            loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
+        if args.v_pred_like_loss:
+            loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
+        if args.debiased_estimation_loss:
+            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
+
+        return loss.mean()
+
     def train(self, args):
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
@@ -1307,7 +1383,6 @@ class NetworkTrainer:
             )
         if network is None:
             return
-        network_has_multiplier = hasattr(network, "set_multiplier")
 
         if hasattr(network, "prepare_network"):
             network.prepare_network(args)
@@ -1772,12 +1847,26 @@ class NetworkTrainer:
         if (args.save_n_epoch_ratio is not None) and (args.save_n_epoch_ratio > 0):
             args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
 
+        avg_cp_mode = getattr(args, "avg_cp_mode", "live")
+        avg_promote_pick = getattr(args, "avg_promote_pick", "fixed")
+        shadow_mode = bool(args.avg_cp and avg_cp_mode == "shadow")
+        promote_mode = bool(args.avg_cp and avg_cp_mode == "promote")
+        proxy_scoring_mode = shadow_mode or promote_mode
+        if proxy_scoring_mode and getattr(args, "resume", False):
+            raise ValueError(f"avg_cp_mode={avg_cp_mode} does not support resume yet / avg_cp_mode={avg_cp_mode} は resume 未対応です")
+        if proxy_scoring_mode and accelerator.num_processes > 1:
+            raise ValueError(
+                f"avg_cp_mode={avg_cp_mode} does not support multi-GPU or distributed training yet / "
+                f"avg_cp_mode={avg_cp_mode} は複数GPU・分散学習に未対応です"
+            )
         cp_window = deque(maxlen=args.avg_window) if args.avg_cp else None
+        cp_window_epochs = deque(maxlen=args.avg_window) if args.avg_cp else None
         if args.avg_cp and args.resume:
             ext = "." + args.save_model_as
             model_name = train_util.default_if_none(args.output_name, train_util.DEFAULT_EPOCH_NAME)
-            for p in collect_last_checkpoints(args.output_dir, model_name, ext, args.avg_window):
+            for epoch_no, p in collect_last_checkpoints_with_epochs(args.output_dir, model_name, ext, args.avg_window):
                 cp_window.append(load_lora_state_dict(p))
+                cp_window_epochs.append(epoch_no)
 
         # 学習する
         # TODO: find a way to handle total batch size when there are multiple datasets
@@ -1809,6 +1898,23 @@ class NetworkTrainer:
                     "group_loss_log: dataset-level batch_size check is skipped because dataset_class does not expose `.datasets`; "
                     "batch_size will be validated at runtime / "
                     "group_loss_log: dataset_class が `.datasets` を持たないため事前のbatch_size検証をスキップします。"
+                    "batch_size は実行時に検証します"
+                )
+
+        if proxy_scoring_mode:
+            datasets_for_check = getattr(train_dataset_group, "datasets", None)
+            if isinstance(datasets_for_check, (list, tuple)) and len(datasets_for_check) > 0:
+                dataset_batch_sizes = [int(getattr(d, "batch_size", -1)) for d in datasets_for_check]
+                if any(bs != 1 for bs in dataset_batch_sizes):
+                    raise ValueError(
+                        f"avg_cp_mode={avg_cp_mode} supports only batch_size=1 datasets. found: {dataset_batch_sizes} / "
+                        f"avg_cp_mode={avg_cp_mode} は batch_size=1 のデータセットのみ対応です。検出値: {dataset_batch_sizes}"
+                    )
+            else:
+                logger.info(
+                    f"avg_cp_mode={avg_cp_mode}: dataset-level batch_size check is skipped because dataset_class does not expose `.datasets`; "
+                    "batch_size will be validated at runtime / "
+                    f"avg_cp_mode={avg_cp_mode}: dataset_class が `.datasets` を持たないため事前のbatch_size検証をスキップします。"
                     "batch_size は実行時に検証します"
                 )
 
@@ -2168,6 +2274,20 @@ class NetworkTrainer:
         group_loss_step_header = "global_step,epoch,group,subset_index,loss,ema_loss_group,count_group,timestep,bucket_reso"
         group_loss_step_log_buffer: List[str] = []
         group_loss_last_flush_step = 0
+        if proxy_scoring_mode and args.avg_shadow_bank_size < 1:
+            raise ValueError("avg_shadow_bank_size must be >= 1 / avg_shadow_bank_size は 1 以上で指定してください")
+        shadow_log_jsonl = proxy_scoring_mode and bool(getattr(args, "avg_shadow_log_jsonl", True))
+        shadow_log_prefix = "avg_shadow" if shadow_mode else "avg_promote"
+        shadow_log_path = (
+            os.path.join(args.output_dir, f"{shadow_log_prefix}+{model_name_for_logs}.jsonl") if shadow_log_jsonl else None
+        )
+        shadow_candidate_pool: List[Dict[str, Any]] = []
+        shadow_candidate_pool_target_size = max(args.avg_shadow_bank_size * 4, 32) if proxy_scoring_mode else 0
+        shadow_candidate_pool_final_size: Optional[int] = None
+        shadow_bank: List[Dict[str, Any]] = []
+        shadow_virtual_win_streak = 0
+        final_avg_raw_sd: Optional[Dict[str, torch.Tensor]] = None
+        final_avg_center_sd: Optional[Dict[str, torch.Tensor]] = None
 
         def _group_csv_escape(value):
             if value is None:
@@ -2251,7 +2371,7 @@ class NetworkTrainer:
                 return value[0]
             return value
 
-        def _infer_group_loss_batch_size(batch):
+        def _infer_runtime_batch_size(batch):
             preferred_keys = (
                 "loss_weights",
                 "latents",
@@ -2291,6 +2411,310 @@ class NetworkTrainer:
                     return size, key
 
             return None, None
+
+        def _shadow_to_cpu(value, compact_float: bool = False):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach().cpu().clone()
+                if compact_float and torch.is_floating_point(tensor):
+                    tensor = tensor.to(torch.float16)
+                return tensor
+            if isinstance(value, list):
+                return list(value)
+            if isinstance(value, tuple):
+                return list(value)
+            return value
+
+        def _shadow_normalize_labels(values):
+            if values is None:
+                return []
+            if not isinstance(values, (list, tuple)):
+                values = [values]
+            normalized = []
+            for value in values:
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text == "":
+                    continue
+                normalized.append(text)
+            return normalized
+
+        def _shadow_primary_label(values):
+            labels = _shadow_normalize_labels(values)
+            if len(labels) < 1:
+                return None
+            unique = list(dict.fromkeys(labels))
+            if len(unique) == 1:
+                return unique[0]
+            return "||".join(unique)
+
+        def _collect_shadow_bank_item(batch, noisy_latents, target, timesteps, huber_c):
+            item: Dict[str, Any] = {
+                "noisy_latents": _shadow_to_cpu(noisy_latents, compact_float=True),
+                "target": _shadow_to_cpu(target, compact_float=True),
+                "timesteps": _shadow_to_cpu(timesteps),
+                "huber_c": _shadow_to_cpu(huber_c),
+                "loss_weights": _shadow_to_cpu(batch["loss_weights"]),
+            }
+            tensor_keys = (
+                "input_ids",
+                "input_ids2",
+                "network_multipliers",
+                "alpha_masks",
+                "original_sizes_hw",
+                "crop_top_lefts",
+                "target_sizes_hw",
+                "text_encoder_outputs1_list",
+                "text_encoder_outputs2_list",
+                "text_encoder_pool2_list",
+            )
+            compact_float_keys = {"alpha_masks", "text_encoder_outputs1_list", "text_encoder_outputs2_list", "text_encoder_pool2_list"}
+            for key in tensor_keys:
+                if key in batch and batch[key] is not None:
+                    item[key] = _shadow_to_cpu(batch[key], compact_float=(key in compact_float_keys))
+            if "captions" in batch and batch["captions"] is not None:
+                item["captions"] = list(batch["captions"])
+            if "image_keys" in batch and batch["image_keys"] is not None:
+                item["image_keys"] = list(batch["image_keys"])
+            if "class_tokens" in batch and batch["class_tokens"] is not None:
+                item["class_tokens"] = list(batch["class_tokens"])
+            item["shadow_primary_class_token"] = _shadow_primary_label(item.get("class_tokens"))
+            item["shadow_primary_image_key"] = _shadow_primary_label(item.get("image_keys"))
+            return item
+
+        def _materialize_shadow_batch(item):
+            runtime_batch: Dict[str, Any] = {}
+            for key, value in item.items():
+                if key in (
+                    "noisy_latents",
+                    "target",
+                    "timesteps",
+                    "huber_c",
+                    "shadow_primary_class_token",
+                    "shadow_primary_image_key",
+                ):
+                    continue
+                if isinstance(value, torch.Tensor):
+                    runtime_batch[key] = value.to(accelerator.device)
+                elif isinstance(value, list):
+                    runtime_batch[key] = list(value)
+                else:
+                    runtime_batch[key] = value
+
+            noisy_latents = item["noisy_latents"].to(accelerator.device, dtype=weight_dtype)
+            target = item["target"].to(accelerator.device, dtype=weight_dtype)
+            timesteps = item["timesteps"].to(accelerator.device)
+            huber_c_value = item.get("huber_c")
+            huber_c_runtime = huber_c_value.to(accelerator.device, dtype=weight_dtype) if isinstance(huber_c_value, torch.Tensor) else huber_c_value
+            return runtime_batch, noisy_latents, target, timesteps, huber_c_runtime
+
+        def _write_shadow_log(payload: Dict[str, Any]):
+            if not shadow_log_jsonl or not accelerator.is_main_process or shadow_log_path is None:
+                return
+            dirpath = os.path.dirname(shadow_log_path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+            with open(shadow_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        def _shadow_select_final_bank(candidate_pool: List[Dict[str, Any]]):
+            if len(candidate_pool) < args.avg_shadow_bank_size:
+                return []
+
+            grouped_candidates: Dict[str, List[Dict[str, Any]]] = {}
+            group_order: List[str] = []
+            for item in candidate_pool:
+                class_key = item.get("shadow_primary_class_token") or "__no_class_tokens__"
+                if class_key not in grouped_candidates:
+                    grouped_candidates[class_key] = []
+                    group_order.append(class_key)
+                grouped_candidates[class_key].append(item)
+
+            selected: List[Dict[str, Any]] = []
+            used_item_ids = set()
+            used_image_keys = set()
+
+            while len(selected) < args.avg_shadow_bank_size:
+                made_progress = False
+                for class_key in group_order:
+                    candidates = grouped_candidates[class_key]
+                    selected_item = None
+                    fallback_item = None
+                    for item in candidates:
+                        item_id = id(item)
+                        if item_id in used_item_ids:
+                            continue
+                        if fallback_item is None:
+                            fallback_item = item
+                        image_key = item.get("shadow_primary_image_key")
+                        if image_key is None or image_key not in used_image_keys:
+                            selected_item = item
+                            break
+                    if selected_item is None:
+                        selected_item = fallback_item
+                    if selected_item is None:
+                        continue
+
+                    item_id = id(selected_item)
+                    used_item_ids.add(item_id)
+                    image_key = selected_item.get("shadow_primary_image_key")
+                    if image_key is not None:
+                        used_image_keys.add(image_key)
+                    selected.append(selected_item)
+                    made_progress = True
+
+                    if len(selected) >= args.avg_shadow_bank_size:
+                        break
+
+                if not made_progress:
+                    break
+
+            if len(selected) < args.avg_shadow_bank_size:
+                for item in candidate_pool:
+                    item_id = id(item)
+                    if item_id in used_item_ids:
+                        continue
+                    selected.append(item)
+                    used_item_ids.add(item_id)
+                    if len(selected) >= args.avg_shadow_bank_size:
+                        break
+
+            return selected
+
+        def _shadow_timestep_bins(items: List[Dict[str, Any]]):
+            total_timesteps = int(noise_scheduler.config.num_train_timesteps)
+            low_cut = total_timesteps // 3
+            high_cut = (total_timesteps * 2) // 3
+            bins = {"low": 0, "mid": 0, "high": 0}
+            for item in items:
+                timesteps_tensor = item.get("timesteps")
+                if not isinstance(timesteps_tensor, torch.Tensor):
+                    continue
+                for timestep in timesteps_tensor.reshape(-1).tolist():
+                    timestep_value = int(timestep)
+                    if timestep_value < low_cut:
+                        bins["low"] += 1
+                    elif timestep_value < high_cut:
+                        bins["mid"] += 1
+                    else:
+                        bins["high"] += 1
+            return bins
+
+        def _shadow_bank_metadata(items: List[Dict[str, Any]]):
+            class_counter: Counter = Counter()
+            image_counter: Counter = Counter()
+            for item in items:
+                class_counter.update(_shadow_normalize_labels(item.get("class_tokens")))
+                image_counter.update(_shadow_normalize_labels(item.get("image_keys")))
+
+            return {
+                "bank_unique_class_tokens": len(class_counter),
+                "bank_max_per_class_tokens": max(class_counter.values()) if len(class_counter) > 0 else 0,
+                "bank_unique_image_keys": len(image_counter),
+                "bank_max_per_image_key": max(image_counter.values()) if len(image_counter) > 0 else 0,
+                "bank_timestep_bins": _shadow_timestep_bins(items),
+            }
+
+        def _shadow_candidate_pool_size_for_log():
+            if shadow_candidate_pool_final_size is not None:
+                return shadow_candidate_pool_final_size
+            return len(shadow_candidate_pool)
+
+        def _finalize_shadow_bank_if_ready(is_last_epoch: bool):
+            nonlocal shadow_candidate_pool_final_size
+            if len(shadow_bank) > 0:
+                return True
+            if len(shadow_candidate_pool) < args.avg_shadow_bank_size:
+                return False
+            if len(shadow_candidate_pool) < shadow_candidate_pool_target_size and not is_last_epoch:
+                return False
+
+            shadow_bank.extend(_shadow_select_final_bank(shadow_candidate_pool))
+            if len(shadow_bank) >= args.avg_shadow_bank_size:
+                shadow_candidate_pool_final_size = len(shadow_candidate_pool)
+                shadow_candidate_pool.clear()
+            return len(shadow_bank) >= args.avg_shadow_bank_size
+
+        def _reset_optimizer_avg_stats():
+            for p_state in optimizer.state.values():
+                p_state["step"] = p_state.get("step", 0)
+                for buf in ("exp_avg", "exp_avg_sq", "exp_avg_max"):
+                    if buf in p_state and isinstance(p_state[buf], torch.Tensor):
+                        p_state[buf].zero_()
+
+        def _save_avg_candidate(kind: str, state_dict: Dict[str, torch.Tensor], epoch_no: int, steps: int):
+            if not accelerator.is_main_process:
+                return
+            os.makedirs(args.output_dir, exist_ok=True)
+            save_sd = {}
+            for key, value in state_dict.items():
+                tensor = value.detach().cpu()
+                if save_dtype is not None:
+                    tensor = tensor.to(save_dtype)
+                save_sd[key] = tensor
+            metadata["ss_training_finished_at"] = str(time.time())
+            metadata["ss_steps"] = str(steps)
+            metadata["ss_epoch"] = str(epoch_no)
+            metadata_to_save = dict(minimum_metadata if args.no_metadata else metadata)
+            metadata_to_save.update(train_util.get_sai_model_spec(None, args, self.is_sdxl, True, False))
+            metadata_to_save["ss_avg_shadow_variant"] = kind
+            model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(save_sd, metadata_to_save)
+            metadata_to_save["sshs_model_hash"] = model_hash
+            metadata_to_save["sshs_legacy_hash"] = legacy_hash
+            model_name = train_util.default_if_none(args.output_name, train_util.DEFAULT_LAST_OUTPUT_NAME)
+            save_lora_state_dict(
+                os.path.join(args.output_dir, f"{model_name}_{kind}.safetensors"), save_sd, dtype=None, metadata=metadata_to_save
+            )
+
+        def _capture_torch_rng_state():
+            state = {"cpu": torch.get_rng_state()}
+            if accelerator.device.type == "cuda" and torch.cuda.is_available():
+                state["cuda"] = torch.cuda.get_rng_state(accelerator.device)
+            return state
+
+        def _restore_torch_rng_state(state):
+            torch.set_rng_state(state["cpu"])
+            if "cuda" in state:
+                torch.cuda.set_rng_state(state["cuda"], accelerator.device)
+
+        def _score_shadow_bank(unwrapped_network):
+            if len(shadow_bank) < args.avg_shadow_bank_size:
+                return None
+
+            total_loss = 0.0
+            total_weight = 0
+            with torch.no_grad():
+                for item in shadow_bank:
+                    runtime_batch, noisy_latents_rt, target_rt, timesteps_rt, huber_c_rt = _materialize_shadow_batch(item)
+                    self._set_network_multiplier_from_batch(unwrapped_network, runtime_batch)
+                    text_encoder_conds = self._get_text_conds_for_batch(
+                        args, accelerator, runtime_batch, tokenizers, text_encoders, weight_dtype, grad_enabled=False
+                    )
+                    loss = self._compute_batch_loss(
+                        args,
+                        accelerator,
+                        runtime_batch,
+                        noise_scheduler,
+                        unet,
+                        text_encoder_conds,
+                        noisy_latents_rt,
+                        timesteps_rt,
+                        target_rt,
+                        huber_c_rt,
+                        weight_dtype,
+                        train_unet=False,
+                    )
+                    batch_size_for_score = int(runtime_batch["loss_weights"].shape[0])
+                    total_loss += loss.detach().item() * batch_size_for_score
+                    total_weight += batch_size_for_score
+                    del runtime_batch, noisy_latents_rt, target_rt, timesteps_rt, huber_c_rt, text_encoder_conds, loss
+
+            clean_memory_on_device(accelerator.device)
+            if total_weight < 1:
+                return None
+            return total_loss / total_weight
 
         if group_loss_log_enabled:
             group_loss_ema_beta = float(getattr(args, "group_loss_ema_beta", 0.98))
@@ -2419,8 +2843,22 @@ class NetworkTrainer:
                     progress_bar.last_print_t = progress_bar.start_t
                     progress_bar_started = True
                 skip_step_flag = False
+                if proxy_scoring_mode:
+                    step_batch_size, batch_size_source = _infer_runtime_batch_size(batch)
+                    if step_batch_size is None:
+                        raise ValueError(
+                            f"avg_cp_mode={avg_cp_mode} could not infer batch_size from the runtime batch; "
+                            f"disable avg_cp_mode={avg_cp_mode} or make the batch expose a batched tensor/list field / "
+                            f"avg_cp_mode={avg_cp_mode} は実行時バッチから batch_size を推定できませんでした。"
+                            f"avg_cp_mode={avg_cp_mode} を無効化するか、バッチにバッチ軸を持つ tensor/list フィールドを含めてください"
+                        )
+                    if step_batch_size != 1:
+                        raise ValueError(
+                            f"avg_cp_mode={avg_cp_mode} supports only batch_size=1. got batch size {step_batch_size} from `{batch_size_source}` at step {step} / "
+                            f"avg_cp_mode={avg_cp_mode} は batch_size=1 のみ対応です。step {step} で `{batch_size_source}` から batch size={step_batch_size} を検出しました"
+                        )
                 if group_loss_log_enabled:
-                    step_batch_size, batch_size_source = _infer_group_loss_batch_size(batch)
+                    step_batch_size, batch_size_source = _infer_runtime_batch_size(batch)
                     if step_batch_size is None:
                         raise ValueError(
                             "group_loss_log could not infer batch_size from the runtime batch; "
@@ -2526,32 +2964,7 @@ class NetworkTrainer:
                             latents = torch.nan_to_num(latents, 0, out=latents)
                     latents = latents * self.vae_scale_factor
 
-                    # get multiplier for each sample
-                    if network_has_multiplier:
-                        multipliers = batch["network_multipliers"]
-                        # if all multipliers are same, use single multiplier
-                        if torch.all(multipliers == multipliers[0]):
-                            multipliers = multipliers[0].item()
-                        else:
-                            raise NotImplementedError("multipliers for each sample is not supported yet")
-                        # print(f"set multiplier: {multipliers}")
-                        accelerator.unwrap_model(network).set_multiplier(multipliers)
-
-                    with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
-                        # Get the text embedding for conditioning
-                        if args.weighted_captions:
-                            text_encoder_conds = get_weighted_text_embeddings(
-                                tokenizer,
-                                text_encoder,
-                                batch["captions"],
-                                accelerator.device,
-                                args.max_token_length // 75 if args.max_token_length else 1,
-                                clip_skip=args.clip_skip,
-                            )
-                        else:
-                            text_encoder_conds = self.get_text_cond(
-                                args, accelerator, batch, tokenizers, text_encoders, weight_dtype
-                            )
+                    self._set_network_multiplier_from_batch(accelerator.unwrap_model(network), batch)
 
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
@@ -2562,6 +2975,11 @@ class NetworkTrainer:
                     )
                     step_timestep = _extract_first(timesteps)
 
+                    with torch.set_grad_enabled(train_text_encoder):
+                        text_encoder_conds = self._get_text_conds_for_batch(
+                            args, accelerator, batch, tokenizers, text_encoders, weight_dtype, grad_enabled=train_text_encoder
+                        )
+
                     # ensure the hidden state will require grad
                     if args.gradient_checkpointing:
                         for x in noisy_latents:
@@ -2569,45 +2987,33 @@ class NetworkTrainer:
                         for t in text_encoder_conds:
                             t.requires_grad_(True)
 
-                    # Predict the noise residual
-                    with accelerator.autocast():
-                        noise_pred = self.call_unet(
-                            args,
-                            accelerator,
-                            unet,
-                            noisy_latents.requires_grad_(train_unet),
-                            timesteps,
-                            text_encoder_conds,
-                            batch,
-                            weight_dtype,
-                        )
-
                     if args.v_parameterization:
                         # v-parameterization training
                         target = noise_scheduler.get_velocity(latents, noise, timesteps)
                     else:
                         target = noise
+                    if (
+                        proxy_scoring_mode
+                        and len(shadow_bank) < args.avg_shadow_bank_size
+                        and len(shadow_candidate_pool) < shadow_candidate_pool_target_size
+                        and (epoch + 1) / num_train_epochs >= args.avg_begin
+                    ):
+                        shadow_candidate_pool.append(_collect_shadow_bank_item(batch, noisy_latents, target, timesteps, huber_c))
 
-                    loss = train_util.conditional_loss(
-                        noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+                    loss = self._compute_batch_loss(
+                        args,
+                        accelerator,
+                        batch,
+                        noise_scheduler,
+                        unet,
+                        text_encoder_conds,
+                        noisy_latents,
+                        timesteps,
+                        target,
+                        huber_c,
+                        weight_dtype,
+                        train_unet=train_unet,
                     )
-                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                        loss = apply_masked_loss(loss, batch)
-                    loss = loss.mean([1, 2, 3])
-
-                    loss_weights = batch["loss_weights"]  # 各sampleごとのweight
-                    loss = loss * loss_weights
-
-                    if args.min_snr_gamma:
-                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
-                    if args.scale_v_pred_loss_like_noise_pred:
-                        loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
-                    if args.v_pred_like_loss:
-                        loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
-                    if args.debiased_estimation_loss:
-                        loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
-
-                    loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
                     accelerator.backward(loss)
                     loss_scalar = loss.detach().item()
@@ -3148,29 +3554,189 @@ class NetworkTrainer:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
+            if proxy_scoring_mode:
+                clean_memory_on_device(accelerator.device)
 
-            if args.avg_cp and (epoch + 1) / num_train_epochs >= args.avg_begin:
-                sd = filter_lora_state_dict(accelerator.unwrap_model(network).state_dict())
-                cp_window.append(sd)
-                if len(cp_window) == args.avg_window:
-                    start_ep = epoch - args.avg_window + 2
-                    if start_ep < 1:
-                        start_ep = 1
-                    logger.info(f"averaging checkpoints from epoch {start_ep} to {epoch + 1}")
-                    avg_sd = average_state_dicts(list(cp_window), args.avg_mode)
-                    accelerator.unwrap_model(network).load_state_dict(avg_sd, strict=False)
-                    if args.avg_reset_stats:
-                        for p_state in optimizer.state.values():
-                            p_state["step"] = p_state.get("step", 0)  # keep real count
-                            for buf in ("exp_avg", "exp_avg_sq", "exp_avg_max"):
-                                if buf in p_state and isinstance(p_state[buf], torch.Tensor):
-                                    p_state[buf].zero_()
-                    if accelerator.distributed_type != DistributedType.NO:
-                        sd = broadcast(accelerator.unwrap_model(network).state_dict())
-                        accelerator.unwrap_model(network).load_state_dict(sd, strict=False)
+            progress_ratio = (epoch + 1) / num_train_epochs
+            if args.avg_cp:
+                shadow_log_payload = None
+                if proxy_scoring_mode:
+                    shadow_log_payload = {
+                        "epoch": epoch + 1,
+                        "progress": round(progress_ratio, 6),
+                        "construction_pool_size": _shadow_candidate_pool_size_for_log(),
+                        "construction_pool_target_size": shadow_candidate_pool_target_size,
+                        "bank_ready": len(shadow_bank) >= args.avg_shadow_bank_size,
+                        "bank_size": len(shadow_bank),
+                        "bank_unique_class_tokens": None,
+                        "bank_max_per_class_tokens": None,
+                        "bank_unique_image_keys": None,
+                        "bank_max_per_image_key": None,
+                        "bank_timestep_bins": None,
+                        "avg_mode": args.avg_mode,
+                        "avg_promote_pick": avg_promote_pick,
+                        "avg_window": args.avg_window,
+                        "raw_proxy_loss": None,
+                        "center_proxy_loss": None,
+                        "ema_proxy_loss": None,
+                        "uniform_proxy_loss": None,
+                        "best_candidate_mode": None,
+                        "best_candidate_proxy_loss": None,
+                        "selected_candidate_mode": args.avg_mode,
+                        "selected_proxy_loss": None,
+                        "delta_abs": None,
+                        "delta_pct": None,
+                        "winner": None,
+                        "winner_mode": None,
+                        "virtual_margin_ok": False,
+                        "virtual_win_streak": shadow_virtual_win_streak,
+                        "virtual_would_promote": False,
+                        "promote_mode": promote_mode,
+                        "promote_decision": None,
+                        "promote_applied": False,
+                        "next_epoch_source": "raw",
+                        "optimizer_reset_applied": False,
+                        "window_epochs": list(cp_window_epochs) if cp_window_epochs is not None else [],
+                        "status": "before_avg_begin" if progress_ratio < args.avg_begin else "pending",
+                    }
+
+                if progress_ratio >= args.avg_begin:
+                    unwrapped_network = accelerator.unwrap_model(network)
+                    raw_sd = filter_lora_state_dict(unwrapped_network.state_dict())
+                    final_avg_raw_sd = raw_sd
+                    cp_window.append(raw_sd)
+                    cp_window_epochs.append(epoch + 1)
+                    if len(cp_window) >= args.avg_window:
+                        final_avg_center_sd = average_state_dicts(list(cp_window), args.avg_mode)
+
+                    if proxy_scoring_mode:
+                        shadow_log_payload["window_epochs"] = list(cp_window_epochs)
+                        bank_ready = _finalize_shadow_bank_if_ready(is_last_epoch=((epoch + 1) >= num_train_epochs))
+                        shadow_log_payload["construction_pool_size"] = _shadow_candidate_pool_size_for_log()
+                        shadow_log_payload["bank_ready"] = bank_ready
+                        shadow_log_payload["bank_size"] = len(shadow_bank)
+                        if bank_ready:
+                            shadow_log_payload.update(_shadow_bank_metadata(shadow_bank))
+
+                        if not bank_ready:
+                            shadow_log_payload["status"] = "building_pool"
+                        elif len(cp_window) < args.avg_window:
+                            shadow_log_payload["status"] = "waiting_window"
+                        elif accelerator.is_main_process:
+                            candidate_state_dicts: Dict[str, Dict[str, torch.Tensor]] = {
+                                "ema": average_state_dicts(list(cp_window), "ema"),
+                                "uniform": average_state_dicts(list(cp_window), "uniform"),
+                            }
+                            if args.avg_mode not in candidate_state_dicts:
+                                candidate_state_dicts[args.avg_mode] = average_state_dicts(list(cp_window), args.avg_mode)
+
+                            rng_state = _capture_torch_rng_state()
+                            raw_score = None
+                            candidate_scores: Dict[str, float] = {}
+                            try:
+                                raw_score = _score_shadow_bank(unwrapped_network)
+                                for candidate_mode, candidate_sd in candidate_state_dicts.items():
+                                    _restore_torch_rng_state(rng_state)
+                                    unwrapped_network.load_state_dict(candidate_sd, strict=False)
+                                    candidate_scores[candidate_mode] = _score_shadow_bank(unwrapped_network)
+                            finally:
+                                unwrapped_network.load_state_dict(raw_sd, strict=False)
+                                _restore_torch_rng_state(rng_state)
+                                clean_memory_on_device(accelerator.device)
+
+                            center_score = candidate_scores[args.avg_mode]
+                            best_candidate_mode = min(("ema", "uniform"), key=lambda mode: candidate_scores[mode])
+                            best_candidate_score = candidate_scores[best_candidate_mode]
+                            selected_candidate_mode = args.avg_mode if avg_promote_pick == "fixed" else best_candidate_mode
+                            selected_sd = candidate_state_dicts[selected_candidate_mode]
+                            selected_score = candidate_scores[selected_candidate_mode]
+                            delta_abs = selected_score - raw_score
+                            delta_pct = (delta_abs / raw_score * 100.0) if raw_score not in (None, 0.0) else None
+                            margin_ok = selected_score < raw_score * (1.0 - args.avg_shadow_margin)
+                            winner = "center" if margin_ok else "raw"
+                            winner_mode = selected_candidate_mode if margin_ok else "raw"
+                            shadow_virtual_win_streak = shadow_virtual_win_streak + 1 if margin_ok else 0
+                            would_promote = shadow_virtual_win_streak >= args.avg_shadow_patience
+                            promote_applied = False
+                            optimizer_reset_applied = False
+                            next_epoch_source = "raw"
+
+                            shadow_log_payload.update(
+                                {
+                                    "raw_proxy_loss": round(raw_score, 10),
+                                    "center_proxy_loss": round(center_score, 10),
+                                    "ema_proxy_loss": round(candidate_scores["ema"], 10),
+                                    "uniform_proxy_loss": round(candidate_scores["uniform"], 10),
+                                    "best_candidate_mode": best_candidate_mode,
+                                    "best_candidate_proxy_loss": round(best_candidate_score, 10),
+                                    "selected_candidate_mode": selected_candidate_mode,
+                                    "selected_proxy_loss": round(selected_score, 10),
+                                    "delta_abs": round(delta_abs, 10),
+                                    "delta_pct": round(delta_pct, 6) if delta_pct is not None else None,
+                                    "winner": winner,
+                                    "winner_mode": winner_mode,
+                                    "virtual_margin_ok": margin_ok,
+                                    "virtual_win_streak": shadow_virtual_win_streak,
+                                    "virtual_would_promote": would_promote,
+                                    "promote_decision": winner_mode,
+                                    "status": "scored",
+                                }
+                            )
+
+                            if promote_mode and winner == "center" and would_promote:
+                                unwrapped_network.load_state_dict(selected_sd, strict=False)
+                                promote_applied = True
+                                next_epoch_source = "center"
+                                if args.avg_reset_stats:
+                                    _reset_optimizer_avg_stats()
+                                    optimizer_reset_applied = True
+
+                            shadow_log_payload.update(
+                                {
+                                    "promote_applied": promote_applied,
+                                    "next_epoch_source": next_epoch_source,
+                                    "optimizer_reset_applied": optimizer_reset_applied,
+                                }
+                            )
+
+                            logger.info(
+                                "avg_cp %s epoch %d: raw=%.6f center(%s)=%.6f ema=%.6f uniform=%.6f winner=%s promote_pick=%s selected=%s streak=%d promote=%s window=%s",
+                                avg_cp_mode,
+                                epoch + 1,
+                                raw_score,
+                                args.avg_mode,
+                                center_score,
+                                candidate_scores["ema"],
+                                candidate_scores["uniform"],
+                                winner_mode,
+                                avg_promote_pick,
+                                selected_candidate_mode,
+                                shadow_virtual_win_streak,
+                                promote_applied,
+                                list(cp_window_epochs),
+                            )
+
                         accelerator.wait_for_everyone()
                     else:
-                        accelerator.wait_for_everyone()
+                        if len(cp_window) == args.avg_window:
+                            start_ep = epoch - args.avg_window + 2
+                            if start_ep < 1:
+                                start_ep = 1
+                            logger.info(f"averaging checkpoints from epoch {start_ep} to {epoch + 1}")
+                            avg_sd = average_state_dicts(list(cp_window), args.avg_mode)
+                            final_avg_center_sd = avg_sd
+                            unwrapped_network.load_state_dict(avg_sd, strict=False)
+                            if args.avg_reset_stats:
+                                _reset_optimizer_avg_stats()
+                            if accelerator.distributed_type != DistributedType.NO:
+                                sd = broadcast(unwrapped_network.state_dict())
+                                unwrapped_network.load_state_dict(sd, strict=False)
+                                accelerator.wait_for_everyone()
+                            else:
+                                accelerator.wait_for_everyone()
+
+                if proxy_scoring_mode:
+                    _write_shadow_log(shadow_log_payload)
 
             # end of epoch
 
@@ -3194,6 +3760,11 @@ class NetworkTrainer:
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
             save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+            if proxy_scoring_mode and getattr(args, "avg_save_last_candidates", False):
+                if final_avg_raw_sd is not None:
+                    _save_avg_candidate("raw", final_avg_raw_sd, num_train_epochs, global_step)
+                if final_avg_center_sd is not None:
+                    _save_avg_candidate("center", final_avg_center_sd, num_train_epochs, global_step)
 
             logger.info("model saved.")
 
@@ -3355,6 +3926,13 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--avg_window", type=int, default=4, help="number of checkpoints to average / 平均するチェックポイント数")
     parser.add_argument("--avg_begin", type=float, default=0.6, help="fraction of total epochs to start averaging / 学習の何割から平均を開始するか")
     parser.add_argument(
+        "--avg_cp_mode",
+        type=str,
+        default="live",
+        choices=["live", "shadow", "promote"],
+        help="avg_cp behavior: live applies averaged weights immediately, shadow scores only, promote adopts center conditionally / avg_cp の動作。live は平均重みを即反映、shadow は採点のみ、promote は条件付きで center を採用",
+    )
+    parser.add_argument(
         "--avg_mode",
         type=str,
         default="ema",
@@ -3362,10 +3940,47 @@ def setup_parser() -> argparse.ArgumentParser:
         help="averaging mode: uniform, ema or metric / 平均化モード",
     )
     parser.add_argument(
+        "--avg_promote_pick",
+        type=str,
+        default="fixed",
+        choices=["fixed", "best"],
+        help="promote candidate selection: fixed uses avg_mode, best picks the better of ema/uniform on proxy bank / promote 候補の選び方。fixed は avg_mode を使用、best は proxy bank 上で ema/uniform の良い方を使う",
+    )
+    parser.add_argument(
+        "--avg_shadow_bank_size",
+        type=int,
+        default=12,
+        help="number of train_proxy batches to retain on CPU for avg_cp shadow scoring / avg_cp shadow 採点用に CPU 保持する train_proxy バッチ数",
+    )
+    parser.add_argument(
+        "--avg_shadow_margin",
+        type=float,
+        default=0.003,
+        help="center wins only when center_score < raw_score * (1 - margin) in shadow/promote mode / shadow/promote で center 勝ちとみなす閾値",
+    )
+    parser.add_argument(
+        "--avg_shadow_patience",
+        type=int,
+        default=2,
+        help="win streak threshold used by shadow logging and promote gating / shadow ログと promote 判定に使う連勝閾値",
+    )
+    parser.add_argument(
+        "--avg_shadow_log_jsonl",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write avg_cp shadow/promote epoch logs to jsonl under output_dir / avg_cp shadow/promote の epoch ログを output_dir 配下の jsonl に出力",
+    )
+    parser.add_argument(
         "--avg_reset_stats",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="reset optimizer stats after averaging / 平均化後にOptimizer統計をリセットする",
+    )
+    parser.add_argument(
+        "--avg_save_last_candidates",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="save final raw/center LoRA candidates as extra files in shadow/promote mode / shadow/promote 時に最終 raw/center の LoRA を追加保存する",
     )
     # LoRA delta fake-quantization (on forward only)
     parser.add_argument(
