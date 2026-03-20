@@ -66,6 +66,7 @@
 | `--avg_begin`（独自） | 0.6 | 平均を開始する進行率 | 進行率 60% 以降 |
 | `--avg_mode`（独自） | ema | 平均方法 | 直近ほど重くする EMA |
 | `--avg_promote_pick`（独自） | fixed | promote 候補の選び方 | `fixed` は `avg_mode` で指定した候補を使う `best` は proxy bank 上で `ema` と `uniform` の良い方を選ぶ |
+| `--avg_save_last_candidates`（独自） | 無効 | 最終 raw / center を追加保存 | `shadow` / `promote` 専用 `<output_name>_raw.safetensors` と `<output_name>_center.safetensors` を保存する |
 | `--avg_reset_stats`（独自） | 有効 | 平均後に optimizer 統計をリセット | 発散抑制の安全策 `promote` ではまず `--no-avg_reset_stats` を試し、不安定なら戻す `live` も伸び鈍化が気になるなら `--no-avg_reset_stats` を試す価値が高い |
 | `--fp16_safe_norms`（独自） | 有効 | fp16 + 小バッチで学習安定性を向上 | フェイク量子化とセットで運用 |
 | **学習率スケジュール** |  |  |  |

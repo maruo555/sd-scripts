@@ -12,7 +12,7 @@ import toml
 from collections import Counter, deque
 import numpy as np
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from tqdm import tqdm
 
@@ -2285,8 +2285,9 @@ class NetworkTrainer:
         shadow_candidate_pool_target_size = max(args.avg_shadow_bank_size * 4, 32) if proxy_scoring_mode else 0
         shadow_candidate_pool_final_size: Optional[int] = None
         shadow_bank: List[Dict[str, Any]] = []
-        shadow_best_scores = {"raw": None, "center": None, "auto": None}
         shadow_virtual_win_streak = 0
+        final_avg_raw_sd: Optional[Dict[str, torch.Tensor]] = None
+        final_avg_center_sd: Optional[Dict[str, torch.Tensor]] = None
 
         def _group_csv_escape(value):
             if value is None:
@@ -2643,7 +2644,7 @@ class NetworkTrainer:
                     if buf in p_state and isinstance(p_state[buf], torch.Tensor):
                         p_state[buf].zero_()
 
-        def _save_shadow_best(kind: str, state_dict: Dict[str, torch.Tensor], score: float, epoch_no: int, steps: int):
+        def _save_avg_candidate(kind: str, state_dict: Dict[str, torch.Tensor], epoch_no: int, steps: int):
             if not accelerator.is_main_process:
                 return
             os.makedirs(args.output_dir, exist_ok=True)
@@ -2659,12 +2660,12 @@ class NetworkTrainer:
             metadata_to_save = dict(minimum_metadata if args.no_metadata else metadata)
             metadata_to_save.update(train_util.get_sai_model_spec(None, args, self.is_sdxl, True, False))
             metadata_to_save["ss_avg_shadow_variant"] = kind
-            metadata_to_save["ss_avg_shadow_proxy_loss"] = f"{score:.10g}"
             model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(save_sd, metadata_to_save)
             metadata_to_save["sshs_model_hash"] = model_hash
             metadata_to_save["sshs_legacy_hash"] = legacy_hash
+            model_name = train_util.default_if_none(args.output_name, train_util.DEFAULT_LAST_OUTPUT_NAME)
             save_lora_state_dict(
-                os.path.join(args.output_dir, f"best_{kind}.safetensors"), save_sd, dtype=None, metadata=metadata_to_save
+                os.path.join(args.output_dir, f"{model_name}_{kind}.safetensors"), save_sd, dtype=None, metadata=metadata_to_save
             )
 
         def _capture_torch_rng_state():
@@ -3602,8 +3603,11 @@ class NetworkTrainer:
                 if progress_ratio >= args.avg_begin:
                     unwrapped_network = accelerator.unwrap_model(network)
                     raw_sd = filter_lora_state_dict(unwrapped_network.state_dict())
+                    final_avg_raw_sd = raw_sd
                     cp_window.append(raw_sd)
                     cp_window_epochs.append(epoch + 1)
+                    if len(cp_window) >= args.avg_window:
+                        final_avg_center_sd = average_state_dicts(list(cp_window), args.avg_mode)
 
                     if proxy_scoring_mode:
                         shadow_log_payload["window_epochs"] = list(cp_window_epochs)
@@ -3679,21 +3683,6 @@ class NetworkTrainer:
                                 }
                             )
 
-                            if shadow_best_scores["raw"] is None or raw_score < shadow_best_scores["raw"]:
-                                shadow_best_scores["raw"] = raw_score
-                                _save_shadow_best("raw", raw_sd, raw_score, epoch + 1, global_step)
-                            if shadow_best_scores["center"] is None or center_score < shadow_best_scores["center"]:
-                                shadow_best_scores["center"] = center_score
-                                _save_shadow_best("center", candidate_state_dicts[args.avg_mode], center_score, epoch + 1, global_step)
-
-                            auto_candidates: Dict[str, Tuple[Dict[str, torch.Tensor], float]] = {"raw": (raw_sd, raw_score)}
-                            for candidate_mode, candidate_sd in candidate_state_dicts.items():
-                                auto_candidates[candidate_mode] = (candidate_sd, candidate_scores[candidate_mode])
-                            _, (auto_state, auto_score) = min(auto_candidates.items(), key=lambda item: item[1][1])
-                            if shadow_best_scores["auto"] is None or auto_score < shadow_best_scores["auto"]:
-                                shadow_best_scores["auto"] = auto_score
-                                _save_shadow_best("auto", auto_state, auto_score, epoch + 1, global_step)
-
                             if promote_mode and winner == "center" and would_promote:
                                 unwrapped_network.load_state_dict(selected_sd, strict=False)
                                 promote_applied = True
@@ -3735,6 +3724,7 @@ class NetworkTrainer:
                                 start_ep = 1
                             logger.info(f"averaging checkpoints from epoch {start_ep} to {epoch + 1}")
                             avg_sd = average_state_dicts(list(cp_window), args.avg_mode)
+                            final_avg_center_sd = avg_sd
                             unwrapped_network.load_state_dict(avg_sd, strict=False)
                             if args.avg_reset_stats:
                                 _reset_optimizer_avg_stats()
@@ -3770,6 +3760,11 @@ class NetworkTrainer:
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
             save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+            if proxy_scoring_mode and getattr(args, "avg_save_last_candidates", False):
+                if final_avg_raw_sd is not None:
+                    _save_avg_candidate("raw", final_avg_raw_sd, num_train_epochs, global_step)
+                if final_avg_center_sd is not None:
+                    _save_avg_candidate("center", final_avg_center_sd, num_train_epochs, global_step)
 
             logger.info("model saved.")
 
@@ -3980,6 +3975,12 @@ def setup_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="reset optimizer stats after averaging / 平均化後にOptimizer統計をリセットする",
+    )
+    parser.add_argument(
+        "--avg_save_last_candidates",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="save final raw/center LoRA candidates as extra files in shadow/promote mode / shadow/promote 時に最終 raw/center の LoRA を追加保存する",
     )
     # LoRA delta fake-quantization (on forward only)
     parser.add_argument(
