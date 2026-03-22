@@ -22,6 +22,18 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _freeze_text_encoder_lora(network) -> None:
+    for lora in getattr(network, "text_encoder_loras", []):
+        lora.requires_grad_(False)
+        for param in lora.parameters():
+            param.requires_grad = False
+
+    for lora in getattr(network, "unet_loras", []):
+        lora.requires_grad_(True)
+        for param in lora.parameters():
+            param.requires_grad = True
+
+
 def _create_network(args, vae, text_encoders, unet):
     network_module = importlib.import_module(args.network_module)
     net_kwargs = self_distill_cache.parse_network_args(args.network_args)
@@ -43,11 +55,14 @@ def _create_network(args, vae, text_encoders, unet):
             neuron_dropout=args.network_dropout,
             **net_kwargs,
         )
-    network.apply_to(text_encoders, unet, False, True)
+    # Keep TE LoRA modules attached so fixed TE weights are preserved in the final student safetensors.
+    # They are frozen below and excluded from optimizer parameter groups.
+    network.apply_to(text_encoders, unet, True, True)
     if init_weights is not None:
         logger.info("load student init weights: %s", init_weights)
         network.load_weights(init_weights)
     lbw_profile.apply_profile_to_network(network, lbw_profile.load_profile(args.lbw_profile))
+    _freeze_text_encoder_lora(network)
     return network, net_kwargs
 
 
