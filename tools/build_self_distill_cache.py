@@ -219,7 +219,6 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache_prompt_embeddings", action="store_true")
     parser.add_argument("--save_previews", action="store_true")
     parser.add_argument("--lbw_profile", type=str, default=None)
-    parser.add_argument("--output_dir", type=str, required=True)
     return parser
 
 

@@ -3,26 +3,26 @@ setlocal
 
 rem ============================================
 rem SDXL Self-Distill v1 minimal 4-step template
-rem cmd.exe / .bat 用
+rem For cmd.exe / .bat
 rem ============================================
 
-rem 1. 必須設定
+rem 1. Required settings
 set BASE=C:\path\to\sdxl_base.safetensors
 set TEACHER=C:\path\to\teacher_lora.safetensors
 set TRIGGER=mytrg
 
-rem 2. 任意設定
+rem 2. Optional settings
 set SUPPORT_TAGS=
 set FRONTIER_TAGS=
 
-rem 3. 作業ディレクトリ
+rem 3. Working directories
 set WORKDIR=outputs\self_distill_test
 set PROMPT_BANK=%WORKDIR%\prompt_bank.json
 set CACHE_DIR=%WORKDIR%\cache
 set TRAIN_DIR=%WORKDIR%\train
 set EVAL_DIR=%WORKDIR%\eval
 
-rem 4. 実験設定
+rem 4. Experiment settings
 set RESOLUTION=768
 set SAMPLE_STEPS=8
 set GUIDANCE=7.5
@@ -34,12 +34,12 @@ set GRAD_ACCUM=4
 set LEARNING_RATE=1e-4
 set OUTPUT_NAME=mytrg_sd_test
 
-rem 5. attention 実装
-rem SDPA を使う場合は --sdpa
-rem xformers を使う場合は --xformers
+rem 5. Attention backend
+rem Use --sdpa for SDPA
+rem Use --xformers for xformers
 set ATTN=--sdpa
 
-rem 6. venv を使う場合は有効化
+rem 6. Activate venv if needed
 rem call venv\Scripts\activate.bat
 
 if not exist "%WORKDIR%" mkdir "%WORKDIR%"

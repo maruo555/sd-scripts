@@ -220,7 +220,6 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--network_args", type=str, nargs="*", default=None)
     parser.add_argument("--dim_from_weights", action="store_true")
     parser.add_argument("--unet_lr", type=float, default=None)
-    parser.add_argument("--save_precision", type=str, default="fp16", choices=["fp16", "bf16", "float", "no"])
     parser.add_argument("--save_every_n_steps", type=int, default=None)
     parser.add_argument("--no_metadata", action="store_true")
     parser.add_argument("--max_embeddings_multiples", type=int, default=3)
@@ -234,8 +233,6 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sparse_loss_weight", type=float, default=0.0)
     parser.add_argument("--high_pass_mode", type=str, default="dog", choices=["dog", "laplacian", "gaussian_residual"])
     parser.add_argument("--low_pass_mode", type=str, default="avg", choices=["avg", "gaussian", "identity"])
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--output_name", type=str, default="self_distill")
     return parser
 
 
