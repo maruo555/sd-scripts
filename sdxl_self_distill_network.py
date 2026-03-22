@@ -219,6 +219,8 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--network_alpha", type=float, default=1.0)
     parser.add_argument("--network_dropout", type=float, default=None)
     parser.add_argument("--network_args", type=str, nargs="*", default=None)
+    parser.add_argument("--network_train_unet_only", action="store_true")
+    parser.add_argument("--network_train_text_encoder_only", action="store_true")
     parser.add_argument("--dim_from_weights", action="store_true")
     parser.add_argument("--unet_lr", type=float, default=None)
     parser.add_argument("--no_metadata", action="store_true")
