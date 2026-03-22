@@ -189,7 +189,6 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lbw_profile", type=str, default=None)
     parser.add_argument("--student_lbw_profile", type=str, default=None)
     parser.add_argument("--resolution", type=int, default=768)
-    parser.add_argument("--sample_sampler", type=str, default="euler_a")
     parser.add_argument("--max_embeddings_multiples", type=int, default=3)
     return parser
 
