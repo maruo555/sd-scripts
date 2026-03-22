@@ -221,7 +221,6 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--network_args", type=str, nargs="*", default=None)
     parser.add_argument("--dim_from_weights", action="store_true")
     parser.add_argument("--unet_lr", type=float, default=None)
-    parser.add_argument("--save_every_n_steps", type=int, default=None)
     parser.add_argument("--no_metadata", action="store_true")
     parser.add_argument("--max_embeddings_multiples", type=int, default=3)
     parser.add_argument("--require_cached_prompt_embeddings", action="store_true")
