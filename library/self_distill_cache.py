@@ -267,7 +267,7 @@ def run_sdxl_rollout(
 
 
 def metadata_for_lora(args, network_args: Dict[str, Any]) -> Dict[str, Any]:
-    return train_util.build_minimum_network_metadata(
+    metadata = train_util.build_minimum_network_metadata(
         v2=False,
         base_model="sdxl_base_v1-0",
         network_module=args.network_module,
@@ -275,6 +275,7 @@ def metadata_for_lora(args, network_args: Dict[str, Any]) -> Dict[str, Any]:
         network_alpha=str(args.network_alpha),
         network_args=network_args,
     )
+    return {str(key): str(value) for key, value in metadata.items()}
 
 
 def default_generation_name(entry: Dict[str, Any], index: int) -> str:
