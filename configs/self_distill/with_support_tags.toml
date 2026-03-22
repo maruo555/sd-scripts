@@ -1,0 +1,13 @@
+trigger_token = "sks_character"
+support_tags = "smile,looking at viewer,solo"
+frontier_tags = "night city,dramatic backlight"
+carrier_families = "1girl,character sheet,anime illustration"
+shot_types = "full body,bust shot,upper body"
+lighting_envs = "golden hour,studio lighting,night neon"
+seed_list = "201,202,203"
+num_templates = 24
+width = 768
+height = 768
+sample_steps = 12
+guidance_scale = 7.5
+sample_sampler = "euler_a"

@@ -1,0 +1,13 @@
+trigger_token = "sks_character"
+support_tags = ""
+frontier_tags = "red hair,blue dress"
+carrier_families = "1girl,portrait,anime illustration"
+shot_types = "close-up,bust shot"
+lighting_envs = "studio lighting,soft rim light"
+seed_list = "101,102"
+num_templates = 8
+width = 768
+height = 768
+sample_steps = 8
+guidance_scale = 7.5
+sample_sampler = "euler_a"

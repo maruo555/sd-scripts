@@ -1,0 +1,16 @@
+resolution = 768
+train_batch_size = 1
+gradient_accumulation_steps = 8
+max_train_steps = 20
+learning_rate = 0.0001
+unet_lr = 0.0001
+optimizer_type = "AdamW8bit"
+mixed_precision = "fp16"
+save_precision = "fp16"
+xformers = true
+gradient_checkpointing = true
+max_data_loader_n_workers = 1
+cache_prompt_embeddings = true
+require_cached_prompt_embeddings = true
+save_every_n_steps = 10
+sample_steps = 8
