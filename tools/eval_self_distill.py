@@ -68,6 +68,7 @@ def _grid(images: List[List[Image.Image]], labels: List[str]) -> Image.Image:
 
 def evaluate(args: argparse.Namespace) -> None:
     setup_logging(args, reset=True)
+    args.deepspeed = False
     accelerator = train_util.prepare_accelerator(args)
     weight_dtype, _ = train_util.prepare_dtype(args)
     records = _load_eval_prompts(args.eval_prompts)

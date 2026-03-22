@@ -100,6 +100,7 @@ def train(args: argparse.Namespace) -> None:
     setup_logging(args, reset=True)
     self_distill_cache.ensure_dir(args.output_dir)
 
+    args.deepspeed = False
     accelerator = train_util.prepare_accelerator(args)
     weight_dtype, _ = train_util.prepare_dtype(args)
     train_util.verify_command_line_training_args(args)

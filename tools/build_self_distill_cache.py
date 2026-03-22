@@ -77,6 +77,7 @@ def build_cache(args: argparse.Namespace) -> None:
     prompt_bank = self_distill_cache.load_prompt_bank(args.prompt_bank)
     records = prompt_bank["records"]
 
+    args.deepspeed = False
     accelerator = train_util.prepare_accelerator(args)
     weight_dtype, _ = train_util.prepare_dtype(args)
     tokenizers = sdxl_train_util.load_tokenizers(args)
