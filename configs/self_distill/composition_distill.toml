@@ -1,0 +1,10 @@
+learning_rate = 1.0e-5
+unet_lr = 1.0e-5
+optimizer_preset = "adamw8bit"
+variant_quota = { keep_strong = 0.35, keep_weak = 0.15, off_null = 0.20, frontier = 0.30 }
+use_coarse_preservation_loss = true
+coarse_preservation_loss_weight = 0.25
+coarse_target_mode = "teacher"
+use_low_pass_delta_loss = true
+low_pass_delta_loss_weight = 0.15
+use_high_pass_delta_loss = false

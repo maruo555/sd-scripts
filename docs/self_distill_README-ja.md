@@ -1,45 +1,280 @@
-# SDXL Self-Distill v1
+# SDXL Self-Distill v2
 
-この fork には、SDXL LoRA の自己蒸留実験用の最小構成を追加しています。通常の `train_network.py` / `sdxl_train_network.py` の学習フローはそのまま残し、自己蒸留用の新規 script と補助 module を別系統で追加しています。
+この fork には、SDXL LoRA のための軽量 self-distill v2 基盤を追加しています。通常の `train_network.py` / `sdxl_train_network.py` の学習フローはそのまま残し、自己蒸留系だけを別導線で再構成しています。
 
-通常の SDXL LoRA 学習との違いは、画像 dataset を直接学習に使わず、`base model` と `teacher LoRA` の観測結果を事前に disk cache 化しておき、学習中はその cache を読みながら `student LoRA` だけを更新する点です。v1 では `U-Net only`、`text encoder frozen`、`teacher/base live forward なし` を前提にしています。
+v2 の目的は「Teacher LoRA の挙動を、軽量な single-timestep cache 学習で keep / suppress し直すこと」です。通常の画像 LoRA 学習とは異なり、画像 dataset を直接学習しません。代わりに `Base model` と `Teacher LoRA` の差分観測を cache 化し、その cache を学習データとして使います。
+
+## v2 の要点
+
+- 学習時は `Teacher/Base live forward なし`
+- 学習時は `Student U-Net 1回 forward`
+- `Student` は基本的に `Teacher` と同じ LoRA 重みから開始
+- `U-Net only train`
+- `Teacher` に Text Encoder LoRA が含まれる場合も対応
+- `export_te_mode=preserve` が既定
+- `xt_source_mode=teacher_rollout` が MVP 本線
 
 ## 追加された主なファイル
 
 - `tools/build_prompt_bank.py`
 - `tools/build_self_distill_cache.py`
-- `sdxl_self_distill_network.py`
+- `tools/cache_audit.py`
 - `tools/eval_self_distill.py`
+- `sdxl_self_distill_network.py`
 - `library/self_distill_cache.py`
 - `library/self_distill_dataset.py`
 - `library/self_distill_losses.py`
+- `library/self_distill_targets.py`
+- `library/self_distill_sampler.py`
 - `library/lbw_profile.py`
 - `configs/self_distill/*.toml`
 
-## フロー
+## 通常の画像 LoRA 学習との違い
 
-1. `build_prompt_bank.py` で single trigger 前提の prompt bank を作る
-2. `build_self_distill_cache.py` で `base model` と `teacher LoRA` の観測を cache 化する
-3. `sdxl_self_distill_network.py` で cached target に対して `student LoRA` を学習する
-4. `eval_self_distill.py` で `base / teacher / student` を比較する
+共通点:
 
-v1 は軽量構成で、teacher/base は cache build 時だけ使います。学習時は cache に入っている `initial_noise_latent`、生成設定、teacher/base の final latent を読み、student だけを rollout します。
+- base model / LoRA / optimizer / scheduler / mixed precision の扱いは通常の sd-scripts に寄せています
+- safetensors 出力、LoRA warm start、LBW-like profile を使えます
+
+違い:
+
+- 画像 dataset ではなく cache manifest を読む
+- Teacher/Base の観測は cache build 時だけ行う
+- 学習時は prompt を live で TE に通さず、cached conditioning を使う
+- keep / suppress の条件別に loss を切り替える
+
+## style distill と composition distill
+
+`style_distill`:
+
+- 主題や構図を変えても Teacher の画風差分を残したいとき向け
+- `high_pass_delta_loss` は optional
+- leak を減らしつつ混ぜやすい LoRA を目指す preset
+
+`composition_distill`:
+
+- exact pose 再現ではなく、柔らかい構図傾向を残したいとき向け
+- `coarse_preservation_loss` と `low_pass_delta_loss` を弱めに使う preset
+- ControlNet 的な厳密空間制御の代替ではありません
+
+## prompt bank の役割
+
+prompt bank は「元の学習タグの再現」ではなく、「Teacher-base 差分が安定して出る条件を観測する bank」です。
+
+標準 variant:
+
+- `keep_strong`
+- `keep_weak`
+- `off_null`
+- `frontier`
+- `suppress_trigger_*`
+
+variant ごとに `conditioning_source` と `loss_role` を持ちます。
+
+MVP の conditioning 方針:
+
+- `keep_*`: `teacher`
+- `off_null`: `base`
+- `suppress_trigger_*`: default は `teacher`
+
+### tag 群の役割
+
+- keep trigger: 残したい中心 trigger。最初は 1 個推奨
+- suppress trigger / nuisance tag: 弱めたい trigger や nuisance
+- support tag: Teacher の良い差分を見えやすくする補助タグ
+- template: prompt bank の本体
+- frontier tag: いまは弱いが将来伸ばしたい方向
+
+### template 軸
+
+- `carrier_families`: 6〜10
+- `shot_types`: 3〜4
+- `lighting_envs`: 3〜4
+- 開始時は template 50〜80、seed 3〜4、variant 4〜6 が実用ラインです
+
+### holdout split
+
+- template 単位で 15〜20% を `holdout` に分離できます
+- 学習 prompt 専用の偽物を避けるため、eval は `holdout` を基本にしてください
+
+## cache の構成
+
+manifest 1行は `prompt variant × seed` の record です。NPZ には複数 timestep を入れます。
+
+必須:
+
+- `target_timesteps`
+- `x_t`
+- `teacher_target`
+- `base_target`
+- `base_prompt_embeds`
+- `base_negative_prompt_embeds`
+- `base_pooled_prompt_embeds`
+- `base_negative_pooled_prompt_embeds`
+
+`teacher_te_included=true` のとき必須:
+
+- `teacher_prompt_embeds`
+- `teacher_negative_prompt_embeds`
+- `teacher_pooled_prompt_embeds`
+- `teacher_negative_pooled_prompt_embeds`
+
+任意:
+
+- `initial_noise_latent`
+- `teacher_final_latent`
+- preview path
+
+### strict manifest check
+
+cache 読み込み時に以下を hard fail で検証します。
+
+- base model identifier/hash
+- teacher LoRA identifier/hash
+- LBW profile hash
+- scheduler / prediction type
+- resolution
+- `xt_source_mode`
+- timestep sampling mode
+- prompt bank hash
+- cache schema version
+
+## Teacher TE を含む場合
+
+Teacher に Text Encoder LoRA が含まれる場合、trigger 応答は TE と U-Net の連携で成立します。v2 ではこれを正式対応とし、teacher/base の conditioning cache を保存します。
+
+- `export_te_mode=preserve` が既定です
+- 学習時は TE を更新しません
+- export 時は TE LoRA を凍結保持したまま student safetensors に含めます
+- `drop` は将来拡張扱いで、trigger 応答が変わる可能性があります
+
+## x_t と target
+
+MVP は `xt_source_mode=teacher_rollout` です。
+
+1. same prompt / same seed / same scheduler で Teacher を rollout
+2. 指定した inference step の latent を `x_t` として保存
+3. その同じ `x_t` 上で Teacher/Base の guided prediction を target 化
+4. target は `eps` または `v` に変換して保存
+
+## loss
+
+コア:
+
+- `keep_delta_loss`
+- `suppress_to_base_loss`
+- `weight_anchor_loss`
+
+optional:
+
+- `coarse_preservation_loss`
+
+experimental:
+
+- `high_pass_delta_loss`
+- `low_pass_delta_loss`
+- `sparse_loss`
+
+`suppress_trigger_*` の MVP 成功条件は「Teacher より明確に弱まる」「base 側に寄る」です。`export_te_mode=preserve` のまま完全 suppress は目標にしません。
+
+## optimizer preset と attention backend
+
+optimizer preset:
+
+- `adamw8bit`
+- `adafactor_fixedlr`
+- `adagrad8bit`
+- `rmsprop8bit`
+
+使い分け:
+
+- まずは `adamw8bit`
+- 低 lr 固定で比較したいなら `adafactor_fixedlr`
+- `adagrad8bit` / `rmsprop8bit` は bitsandbytes 依存です。未対応環境では hard fail します
+
+attention backend:
+
+- `auto`
+- `sdpa`
+- `xformers`
+
+`auto` は `xformers > sdpa > default` の順で選びます。
+
+## coverage と step 数
+
+定義:
+
+- `T = template 数`
+- `R = seeds / template`
+- `V = variant 数`
+- `K = timesteps / record`
+- `N_records = T × R × V`
+- `N_items = N_records × K`
+- `coverage rho = (S × B × A) / N_items`
+
+目安:
+
+- `rho = 0.2〜0.4`: smoke test
+- `rho = 0.5〜1.0`: 初回本命
+- `rho = 1.0〜2.0`: 強めの suppress / forgetting
+- `rho > 3.0`: 上書きしすぎのリスク
+
+Teacher が十分学習済みなら、v2 の開始 lr は `teacher lr / 10〜30` を目安にしてください。
+
+- keep 重視: `1e-5〜2e-5`
+- keep + suppress 強め: `2e-5〜3.5e-5`
+- frequency 実験: `5e-6〜1e-5`
+
+step 数は Teacher の元 step をそのまま使わず、coverage で決めます。
+
+- smoke / first-pass: `500〜1500`
+- 本命: `1500〜3500`
+
+## ディスク容量の考え方
+
+latent は fp16 で概算します。
+
+- 640 解像度の latent は約 `4 × 80 × 80 × 2 bytes ≒ 50KB`
+- 768 解像度の latent は約 `4 × 96 × 96 × 2 bytes ≒ 72KB`
+- record 1件で `x_t[K]`, `teacher_target[K]`, `base_target[K]`, conditioning を持つため、実サイズはこれより大きくなります
+- 実用セットでは prompt conditioning が支配的になりやすいので、まず small bank で実測してください
+
+## 16GB 向け基本方針
+
+- `train_batch_size = 1`
+- `gradient_accumulation_steps = 1 or 2`
+- `mixed_precision = fp16`
+- `optimizer_preset = adamw8bit`
+- `attention_backend = auto` または `xformers`
+- `gradient_checkpointing = true`
+- `resolution = 640`
+- preview generation during train は off
+- Teacher/Base は学習時に live forward しない
+
+危険設定:
+
+- `resolution > 768`
+- `batch_size > 1`
+- `sample_steps` を大きくしすぎる
+- conditioning cache なしで学習しようとする構成
 
 ## 最小実行例
 
-prompt bank 作成:
+prompt bank:
 
 ```bash
 python tools/build_prompt_bank.py \
   --output outputs/self_distill/prompt_bank.json \
-  --trigger_token sks_character \
-  --carrier_families "1girl,anime illustration" \
-  --shot_types "bust shot,close-up" \
-  --lighting_envs "studio lighting,soft rim light" \
-  --seed_list "101,102"
+  --keep_triggers "my_style" \
+  --support_tags "diffused light,wet surface" \
+  --carrier_families "portrait photo of a person,product photo of a ceramic cup,rock and water landscape material" \
+  --shot_types "close-up,bust shot,material study" \
+  --lighting_envs "soft studio light,overcast daylight,rim light" \
+  --seed_list "101,102,103" \
+  --variant_quota '{"keep_strong":0.4,"keep_weak":0.2,"off_null":0.3,"frontier":0.1}'
 ```
 
-cache 作成:
+cache build:
 
 ```bash
 python tools/build_self_distill_cache.py \
@@ -48,143 +283,82 @@ python tools/build_self_distill_cache.py \
   --output_dir outputs/self_distill/cache \
   --teacher_lora_weights path/to/teacher.safetensors \
   --pretrained_model_name_or_path path/to/sdxl_base.safetensors \
-  --cache_prompt_embeddings
+  --sample_sampler euler_a
 ```
 
-train 実行:
+cache audit:
+
+```bash
+python tools/cache_audit.py \
+  --cache_manifest outputs/self_distill/cache/manifest.jsonl \
+  --output_dir outputs/self_distill/audit \
+  --output_csv
+```
+
+train:
 
 ```bash
 python sdxl_self_distill_network.py \
   --config_file configs/self_distill/base.toml \
   --cache_manifest outputs/self_distill/cache/manifest.jsonl \
+  --teacher_lora_weights path/to/teacher.safetensors \
   --student_init_weights path/to/teacher.safetensors \
   --output_dir outputs/self_distill/train \
-  --output_name self_distill_run
+  --output_name self_distill_v2
 ```
 
-eval 実行:
+eval:
 
 ```bash
 python tools/eval_self_distill.py \
+  --config_file configs/self_distill/base.toml \
   --pretrained_model_name_or_path path/to/sdxl_base.safetensors \
   --eval_prompts outputs/self_distill/prompt_bank.json \
   --teacher_lora_weights path/to/teacher.safetensors \
-  --student_lora_weights outputs/self_distill/train/self_distill_run-step000100.safetensors \
+  --student_lora_weights outputs/self_distill/train/self_distill_v2-step001500.safetensors \
   --output_dir outputs/self_distill/eval
 ```
 
-## 各 script の役割
+dry run:
 
-### `tools/build_prompt_bank.py`
+```bash
+python tools/build_self_distill_cache.py \
+  --config_file configs/self_distill/base.toml \
+  --prompt_bank outputs/self_distill/prompt_bank.json \
+  --output_dir outputs/self_distill/cache \
+  --teacher_lora_weights path/to/teacher.safetensors \
+  --pretrained_model_name_or_path path/to/sdxl_base.safetensors \
+  --dry_run
 
-- single trigger LoRA 向けに prompt bank を JSON で生成します
-- `carrier_families × shot_types × lighting_envs` をベースに template を作ります
-- `strong / weak / off / support_only / frontier` を variant として展開します
+python sdxl_self_distill_network.py \
+  --config_file configs/self_distill/base.toml \
+  --cache_manifest outputs/self_distill/cache/manifest.jsonl \
+  --teacher_lora_weights path/to/teacher.safetensors \
+  --student_init_weights path/to/teacher.safetensors \
+  --dry_run
+```
 
-主な入力:
+## smoke test の目安
 
-- `--trigger_token`
-- `--support_tags`
-- `--frontier_tags`
-- `--carrier_families`
-- `--shot_types`
-- `--lighting_envs`
-- `--seed_list`
+- templates: 24
+- seeds: 2
+- variants: 3〜5
+- timesteps per record: 2
+- resolution: 640
+- batch_size: 1
+- grad_accum: 1
+- steps: 200〜500
 
-### `tools/build_self_distill_cache.py`
+## 既知の制限
 
-- prompt bank を読み、base model と teacher LoRA の観測 cache を作ります
-- `teacher_final_latent` と `base_final_latent` を保存します
-- 必要に応じて prompt embeddings と preview 画像も保存できます
-- LBW-like profile を teacher 側に適用できます
-- teacher LoRA に Text Encoder 重みが含まれる場合は `--cache_prompt_embeddings` が必須です
+- `export_te_mode=drop` は将来拡張扱いです
+- `suppress_trigger_*` は MVP では U-Net 側抑制です
+- exact pose 再現や ControlNet 的厳密空間制御は対象外です
+- high/low frequency 機能は optional な実験機能です
+- rank 圧縮、TE 学習、full rollout 学習は v2 本線に含めません
 
-cache の必須項目:
+## 補足
 
-- `prompt_text`
-- `variant_type`
-- `seed`
-- `generation_settings`
-- `initial_noise_latent`
-- `teacher_final_latent`
-- `base_final_latent`
-
-cache の任意項目:
-
-- `prompt_embeds`
-- `negative_prompt_embeds`
-- `pooled_prompt_embeds`
-- `negative_pooled_prompt_embeds`
-- `preview_image_path`
-
-### `sdxl_self_distill_network.py`
-
-- cache から prompt / latent / 設定を読みます
-- student LoRA を既存 LoRA 重みから warm start できます
-- `--dim_from_weights` 相当の初期化を使えます
-- 学習中は teacher/base を live で回しません
-- loss は `library/self_distill_losses.py` で差し替えやすくしています
-
-対応している loss:
-
-- positive high-pass delta loss
-- coarse preservation loss
-- off loss
-- anchor loss
-- optional sparse loss
-
-high-pass:
-
-- `dog`
-- `laplacian`
-- `gaussian_residual`
-
-low-pass:
-
-- `avg`
-- `gaussian`
-- `identity`
-
-### `tools/eval_self_distill.py`
-
-- fixed prompt suite と fixed seed で `base / teacher / student` を比較します
-- preview grid を保存します
-- JSON metrics を保存します
-
-v1 で出す proxy:
-
-- `retain_proxy`
-- `leakage_proxy`
-- `drift_proxy`
-
-## 16GB VRAM で危険な設定
-
-- `resolution > 768`
-- `batch_size > 1`
-- `gradient_checkpointing` 無効
-- `cache_prompt_embeddings` 無効で、長い prompt を毎 step 再エンコードする構成
-- `sample_steps` を大きくしすぎる構成
-
-## OOM 対策
-
-- `configs/self_distill/vram16.toml` を基準にする
-- `batch_size=1` を維持する
-- `gradient_accumulation_steps` を増やす
-- `gradient_checkpointing` と `xformers` を有効にする
-- cache を disk に置き、prompt embeddings も cache する
-- まず `sample_steps=8` 前後の short smoke test で詰める
-
-## 差し替えポイント
-
-- loss を差し替える: `library/self_distill_losses.py`
-- prompt bank のロジックを差し替える: `tools/build_prompt_bank.py`
-- cache schema や rollout helper を拡張する: `library/self_distill_cache.py`
-- LBW-like profile を調整する: `library/lbw_profile.py`
-
-## v1 で未実装の点
-
-- text encoder 学習
-- teacher/base を学習時に live で回す mode
-- intermediate timestep target
-- perceptual / image loss
-- A1111 完全互換の LBW
+- `--resume_cache` は既存 manifest header と現在設定が一致する場合だけ再利用されます
+- train 時の strict manifest check で teacher 一致まで見たい場合は `--teacher_lora_weights` を渡してください
+- `gradient_accumulation_steps > 1` のときも requested `max_train_steps` に届くように sampler 長を調整しています

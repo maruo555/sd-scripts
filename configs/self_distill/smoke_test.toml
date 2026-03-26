@@ -1,9 +1,9 @@
 resolution = 640
 train_batch_size = 1
 gradient_accumulation_steps = 1
-max_train_steps = 800
-learning_rate = 2.0e-5
-unet_lr = 2.0e-5
+max_train_steps = 300
+learning_rate = 1.5e-5
+unet_lr = 1.5e-5
 optimizer_preset = "adamw8bit"
 mixed_precision = "fp16"
 save_precision = "fp16"
@@ -11,5 +11,6 @@ gradient_checkpointing = true
 max_data_loader_n_workers = 1
 attention_backend = "auto"
 num_target_timesteps = 2
-timestep_sampling_mode = "late_bias"
-save_every_n_steps = 200
+timestep_sampling_mode = "uniform"
+variant_quota = { keep_strong = 0.40, keep_weak = 0.20, off_null = 0.30, frontier = 0.10 }
+save_every_n_steps = 100

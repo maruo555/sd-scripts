@@ -1,9 +1,7 @@
 import argparse
 import importlib
-import json
-import math
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -13,7 +11,16 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from library import lbw_profile, self_distill_cache, self_distill_dataset, self_distill_losses, sdxl_model_util, sdxl_train_util, train_util
+from library import (
+    lbw_profile,
+    self_distill_cache,
+    self_distill_dataset,
+    self_distill_losses,
+    self_distill_sampler,
+    sdxl_model_util,
+    sdxl_train_util,
+    train_util,
+)
 from library.utils import setup_logging, add_logging_arguments
 
 setup_logging()
@@ -55,8 +62,6 @@ def _create_network(args, vae, text_encoders, unet):
             neuron_dropout=args.network_dropout,
             **net_kwargs,
         )
-    # Keep TE LoRA modules attached so fixed TE weights are preserved in the final student safetensors.
-    # They are frozen below and excluded from optimizer parameter groups.
     network.apply_to(text_encoders, unet, True, True)
     if init_weights is not None:
         logger.info("load student init weights: %s", init_weights)
@@ -66,24 +71,46 @@ def _create_network(args, vae, text_encoders, unet):
     return network, net_kwargs
 
 
-def _prepare_conditioning(args, item, tokenizers, text_encoders, device, weight_dtype):
-    if "prompt_embeds" in item:
-        return {
-            "prompt_embeds": item["prompt_embeds"].to(device=device, dtype=weight_dtype),
-            "negative_prompt_embeds": item["negative_prompt_embeds"].to(device=device, dtype=weight_dtype),
-            "pooled_prompt_embeds": item["pooled_prompt_embeds"].to(device=device, dtype=weight_dtype),
-            "negative_pooled_prompt_embeds": item["negative_pooled_prompt_embeds"].to(device=device, dtype=weight_dtype),
-        }
-    return self_distill_cache.build_prompt_conditioning(
-        tokenizers,
-        text_encoders,
-        item["prompt_text"],
-        item.get("negative_prompt", ""),
-        device,
-        weight_dtype,
-        max_embeddings_multiples=args.max_embeddings_multiples,
-        clip_skip=args.clip_skip,
-    )
+def _expand_optimizer_preset(args) -> None:
+    preset = getattr(args, "optimizer_preset", None)
+    if not preset:
+        return
+    preset = preset.lower()
+    if preset == "adamw8bit":
+        args.optimizer_type = "AdamW8bit"
+    elif preset == "adafactor_fixedlr":
+        args.optimizer_type = "Adafactor"
+        args.optimizer_args = ["relative_step=False", "scale_parameter=False", "warmup_init=False"]
+    elif preset == "adagrad8bit":
+        args.optimizer_type = "bitsandbytes.optim.Adagrad8bit"
+    elif preset == "rmsprop8bit":
+        args.optimizer_type = "bitsandbytes.optim.RMSprop8bit"
+    else:
+        raise ValueError(f"Unsupported optimizer_preset: {args.optimizer_preset}")
+
+
+def _select_step_tensors(item, device, dtype):
+    num_steps = item["target_timesteps"].shape[0]
+    index = torch.randint(low=0, high=num_steps, size=(1,)).item()
+    timestep = item["target_timesteps"][index].to(device=device)
+    x_t = item["x_t"][index].to(device=device, dtype=dtype)
+    teacher_target = item["teacher_target"][index].to(device=device, dtype=dtype)
+    base_target = item["base_target"][index].to(device=device, dtype=dtype)
+    return index, timestep, x_t, teacher_target, base_target
+
+
+def _save_state_dict(file_path: str, state_dict: Dict[str, torch.Tensor], metadata: Optional[Dict[str, str]]) -> None:
+    if os.path.splitext(file_path)[1] == ".safetensors":
+        from safetensors.torch import save_file
+
+        if metadata is None:
+            metadata = {}
+        model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(state_dict, metadata)
+        metadata["sshs_model_hash"] = model_hash
+        metadata["sshs_legacy_hash"] = legacy_hash
+        save_file(state_dict, file_path, metadata)
+        return
+    torch.save(state_dict, file_path)
 
 
 def _save_checkpoint(args, accelerator, network, network_args, global_step):
@@ -92,25 +119,38 @@ def _save_checkpoint(args, accelerator, network, network_args, global_step):
     file_path = os.path.join(args.output_dir, f"{model_name}-step{global_step:06d}.safetensors")
     metadata = None if args.no_metadata else self_distill_cache.metadata_for_lora(args, network_args)
     _, save_dtype = train_util.prepare_dtype(args)
-    model.save_weights(file_path, save_dtype, metadata)
+
+    if args.export_te_mode == "preserve":
+        model.save_weights(file_path, save_dtype, metadata)
+        return file_path
+
+    state_dict = model.state_dict()
+    filtered_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("lora_te"):
+            continue
+        filtered_state_dict[key] = value.detach().clone().to("cpu").to(save_dtype)
+    _save_state_dict(file_path, filtered_state_dict, metadata)
     return file_path
 
 
 def train(args: argparse.Namespace) -> None:
     setup_logging(args, reset=True)
     self_distill_cache.ensure_dir(args.output_dir)
+    _expand_optimizer_preset(args)
 
     args.deepspeed = False
     accelerator = train_util.prepare_accelerator(args)
     weight_dtype, _ = train_util.prepare_dtype(args)
     train_util.verify_command_line_training_args(args)
 
+    header, _ = self_distill_cache.load_manifest_with_header(args.cache_manifest)
+    self_distill_cache.validate_manifest_header(header, args)
+
     _, text_encoder1, text_encoder2, vae, unet, _, _ = sdxl_train_util.load_target_model(
         args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype
     )
     text_encoders = [text_encoder1, text_encoder2]
-    tokenizers = sdxl_train_util.load_tokenizers(args)
-
     for text_encoder in text_encoders:
         text_encoder.to("cpu", dtype=torch.float32)
         text_encoder.eval()
@@ -120,7 +160,7 @@ def train(args: argparse.Namespace) -> None:
     unet.to(accelerator.device, dtype=weight_dtype)
     unet.requires_grad_(False)
     unet.train()
-    train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
+    self_distill_cache.apply_attention_backend(unet, args)
 
     network, network_args = _create_network(args, vae, text_encoders, unet)
     if args.gradient_checkpointing:
@@ -131,74 +171,116 @@ def train(args: argparse.Namespace) -> None:
     optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, params)
     lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
-    dataset = self_distill_dataset.SelfDistillDataset(args.cache_manifest, require_prompt_embeddings=args.require_cached_prompt_embeddings)
+    dataset = self_distill_dataset.SelfDistillDataset(args.cache_manifest, split="train", require_teacher_conditioning=bool(header["teacher_te_included"]))
+    required_samples = max(
+        len(dataset),
+        int(args.max_train_steps)
+        * max(1, int(getattr(args, "gradient_accumulation_steps", 1)))
+        * max(1, int(accelerator.num_processes)),
+    )
+    sampler = self_distill_sampler.VariantQuotaSampler(
+        dataset.entries,
+        variant_quota=self_distill_sampler.quota_from_args(args),
+        num_samples=required_samples,
+        seed=args.seed or 0,
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=1,
-        shuffle=True,
+        sampler=sampler,
         num_workers=min(args.max_data_loader_n_workers, 2),
         collate_fn=self_distill_dataset.collate_single,
     )
 
     network, optimizer, dataloader, lr_scheduler = accelerator.prepare(network, optimizer, dataloader, lr_scheduler)
 
+    anchor_targets = None
+    if getattr(args, "use_weight_anchor_loss", True):
+        unwrapped = accelerator.unwrap_model(network)
+        anchor_targets = {
+            name: param.detach().clone().to("cpu", dtype=torch.float32)
+            for name, param in unwrapped.named_parameters()
+            if param.requires_grad
+        }
+
     global_step = 0
     progress = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process, desc="steps")
-    for epoch in range(10**6):
-        for item in dataloader:
-            settings = item["generation_settings"]
-            if args.dry_run:
-                _prepare_conditioning(args, item, tokenizers, text_encoders, accelerator.device, weight_dtype)
-                logger.info("dry_run checked record: %s", item["record_id"])
-                return
+    for item in dataloader:
+        if args.dry_run:
+            _, timestep, x_t, teacher_target, base_target = _select_step_tensors(item, accelerator.device, weight_dtype)
+            conditioning = self_distill_cache.select_cached_conditioning(item, item["conditioning_source"])
+            student_pred = self_distill_cache.unet_predict_cfg(
+                unet,
+                self_distill_cache.scheduler_from_settings(
+                    item["generation_settings"]["sample_sampler"], prediction_type=self_distill_cache.resolve_prediction_type(args)
+                ),
+                conditioning,
+                x_t,
+                timestep,
+                int(item["generation_settings"]["height"]),
+                int(item["generation_settings"]["width"]),
+                float(item["generation_settings"]["scale"]),
+            )
+            _ = self_distill_cache.prediction_to_target(
+                student_pred,
+                args.prediction_target,
+                self_distill_cache.scheduler_from_settings(
+                    item["generation_settings"]["sample_sampler"], prediction_type=self_distill_cache.resolve_prediction_type(args)
+                ),
+                x_t,
+                timestep,
+            )
+            logger.info("dry_run checked record: %s", item["record_id"])
+            return
 
-            with accelerator.accumulate(network):
-                conditioning = _prepare_conditioning(args, item, tokenizers, text_encoders, accelerator.device, weight_dtype)
-                initial_latents = item["initial_noise_latent"].to(accelerator.device, dtype=weight_dtype)
-                teacher_latents = item["teacher_final_latent"].to(accelerator.device, dtype=weight_dtype)
-                base_latents = item["base_final_latent"].to(accelerator.device, dtype=weight_dtype)
+        with accelerator.accumulate(network):
+            _, timestep, x_t, teacher_target, base_target = _select_step_tensors(item, accelerator.device, weight_dtype)
+            conditioning = self_distill_cache.select_cached_conditioning(item, item["conditioning_source"])
+            scheduler = self_distill_cache.scheduler_from_settings(
+                item["generation_settings"]["sample_sampler"], prediction_type=self_distill_cache.resolve_prediction_type(args)
+            )
 
-                scheduler = self_distill_cache.scheduler_from_settings(settings["sample_sampler"], args.v_parameterization)
-                with accelerator.autocast():
-                    student_latents = self_distill_cache.run_sdxl_rollout(
-                        unet,
-                        scheduler,
-                        conditioning,
-                        initial_latents.clone(),
-                        int(settings["height"]),
-                        int(settings["width"]),
-                        int(settings["sample_steps"]),
-                        float(settings["scale"]),
-                    )
-                    loss, loss_logs = self_distill_losses.compute_self_distill_loss(
-                        student_latents,
-                        teacher_latents,
-                        base_latents,
-                        item["variant_type"],
-                        args,
-                    )
+            with accelerator.autocast():
+                student_pred = self_distill_cache.unet_predict_cfg(
+                    unet,
+                    scheduler,
+                    conditioning,
+                    x_t,
+                    timestep,
+                    int(item["generation_settings"]["height"]),
+                    int(item["generation_settings"]["width"]),
+                    float(item["generation_settings"]["scale"]),
+                )
+                student_target = self_distill_cache.prediction_to_target(student_pred, args.prediction_target, scheduler, x_t, timestep)
+                loss, loss_logs = self_distill_losses.compute_self_distill_loss(
+                    student_target,
+                    teacher_target,
+                    base_target,
+                    item["variant_type"],
+                    item["loss_role"],
+                    args,
+                    network=accelerator.unwrap_model(network),
+                    anchor_targets=anchor_targets,
+                )
 
-                accelerator.backward(loss)
-                if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                    accelerator.clip_grad_norm_(network.parameters(), args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+            accelerator.backward(loss)
+            if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                accelerator.clip_grad_norm_(network.parameters(), args.max_grad_norm)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
-            if accelerator.sync_gradients:
-                global_step += 1
-                progress.update(1)
-                progress.set_postfix(loss=f"{loss_logs['loss']:.4f}", variant=item["variant_type"])
-                if accelerator.is_main_process and args.logging_dir:
-                    accelerator.log(loss_logs, step=global_step)
-                if args.save_every_n_steps and global_step % args.save_every_n_steps == 0:
-                    _save_checkpoint(args, accelerator, network, network_args, global_step)
-                if global_step >= args.max_train_steps:
-                    break
-            clean_memory_on_device(accelerator.device)
-
-        if global_step >= args.max_train_steps:
-            break
+        if accelerator.sync_gradients:
+            global_step += 1
+            progress.update(1)
+            progress.set_postfix(loss=f"{loss_logs['loss']:.4f}", variant=item["variant_type"])
+            if accelerator.is_main_process and args.logging_dir:
+                accelerator.log(loss_logs, step=global_step)
+            if args.save_every_n_steps and global_step % args.save_every_n_steps == 0:
+                _save_checkpoint(args, accelerator, network, network_args, global_step)
+            if global_step >= args.max_train_steps:
+                break
+        clean_memory_on_device(accelerator.device)
 
     final_path = _save_checkpoint(args, accelerator, network, network_args, global_step)
     logger.info("saved final self-distill checkpoint to %s", final_path)
@@ -212,6 +294,7 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_optimizer_arguments(parser)
     sdxl_train_util.add_sdxl_training_arguments(parser)
     parser.add_argument("--cache_manifest", type=str, required=True)
+    parser.add_argument("--teacher_lora_weights", type=str, default=None)
     parser.add_argument("--student_init_weights", type=str, default=None)
     parser.add_argument("--network_weights", type=str, default=None)
     parser.add_argument("--network_module", type=str, default="networks.lora")
@@ -224,17 +307,35 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dim_from_weights", action="store_true")
     parser.add_argument("--unet_lr", type=float, default=None)
     parser.add_argument("--no_metadata", action="store_true")
-    parser.add_argument("--max_embeddings_multiples", type=int, default=3)
-    parser.add_argument("--require_cached_prompt_embeddings", action="store_true")
     parser.add_argument("--lbw_profile", type=str, default=None)
     parser.add_argument("--dry_run", action="store_true")
-    parser.add_argument("--positive_high_pass_delta_weight", type=float, default=1.0)
-    parser.add_argument("--coarse_preservation_weight", type=float, default=0.25)
-    parser.add_argument("--off_loss_weight", type=float, default=1.0)
-    parser.add_argument("--anchor_loss_weight", type=float, default=0.1)
+    parser.add_argument("--prediction_target", type=str, choices=["eps", "v"], default="eps")
+    parser.add_argument("--xt_source_mode", type=str, choices=["teacher_rollout"], default="teacher_rollout")
+    parser.add_argument("--export_te_mode", type=str, choices=["preserve", "drop"], default="preserve")
+    parser.add_argument("--optimizer_preset", type=str, default="adamw8bit")
+    parser.add_argument("--attention_backend", type=str, choices=["auto", "sdpa", "xformers"], default="auto")
+    parser.add_argument("--sample_sampler", type=str, default="euler_a")
+    parser.add_argument("--timestep_sampling_mode", type=str, choices=["uniform", "late_bias", "custom"], default="uniform")
+    parser.add_argument("--variant_quota", type=str, default="")
+    parser.add_argument("--use_keep_delta_loss", action="store_true", default=True)
+    parser.add_argument("--use_suppress_to_base_loss", action="store_true", default=True)
+    parser.add_argument("--use_weight_anchor_loss", action="store_true", default=True)
+    parser.add_argument("--use_coarse_preservation_loss", action="store_true")
+    parser.add_argument("--use_high_pass_delta_loss", action="store_true")
+    parser.add_argument("--use_low_pass_delta_loss", action="store_true")
+    parser.add_argument("--use_sparse_loss", action="store_true")
+    parser.add_argument("--keep_delta_loss_weight", type=float, default=1.0)
+    parser.add_argument("--suppress_to_base_loss_weight", type=float, default=1.0)
+    parser.add_argument("--weight_anchor_loss_weight", type=float, default=0.05)
+    parser.add_argument("--coarse_preservation_loss_weight", type=float, default=0.0)
+    parser.add_argument("--high_pass_delta_loss_weight", type=float, default=0.0)
+    parser.add_argument("--low_pass_delta_loss_weight", type=float, default=0.0)
     parser.add_argument("--sparse_loss_weight", type=float, default=0.0)
     parser.add_argument("--high_pass_mode", type=str, default="dog", choices=["dog", "laplacian", "gaussian_residual"])
     parser.add_argument("--low_pass_mode", type=str, default="avg", choices=["avg", "gaussian", "identity"])
+    parser.add_argument("--coarse_target_mode", type=str, default="teacher", choices=["base", "teacher"])
+    parser.add_argument("--per_variant_loss_weight", type=str, default="")
+    parser.add_argument("--per_block_anchor_weight", type=str, default="")
     return parser
 
 

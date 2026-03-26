@@ -1,0 +1,6 @@
+variant_quota = { keep_strong = 0.35, keep_weak = 0.15, off_null = 0.20, suppress_trigger_style_b = 0.15, suppress_trigger_style_c = 0.15 }
+learning_rate = 2.0e-5
+unet_lr = 2.0e-5
+optimizer_preset = "adamw8bit"
+use_weight_anchor_loss = true
+weight_anchor_loss_weight = 0.05

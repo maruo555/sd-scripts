@@ -5,6 +5,8 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from library import self_distill_cache
+
 
 def _load_profile_file(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
@@ -80,3 +82,9 @@ def apply_profile_to_network(network, profile: Optional[Dict[str, float]]) -> No
             multiplier = profile.get(group, profile.get("default", 1.0))
             state_dict[key] = value * math.sqrt(max(multiplier, 0.0))
     network.load_state_dict(state_dict, strict=False)
+
+
+def profile_hash(path: Optional[str]) -> str:
+    if path is None:
+        return ""
+    return self_distill_cache.file_sha256(path)

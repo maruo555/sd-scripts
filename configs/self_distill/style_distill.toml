@@ -1,0 +1,9 @@
+learning_rate = 1.5e-5
+unet_lr = 1.5e-5
+optimizer_preset = "adamw8bit"
+variant_quota = { keep_strong = 0.40, keep_weak = 0.20, off_null = 0.25, frontier = 0.15 }
+use_high_pass_delta_loss = true
+high_pass_delta_loss_weight = 0.1
+use_low_pass_delta_loss = false
+use_coarse_preservation_loss = false
+per_variant_loss_weight = { keep_strong = 1.0, keep_weak = 0.9, off_null = 1.0, frontier = 0.8 }

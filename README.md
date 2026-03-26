@@ -52,10 +52,11 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 |---|---|---|
 | `sdxl_tokenize.py` | SDXLのTE1/TE2トークン分割の表示と候補探索 | [docs/sdxl_tokenize_tool-ja.md](docs/sdxl_tokenize_tool-ja.md) |
 | `make_lora_diagnostic_report.py` | LoRA学習ログ（`grad_norm` / `dq_delta`）とLoRA重みを診断し、グラフ内蔵HTMLを生成 | 使い方とオプション詳細: [docs/make_lora_diagnostic_report-ja.md](docs/make_lora_diagnostic_report-ja.md) |
-| `build_prompt_bank.py` | single trigger 前提の prompt bank を生成 | Self-distill の流れとオプション: [docs/self_distill_README-ja.md](docs/self_distill_README-ja.md) |
-| `build_self_distill_cache.py` | base model と teacher LoRA の観測 cache を作成 | Self-distill の流れとオプション: [docs/self_distill_README-ja.md](docs/self_distill_README-ja.md) |
-| `sdxl_self_distill_network.py` | cached target を使って student LoRA を自己蒸留学習 | Self-distill の流れとオプション: [docs/self_distill_README-ja.md](docs/self_distill_README-ja.md) |
-| `eval_self_distill.py` | base / teacher / student を固定 prompt で比較評価 | Self-distill の流れとオプション: [docs/self_distill_README-ja.md](docs/self_distill_README-ja.md) |
+| `build_prompt_bank.py` | style / composition / trigger cleanup 向けの prompt bank を生成 | Self-distill v2 の流れとオプション: [docs/self_distill_README-ja.md](docs/self_distill_README-ja.md) |
+| `build_self_distill_cache.py` | teacher rollout 由来の `x_t` / target / conditioning cache を作成 | Self-distill v2 の流れとオプション: [docs/self_distill_README-ja.md](docs/self_distill_README-ja.md) |
+| `cache_audit.py` | cache 内の teacher-base 差分強度を監査し、弱い bank を洗う | Self-distill v2 の流れとオプション: [docs/self_distill_README-ja.md](docs/self_distill_README-ja.md) |
+| `sdxl_self_distill_network.py` | single-timestep cached target を使って student LoRA を自己蒸留学習 | Self-distill v2 の流れとオプション: [docs/self_distill_README-ja.md](docs/self_distill_README-ja.md) |
+| `eval_self_distill.py` | base / teacher raw / teacher+LBW / student を固定 prompt で比較評価 | Self-distill v2 の流れとオプション: [docs/self_distill_README-ja.md](docs/self_distill_README-ja.md) |
 
 ---
 

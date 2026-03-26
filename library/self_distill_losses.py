@@ -1,7 +1,9 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+from library import lbw_profile, self_distill_cache
 
 
 def _gaussian_residual(x: torch.Tensor, kernel: int) -> torch.Tensor:
@@ -47,48 +49,102 @@ def low_pass(x: torch.Tensor, mode: str) -> torch.Tensor:
     raise ValueError(f"Unsupported low-pass mode: {mode}")
 
 
-def _variant_is_positive(variant_type: str) -> bool:
-    return variant_type in {"strong", "weak", "frontier", "support_only"}
+def _variant_weight(args, variant_type: str) -> float:
+    weights = self_distill_cache.parse_mapping_arg(getattr(args, "per_variant_loss_weight", None))
+    return float(weights.get(variant_type, 1.0))
+
+
+def _anchor_group_weight(args, parameter_name: str) -> float:
+    weights = self_distill_cache.parse_mapping_arg(getattr(args, "per_block_anchor_weight", None))
+    lora_name = parameter_name.rsplit(".", 2)[0]
+    group = lbw_profile.group_for_lora_name(lora_name)
+    return float(weights.get(group, weights.get("default", 1.0)))
+
+
+def compute_weight_anchor_loss(network, anchor_targets: Optional[Dict[str, torch.Tensor]], args) -> Optional[torch.Tensor]:
+    if not getattr(args, "use_weight_anchor_loss", True):
+        return None
+    if anchor_targets is None:
+        return None
+
+    base_weight = float(getattr(args, "weight_anchor_loss_weight", 0.0))
+    if base_weight <= 0:
+        return None
+
+    total = None
+    for name, param in network.named_parameters():
+        if not param.requires_grad:
+            continue
+        target = anchor_targets.get(name)
+        if target is None:
+            continue
+        loss = F.mse_loss(param, target.to(device=param.device, dtype=param.dtype))
+        loss = loss * base_weight * _anchor_group_weight(args, name)
+        total = loss if total is None else total + loss
+    return total
 
 
 def compute_self_distill_loss(
-    student_latent: torch.Tensor,
-    teacher_latent: torch.Tensor,
-    base_latent: torch.Tensor,
+    student_target: torch.Tensor,
+    teacher_target: torch.Tensor,
+    base_target: torch.Tensor,
     variant_type: str,
+    loss_role: str,
     args,
+    network=None,
+    anchor_targets: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     losses: Dict[str, torch.Tensor] = {}
-    student_delta = student_latent - base_latent
-    teacher_delta = teacher_latent - base_latent
-    positive_variant = _variant_is_positive(variant_type)
+    variant_weight = _variant_weight(args, variant_type)
 
-    if getattr(args, "positive_high_pass_delta_weight", 0.0) > 0 and positive_variant:
-        student_hp = high_pass(student_delta, args.high_pass_mode)
-        teacher_hp = high_pass(teacher_delta, args.high_pass_mode)
-        losses["positive_high_pass_delta"] = F.mse_loss(student_hp, teacher_hp) * args.positive_high_pass_delta_weight
+    student_delta = student_target - base_target
+    teacher_delta = teacher_target - base_target
+    is_keep = loss_role == "keep"
+    is_suppress = loss_role in {"off", "suppress"}
 
-    if getattr(args, "coarse_preservation_weight", 0.0) > 0:
-        target = teacher_latent if positive_variant else base_latent
-        losses["coarse_preservation"] = (
-            F.mse_loss(low_pass(student_latent, args.low_pass_mode), low_pass(target, args.low_pass_mode))
-            * args.coarse_preservation_weight
+    if getattr(args, "use_keep_delta_loss", True) and is_keep:
+        losses["keep_delta_loss"] = F.mse_loss(student_delta, teacher_delta) * float(getattr(args, "keep_delta_loss_weight", 1.0))
+
+    if getattr(args, "use_suppress_to_base_loss", True) and is_suppress:
+        losses["suppress_to_base_loss"] = F.mse_loss(student_target, base_target) * float(
+            getattr(args, "suppress_to_base_loss_weight", 1.0)
         )
 
-    if getattr(args, "off_loss_weight", 0.0) > 0 and variant_type == "off":
-        losses["off_loss"] = F.mse_loss(student_latent, base_latent) * args.off_loss_weight
+    if getattr(args, "use_coarse_preservation_loss", False):
+        if is_keep:
+            coarse_target_mode = getattr(args, "coarse_target_mode", "teacher")
+            coarse_target = teacher_target if coarse_target_mode == "teacher" else base_target
+        else:
+            coarse_target = base_target
+        losses["coarse_preservation_loss"] = (
+            F.mse_loss(low_pass(student_target, args.low_pass_mode), low_pass(coarse_target, args.low_pass_mode))
+            * float(getattr(args, "coarse_preservation_loss_weight", 0.0))
+        )
 
-    if getattr(args, "anchor_loss_weight", 0.0) > 0:
-        target = teacher_latent if positive_variant else base_latent
-        losses["anchor_loss"] = F.mse_loss(student_latent, target) * args.anchor_loss_weight
+    if getattr(args, "use_high_pass_delta_loss", False) and is_keep:
+        losses["high_pass_delta_loss"] = (
+            F.mse_loss(high_pass(student_delta, args.high_pass_mode), high_pass(teacher_delta, args.high_pass_mode))
+            * float(getattr(args, "high_pass_delta_loss_weight", 0.0))
+        )
 
-    if getattr(args, "sparse_loss_weight", 0.0) > 0:
-        losses["sparse_loss"] = student_delta.abs().mean() * args.sparse_loss_weight
+    if getattr(args, "use_low_pass_delta_loss", False) and is_keep:
+        losses["low_pass_delta_loss"] = (
+            F.mse_loss(low_pass(student_delta, args.low_pass_mode), low_pass(teacher_delta, args.low_pass_mode))
+            * float(getattr(args, "low_pass_delta_loss_weight", 0.0))
+        )
+
+    if getattr(args, "use_sparse_loss", False):
+        losses["sparse_loss"] = student_delta.abs().mean() * float(getattr(args, "sparse_loss_weight", 0.0))
+
+    anchor_loss = compute_weight_anchor_loss(network, anchor_targets, args)
+    if anchor_loss is not None:
+        losses["weight_anchor_loss"] = anchor_loss
 
     if not losses:
-        losses["anchor_loss"] = F.mse_loss(student_latent, teacher_latent if positive_variant else base_latent)
+        losses["fallback_loss"] = F.mse_loss(student_target, teacher_target if is_keep else base_target)
 
-    total = sum(losses.values())
+    total = sum(losses.values()) * variant_weight
     scalar_logs = {name: float(value.detach().item()) for name, value in losses.items()}
+    scalar_logs["variant_weight"] = variant_weight
     scalar_logs["loss"] = float(total.detach().item())
     return total, scalar_logs
