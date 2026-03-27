@@ -29,6 +29,22 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _weights_include_text_encoder_lora(weights_path: Optional[str]) -> bool:
+    if not weights_path:
+        return False
+    if os.path.splitext(weights_path)[1] == ".safetensors":
+        from safetensors import safe_open
+
+        with safe_open(weights_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key.startswith("lora_te"):
+                    return True
+        return False
+
+    weights_sd = torch.load(weights_path, map_location="cpu")
+    return any(key.startswith("lora_te") for key in weights_sd.keys())
+
+
 def _freeze_text_encoder_lora(network) -> None:
     for lora in getattr(network, "text_encoder_loras", []):
         lora.requires_grad_(False)
@@ -41,7 +57,7 @@ def _freeze_text_encoder_lora(network) -> None:
             param.requires_grad = True
 
 
-def _create_network(args, vae, text_encoders, unet):
+def _create_network(args, vae, text_encoders, unet, require_text_encoder_lora: bool = False):
     network_module = importlib.import_module(args.network_module)
     net_kwargs = self_distill_cache.parse_network_args(args.network_args)
     init_weights = args.student_init_weights or args.network_weights
@@ -62,7 +78,8 @@ def _create_network(args, vae, text_encoders, unet):
             neuron_dropout=args.network_dropout,
             **net_kwargs,
         )
-    network.apply_to(text_encoders, unet, True, True)
+    attach_text_encoder = require_text_encoder_lora or _weights_include_text_encoder_lora(init_weights)
+    network.apply_to(text_encoders, unet, attach_text_encoder, True)
     if init_weights is not None:
         logger.info("load student init weights: %s", init_weights)
         network.load_weights(init_weights)
@@ -138,6 +155,8 @@ def train(args: argparse.Namespace) -> None:
     setup_logging(args, reset=True)
     self_distill_cache.ensure_dir(args.output_dir)
     _expand_optimizer_preset(args)
+    if args.network_train_text_encoder_only:
+        raise ValueError("self-distill v2 currently supports U-Net-only training; --network_train_text_encoder_only is not supported.")
 
     args.deepspeed = False
     accelerator = train_util.prepare_accelerator(args)
@@ -166,7 +185,7 @@ def train(args: argparse.Namespace) -> None:
     unet.train()
     self_distill_cache.apply_attention_backend(unet, args)
 
-    network, network_args = _create_network(args, vae, text_encoders, unet)
+    network, network_args = _create_network(args, vae, text_encoders, unet, require_text_encoder_lora=bool(header["teacher_te_included"]))
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
         network.enable_gradient_checkpointing()

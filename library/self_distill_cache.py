@@ -276,15 +276,17 @@ def build_prompt_conditioning(
     dtype: torch.dtype,
     max_embeddings_multiples: int = 3,
     clip_skip: Optional[int] = None,
+    text_encoder_device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     prompt_embeds = []
     negative_prompt_embeds = []
     pooled = None
     negative_pooled = None
+    te_device = text_encoder_device or device
 
     for idx, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
-        stub = _make_pipe_stub(tokenizer, text_encoder, device)
-        text_encoder = text_encoder.to(device)
+        stub = _make_pipe_stub(tokenizer, text_encoder, te_device)
+        text_encoder = text_encoder.to(te_device)
         text_encoder.eval()
 
         emb, pool, uncond_emb, uncond_pool = get_weighted_text_embeddings(
@@ -296,18 +298,18 @@ def build_prompt_conditioning(
             clip_skip=clip_skip,
             is_sdxl_text_encoder2=idx == 1,
         )
-        prompt_embeds.append(emb)
-        negative_prompt_embeds.append(uncond_emb)
+        prompt_embeds.append(emb.to(device=device, dtype=dtype))
+        negative_prompt_embeds.append(uncond_emb.to(device=device, dtype=dtype))
         if pool is not None:
-            pooled = pool
+            pooled = pool.to(device=device, dtype=dtype)
         if uncond_pool is not None:
-            negative_pooled = uncond_pool
+            negative_pooled = uncond_pool.to(device=device, dtype=dtype)
 
     return {
-        "prompt_embeds": torch.cat(prompt_embeds, dim=2).to(dtype),
-        "negative_prompt_embeds": torch.cat(negative_prompt_embeds, dim=2).to(dtype),
-        "pooled_prompt_embeds": pooled.to(dtype),
-        "negative_pooled_prompt_embeds": negative_pooled.to(dtype),
+        "prompt_embeds": torch.cat(prompt_embeds, dim=2),
+        "negative_prompt_embeds": torch.cat(negative_prompt_embeds, dim=2),
+        "pooled_prompt_embeds": pooled,
+        "negative_pooled_prompt_embeds": negative_pooled,
     }
 
 

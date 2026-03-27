@@ -2,7 +2,7 @@ import argparse
 import importlib
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
@@ -40,24 +40,58 @@ def _teacher_uses_text_encoder(network) -> bool:
     return len(getattr(network, "text_encoder_loras", [])) > 0
 
 
-def _load_base_bundle(args, accelerator, weight_dtype):
+def _load_model_bundle_to_cpu(args, accelerator, weight_dtype, tokenizers=None):
     _, text_encoder1, text_encoder2, vae, unet, _, _ = sdxl_train_util.load_target_model(
         args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype
     )
-    tokenizers = sdxl_train_util.load_tokenizers(args)
+    if tokenizers is None:
+        tokenizers = sdxl_train_util.load_tokenizers(args)
     text_encoders = [text_encoder1, text_encoder2]
     for te in text_encoders:
-        te.to(accelerator.device if args.cache_conditioning else "cpu", dtype=torch.float32)
+        te.to("cpu", dtype=torch.float32)
         te.eval()
         te.requires_grad_(False)
-    vae.to(accelerator.device, dtype=weight_dtype)
-    unet.to(accelerator.device, dtype=weight_dtype)
+    vae.to("cpu", dtype=weight_dtype)
+    unet.to("cpu", dtype=weight_dtype)
     unet.eval()
     self_distill_cache.apply_attention_backend(unet, args)
-    return tokenizers, text_encoders, vae, unet
+    return {
+        "tokenizers": tokenizers,
+        "text_encoders": text_encoders,
+        "vae": vae,
+        "unet": unet,
+    }
+
+
+def _move_bundle(bundle: Dict, device: torch.device, weight_dtype: torch.dtype, cache_conditioning: bool) -> None:
+    te_device = device if cache_conditioning else torch.device("cpu")
+    for te in bundle["text_encoders"]:
+        te.to(te_device, dtype=torch.float32)
+        te.eval()
+    bundle["unet"].to(device, dtype=weight_dtype)
+    bundle["unet"].eval()
+
+
+def _offload_bundle(bundle: Dict, weight_dtype: torch.dtype) -> None:
+    for te in bundle["text_encoders"]:
+        te.to("cpu", dtype=torch.float32)
+        te.eval()
+    bundle["unet"].to("cpu", dtype=weight_dtype)
+    bundle["unet"].eval()
+
+
+def _build_teacher_bundle(args, accelerator, weight_dtype, tokenizers):
+    bundle = _load_model_bundle_to_cpu(args, accelerator, weight_dtype, tokenizers=tokenizers)
+    teacher_network, teacher_weights_sd = _prepare_teacher_network(args, bundle["text_encoders"], bundle["vae"], bundle["unet"])
+    teacher_te_included = _teacher_uses_text_encoder(teacher_network)
+    teacher_network.merge_to(bundle["text_encoders"], bundle["unet"], teacher_weights_sd, weight_dtype, torch.device("cpu"))
+    del teacher_network
+    del teacher_weights_sd
+    return bundle, teacher_te_included
 
 
 def _conditioning_for_prompt(args, tokenizers, text_encoders, prompt_text: str, negative_prompt: str, device, weight_dtype):
+    te_device = device if args.cache_conditioning else torch.device("cpu")
     return self_distill_cache.build_prompt_conditioning(
         tokenizers,
         text_encoders,
@@ -67,6 +101,7 @@ def _conditioning_for_prompt(args, tokenizers, text_encoders, prompt_text: str, 
         weight_dtype,
         max_embeddings_multiples=args.max_embeddings_multiples,
         clip_skip=args.clip_skip,
+        text_encoder_device=te_device,
     )
 
 
@@ -111,9 +146,9 @@ def build_cache(args: argparse.Namespace) -> None:
     args.deepspeed = False
     accelerator = train_util.prepare_accelerator(args)
     weight_dtype, _ = train_util.prepare_dtype(args)
-    tokenizers, text_encoders, vae, unet = _load_base_bundle(args, accelerator, weight_dtype)
-    teacher_network, teacher_weights_sd = _prepare_teacher_network(args, text_encoders, vae, unet)
-    teacher_te_included = _teacher_uses_text_encoder(teacher_network)
+    tokenizers = sdxl_train_util.load_tokenizers(args)
+    base_bundle = _load_model_bundle_to_cpu(args, accelerator, weight_dtype, tokenizers=tokenizers)
+    teacher_bundle, teacher_te_included = _build_teacher_bundle(args, accelerator, weight_dtype, tokenizers=tokenizers)
 
     self_distill_cache.ensure_dir(args.output_dir)
     manifest_path = os.path.join(args.output_dir, "manifest.jsonl")
@@ -140,10 +175,11 @@ def build_cache(args: argparse.Namespace) -> None:
         prediction_type = header.prediction_type
         target_type = settings.get("prediction_target", args.prediction_target)
 
+        _move_bundle(base_bundle, accelerator.device, weight_dtype, args.cache_conditioning)
         base_conditioning = _conditioning_for_prompt(
             args,
-            tokenizers,
-            text_encoders,
+            base_bundle["tokenizers"],
+            base_bundle["text_encoders"],
             record["prompt_text"],
             record.get("negative_prompt", ""),
             accelerator.device,
@@ -158,12 +194,13 @@ def build_cache(args: argparse.Namespace) -> None:
             weight_dtype,
             self_distill_cache.scheduler_from_settings(settings["sample_sampler"], prediction_type=prediction_type),
         )
+        _offload_bundle(base_bundle, weight_dtype)
 
-        teacher_network.merge_to(text_encoders, unet, teacher_weights_sd, weight_dtype, accelerator.device)
+        _move_bundle(teacher_bundle, accelerator.device, weight_dtype, args.cache_conditioning)
         teacher_conditioning = _conditioning_for_prompt(
             args,
-            tokenizers,
-            text_encoders,
+            teacher_bundle["tokenizers"],
+            teacher_bundle["text_encoders"],
             record["prompt_text"],
             record.get("negative_prompt", ""),
             accelerator.device,
@@ -179,7 +216,7 @@ def build_cache(args: argparse.Namespace) -> None:
         )
         with torch.no_grad():
             teacher_final_latent, captures = self_distill_targets.build_teacher_rollout_targets(
-                unet,
+                teacher_bundle["unet"],
                 teacher_scheduler,
                 chosen_conditioning,
                 initial_latents.clone(),
@@ -190,12 +227,13 @@ def build_cache(args: argparse.Namespace) -> None:
                 target_type,
                 capture_indices,
             )
+        _offload_bundle(teacher_bundle, weight_dtype)
 
-        tokenizers, text_encoders, vae, unet = _load_base_bundle(args, accelerator, weight_dtype)
+        _move_bundle(base_bundle, accelerator.device, weight_dtype, args.cache_conditioning)
         base_conditioning_reloaded = _conditioning_for_prompt(
             args,
-            tokenizers,
-            text_encoders,
+            base_bundle["tokenizers"],
+            base_bundle["text_encoders"],
             record["prompt_text"],
             record.get("negative_prompt", ""),
             accelerator.device,
@@ -212,7 +250,7 @@ def build_cache(args: argparse.Namespace) -> None:
             for capture in captures:
                 timestep_tensor = torch.tensor(capture["timestep"], device=accelerator.device)
                 base_pred = self_distill_cache.unet_predict_cfg(
-                    unet,
+                    base_bundle["unet"],
                     base_scheduler,
                     chosen_base_conditioning,
                     capture["x_t"].to(accelerator.device, dtype=weight_dtype),
@@ -232,6 +270,7 @@ def build_cache(args: argparse.Namespace) -> None:
                 timestep_list.append(capture["timestep"])
                 teacher_target_list.append(capture["target"].to("cpu"))
                 base_target_list.append(base_target.detach().to("cpu"))
+        _offload_bundle(base_bundle, weight_dtype)
 
         bundle = {
             "target_timesteps": torch.tensor(timestep_list, dtype=torch.long),
@@ -246,8 +285,6 @@ def build_cache(args: argparse.Namespace) -> None:
 
         entry = _save_record(args.output_dir, record, settings, bundle)
         manifest_entries.append(entry)
-
-        teacher_network, teacher_weights_sd = _prepare_teacher_network(args, text_encoders, vae, unet)
         clean_memory_on_device(accelerator.device)
 
     self_distill_cache.save_manifest(manifest_path, header, manifest_entries)
