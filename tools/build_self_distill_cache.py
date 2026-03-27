@@ -300,8 +300,6 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_lora_weights", type=str, required=True)
     parser.add_argument("--teacher_lora_multiplier", type=float, default=1.0)
     parser.add_argument("--network_module", type=str, default="networks.lora")
-    parser.add_argument("--resolution", type=int, default=640)
-    parser.add_argument("--sample_sampler", type=str, default="euler_a")
     parser.add_argument("--max_embeddings_multiples", type=int, default=3)
     parser.add_argument("--cache_conditioning", action="store_true", default=True)
     parser.add_argument("--lbw_profile", type=str, default=None)

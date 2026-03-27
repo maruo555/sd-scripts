@@ -144,6 +144,8 @@ cache 読み込み時に以下を hard fail で検証します。
 - prompt bank hash
 - cache schema version
 
+cache header の `scheduler` / `prediction_type` は cache build 時の CLI 既定値ではなく、prompt bank 側の `generation_settings` から確定します。
+
 ## Teacher TE を含む場合
 
 Teacher に Text Encoder LoRA が含まれる場合、trigger 応答は TE と U-Net の連携で成立します。v2 ではこれを正式対応とし、teacher/base の conditioning cache を保存します。
@@ -155,6 +157,7 @@ Teacher に Text Encoder LoRA が含まれる場合、trigger 応答は TE と U
 - `teacher_te_included=true` の cache に対して `export_te_mode=drop` は未対応で、train 開始時に hard fail します
 - `--lbw_profile` を付けた評価では、retain/suppress/drift の基準も `teacher+LBW` に切り替わります
 - `teacher_te_included=true` の cache では、student 初期重みが U-Net-only でも student 側に TE LoRA を作って保持します
+- `dim_from_weights=true` かつ U-Net-only init でも、teacher TE 付き cache なら U-Net 側の rank/alpha を引き継いで TE LoRA を生成します
 
 ## x_t と target
 
@@ -371,3 +374,5 @@ python sdxl_self_distill_network.py \
 - `--resume_cache` は既存 manifest header と現在設定が一致する場合だけ再利用されます
 - train 時の strict manifest check で teacher 一致まで見たい場合は `--teacher_lora_weights` を渡してください
 - `gradient_accumulation_steps > 1` のときも requested `max_train_steps` に届くように sampler 長を調整しています
+- `--logging_dir` を使う場合、self-distill train でも tracker を初期化して `accelerator.log` へ流します
+- `pretrained_model_name_or_path` は単一ファイルだけでなく diffusers directory や model identifier でも manifest hash を計算できます

@@ -101,14 +101,31 @@ def ensure_dir(path: str) -> None:
 def normalize_path(path: Optional[str]) -> str:
     if path is None:
         return ""
-    return os.path.abspath(os.path.expanduser(path))
+    expanded = os.path.expanduser(path)
+    if os.path.exists(expanded):
+        return os.path.abspath(expanded)
+    return str(path)
 
 
 def file_sha256(path: Optional[str]) -> str:
     if path is None:
         return ""
+    expanded = os.path.expanduser(path)
+    if not os.path.exists(expanded):
+        return hashlib.sha256(str(path).encode("utf-8")).hexdigest()
+    if os.path.isdir(expanded):
+        digest = hashlib.sha256()
+        for root, _, files in os.walk(expanded):
+            for name in sorted(files):
+                full_path = os.path.join(root, name)
+                rel_path = os.path.relpath(full_path, expanded).replace(os.sep, "/")
+                digest.update(rel_path.encode("utf-8"))
+                with open(full_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        digest.update(chunk)
+        return digest.hexdigest()
     digest = hashlib.sha256()
-    with open(path, "rb") as f:
+    with open(expanded, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -464,7 +481,24 @@ def default_generation_name(entry: Dict[str, Any], index: int) -> str:
 
 
 def build_manifest_header(args, teacher_te_included: bool, prompt_bank_path: str) -> CacheManifestHeader:
-    prediction_type = resolve_prediction_type(args)
+    prompt_bank = load_prompt_bank(prompt_bank_path)
+    samplers = sorted(
+        {
+            generation_settings_from_prompt_record(record, args.resolution)["sample_sampler"]
+            for record in prompt_bank["records"]
+        }
+    )
+    prediction_targets = sorted(
+        {
+            generation_settings_from_prompt_record(record, args.resolution)["prediction_target"]
+            for record in prompt_bank["records"]
+        }
+    )
+    if len(samplers) != 1:
+        raise ValueError(f"Prompt bank must use a single sample_sampler for cache build: found {samplers}")
+    if len(prediction_targets) != 1:
+        raise ValueError(f"Prompt bank must use a single prediction_target for cache build: found {prediction_targets}")
+    prediction_type = "epsilon" if prediction_targets[0] == "eps" else "v_prediction"
     return CacheManifestHeader(
         version=CACHE_MANIFEST_VERSION,
         base_model_identifier=normalize_path(args.pretrained_model_name_or_path),
@@ -476,7 +510,7 @@ def build_manifest_header(args, teacher_te_included: bool, prompt_bank_path: str
         lbw_profile_hash=file_sha256(getattr(args, "lbw_profile", None)),
         prediction_type=prediction_type,
         resolution=int(args.resolution),
-        scheduler=str(getattr(args, "sample_sampler", "euler_a")),
+        scheduler=samplers[0],
         xt_source_mode=str(getattr(args, "xt_source_mode", "teacher_rollout")),
         timestep_sampling_mode=str(getattr(args, "timestep_sampling_mode", "uniform")),
         prompt_bank_hash=file_sha256(prompt_bank_path),

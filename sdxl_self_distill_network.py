@@ -45,6 +45,49 @@ def _weights_include_text_encoder_lora(weights_path: Optional[str]) -> bool:
     return any(key.startswith("lora_te") for key in weights_sd.keys())
 
 
+def _load_weights_sd(weights_path: str) -> Dict[str, torch.Tensor]:
+    if os.path.splitext(weights_path)[1] == ".safetensors":
+        from safetensors.torch import load_file
+
+        return load_file(weights_path)
+    return torch.load(weights_path, map_location="cpu")
+
+
+def _infer_network_shape_from_weights(weights_path: str) -> Dict[str, Optional[float]]:
+    weights_sd = _load_weights_sd(weights_path)
+    base_dims = set()
+    base_alphas = set()
+    conv_dims = set()
+    conv_alphas = set()
+
+    for key, value in weights_sd.items():
+        if not key.endswith("lora_down.weight"):
+            continue
+        lora_name = key.rsplit(".", 2)[0]
+        alpha_key = f"{lora_name}.alpha"
+        alpha_value = weights_sd.get(alpha_key, value.shape[0])
+        if value.ndim == 4 and tuple(value.shape[-2:]) != (1, 1):
+            conv_dims.add(int(value.shape[0]))
+            conv_alphas.add(float(alpha_value))
+        else:
+            base_dims.add(int(value.shape[0]))
+            base_alphas.add(float(alpha_value))
+
+    if len(base_dims) != 1 or len(base_alphas) != 1:
+        raise ValueError(f"Could not infer a single base LoRA rank/alpha from {weights_path}.")
+    if len(conv_dims) > 1 or len(conv_alphas) > 1:
+        raise ValueError(f"Could not infer a single Conv2d(3x3) LoRA rank/alpha from {weights_path}.")
+
+    conv_dim = next(iter(conv_dims)) if conv_dims else None
+    conv_alpha = next(iter(conv_alphas)) if conv_alphas else None
+    return {
+        "network_dim": next(iter(base_dims)),
+        "network_alpha": next(iter(base_alphas)),
+        "conv_lora_dim": conv_dim,
+        "conv_alpha": conv_alpha,
+    }
+
+
 def _freeze_text_encoder_lora(network) -> None:
     for lora in getattr(network, "text_encoder_loras", []):
         lora.requires_grad_(False)
@@ -61,24 +104,39 @@ def _create_network(args, vae, text_encoders, unet, require_text_encoder_lora: b
     network_module = importlib.import_module(args.network_module)
     net_kwargs = self_distill_cache.parse_network_args(args.network_args)
     init_weights = args.student_init_weights or args.network_weights
-    if args.dim_from_weights:
+    attach_text_encoder = require_text_encoder_lora or _weights_include_text_encoder_lora(init_weights)
+    can_create_from_weights = args.dim_from_weights and not (attach_text_encoder and init_weights and not _weights_include_text_encoder_lora(init_weights))
+    if can_create_from_weights:
         if init_weights is None:
             raise ValueError("--dim_from_weights requires --student_init_weights or --network_weights.")
         network, _ = network_module.create_network_from_weights(1.0, init_weights, vae, text_encoders, unet, **net_kwargs)
     else:
+        inferred_shape = None
+        if args.dim_from_weights:
+            if init_weights is None:
+                raise ValueError("--dim_from_weights requires --student_init_weights or --network_weights.")
+            inferred_shape = _infer_network_shape_from_weights(init_weights)
         if "dropout" not in net_kwargs:
             net_kwargs["dropout"] = args.network_dropout
+        network_dim = inferred_shape["network_dim"] if inferred_shape is not None else args.network_dim
+        network_alpha = inferred_shape["network_alpha"] if inferred_shape is not None else args.network_alpha
+        conv_lora_dim = inferred_shape["conv_lora_dim"] if inferred_shape is not None else net_kwargs.get("conv_lora_dim")
+        conv_alpha = inferred_shape["conv_alpha"] if inferred_shape is not None else net_kwargs.get("conv_alpha")
+        if inferred_shape is not None:
+            if conv_lora_dim is not None:
+                net_kwargs["conv_lora_dim"] = conv_lora_dim
+            if conv_alpha is not None:
+                net_kwargs["conv_alpha"] = conv_alpha
         network = network_module.create_network(
             1.0,
-            args.network_dim,
-            args.network_alpha,
+            network_dim,
+            network_alpha,
             vae,
             text_encoders,
             unet,
             neuron_dropout=args.network_dropout,
             **net_kwargs,
         )
-    attach_text_encoder = require_text_encoder_lora or _weights_include_text_encoder_lora(init_weights)
     network.apply_to(text_encoders, unet, attach_text_encoder, True)
     if init_weights is not None:
         logger.info("load student init weights: %s", init_weights)
@@ -216,6 +274,9 @@ def train(args: argparse.Namespace) -> None:
     )
 
     network, optimizer, dataloader, lr_scheduler = accelerator.prepare(network, optimizer, dataloader, lr_scheduler)
+    if accelerator.is_main_process and args.logging_dir:
+        tracker_name = args.log_tracker_name or "self_distill_v2"
+        accelerator.init_trackers(tracker_name, config=vars(args))
 
     anchor_targets = None
     if getattr(args, "use_weight_anchor_loss", True):
@@ -337,7 +398,6 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--export_te_mode", type=str, choices=["preserve", "drop"], default="preserve")
     parser.add_argument("--optimizer_preset", type=str, default="adamw8bit")
     parser.add_argument("--attention_backend", type=str, choices=["auto", "sdpa", "xformers"], default="auto")
-    parser.add_argument("--sample_sampler", type=str, default="euler_a")
     parser.add_argument("--timestep_sampling_mode", type=str, choices=["uniform", "late_bias", "custom"], default="uniform")
     parser.add_argument("--variant_quota", type=str, default="")
     parser.add_argument("--use_keep_delta_loss", action="store_true", default=True)
