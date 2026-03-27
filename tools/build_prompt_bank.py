@@ -84,8 +84,9 @@ def build_prompt_bank(args: argparse.Namespace) -> Dict[str, Any]:
                 "keep_strong": _compose(keep_triggers + support_subset + [template]),
                 "keep_weak": _compose(keep_triggers + [template]),
                 "off_null": _compose([template]),
-                "frontier": _compose(keep_triggers + ([frontier_tag] if frontier_tag else []) + [template]),
             }
+            if frontier_tag:
+                variants["frontier"] = _compose(keep_triggers + [frontier_tag, template])
             for suppress_trigger in suppress_triggers:
                 variants[f"suppress_trigger_{suppress_trigger}"] = _compose([suppress_trigger, template])
 

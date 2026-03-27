@@ -146,6 +146,10 @@ def train(args: argparse.Namespace) -> None:
 
     header, _ = self_distill_cache.load_manifest_with_header(args.cache_manifest)
     self_distill_cache.validate_manifest_header(header, args)
+    if bool(header["teacher_te_included"]) and args.export_te_mode == "drop":
+        raise ValueError(
+            "export_te_mode=drop is not supported when the cache was built from a teacher that includes Text Encoder LoRA."
+        )
 
     _, text_encoder1, text_encoder2, vae, unet, _, _ = sdxl_train_util.load_target_model(
         args, accelerator, sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, weight_dtype

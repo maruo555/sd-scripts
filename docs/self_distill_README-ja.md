@@ -76,6 +76,7 @@ MVP の conditioning 方針:
 - `keep_*`: `teacher`
 - `off_null`: `base`
 - `suppress_trigger_*`: default は `teacher`
+- `frontier_tags` が空なら `frontier` variant は生成されません
 
 ### tag 群の役割
 
@@ -147,6 +148,8 @@ Teacher に Text Encoder LoRA が含まれる場合、trigger 応答は TE と U
 - 学習時は TE を更新しません
 - export 時は TE LoRA を凍結保持したまま student safetensors に含めます
 - `drop` は将来拡張扱いで、trigger 応答が変わる可能性があります
+- `teacher_te_included=true` の cache に対して `export_te_mode=drop` は未対応で、train 開始時に hard fail します
+- `--lbw_profile` を付けた評価では、retain/suppress/drift の基準も `teacher+LBW` に切り替わります
 
 ## x_t と target
 
@@ -356,6 +359,7 @@ python sdxl_self_distill_network.py \
 - exact pose 再現や ControlNet 的厳密空間制御は対象外です
 - high/low frequency 機能は optional な実験機能です
 - rank 圧縮、TE 学習、full rollout 学習は v2 本線に含めません
+- `eval_split` に該当する record が 0 件なら `eval_self_distill.py` は明示エラーで止まります
 
 ## 補足
 

@@ -130,6 +130,8 @@ def evaluate(args: argparse.Namespace) -> None:
     accelerator = train_util.prepare_accelerator(args)
     weight_dtype, _ = train_util.prepare_dtype(args)
     records = _load_eval_prompts(args.eval_prompts, args.eval_split)
+    if not records:
+        raise ValueError(f"No evaluation records found for split={args.eval_split!r} in {args.eval_prompts}")
     self_distill_cache.ensure_dir(args.output_dir)
 
     base_outputs = _generate_for_mode(args, accelerator, weight_dtype, records)
@@ -146,8 +148,9 @@ def evaluate(args: argparse.Namespace) -> None:
         base_outputs, teacher_outputs, teacher_lbw_outputs, student_outputs
     ):
         images.append([base_img, teacher_img, teacher_lbw_img, student_img])
-        base_teacher = _mse(base_latent, teacher_latent)
-        student_teacher = _mse(student_latent, teacher_latent)
+        teacher_reference_latent = teacher_lbw_latent if args.lbw_profile else teacher_latent
+        base_teacher = _mse(base_latent, teacher_reference_latent)
+        student_teacher = _mse(student_latent, teacher_reference_latent)
         student_base = _mse(student_latent, base_latent)
         teacher_lbw_teacher = _mse(teacher_lbw_latent, teacher_latent)
         variant = record["variant_type"]
@@ -158,6 +161,7 @@ def evaluate(args: argparse.Namespace) -> None:
             "student_teacher_mse": student_teacher,
             "student_base_mse": student_base,
             "teacher_lbw_teacher_mse": teacher_lbw_teacher,
+            "teacher_reference": "teacher_lbw" if args.lbw_profile else "teacher_raw",
         }
         per_prompt.append(metrics)
 
