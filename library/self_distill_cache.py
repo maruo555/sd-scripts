@@ -528,7 +528,6 @@ def validate_manifest_header(header: Dict[str, Any], args, prompt_bank_path: Opt
         "lbw_profile_hash": file_sha256(getattr(args, "lbw_profile", None)),
         "prediction_type": expected_prediction,
         "resolution": int(args.resolution),
-        "scheduler": str(getattr(args, "sample_sampler", header.get("scheduler", ""))),
         "xt_source_mode": str(getattr(args, "xt_source_mode", "teacher_rollout")),
         "timestep_sampling_mode": str(getattr(args, "timestep_sampling_mode", header.get("timestep_sampling_mode", ""))),
         "cache_schema_version": CACHE_MANIFEST_VERSION,

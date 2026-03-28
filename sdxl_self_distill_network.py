@@ -88,6 +88,20 @@ def _infer_network_shape_from_weights(weights_path: str) -> Dict[str, Optional[f
     }
 
 
+def _load_teacher_text_encoder_weights(network, teacher_weights_path: str) -> None:
+    teacher_sd = _load_weights_sd(teacher_weights_path)
+    te_state = {key: value for key, value in teacher_sd.items() if key.startswith("lora_te")}
+    if not te_state:
+        raise ValueError(f"teacher_lora_weights does not contain Text Encoder LoRA weights: {teacher_weights_path}")
+    info = network.load_state_dict(te_state, strict=False)
+    missing_te = [key for key in info.missing_keys if key.startswith("lora_te")]
+    unexpected_te = [key for key in info.unexpected_keys if key.startswith("lora_te")]
+    if missing_te or unexpected_te:
+        raise ValueError(
+            f"Failed to load teacher Text Encoder LoRA weights cleanly. missing={missing_te} unexpected={unexpected_te}"
+        )
+
+
 def _freeze_text_encoder_lora(network) -> None:
     for lora in getattr(network, "text_encoder_loras", []):
         lora.requires_grad_(False)
@@ -141,6 +155,13 @@ def _create_network(args, vae, text_encoders, unet, require_text_encoder_lora: b
     if init_weights is not None:
         logger.info("load student init weights: %s", init_weights)
         network.load_weights(init_weights)
+    if require_text_encoder_lora and not _weights_include_text_encoder_lora(init_weights):
+        if not getattr(args, "teacher_lora_weights", None):
+            raise ValueError(
+                "teacher_te_included=true cache requires --teacher_lora_weights when student init weights do not contain Text Encoder LoRA."
+            )
+        logger.info("load teacher Text Encoder LoRA weights for preserved TE behavior: %s", args.teacher_lora_weights)
+        _load_teacher_text_encoder_weights(network, args.teacher_lora_weights)
     lbw_profile.apply_profile_to_network(network, lbw_profile.load_profile(args.lbw_profile))
     _freeze_text_encoder_lora(network)
     return network, net_kwargs
