@@ -18,6 +18,7 @@ class SelfDistillDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         entry = self.entries[index]
         bundle = self_distill_cache.load_tensor_bundle(entry["tensors_path"])
+        conditioning_source = entry.get("conditioning_source", "teacher")
 
         required = {
             "base_prompt_embeds",
@@ -29,7 +30,7 @@ class SelfDistillDataset(Dataset):
             "teacher_target",
             "base_target",
         }
-        if self.require_teacher_conditioning:
+        if self.require_teacher_conditioning or conditioning_source == "teacher":
             required.update(
                 {
                     "teacher_prompt_embeds",
@@ -50,7 +51,7 @@ class SelfDistillDataset(Dataset):
             "variant_type": entry["variant_type"],
             "split": entry.get("split", "train"),
             "seed": entry["seed"],
-            "conditioning_source": entry.get("conditioning_source", "teacher"),
+            "conditioning_source": conditioning_source,
             "loss_role": entry.get("loss_role", "keep"),
             "generation_settings": entry["generation_settings"],
             "template": entry.get("template", ""),

@@ -136,8 +136,10 @@ def evaluate(args: argparse.Namespace) -> None:
 
     base_outputs = _generate_for_mode(args, accelerator, weight_dtype, records)
     teacher_outputs = _generate_for_mode(args, accelerator, weight_dtype, records, args.teacher_lora_weights, args.teacher_lora_multiplier, None)
-    teacher_lbw_outputs = _generate_for_mode(
-        args, accelerator, weight_dtype, records, args.teacher_lora_weights, args.teacher_lora_multiplier, args.lbw_profile
+    teacher_lbw_outputs = (
+        _generate_for_mode(args, accelerator, weight_dtype, records, args.teacher_lora_weights, args.teacher_lora_multiplier, args.lbw_profile)
+        if args.lbw_profile
+        else teacher_outputs
     )
     student_outputs = _generate_for_mode(args, accelerator, weight_dtype, records, args.student_lora_weights, 1.0, args.student_lbw_profile)
 

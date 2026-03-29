@@ -15,7 +15,7 @@ from library.sdxl_lpw_stable_diffusion import get_weighted_text_embeddings
 
 
 PROMPT_BANK_VERSION = 2
-CACHE_MANIFEST_VERSION = 2
+CACHE_MANIFEST_VERSION = 3
 
 
 @dataclass
@@ -29,7 +29,7 @@ class CacheManifestHeader:
     export_te_mode: str
     lbw_profile_hash: str
     prediction_type: str
-    resolution: int
+    resolution: Dict[str, Any]
     scheduler: str
     xt_source_mode: str
     timestep_sampling_mode: str
@@ -262,6 +262,19 @@ def generation_settings_from_prompt_record(record: Dict[str, Any], fallback_reso
     settings.setdefault("negative_prompt", record.get("negative_prompt", ""))
     settings.setdefault("prediction_target", record.get("prediction_target", "eps"))
     return settings
+
+
+def resolution_signature_from_prompt_bank(prompt_bank: Dict[str, Any], fallback_resolution: int) -> Dict[str, Any]:
+    pairs = sorted(
+        {
+            (int(settings["width"]), int(settings["height"]))
+            for settings in (generation_settings_from_prompt_record(record, fallback_resolution) for record in prompt_bank["records"])
+        }
+    )
+    if len(pairs) == 1:
+        width, height = pairs[0]
+        return {"mode": "single", "width": width, "height": height}
+    return {"mode": "mixed", "pairs": [[width, height] for width, height in pairs]}
 
 
 def make_initial_latents(
@@ -499,6 +512,7 @@ def build_manifest_header(args, teacher_te_included: bool, prompt_bank_path: str
     if len(prediction_targets) != 1:
         raise ValueError(f"Prompt bank must use a single prediction_target for cache build: found {prediction_targets}")
     prediction_type = "epsilon" if prediction_targets[0] == "eps" else "v_prediction"
+    resolution_signature = resolution_signature_from_prompt_bank(prompt_bank, args.resolution)
     return CacheManifestHeader(
         version=CACHE_MANIFEST_VERSION,
         base_model_identifier=normalize_path(args.pretrained_model_name_or_path),
@@ -509,7 +523,7 @@ def build_manifest_header(args, teacher_te_included: bool, prompt_bank_path: str
         export_te_mode=getattr(args, "export_te_mode", "preserve"),
         lbw_profile_hash=file_sha256(getattr(args, "lbw_profile", None)),
         prediction_type=prediction_type,
-        resolution=int(args.resolution),
+        resolution=resolution_signature,
         scheduler=samplers[0],
         xt_source_mode=str(getattr(args, "xt_source_mode", "teacher_rollout")),
         timestep_sampling_mode=str(getattr(args, "timestep_sampling_mode", "uniform")),
@@ -522,12 +536,15 @@ def build_manifest_header(args, teacher_te_included: bool, prompt_bank_path: str
 
 def validate_manifest_header(header: Dict[str, Any], args, prompt_bank_path: Optional[str] = None) -> None:
     expected_prediction = resolve_prediction_type(args)
+    expected_resolution = header.get("resolution")
+    if prompt_bank_path is not None:
+        expected_resolution = resolution_signature_from_prompt_bank(load_prompt_bank(prompt_bank_path), args.resolution)
     checks = {
         "base_model_identifier": normalize_path(args.pretrained_model_name_or_path),
         "base_model_hash": file_sha256(args.pretrained_model_name_or_path),
         "lbw_profile_hash": file_sha256(getattr(args, "lbw_profile", None)),
         "prediction_type": expected_prediction,
-        "resolution": int(args.resolution),
+        "resolution": expected_resolution,
         "xt_source_mode": str(getattr(args, "xt_source_mode", "teacher_rollout")),
         "timestep_sampling_mode": str(getattr(args, "timestep_sampling_mode", header.get("timestep_sampling_mode", ""))),
         "cache_schema_version": CACHE_MANIFEST_VERSION,

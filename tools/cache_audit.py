@@ -79,7 +79,7 @@ def audit_cache(args):
     with open(os.path.join(args.output_dir, "cache_audit_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    if args.output_csv:
+    if args.output_csv and rows:
         with open(os.path.join(args.output_dir, "cache_audit_rows.csv"), "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             writer.writeheader()

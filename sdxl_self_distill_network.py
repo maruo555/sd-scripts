@@ -273,6 +273,9 @@ def train(args: argparse.Namespace) -> None:
     optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, params)
     lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
+    if int(getattr(args, "train_batch_size", 1)) != 1:
+        raise ValueError("self-distill v2 currently supports only train_batch_size=1")
+
     dataset = self_distill_dataset.SelfDistillDataset(args.cache_manifest, split="train", require_teacher_conditioning=bool(header["teacher_te_included"]))
     required_samples = max(
         len(dataset),
@@ -382,13 +385,20 @@ def train(args: argparse.Namespace) -> None:
             if accelerator.is_main_process and args.logging_dir:
                 accelerator.log(loss_logs, step=global_step)
             if args.save_every_n_steps and global_step % args.save_every_n_steps == 0:
-                _save_checkpoint(args, accelerator, network, network_args, global_step)
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    _save_checkpoint(args, accelerator, network, network_args, global_step)
+                accelerator.wait_for_everyone()
             if global_step >= args.max_train_steps:
                 break
         clean_memory_on_device(accelerator.device)
 
-    final_path = _save_checkpoint(args, accelerator, network, network_args, global_step)
-    logger.info("saved final self-distill checkpoint to %s", final_path)
+    accelerator.wait_for_everyone()
+    final_path = None
+    if accelerator.is_main_process:
+        final_path = _save_checkpoint(args, accelerator, network, network_args, global_step)
+        logger.info("saved final self-distill checkpoint to %s", final_path)
+    accelerator.wait_for_everyone()
 
 
 def setup_parser() -> argparse.ArgumentParser:
