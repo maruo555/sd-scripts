@@ -78,7 +78,6 @@ python tools\build_self_distill_cache.py ^
   --teacher_lora_weights "%TEACHER%" ^
   --output_dir "%CACHE_DIR%" ^
   --network_module networks.lora ^
-  --resolution %RESOLUTION% ^
   --num_target_timesteps 2 ^
   --timestep_sampling_mode uniform ^
   --prediction_target eps ^
@@ -147,7 +146,6 @@ python tools\eval_self_distill.py ^
   --student_lora_weights "%STUDENT%" ^
   --output_dir "%EVAL_DIR%" ^
   --network_module networks.lora ^
-  --resolution %RESOLUTION% ^
   --sample_sampler %SAMPLER% ^
   --prediction_target eps ^
   --attention_backend auto ^

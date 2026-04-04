@@ -264,6 +264,18 @@ def generation_settings_from_prompt_record(record: Dict[str, Any], fallback_reso
     return settings
 
 
+def fallback_resolution_from_args(args) -> int:
+    value = getattr(args, "resolution", None)
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if value in (None, "", "None"):
+        return 640
+    text = str(value)
+    if "," in text:
+        text = text.split(",", 1)[0]
+    return int(text)
+
+
 def resolution_signature_from_prompt_bank(prompt_bank: Dict[str, Any], fallback_resolution: int) -> Dict[str, Any]:
     pairs = sorted(
         {
@@ -495,15 +507,16 @@ def default_generation_name(entry: Dict[str, Any], index: int) -> str:
 
 def build_manifest_header(args, teacher_te_included: bool, prompt_bank_path: str) -> CacheManifestHeader:
     prompt_bank = load_prompt_bank(prompt_bank_path)
+    fallback_resolution = fallback_resolution_from_args(args)
     samplers = sorted(
         {
-            generation_settings_from_prompt_record(record, args.resolution)["sample_sampler"]
+            generation_settings_from_prompt_record(record, fallback_resolution)["sample_sampler"]
             for record in prompt_bank["records"]
         }
     )
     prediction_targets = sorted(
         {
-            generation_settings_from_prompt_record(record, args.resolution)["prediction_target"]
+            generation_settings_from_prompt_record(record, fallback_resolution)["prediction_target"]
             for record in prompt_bank["records"]
         }
     )
@@ -512,7 +525,7 @@ def build_manifest_header(args, teacher_te_included: bool, prompt_bank_path: str
     if len(prediction_targets) != 1:
         raise ValueError(f"Prompt bank must use a single prediction_target for cache build: found {prediction_targets}")
     prediction_type = "epsilon" if prediction_targets[0] == "eps" else "v_prediction"
-    resolution_signature = resolution_signature_from_prompt_bank(prompt_bank, args.resolution)
+    resolution_signature = resolution_signature_from_prompt_bank(prompt_bank, fallback_resolution)
     return CacheManifestHeader(
         version=CACHE_MANIFEST_VERSION,
         base_model_identifier=normalize_path(args.pretrained_model_name_or_path),
@@ -538,7 +551,7 @@ def validate_manifest_header(header: Dict[str, Any], args, prompt_bank_path: Opt
     expected_prediction = resolve_prediction_type(args)
     expected_resolution = header.get("resolution")
     if prompt_bank_path is not None:
-        expected_resolution = resolution_signature_from_prompt_bank(load_prompt_bank(prompt_bank_path), args.resolution)
+        expected_resolution = resolution_signature_from_prompt_bank(load_prompt_bank(prompt_bank_path), fallback_resolution_from_args(args))
     checks = {
         "base_model_identifier": normalize_path(args.pretrained_model_name_or_path),
         "base_model_hash": file_sha256(args.pretrained_model_name_or_path),
