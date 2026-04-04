@@ -88,7 +88,9 @@ def _generate_for_mode(args, accelerator, weight_dtype, records, lora_path: str 
     outputs = []
     with torch.no_grad():
         for record in records:
-            settings = self_distill_cache.generation_settings_from_prompt_record(record, args.resolution)
+            settings = self_distill_cache.generation_settings_from_prompt_record(
+        record, self_distill_cache.fallback_resolution_from_args(args)
+    )
             conditioning = self_distill_cache.build_prompt_conditioning(
                 tokenizers,
                 text_encoders,
