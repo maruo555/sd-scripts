@@ -171,7 +171,9 @@ def build_cache(args: argparse.Namespace) -> None:
             manifest_entries.append(self_distill_cache.CacheRecord(**entry))
             continue
 
-        settings = self_distill_cache.generation_settings_from_prompt_record(record, args.resolution)
+        settings = self_distill_cache.generation_settings_from_prompt_record(
+            record, self_distill_cache.fallback_resolution_from_args(args)
+        )
         prediction_type = header.prediction_type
         target_type = settings.get("prediction_target", args.prediction_target)
 
