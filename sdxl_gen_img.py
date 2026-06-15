@@ -3029,7 +3029,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--network_lbw",
         type=str,
         default=None,
-        nargs="*",
+        nargs="+",
         help=(
             "SDXL LoRA Block Weight preset name or 12 comma-separated values for each network. "
             "Use with --network_module networks.lora_lbw. "
