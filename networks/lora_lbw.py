@@ -1323,10 +1323,19 @@ def convert_diffusers_to_sai_if_needed(weights_sd):
             logger.warning(f"Key {k} is not found in unet_conversion_map")
 
 
+def is_sdxl_unet(unet) -> bool:
+    if unet is None:
+        return False
+    if isinstance(unet, SdxlUNet2DConditionModel):
+        return True
+    delegate = getattr(unet, "delegate", None)
+    return isinstance(delegate, SdxlUNet2DConditionModel)
+
+
 # Create network from weights for inference, weights are not loaded here (because can be merged)
 def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weights_sd=None, for_inference=False, **kwargs):
     # if unet is an instance of SdxlUNet2DConditionModel or subclass, set is_sdxl to True
-    is_sdxl = unet is not None and issubclass(unet.__class__, SdxlUNet2DConditionModel)
+    is_sdxl = is_sdxl_unet(unet)
 
     if weights_sd is None:
         if os.path.splitext(file)[1] == ".safetensors":
