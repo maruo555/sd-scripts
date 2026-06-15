@@ -1665,6 +1665,7 @@ def main(args):
     if args.network_module:
         networks = []
         network_default_muls = []
+        network_default_lbws = []
         network_pre_calc = args.network_pre_calc
 
         # merge関連の引数を統合する
@@ -1711,6 +1712,7 @@ def main(args):
             if network is None:
                 return
 
+            network_lbw = None
             if args.network_lbw:
                 network_lbw = args.network_lbw[i] if i < len(args.network_lbw) else args.network_lbw[-1]
                 if not hasattr(network, "set_lbw_weights"):
@@ -1740,11 +1742,13 @@ def main(args):
 
                 networks.append(network)
                 network_default_muls.append(network_mul)
+                network_default_lbws.append(network_lbw)
             else:
                 network.merge_to([text_encoder1, text_encoder2], unet, weights_sd, dtype, device)
 
     else:
         networks = []
+        network_default_lbws = []
 
     # upscalerの指定があれば取得する
     upscaler = None
@@ -2318,13 +2322,7 @@ def main(args):
             if networks:
                 # 追加ネットワークの処理
                 shared = {}
-                lbw_weights = args.network_lbw
-                if lbw_weights:
-                    lbw_weights = list(lbw_weights)
-                    while len(lbw_weights) < len(networks):
-                        lbw_weights.append(lbw_weights[-1])
-                else:
-                    lbw_weights = [None] * len(networks)
+                lbw_weights = network_default_lbws if args.network_lbw else [None] * len(networks)
 
                 for n, m, lbw in zip(networks, network_muls if network_muls else network_default_muls, lbw_weights):
                     n.set_multiplier(m)

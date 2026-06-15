@@ -1772,7 +1772,7 @@ class LoRANetwork(torch.nn.Module):
                 lora.lbw_multiplier = 1.0
                 continue
             idx = get_sdxl_lbw_index(lora.lora_name)
-            lora.lbw_multiplier = lbw_weights[idx] if idx is not None else 0.0
+            lora.lbw_multiplier = lbw_weights[idx] if idx is not None else 1.0
 
     def set_enabled(self, is_enabled):
         for lora in self.text_encoder_loras + self.unet_loras:
