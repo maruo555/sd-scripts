@@ -1658,6 +1658,9 @@ def main(args):
     text_encoder2.eval()
     unet.eval()
 
+    if args.network_lbw and not args.network_module:
+        raise ValueError("--network_lbw requires --network_module / --network_lbwには--network_moduleが必要です")
+
     # networkを組み込む
     if args.network_module:
         networks = []
@@ -1707,6 +1710,15 @@ def main(args):
             )
             if network is None:
                 return
+
+            if args.network_lbw:
+                network_lbw = args.network_lbw[i] if i < len(args.network_lbw) else args.network_lbw[-1]
+                if not hasattr(network, "set_lbw_weights"):
+                    raise ValueError(
+                        "--network_lbw requires a network module that supports set_lbw_weights, "
+                        "for example --network_module networks.lora_lbw"
+                    )
+                network.set_lbw_weights(network_lbw)
 
             mergeable = network.is_mergeable()
             if network_merge and not mergeable:
@@ -2306,8 +2318,23 @@ def main(args):
             if networks:
                 # 追加ネットワークの処理
                 shared = {}
-                for n, m in zip(networks, network_muls if network_muls else network_default_muls):
+                lbw_weights = args.network_lbw
+                if lbw_weights:
+                    lbw_weights = list(lbw_weights)
+                    while len(lbw_weights) < len(networks):
+                        lbw_weights.append(lbw_weights[-1])
+                else:
+                    lbw_weights = [None] * len(networks)
+
+                for n, m, lbw in zip(networks, network_muls if network_muls else network_default_muls, lbw_weights):
                     n.set_multiplier(m)
+                    if lbw is not None:
+                        if not hasattr(n, "set_lbw_weights"):
+                            raise ValueError(
+                                "--network_lbw requires a network module that supports set_lbw_weights, "
+                                "for example --network_module networks.lora_lbw"
+                            )
+                        n.set_lbw_weights(lbw)
                     if regional_network:
                         n.set_current_generation(batch_size, num_sub_prompts, width, height, shared)
 
@@ -2999,6 +3026,17 @@ def setup_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--network_mul", type=float, default=None, nargs="*", help="additional network multiplier / 追加ネットワークの効果の倍率"
+    )
+    parser.add_argument(
+        "--network_lbw",
+        type=str,
+        default=None,
+        nargs="*",
+        help=(
+            "SDXL LoRA Block Weight preset name or 12 comma-separated values for each network. "
+            "Use with --network_module networks.lora_lbw. "
+            "/ SDXL LoRA Block Weightのプリセット名または12個のカンマ区切り値。--network_module networks.lora_lbw と併用してください"
+        ),
     )
     parser.add_argument(
         "--network_args",
