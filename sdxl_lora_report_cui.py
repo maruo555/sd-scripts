@@ -1,0 +1,462 @@
+#!/usr/bin/env python
+import argparse
+import datetime as dt
+import html
+import json
+import random
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def sanitize_id(value: str, fallback: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        value = fallback
+    value = re.sub(r"[^\w.-]+", "_", value, flags=re.ASCII)
+    value = value.strip("._-")
+    return value or fallback
+
+
+def resolve_path(path: str | None, base_dir: Path) -> Path | None:
+    if path is None:
+        return None
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return (base_dir / p).resolve()
+
+
+def load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def parse_prompt_file(path: Path) -> list[dict]:
+    prompts = []
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) == 1:
+                prompt_id = f"p{len(prompts) + 1:03d}"
+                prompt = parts[0]
+                negative = ""
+                width = None
+                height = None
+            else:
+                prompt_id = parts[0] or f"p{len(prompts) + 1:03d}"
+                prompt = parts[1] if len(parts) > 1 else ""
+                negative = parts[2] if len(parts) > 2 else ""
+                width = int(parts[3]) if len(parts) > 3 and parts[3] else None
+                height = int(parts[4]) if len(parts) > 4 and parts[4] else None
+
+            if not prompt:
+                raise ValueError(f"Prompt is empty at {path}:{line_no}")
+
+            prompts.append(
+                {
+                    "id": sanitize_id(prompt_id, f"p{len(prompts) + 1:03d}"),
+                    "prompt": prompt,
+                    "negative": negative,
+                    "width": width,
+                    "height": height,
+                    "line_no": line_no,
+                }
+            )
+
+    if not prompts:
+        raise ValueError(f"No prompts found: {path}")
+    return prompts
+
+
+def build_seeds(seed_config: dict) -> list[int]:
+    values = [int(v) for v in seed_config.get("values", [])]
+    random_count = int(seed_config.get("random_count", 0) or 0)
+    if random_count > 0:
+        rnd = random.Random(seed_config.get("random_source_seed"))
+        min_seed = int(seed_config.get("random_min", 0))
+        max_seed = int(seed_config.get("random_max", 2**32 - 1))
+        values.extend(rnd.randint(min_seed, max_seed) for _ in range(random_count))
+    if not values:
+        raise ValueError("At least one seed is required. Set seeds.values or seeds.random_count.")
+    return values
+
+
+def normalize_lora_item(item: dict, config_dir: Path, force_lbw_module: bool, condition_id: str, item_index: int) -> dict:
+    path = resolve_path(item.get("path"), config_dir)
+    if path is None:
+        raise ValueError(f"LoRA condition '{condition_id}' item {item_index} requires path")
+
+    lbw = item.get("lbw")
+    if force_lbw_module and lbw is None:
+        raise ValueError(f"LoRA condition '{condition_id}' item {item_index} requires lbw when the condition uses LBW")
+
+    module = item.get("module")
+    if not module:
+        module = "networks.lora_lbw" if force_lbw_module or lbw is not None else "networks.lora"
+
+    return {
+        "name": item.get("name") or Path(path).stem,
+        "path": str(path),
+        "strength": float(item.get("strength", 1.0)),
+        "lbw": lbw,
+        "module": module,
+    }
+
+
+def build_lora_conditions(config: dict, config_dir: Path) -> list[dict]:
+    conditions = []
+    if config.get("include_baseline", True):
+        conditions.append({"id": "baseline", "name": "baseline", "items": []})
+
+    for idx, raw in enumerate(config.get("loras", []), 1):
+        condition_id = sanitize_id(raw.get("id") or raw.get("name"), f"lora_{idx:02d}")
+        items = raw.get("items")
+        if items is None:
+            items = [raw]
+        if not isinstance(items, list) or len(items) == 0:
+            raise ValueError(f"LoRA condition '{condition_id}' requires a non-empty items list")
+        force_lbw_module = any(item.get("lbw") is not None for item in items)
+        normalized_items = [
+            normalize_lora_item(item, config_dir, force_lbw_module, condition_id, item_index)
+            for item_index, item in enumerate(items, 1)
+        ]
+        conditions.append(
+            {
+                "id": condition_id,
+                "name": raw.get("name") or condition_id,
+                "items": normalized_items,
+            }
+        )
+
+    if not conditions:
+        raise ValueError("No LoRA conditions found. Add loras or set include_baseline=true.")
+    return conditions
+
+
+def run_report_worker(
+    output_dir: Path,
+    gen_config: dict,
+    conditions: list[dict],
+    jobs: list[dict],
+    dry_run: bool,
+    skip_existing: bool,
+) -> int:
+    active_jobs = []
+    for job in jobs:
+        target_path = Path(job["target_path"])
+        if skip_existing and target_path.exists():
+            job["status"] = "done"
+            job["returncode"] = 0
+            continue
+        active_jobs.append(job)
+
+    if not active_jobs:
+        return 0
+
+    worker_dir = output_dir / "worker"
+    worker_outdir = worker_dir / "images"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    job_plan_path = worker_dir / "worker_job.json"
+    result_path = worker_dir / "worker_result.json"
+    job_index = {id(job): index for index, job in enumerate(jobs)}
+    job_plan = {
+        "sdxl_gen_img": gen_config,
+        "conditions": conditions,
+        "work_outdir": str(worker_outdir),
+        "jobs": [
+            {
+                "job_index": job_index[id(job)],
+                "prompt_id": job["prompt_id"],
+                "prompt": job["prompt"],
+                "negative": job.get("negative", ""),
+                "width": job.get("width"),
+                "height": job.get("height"),
+                "seed": job["seed"],
+                "condition_id": job["condition_id"],
+                "condition_items": job["condition_items"],
+                "target_path": job["target_path"],
+            }
+            for job in active_jobs
+        ],
+    }
+    with job_plan_path.open("w", encoding="utf-8") as f:
+        json.dump(job_plan, f, ensure_ascii=False, indent=2)
+
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "sdxl_lora_report_worker.py"),
+        "--job-json",
+        str(job_plan_path),
+        "--result-json",
+        str(result_path),
+    ]
+    if dry_run:
+        command.append("--dry-run")
+
+    result = subprocess.run(command, cwd=Path(__file__).resolve().parent)
+    if result_path.exists():
+        with result_path.open("r", encoding="utf-8") as f:
+            worker_result = json.load(f)
+        for item in worker_result.get("results", []):
+            job = jobs[item["job_index"]]
+            job["status"] = item.get("status", "failed")
+            job["returncode"] = worker_result.get("returncode")
+            job["worker_command"] = worker_result.get("command", [])
+            job["worker_slots"] = worker_result.get("slots", [])
+            if item.get("error"):
+                job["error"] = item["error"]
+    return result.returncode
+
+
+def copy_run_inputs(config_path: Path, prompt_path: Path, output_dir: Path, config: dict, prompts: list[dict]):
+    with (output_dir / "config.json").open("w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    shutil.copy2(prompt_path, output_dir / "prompts.txt")
+    with (output_dir / "prompts.parsed.json").open("w", encoding="utf-8") as f:
+        json.dump({"source": str(config_path), "prompts": prompts}, f, ensure_ascii=False, indent=2)
+
+
+def make_image_name(prompt: dict, seed: int) -> str:
+    return f"{prompt['id']}_seed{seed}.png"
+
+
+def generate_jobs(config_path: Path, config: dict) -> tuple[Path, list[dict], list[dict], list[int], list[dict]]:
+    config_dir = config_path.parent
+    output_root = resolve_path(config.get("output_root", "lora_reports"), config_dir)
+    run_name = sanitize_id(config.get("run_name"), "lora_report")
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = output_root / f"{timestamp}_{run_name}"
+
+    prompt_path = resolve_path(config.get("prompt_file"), config_dir)
+    if prompt_path is None:
+        raise ValueError("prompt_file is required")
+
+    prompts = parse_prompt_file(prompt_path)
+    seeds = build_seeds(config.get("seeds", {}))
+    conditions = build_lora_conditions(config, config_dir)
+    gen_config = config.get("sdxl_gen_img", {})
+
+    jobs = []
+    for prompt in prompts:
+        for seed in seeds:
+            for condition in conditions:
+                condition_dir = output_dir / "images" / condition["id"]
+                target_path = condition_dir / make_image_name(prompt, seed)
+                jobs.append(
+                    {
+                        "prompt_id": prompt["id"],
+                        "prompt": prompt["prompt"],
+                        "negative": prompt.get("negative", ""),
+                        "width": prompt.get("width") or gen_config.get("width"),
+                        "height": prompt.get("height") or gen_config.get("height"),
+                        "seed": seed,
+                        "condition_id": condition["id"],
+                        "condition_name": condition["name"],
+                        "condition_items": condition["items"],
+                        "image": str(target_path.relative_to(output_dir)).replace("\\", "/"),
+                        "target_path": str(target_path),
+                        "returncode": None,
+                        "status": "pending",
+                    }
+                )
+
+    return output_dir, prompts, conditions, seeds, jobs
+
+
+def write_metadata(output_dir: Path, prompts: list[dict], conditions: list[dict], seeds: list[int], jobs: list[dict]):
+    serializable_jobs = []
+    for job in jobs:
+        item = dict(job)
+        item.pop("target_path", None)
+        serializable_jobs.append(item)
+    metadata = {
+        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "prompts": prompts,
+        "conditions": conditions,
+        "seeds": seeds,
+        "jobs": serializable_jobs,
+    }
+    with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    return metadata
+
+
+def write_report(output_dir: Path, metadata: dict):
+    data_json = json.dumps(metadata, ensure_ascii=False)
+    report = f"""<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SDXL LoRA Report</title>
+<style>
+:root {{ color-scheme: light dark; }}
+body {{ margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #f5f5f2; color: #202124; }}
+header {{ position: sticky; top: 0; z-index: 3; background: #ffffffee; border-bottom: 1px solid #d8d8d0; padding: 12px 18px; backdrop-filter: blur(8px); }}
+h1 {{ font-size: 18px; margin: 0 0 10px; }}
+.toolbar {{ display: flex; flex-wrap: wrap; gap: 14px; align-items: center; font-size: 13px; }}
+.panel {{ padding: 12px 18px; border-bottom: 1px solid #ddd; background: #fbfbf8; }}
+.filter-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
+.filter-box {{ max-height: 150px; overflow: auto; border: 1px solid #d6d6ce; padding: 8px; background: white; }}
+.filter-box label {{ display: block; margin: 3px 0; white-space: nowrap; }}
+main {{ padding: 18px; overflow: auto; }}
+table {{ border-collapse: separate; border-spacing: 0; background: white; box-shadow: 0 1px 3px #0001; }}
+th, td {{ border-right: 1px solid #d8d8d0; border-bottom: 1px solid #d8d8d0; padding: 8px; vertical-align: top; }}
+th {{ position: sticky; top: 96px; z-index: 2; background: #ecece6; font-size: 12px; text-align: left; }}
+th:first-child {{ left: 0; z-index: 4; }}
+td:first-child {{ position: sticky; left: 0; z-index: 1; background: #fafaf6; font-size: 12px; min-width: 190px; }}
+.cell {{ min-width: 180px; }}
+.cell img {{ width: var(--image-width, 50%); max-width: none; height: auto; display: block; cursor: zoom-in; border: 1px solid #ccc; background: #eee; }}
+.missing {{ width: 180px; min-height: 120px; display: grid; place-items: center; border: 1px dashed #aaa; color: #777; font-size: 12px; }}
+.meta {{ margin-top: 6px; font-size: 11px; color: #555; line-height: 1.35; }}
+dialog {{ max-width: 96vw; max-height: 96vh; border: 0; padding: 0; background: transparent; }}
+dialog img {{ max-width: 96vw; max-height: 92vh; display: block; background: #111; }}
+dialog::backdrop {{ background: rgba(0,0,0,.78); }}
+button, select, input {{ font: inherit; }}
+@media (prefers-color-scheme: dark) {{
+  body {{ background: #1f211f; color: #eee; }}
+  header, .panel, table, .filter-box {{ background: #282b28; }}
+  th {{ background: #343832; }}
+  td:first-child {{ background: #2b2e2a; }}
+  th, td, header, .panel, .filter-box {{ border-color: #474b43; }}
+  .meta {{ color: #bbb; }}
+}}
+</style>
+</head>
+<body>
+<header>
+  <h1>SDXL LoRA Report</h1>
+  <div class="toolbar">
+    <label>Axis <select id="axis"><option value="condition">X: LoRA / Y: Prompt+Seed</option><option value="case">X: Prompt+Seed / Y: LoRA</option></select></label>
+    <label>Image size <input id="size" type="range" min="20" max="120" value="50"> <span id="sizeLabel">50%</span></label>
+    <button id="showAll">Show all</button>
+  </div>
+</header>
+<section class="panel">
+  <div class="filter-grid">
+    <div><strong>LoRA</strong><div id="conditionFilters" class="filter-box"></div></div>
+    <div><strong>Prompt</strong><div id="promptFilters" class="filter-box"></div></div>
+    <div><strong>Seed</strong><div id="seedFilters" class="filter-box"></div></div>
+  </div>
+</section>
+<main id="report"></main>
+<dialog id="viewer"><img id="viewerImage" alt=""></dialog>
+<script>
+const reportData = {data_json};
+const state = {{ axis: "condition", conditions: new Set(), prompts: new Set(), seeds: new Set(), size: 50 }};
+const byId = id => document.getElementById(id);
+const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}}[ch]));
+const caseId = job => `${{job.prompt_id}} / seed ${{job.seed}}`;
+function initState() {{
+  reportData.conditions.forEach(c => state.conditions.add(c.id));
+  reportData.prompts.forEach(p => state.prompts.add(p.id));
+  reportData.seeds.forEach(s => state.seeds.add(String(s)));
+}}
+function checkboxList(root, items, selected, labelFn) {{
+  root.innerHTML = items.map(item => {{
+    const id = String(item.id ?? item);
+    return `<label><input type="checkbox" data-id="${{esc(id)}}" checked> ${{esc(labelFn(item))}}</label>`;
+  }}).join("");
+  root.querySelectorAll("input").forEach(input => {{
+    input.addEventListener("change", () => {{
+      if (input.checked) selected.add(input.dataset.id); else selected.delete(input.dataset.id);
+      render();
+    }});
+  }});
+}}
+function selectedJobs() {{
+  return reportData.jobs.filter(j => state.conditions.has(j.condition_id) && state.prompts.has(j.prompt_id) && state.seeds.has(String(j.seed)));
+}}
+function cell(job) {{
+  if (!job) return `<td class="cell"><div class="missing">no job</div></td>`;
+  const image = job.status === "done" ? `<img src="${{esc(job.image)}}" alt="" loading="lazy">` : `<div class="missing">${{esc(job.status)}}</div>`;
+  const items = (job.condition_items || []).map(item => `${{esc(item.name || item.path)}} x${{esc(item.strength)}} lbw=${{esc(item.lbw ?? "")}}`).join("<br>");
+  return `<td class="cell">${{image}}<div class="meta">${{esc(job.condition_name)}}<br>${{items}}<br>${{esc(job.prompt_id)}} / seed ${{esc(job.seed)}}<br>${{esc(job.width)}}x${{esc(job.height)}}</div></td>`;
+}}
+function render() {{
+  document.documentElement.style.setProperty("--image-width", `${{state.size}}%`);
+  const jobs = selectedJobs();
+  const report = byId("report");
+  const axis = state.axis;
+  const jobMap = new Map(jobs.map(j => [`${{j.condition_id}}@@${{caseId(j)}}`, j]));
+  const cases = Array.from(new Set(jobs.map(caseId)));
+  const conditions = reportData.conditions.filter(c => state.conditions.has(c.id));
+  let html = "<table>";
+  if (axis === "condition") {{
+    html += "<thead><tr><th>Prompt / Seed</th>" + conditions.map(c => `<th>${{esc(c.name)}}</th>`).join("") + "</tr></thead><tbody>";
+    for (const caze of cases) {{
+      html += `<tr><td>${{esc(caze)}}</td>`;
+      for (const condition of conditions) html += cell(jobMap.get(`${{condition.id}}@@${{caze}}`));
+      html += "</tr>";
+    }}
+  }} else {{
+    html += "<thead><tr><th>LoRA</th>" + cases.map(c => `<th>${{esc(c)}}</th>`).join("") + "</tr></thead><tbody>";
+    for (const condition of conditions) {{
+      html += `<tr><td>${{esc(condition.name)}}</td>`;
+      for (const caze of cases) html += cell(jobMap.get(`${{condition.id}}@@${{caze}}`));
+      html += "</tr>";
+    }}
+  }}
+  html += "</tbody></table>";
+  report.innerHTML = html;
+  report.querySelectorAll("img").forEach(img => img.addEventListener("click", () => {{
+    byId("viewerImage").src = img.src;
+    byId("viewer").showModal();
+  }}));
+}}
+initState();
+checkboxList(byId("conditionFilters"), reportData.conditions, state.conditions, item => item.name);
+checkboxList(byId("promptFilters"), reportData.prompts, state.prompts, item => item.id);
+checkboxList(byId("seedFilters"), reportData.seeds, state.seeds, item => item);
+byId("axis").addEventListener("change", event => {{ state.axis = event.target.value; render(); }});
+byId("size").addEventListener("input", event => {{ state.size = event.target.value; byId("sizeLabel").textContent = `${{state.size}}%`; render(); }});
+byId("showAll").addEventListener("click", () => location.reload());
+byId("viewer").addEventListener("click", () => byId("viewer").close());
+render();
+</script>
+</body>
+</html>
+"""
+    with (output_dir / "report.html").open("w", encoding="utf-8") as f:
+        f.write(report)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate SDXL LoRA comparison images and an HTML report.")
+    parser.add_argument("--config", required=True, help="Path to report JSON config.")
+    parser.add_argument("--dry-run", action="store_true", help="Write metadata/report without running image generation.")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip a job when its target image already exists.")
+    args = parser.parse_args()
+
+    config_path = Path(args.config).resolve()
+    config = load_json(config_path)
+    output_dir, prompts, conditions, seeds, jobs = generate_jobs(config_path, config)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt_path = resolve_path(config.get("prompt_file"), config_path.parent)
+    copy_run_inputs(config_path, prompt_path, output_dir, config, prompts)
+
+    print(f"Output: {output_dir}")
+    print(f"Jobs: {len(jobs)}")
+    gen_config = config.get("sdxl_gen_img", {})
+    print(f"[1/1] worker ({len(jobs)} jobs, {len(conditions)} conditions)")
+    returncode = run_report_worker(output_dir, gen_config, conditions, jobs, args.dry_run, args.skip_existing)
+    if returncode != 0:
+        metadata = write_metadata(output_dir, prompts, conditions, seeds, jobs)
+        write_report(output_dir, metadata)
+        raise SystemExit(returncode)
+
+    metadata = write_metadata(output_dir, prompts, conditions, seeds, jobs)
+    write_report(output_dir, metadata)
+    print(f"Report: {output_dir / 'report.html'}")
+
+
+if __name__ == "__main__":
+    main()
