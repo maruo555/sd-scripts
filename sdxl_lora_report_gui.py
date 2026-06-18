@@ -219,7 +219,7 @@ class MainWindow(QMainWindow):
         top_grid = QGridLayout(top)
         self.model_edit = PathDropLineEdit("file", {".safetensors", ".ckpt"})
         self.output_edit = PathDropLineEdit("folder")
-        self.prompt_edit = PathDropLineEdit("file", {".txt"})
+        self.prompt_edit = PathDropLineEdit("file", {".txt", ".tsv"})
         self.run_name_edit = QLineEdit()
         top_grid.addWidget(QLabel("Model"), 0, 0)
         top_grid.addWidget(self.model_edit, 0, 1)
@@ -229,7 +229,7 @@ class MainWindow(QMainWindow):
         top_grid.addWidget(self._folder_button(self.output_edit, "Output root"), 1, 2)
         top_grid.addWidget(QLabel("Prompt file"), 2, 0)
         top_grid.addWidget(self.prompt_edit, 2, 1)
-        top_grid.addWidget(self._browse_button(self.prompt_edit, "Prompt file", "Text (*.txt);;All files (*)"), 2, 2)
+        top_grid.addWidget(self._browse_button(self.prompt_edit, "Prompt file", "Prompt files (*.txt *.tsv);;All files (*)"), 2, 2)
         top_grid.addWidget(QLabel("Run name"), 3, 0)
         top_grid.addWidget(self.run_name_edit, 3, 1, 1, 2)
 

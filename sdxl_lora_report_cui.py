@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import argparse
+import csv
 import datetime as dt
 import html
 import json
@@ -35,6 +36,12 @@ def load_json(path: Path) -> dict:
 
 
 def parse_prompt_file(path: Path) -> list[dict]:
+    if path.suffix.lower() == ".tsv":
+        return parse_prompt_tsv(path)
+    return parse_prompt_pipe_text(path)
+
+
+def parse_prompt_pipe_text(path: Path) -> list[dict]:
     prompts = []
     with path.open("r", encoding="utf-8") as f:
         for line_no, raw_line in enumerate(f, 1):
@@ -73,6 +80,76 @@ def parse_prompt_file(path: Path) -> list[dict]:
     if not prompts:
         raise ValueError(f"No prompts found: {path}")
     return prompts
+
+
+def parse_prompt_tsv(path: Path) -> list[dict]:
+    prompts = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError(f"No TSV header found: {path}")
+        normalized_fields = {normalize_prompt_field(name): name for name in reader.fieldnames}
+        if "prompt" not in normalized_fields:
+            raise ValueError(f"TSV prompt file requires a 'prompt' column: {path}")
+
+        for row_index, row in enumerate(reader, 2):
+            if is_empty_prompt_row(row):
+                continue
+            prompt = cell(row, normalized_fields, "prompt")
+            if not prompt or prompt.startswith("#"):
+                continue
+
+            prompt_id = cell(row, normalized_fields, "id") or f"p{len(prompts) + 1:03d}"
+            negative = cell(row, normalized_fields, "negative")
+            width = parse_optional_int(cell(row, normalized_fields, "width"), path, row_index, "width")
+            height = parse_optional_int(cell(row, normalized_fields, "height"), path, row_index, "height")
+
+            prompts.append(
+                {
+                    "id": sanitize_id(prompt_id, f"p{len(prompts) + 1:03d}"),
+                    "prompt": prompt,
+                    "negative": negative,
+                    "width": width,
+                    "height": height,
+                    "line_no": row_index,
+                }
+            )
+
+    if not prompts:
+        raise ValueError(f"No prompts found: {path}")
+    return prompts
+
+
+def normalize_prompt_field(name: str | None) -> str:
+    value = (name or "").strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "prompt_id": "id",
+        "negative_prompt": "negative",
+        "neg": "negative",
+        "w": "width",
+        "h": "height",
+    }
+    return aliases.get(value, value)
+
+
+def cell(row: dict, fields: dict[str, str], name: str) -> str:
+    source = fields.get(name)
+    if source is None:
+        return ""
+    return (row.get(source) or "").strip()
+
+
+def is_empty_prompt_row(row: dict) -> bool:
+    return not any((value or "").strip() for value in row.values())
+
+
+def parse_optional_int(value: str, path: Path, line_no: int, column: str) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {column} value at {path}:{line_no}: {value}") from exc
 
 
 def build_seeds(seed_config: dict) -> list[int]:
@@ -309,8 +386,7 @@ h1 {{ font-size: 18px; margin: 0 0 10px; }}
 main {{ padding: 18px; overflow: auto; }}
 table {{ border-collapse: separate; border-spacing: 0; background: white; box-shadow: 0 1px 3px #0001; }}
 th, td {{ border-right: 1px solid #d8d8d0; border-bottom: 1px solid #d8d8d0; padding: 8px; vertical-align: top; }}
-th {{ position: sticky; top: 96px; z-index: 2; background: #ecece6; font-size: 12px; text-align: left; }}
-th:first-child {{ left: 0; z-index: 4; }}
+th {{ background: #ecece6; font-size: 12px; text-align: left; }}
 td:first-child {{ position: sticky; left: 0; z-index: 1; background: #fafaf6; font-size: 12px; min-width: 190px; }}
 .cell {{ min-width: 180px; }}
 .cell img {{ width: var(--image-width, 50%); max-width: none; height: auto; display: block; cursor: zoom-in; border: 1px solid #ccc; background: #eee; }}
