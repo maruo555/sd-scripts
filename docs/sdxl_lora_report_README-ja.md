@@ -101,6 +101,7 @@ python sdxl_lora_report_gui.py
 - `Cancel running`: 現在実行中のキュージョブを中断します。
 - `Remove selected`: 選択したキュー項目を削除します。
 - `Clear done`: 完了済みのキュー項目を削除します。
+- `Load selected into setup`: 選択したキュー項目の設定をGUI上部、生成設定、LoRA条件へ読み戻します。少し編集して再実行したい場合に使います。
 - `Open selected report`: 完了したキュー項目のHTMLレポートを開きます。
 
 キューは `.tmp/queue/queue_state.json` に保存され、次回GUI起動時に復元されます。

@@ -275,6 +275,7 @@ class MainWindow(QMainWindow):
         self.cancel_running_button = QPushButton("Cancel running")
         self.remove_queue_button = QPushButton("Remove selected")
         self.clear_done_button = QPushButton("Clear done")
+        self.load_queue_button = QPushButton("Load selected into setup")
         self.open_queue_report_button = QPushButton("Open selected report")
         self.stop_after_current_button.setEnabled(False)
         self.cancel_running_button.setEnabled(False)
@@ -283,6 +284,7 @@ class MainWindow(QMainWindow):
         queue_controls.addWidget(self.cancel_running_button)
         queue_controls.addWidget(self.remove_queue_button)
         queue_controls.addWidget(self.clear_done_button)
+        queue_controls.addWidget(self.load_queue_button)
         queue_controls.addStretch(1)
         queue_controls.addWidget(self.open_queue_report_button)
         queue_layout.addLayout(queue_controls)
@@ -308,6 +310,7 @@ class MainWindow(QMainWindow):
         self.cancel_running_button.clicked.connect(self.cancel_running)
         self.remove_queue_button.clicked.connect(self.remove_selected_queue_items)
         self.clear_done_button.clicked.connect(self.clear_done_queue_items)
+        self.load_queue_button.clicked.connect(self.load_selected_queue_into_setup)
         self.stop_button.clicked.connect(self.stop_report)
         self.open_report_button.clicked.connect(self.open_report)
         self.open_queue_report_button.clicked.connect(self.open_selected_queue_report)
@@ -707,6 +710,23 @@ class MainWindow(QMainWindow):
     def condition_item_from_asset(self, asset: LoraAsset) -> ConditionItem:
         return ConditionItem(asset.asset_id, asset.name, asset.path, asset.strength, asset.lbw)
 
+    def rebuild_assets_from_conditions(self):
+        by_path: dict[str, LoraAsset] = {}
+        for condition in self.conditions:
+            for item in condition.items:
+                key = str(Path(item.path).resolve())
+                if key not in by_path:
+                    by_path[key] = LoraAsset(
+                        asset_id=sanitize_id(Path(item.path).stem, f"lora_{len(by_path) + 1:02d}"),
+                        name=item.name or path_to_name(item.path),
+                        path=key,
+                        strength=item.strength,
+                        lbw=item.lbw,
+                    )
+                item.asset_id = by_path[key].asset_id
+        self.assets = list(by_path.values())
+        self.refresh_asset_list()
+
     def unique_condition_id(self, name: str, current: str | None = None) -> str:
         base = sanitize_id(name, f"condition_{len(self.conditions) + 1:02d}")
         condition_id = base
@@ -1032,11 +1052,71 @@ class MainWindow(QMainWindow):
         self.save_queue()
         self.refresh_queue_tree()
 
+    def load_selected_queue_into_setup(self):
+        indexes = self.selected_queue_indexes()
+        if not indexes:
+            return
+        config = self.queue[min(indexes)].get("config")
+        if not isinstance(config, dict):
+            return
+        try:
+            self.apply_config_to_setup(config)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not load queue item", str(exc))
+            return
+        self.log(f"Loaded queued settings: {config.get('run_name', 'lora_report')}")
+
+    def apply_config_to_setup(self, config: dict):
+        self.output_edit.setText(str(config.get("output_root") or ""))
+        self.run_name_edit.setText(str(config.get("run_name") or "lora_report"))
+        self.prompt_edit.setText(str(config.get("prompt_file") or ""))
+        self.baseline_check.setChecked(bool(config.get("include_baseline", False)))
+
+        gen_config = config.get("sdxl_gen_img", {})
+        self.model_edit.setText(str(gen_config.get("ckpt") or ""))
+        self._set_spin_value(self.width_spin, gen_config.get("width"))
+        self._set_spin_value(self.height_spin, gen_config.get("height"))
+        self._set_spin_value(self.steps_spin, gen_config.get("steps"))
+        self._set_spin_value(self.scale_spin, gen_config.get("scale"))
+        self._set_spin_value(self.batch_spin, gen_config.get("batch_size"))
+        if gen_config.get("sampler"):
+            self.sampler_combo.setCurrentText(str(gen_config.get("sampler")))
+        self.restore_common_args(gen_config.get("common_args", []))
+
+        seed_config = config.get("seeds", {})
+        self.seed_values_edit.setText(", ".join(str(seed) for seed in seed_config.get("values", [])))
+        self.random_count_spin.setValue(int(seed_config.get("random_count", 0) or 0))
+
+        self.conditions = self.conditions_from_config(config)
+        self.rebuild_assets_from_conditions()
+        self.refresh_condition_tree()
+
+    def conditions_from_config(self, config: dict) -> list[LoraCondition]:
+        conditions = []
+        for index, raw in enumerate(config.get("loras", []), 1):
+            condition_id = sanitize_id(raw.get("id") or raw.get("name"), f"condition_{index:02d}")
+            raw_items = raw.get("items") or [raw]
+            items = []
+            for item_index, raw_item in enumerate(raw_items, 1):
+                path = str(Path(raw_item.get("path", "")).resolve()) if raw_item.get("path") else ""
+                name = raw_item.get("name") or path_to_name(path) or f"lora_{item_index:02d}"
+                items.append(
+                    ConditionItem(
+                        asset_id=sanitize_id(Path(path).stem, f"lora_{item_index:02d}"),
+                        name=name,
+                        path=path,
+                        strength=float(raw_item.get("strength", 1.0)),
+                        lbw=str(raw_item.get("lbw") or "ALL"),
+                    )
+                )
+            conditions.append(LoraCondition(condition_id=condition_id, name=raw.get("name") or condition_id, items=items))
+        return conditions
+
     def open_selected_queue_report(self):
         indexes = self.selected_queue_indexes()
         if not indexes:
             return
-        item = self.queue[indexes[-1]]
+        item = self.queue[min(indexes)]
         report_path = item.get("report_path")
         if report_path and Path(report_path).exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(report_path))
