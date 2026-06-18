@@ -237,6 +237,8 @@ def run_report_worker(
     if not active_jobs:
         return 0
 
+    active_jobs = order_jobs_for_generation(active_jobs, conditions)
+
     worker_dir = output_dir / "worker"
     worker_outdir = worker_dir / "images"
     worker_dir.mkdir(parents=True, exist_ok=True)
@@ -290,6 +292,18 @@ def run_report_worker(
             if item.get("error"):
                 job["error"] = item["error"]
     return result.returncode
+
+
+def order_jobs_for_generation(jobs: list[dict], conditions: list[dict]) -> list[dict]:
+    condition_order = {condition["id"]: index for index, condition in enumerate(conditions)}
+    original_order = {id(job): index for index, job in enumerate(jobs)}
+    return sorted(
+        jobs,
+        key=lambda job: (
+            condition_order.get(job["condition_id"], len(condition_order)),
+            original_order[id(job)],
+        ),
+    )
 
 
 def copy_run_inputs(config_path: Path, prompt_path: Path, output_dir: Path, config: dict, prompts: list[dict]):

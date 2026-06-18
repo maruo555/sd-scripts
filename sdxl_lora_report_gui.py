@@ -401,7 +401,7 @@ class MainWindow(QMainWindow):
         form.addRow("Steps", self.steps_spin)
         form.addRow("Sampler", self.sampler_combo)
         form.addRow("Scale", self.scale_spin)
-        form.addRow("Batch size", self.batch_spin)
+        form.addRow("Batch size (1 for strict compare)", self.batch_spin)
 
         common = QGroupBox("Common args")
         layout.addWidget(common)
