@@ -39,6 +39,8 @@ from PySide6.QtWidgets import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 GUI_CONFIG_PATH = SCRIPT_DIR / ".tmp" / "lora_report_gui_last.json"
+QUEUE_DIR = SCRIPT_DIR / ".tmp" / "queue"
+QUEUE_STATE_PATH = QUEUE_DIR / "queue_state.json"
 DEFAULT_LBW_PRESETS = ["ALL", "XLMIDD", "XLMLT1"]
 
 
@@ -202,12 +204,18 @@ class MainWindow(QMainWindow):
         self.resize(1320, 860)
         self.assets: list[LoraAsset] = []
         self.conditions: list[LoraCondition] = []
+        self.queue: list[dict] = []
+        self.running_queue_index: int | None = None
+        self.stop_after_current_requested = False
+        self.cancel_running_requested = False
         self.process: QProcess | None = None
+        self.process_mode: str | None = None
         self.current_report: Path | None = None
         self._updating_tree = False
         self._build_ui()
         self._set_defaults()
         self.restore_last_generation_settings()
+        self.load_queue()
 
     def _build_ui(self):
         root = QWidget()
@@ -246,6 +254,7 @@ class MainWindow(QMainWindow):
         self.skip_existing_check = QCheckBox("Skip existing")
         self.skip_existing_check.setChecked(True)
         self.run_button = QPushButton("Run report")
+        self.add_queue_button = QPushButton("Add to queue")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
         self.open_report_button = QPushButton("Open report")
@@ -254,8 +263,38 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.skip_existing_check)
         bottom.addStretch(1)
         bottom.addWidget(self.run_button)
+        bottom.addWidget(self.add_queue_button)
         bottom.addWidget(self.stop_button)
         bottom.addWidget(self.open_report_button)
+
+        queue_box = QGroupBox("Queue")
+        queue_layout = QVBoxLayout(queue_box)
+        queue_controls = QHBoxLayout()
+        self.run_queue_button = QPushButton("Run queue")
+        self.stop_after_current_button = QPushButton("Stop after current")
+        self.cancel_running_button = QPushButton("Cancel running")
+        self.remove_queue_button = QPushButton("Remove selected")
+        self.clear_done_button = QPushButton("Clear done")
+        self.open_queue_report_button = QPushButton("Open selected report")
+        self.stop_after_current_button.setEnabled(False)
+        self.cancel_running_button.setEnabled(False)
+        queue_controls.addWidget(self.run_queue_button)
+        queue_controls.addWidget(self.stop_after_current_button)
+        queue_controls.addWidget(self.cancel_running_button)
+        queue_controls.addWidget(self.remove_queue_button)
+        queue_controls.addWidget(self.clear_done_button)
+        queue_controls.addStretch(1)
+        queue_controls.addWidget(self.open_queue_report_button)
+        queue_layout.addLayout(queue_controls)
+        self.queue_tree = QTreeWidget()
+        self.queue_tree.setHeaderLabels(["Status", "Run name", "Conditions", "Seeds", "Jobs", "Report"])
+        self.queue_tree.setAlternatingRowColors(True)
+        self.queue_tree.setMinimumHeight(150)
+        self.queue_tree.setColumnWidth(0, 95)
+        self.queue_tree.setColumnWidth(1, 220)
+        self.queue_tree.setColumnWidth(5, 360)
+        queue_layout.addWidget(self.queue_tree)
+        main.addWidget(queue_box)
 
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
@@ -263,8 +302,15 @@ class MainWindow(QMainWindow):
         main.addWidget(self.log_edit)
 
         self.run_button.clicked.connect(self.run_report)
+        self.add_queue_button.clicked.connect(self.add_current_settings_to_queue)
+        self.run_queue_button.clicked.connect(self.run_queue)
+        self.stop_after_current_button.clicked.connect(self.stop_after_current)
+        self.cancel_running_button.clicked.connect(self.cancel_running)
+        self.remove_queue_button.clicked.connect(self.remove_selected_queue_items)
+        self.clear_done_button.clicked.connect(self.clear_done_queue_items)
         self.stop_button.clicked.connect(self.stop_report)
         self.open_report_button.clicked.connect(self.open_report)
+        self.open_queue_report_button.clicked.connect(self.open_selected_queue_report)
 
     def _build_asset_panel(self) -> QWidget:
         panel = QGroupBox("LoRA assets")
@@ -773,6 +819,188 @@ class MainWindow(QMainWindow):
             f.write("\n")
         return GUI_CONFIG_PATH
 
+    def load_queue(self):
+        if not QUEUE_STATE_PATH.exists():
+            return
+        try:
+            with QUEUE_STATE_PATH.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.queue = data.get("items", [])
+            for item in self.queue:
+                if item.get("status") == "Running":
+                    item["status"] = "Waiting"
+        except Exception as exc:
+            self.log(f"Could not restore queue: {exc}")
+            self.queue = []
+        self.refresh_queue_tree()
+
+    def save_queue(self):
+        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        with QUEUE_STATE_PATH.open("w", encoding="utf-8") as f:
+            json.dump({"items": self.queue}, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+    def add_current_settings_to_queue(self):
+        try:
+            config = self.build_config()
+        except Exception as exc:
+            QMessageBox.warning(self, "Invalid settings", str(exc))
+            return
+
+        item = {
+            "id": f"job_{time.strftime('%Y%m%d_%H%M%S')}_{len(self.queue) + 1:03d}",
+            "status": "Waiting",
+            "config": config,
+            "summary": self.queue_summary(config),
+            "options": {
+                "dry_run": self.dry_run_check.isChecked(),
+                "skip_existing": self.skip_existing_check.isChecked(),
+            },
+            "report_path": "",
+            "exit_code": None,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "started_at": "",
+            "finished_at": "",
+        }
+        self.queue.append(item)
+        self.save_queue()
+        self.refresh_queue_tree()
+        self.log(f"Queued: {config.get('run_name', 'lora_report')}")
+
+    def queue_summary(self, config: dict) -> dict:
+        conditions = len(config.get("loras", [])) + (1 if config.get("include_baseline") else 0)
+        seed_config = config.get("seeds", {})
+        seeds = len(seed_config.get("values", [])) + int(seed_config.get("random_count", 0) or 0)
+        prompts = self.count_prompts(config.get("prompt_file"))
+        return {
+            "run_name": config.get("run_name", "lora_report"),
+            "conditions": conditions,
+            "seeds": seeds,
+            "prompts": prompts,
+            "jobs": conditions * seeds * prompts if prompts >= 0 else "",
+        }
+
+    def count_prompts(self, prompt_file: str | None) -> int:
+        if not prompt_file:
+            return 0
+        try:
+            import sdxl_lora_report_cui as report_cui
+
+            return len(report_cui.parse_prompt_file(Path(prompt_file)))
+        except Exception:
+            return -1
+
+    def refresh_queue_tree(self):
+        self.queue_tree.clear()
+        for index, item in enumerate(self.queue):
+            summary = item.get("summary", {})
+            tree_item = QTreeWidgetItem(
+                [
+                    item.get("status", ""),
+                    str(summary.get("run_name", "")),
+                    str(summary.get("conditions", "")),
+                    str(summary.get("seeds", "")),
+                    str(summary.get("jobs", "")),
+                    item.get("report_path", ""),
+                ]
+            )
+            tree_item.setData(0, Qt.UserRole, index)
+            self.queue_tree.addTopLevelItem(tree_item)
+
+    def selected_queue_indexes(self) -> list[int]:
+        indexes = []
+        for item in self.queue_tree.selectedItems():
+            index = item.data(0, Qt.UserRole)
+            if isinstance(index, int):
+                indexes.append(index)
+        return sorted(set(indexes), reverse=True)
+
+    def run_queue(self):
+        if self.process is not None:
+            return
+        self.stop_after_current_requested = False
+        self.start_next_queue_item()
+
+    def start_next_queue_item(self):
+        next_index = None
+        for index, item in enumerate(self.queue):
+            if item.get("status") == "Waiting":
+                next_index = index
+                break
+        if next_index is None:
+            self.running_queue_index = None
+            self.update_queue_buttons()
+            self.log("Queue finished.")
+            return
+
+        self.running_queue_index = next_index
+        item = self.queue[next_index]
+        item["status"] = "Running"
+        item["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        item["finished_at"] = ""
+        item["exit_code"] = None
+        item["report_path"] = ""
+        self.cancel_running_requested = False
+        self.save_queue()
+        self.refresh_queue_tree()
+        options = item.get("options", {})
+        self.start_process_for_config(
+            self.queue_config_path(item),
+            "queue",
+            dry_run=bool(options.get("dry_run")),
+            skip_existing=bool(options.get("skip_existing", True)),
+        )
+
+    def queue_config_path(self, item: dict) -> Path:
+        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        path = QUEUE_DIR / f"{item['id']}.json"
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(item["config"], f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        return path
+
+    def stop_after_current(self):
+        self.stop_after_current_requested = True
+        self.log("Queue will stop after the current job.")
+        self.update_queue_buttons()
+
+    def cancel_running(self):
+        if self.process is not None and self.process_mode == "queue":
+            self.cancel_running_requested = True
+            self.process.kill()
+
+    def remove_selected_queue_items(self):
+        if self.process_mode == "queue" and self.running_queue_index in self.selected_queue_indexes():
+            QMessageBox.warning(self, "Queue item is running", "Cancel the running job before removing it.")
+            return
+        for index in self.selected_queue_indexes():
+            if 0 <= index < len(self.queue):
+                self.queue.pop(index)
+        self.save_queue()
+        self.refresh_queue_tree()
+
+    def clear_done_queue_items(self):
+        self.queue = [item for item in self.queue if item.get("status") != "Done"]
+        self.save_queue()
+        self.refresh_queue_tree()
+
+    def open_selected_queue_report(self):
+        indexes = self.selected_queue_indexes()
+        if not indexes:
+            return
+        item = self.queue[indexes[-1]]
+        report_path = item.get("report_path")
+        if report_path and Path(report_path).exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(report_path))
+
+    def update_queue_buttons(self):
+        queue_running = self.process is not None and self.process_mode == "queue"
+        self.run_queue_button.setEnabled(self.process is None)
+        self.stop_after_current_button.setEnabled(queue_running and not self.stop_after_current_requested)
+        self.cancel_running_button.setEnabled(queue_running)
+        self.add_queue_button.setEnabled(self.process is None)
+        self.run_button.setEnabled(self.process is None)
+
     def run_report(self):
         if self.process is not None:
             return
@@ -786,12 +1014,18 @@ class MainWindow(QMainWindow):
         self.current_report = None
         self.open_report_button.setEnabled(False)
         self.log_edit.clear()
-        self.log(f"Config: {config_path}")
+        self.start_process_for_config(
+            config_path,
+            "single",
+            dry_run=self.dry_run_check.isChecked(),
+            skip_existing=self.skip_existing_check.isChecked(),
+        )
 
+    def start_process_for_config(self, config_path: Path, mode: str, dry_run: bool, skip_existing: bool):
         args = [str(SCRIPT_DIR / "sdxl_lora_report_cui.py"), "--config", str(config_path)]
-        if self.dry_run_check.isChecked():
+        if dry_run:
             args.append("--dry-run")
-        if self.skip_existing_check.isChecked():
+        if skip_existing:
             args.append("--skip-existing")
 
         self.process = QProcess(self)
@@ -801,8 +1035,12 @@ class MainWindow(QMainWindow):
         self.process.setProcessChannelMode(QProcess.MergedChannels)
         self.process.readyReadStandardOutput.connect(self.read_process_output)
         self.process.finished.connect(self.process_finished)
+        self.process_mode = mode
+        self.current_report = None
         self.run_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.update_queue_buttons()
+        self.log(f"Config: {config_path}")
         self.process.start()
 
     def read_process_output(self):
@@ -816,13 +1054,40 @@ class MainWindow(QMainWindow):
 
     def process_finished(self, exit_code: int, _exit_status):
         self.log(f"Process finished with exit code {exit_code}")
-        self.run_button.setEnabled(True)
+        mode = self.process_mode
+        if mode == "queue" and self.running_queue_index is not None:
+            item = self.queue[self.running_queue_index]
+            item["exit_code"] = exit_code
+            item["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            if self.current_report is not None:
+                item["report_path"] = str(self.current_report)
+            if self.cancel_running_requested:
+                item["status"] = "Canceled"
+            else:
+                item["status"] = "Done" if exit_code == 0 else "Failed"
+            self.save_queue()
+            self.refresh_queue_tree()
+
         self.stop_button.setEnabled(False)
         self.open_report_button.setEnabled(self.current_report is not None and self.current_report.exists())
         self.process = None
+        self.process_mode = None
+        self.cancel_running_requested = False
+        self.update_queue_buttons()
+
+        if mode == "queue":
+            if self.stop_after_current_requested:
+                self.running_queue_index = None
+                self.stop_after_current_requested = False
+                self.update_queue_buttons()
+                self.log("Queue stopped.")
+            else:
+                self.start_next_queue_item()
 
     def stop_report(self):
         if self.process is not None:
+            if self.process_mode == "queue":
+                self.cancel_running_requested = True
             self.process.kill()
 
     def open_report(self):

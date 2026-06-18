@@ -80,6 +80,21 @@ python sdxl_lora_report_gui.py
 
 `Include baseline` をオンにすると、LoRAなし画像も同じprompt/seedで生成します。
 
+### Queue
+
+生成に時間がかかる場合は、現在の設定をキューに入れてからまとめて実行できます。
+
+- `Run report`: 現在の設定をすぐに生成します。
+- `Add to queue`: 現在の設定をキューに追加します。キューに入った内容はスナップショットなので、その後GUI上の設定を変えても既存キューには影響しません。
+- `Run queue`: `Waiting` 状態のキューを上から順番に実行します。
+- `Stop after current`: 現在実行中のジョブが終わったところでキュー実行を止めます。
+- `Cancel running`: 現在実行中のキュージョブを中断します。
+- `Remove selected`: 選択したキュー項目を削除します。
+- `Clear done`: 完了済みのキュー項目を削除します。
+- `Open selected report`: 完了したキュー項目のHTMLレポートを開きます。
+
+キューは `.tmp/queue/queue_state.json` に保存され、次回GUI起動時に復元されます。
+
 ## 前回設定の復元
 
 GUI実行時には `.tmp/lora_report_gui_last.json` が作られます。
