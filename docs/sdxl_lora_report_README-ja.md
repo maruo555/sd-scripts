@@ -63,6 +63,7 @@ python sdxl_lora_report_gui.py
 - `Make single conditions`: 選択中のLoRAから、単体LoRA条件をまとめて作ります。
 - `Add condition`: 空の比較条件を作ります。
 - `Add selected LoRA`: 選択中のLoRAを、選択中の比較条件に追加します。
+- `Move up` / `Move down`: 選択中の比較条件を上下に移動します。この順番がHTMLレポート上のLoRA条件の並び順になります。
 - 1つの条件にLoRAが1個なら単体LoRA、2個以上なら重ね掛け条件です。
 - 条件内のLoRA行で `strength` と `LBW` を編集できます。
 
@@ -73,12 +74,19 @@ python sdxl_lora_report_gui.py
 - `Sampler`
 - `Scale`
 - `Batch size`
-- `Images / prompt`
-- `Common args`
+- `Precision`
+- `Attention`
+- `Extra args`
 - `Seeds`
 - `Include baseline`
 
 `Include baseline` をオンにすると、LoRAなし画像も同じprompt/seedで生成します。
+
+`Precision` は `fp32 / none`、`bf16`、`fp16` から選びます。`bf16` を選ぶと `--bf16`、`fp16` を選ぶと `--fp16` が `common_args` に入ります。
+
+`Attention` は `none`、`sdpa`、`xformers` から選びます。`sdpa` と `xformers` は通常どちらか一方だけを使うため、GUIでは同時指定できない選択式にしています。
+
+`Extra args` には、GUIに専用欄がない追加オプションをスペース区切りで指定できます。
 
 ### Queue
 
@@ -108,7 +116,6 @@ GUI実行時には `.tmp/lora_report_gui_last.json` が作られます。
 - sampler
 - scale
 - batch_size
-- images_per_prompt
 - common_args
 
 LoRA条件やprompt fileまでは自動復元しません。実験条件を勝手に持ち越す事故を避けるためです。
@@ -204,7 +211,7 @@ python sdxl_lora_report_cui.py --config path\to\config.json --skip-existing
     "scale": 7.0,
     "batch_size": 1,
     "images_per_prompt": 1,
-    "common_args": ["--xformers", "--bf16"]
+    "common_args": ["--bf16", "--sdpa"]
   },
   "seeds": {
     "values": [12345],
@@ -304,7 +311,7 @@ baseline:     --am 0.0 0.0
 
 ## 制約
 
-- 現在のworkerは `images_per_prompt=1` を前提にしています。
+- 現在のworkerは `images_per_prompt=1` を前提にしています。GUIではこの値を表示せず、常に1としてconfigを生成します。
 - SDXL LoRA LBW利用を主目的にしているため、LBWを使う場合は `networks.lora_lbw` が使われます。
 - GUIの前回復元対象はモデルと生成設定だけです。LoRA条件やprompt fileは自動復元しません。
 - `.tmp/` は個人環境のパスを含むためコミット対象外です。

@@ -358,10 +358,14 @@ class MainWindow(QMainWindow):
         add_selected_button = QPushButton("Add selected LoRA")
         duplicate_button = QPushButton("Duplicate condition")
         remove_button = QPushButton("Remove")
+        move_up_button = QPushButton("Move up")
+        move_down_button = QPushButton("Move down")
         controls.addWidget(add_condition_button, 0, 0)
         controls.addWidget(add_selected_button, 0, 1)
         controls.addWidget(duplicate_button, 1, 0)
         controls.addWidget(remove_button, 1, 1)
+        controls.addWidget(move_up_button, 2, 0)
+        controls.addWidget(move_down_button, 2, 1)
         layout.addLayout(controls)
 
         self.condition_tree.itemChanged.connect(self.on_condition_item_changed)
@@ -369,6 +373,8 @@ class MainWindow(QMainWindow):
         add_selected_button.clicked.connect(self.add_selected_assets_to_selected_condition)
         duplicate_button.clicked.connect(self.duplicate_selected_condition)
         remove_button.clicked.connect(self.remove_selected_condition_items)
+        move_up_button.clicked.connect(lambda: self.move_selected_condition(-1))
+        move_down_button.clicked.connect(lambda: self.move_selected_condition(1))
         return panel
 
     def _build_settings_panel(self) -> QWidget:
@@ -387,7 +393,6 @@ class MainWindow(QMainWindow):
         self.scale_spin.setValue(7.0)
         self.scale_spin.setDecimals(2)
         self.batch_spin = self._int_spin(1, 16, 1, 1)
-        self.images_spin = self._int_spin(1, 16, 1, 1)
         self.sampler_combo = QComboBox()
         self.sampler_combo.setEditable(True)
         self.sampler_combo.addItems(["euler_a", "euler", "ddim", "dpm_2", "dpm_2_a", "dpmsolver++"])
@@ -397,20 +402,18 @@ class MainWindow(QMainWindow):
         form.addRow("Sampler", self.sampler_combo)
         form.addRow("Scale", self.scale_spin)
         form.addRow("Batch size", self.batch_spin)
-        form.addRow("Images / prompt", self.images_spin)
 
         common = QGroupBox("Common args")
         layout.addWidget(common)
-        common_layout = QVBoxLayout(common)
-        self.sdpa_check = QCheckBox("--sdpa")
-        self.bf16_check = QCheckBox("--bf16")
-        self.xformers_check = QCheckBox("--xformers")
+        common_layout = QFormLayout(common)
+        self.precision_combo = QComboBox()
+        self.precision_combo.addItems(["fp32 / none", "bf16", "fp16"])
+        self.attention_combo = QComboBox()
+        self.attention_combo.addItems(["none", "sdpa", "xformers"])
         self.extra_args_edit = QLineEdit()
-        common_layout.addWidget(self.sdpa_check)
-        common_layout.addWidget(self.bf16_check)
-        common_layout.addWidget(self.xformers_check)
-        common_layout.addWidget(QLabel("Extra args, separated by spaces"))
-        common_layout.addWidget(self.extra_args_edit)
+        common_layout.addRow("Precision", self.precision_combo)
+        common_layout.addRow("Attention", self.attention_combo)
+        common_layout.addRow("Extra args", self.extra_args_edit)
 
         seeds = QGroupBox("Seeds")
         layout.addWidget(seeds)
@@ -467,8 +470,8 @@ class MainWindow(QMainWindow):
         self.default_strength_spin.setValue(0.8)
         self.default_lbw_combo.setCurrentText("XLMLT1")
         self.seed_values_edit.setText("12345")
-        self.sdpa_check.setChecked(True)
-        self.bf16_check.setChecked(True)
+        self.precision_combo.setCurrentText("bf16")
+        self.attention_combo.setCurrentText("sdpa")
 
     def restore_last_generation_settings(self):
         if not GUI_CONFIG_PATH.exists():
@@ -490,7 +493,6 @@ class MainWindow(QMainWindow):
         self._set_spin_value(self.steps_spin, gen_config.get("steps"))
         self._set_spin_value(self.scale_spin, gen_config.get("scale"))
         self._set_spin_value(self.batch_spin, gen_config.get("batch_size"))
-        self._set_spin_value(self.images_spin, gen_config.get("images_per_prompt"))
 
         sampler = gen_config.get("sampler")
         if sampler:
@@ -511,10 +513,21 @@ class MainWindow(QMainWindow):
         if not isinstance(common_args, list):
             return
         args = [str(arg) for arg in common_args]
-        self.sdpa_check.setChecked("--sdpa" in args)
-        self.bf16_check.setChecked("--bf16" in args)
-        self.xformers_check.setChecked("--xformers" in args)
-        known = {"--sdpa", "--bf16", "--xformers"}
+        if "--fp16" in args:
+            self.precision_combo.setCurrentText("fp16")
+        elif "--bf16" in args:
+            self.precision_combo.setCurrentText("bf16")
+        else:
+            self.precision_combo.setCurrentText("fp32 / none")
+
+        if "--xformers" in args:
+            self.attention_combo.setCurrentText("xformers")
+        elif "--sdpa" in args:
+            self.attention_combo.setCurrentText("sdpa")
+        else:
+            self.attention_combo.setCurrentText("none")
+
+        known = {"--sdpa", "--xformers", "--bf16", "--fp16"}
         self.extra_args_edit.setText(" ".join(arg for arg in args if arg not in known))
 
     def browse_loras(self):
@@ -660,6 +673,37 @@ class MainWindow(QMainWindow):
                 return condition
         return None
 
+    def selected_condition_index(self) -> int | None:
+        item = self.condition_tree.currentItem()
+        if item is None:
+            return None
+        if item.parent() is not None:
+            item = item.parent()
+        condition_id = item.data(0, Qt.UserRole)
+        for index, condition in enumerate(self.conditions):
+            if condition.condition_id == condition_id:
+                return index
+        return None
+
+    def move_selected_condition(self, offset: int):
+        index = self.selected_condition_index()
+        if index is None:
+            return
+        new_index = index + offset
+        if new_index < 0 or new_index >= len(self.conditions):
+            return
+        self.conditions[index], self.conditions[new_index] = self.conditions[new_index], self.conditions[index]
+        moved_id = self.conditions[new_index].condition_id
+        self.refresh_condition_tree()
+        self.select_condition_by_id(moved_id)
+
+    def select_condition_by_id(self, condition_id: str):
+        for index in range(self.condition_tree.topLevelItemCount()):
+            item = self.condition_tree.topLevelItem(index)
+            if item.data(0, Qt.UserRole) == condition_id:
+                self.condition_tree.setCurrentItem(item)
+                return
+
     def condition_item_from_asset(self, asset: LoraAsset) -> ConditionItem:
         return ConditionItem(asset.asset_id, asset.name, asset.path, asset.strength, asset.lbw)
 
@@ -737,11 +781,15 @@ class MainWindow(QMainWindow):
 
     def common_args(self) -> list[str]:
         args = []
-        if self.sdpa_check.isChecked():
-            args.append("--sdpa")
-        if self.bf16_check.isChecked():
+        precision = self.precision_combo.currentText()
+        attention = self.attention_combo.currentText()
+        if precision == "bf16":
             args.append("--bf16")
-        if self.xformers_check.isChecked():
+        elif precision == "fp16":
+            args.append("--fp16")
+        if attention == "sdpa":
+            args.append("--sdpa")
+        elif attention == "xformers":
             args.append("--xformers")
         args.extend(arg for arg in self.extra_args_edit.text().split() if arg)
         return args
@@ -804,7 +852,7 @@ class MainWindow(QMainWindow):
                 "sampler": self.sampler_combo.currentText().strip(),
                 "scale": self.scale_spin.value(),
                 "batch_size": self.batch_spin.value(),
-                "images_per_prompt": self.images_spin.value(),
+                "images_per_prompt": 1,
                 "common_args": self.common_args(),
             },
             "seeds": {"values": seeds, "random_count": random_count},

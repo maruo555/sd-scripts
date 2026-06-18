@@ -12,8 +12,8 @@
     "batch_size": 1,
     "images_per_prompt": 1,
     "common_args": [
-      "--xformers",
-      "--bf16"
+      "--bf16",
+      "--sdpa"
     ]
   },
   "seeds": {
