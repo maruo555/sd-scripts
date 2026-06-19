@@ -36,9 +36,27 @@ def load_json(path: Path) -> dict:
 
 
 def parse_prompt_file(path: Path) -> list[dict]:
-    if path.suffix.lower() == ".tsv":
+    if path.suffix.lower() == ".tsv" or looks_like_prompt_tsv(path):
         return parse_prompt_tsv(path)
     return parse_prompt_pipe_text(path)
+
+
+def looks_like_prompt_tsv(path: Path) -> bool:
+    if path.suffix.lower() != ".txt":
+        return False
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "\t" not in line:
+                    return False
+                fields = [normalize_prompt_field(part) for part in next(csv.reader([line], delimiter="\t"))]
+                return "prompt" in fields
+    except OSError:
+        return False
+    return False
 
 
 def parse_prompt_pipe_text(path: Path) -> list[dict]:
@@ -150,6 +168,19 @@ def parse_optional_int(value: str, path: Path, line_no: int, column: str) -> int
         return int(value)
     except ValueError as exc:
         raise ValueError(f"Invalid {column} value at {path}:{line_no}: {value}") from exc
+
+
+def validate_image_size(width: int | None, height: int | None, source: str):
+    if width is None or height is None:
+        raise ValueError(f"{source}: width and height are required")
+    for name, value in (("width", width), ("height", height)):
+        if int(value) <= 0:
+            raise ValueError(f"{source}: {name} must be positive: {value}")
+        if int(value) % 64 != 0:
+            raise ValueError(
+                f"{source}: {name} must be a multiple of 64 for SDXL generation: {value}. "
+                "Use a nearby value such as 896, 960, or 1024."
+            )
 
 
 def build_seeds(seed_config: dict) -> list[int]:
@@ -333,9 +364,15 @@ def generate_jobs(config_path: Path, config: dict) -> tuple[Path, list[dict], li
     seeds = build_seeds(config.get("seeds", {}))
     conditions = build_lora_conditions(config, config_dir)
     gen_config = config.get("sdxl_gen_img", {})
+    base_width = gen_config.get("width")
+    base_height = gen_config.get("height")
+    validate_image_size(base_width, base_height, "sdxl_gen_img")
 
     jobs = []
     for prompt in prompts:
+        width = prompt.get("width") or base_width
+        height = prompt.get("height") or base_height
+        validate_image_size(width, height, f"{prompt_path}:{prompt['line_no']} ({prompt['id']})")
         for seed in seeds:
             for condition in conditions:
                 condition_dir = output_dir / "images" / condition["id"]
@@ -345,8 +382,8 @@ def generate_jobs(config_path: Path, config: dict) -> tuple[Path, list[dict], li
                         "prompt_id": prompt["id"],
                         "prompt": prompt["prompt"],
                         "negative": prompt.get("negative", ""),
-                        "width": prompt.get("width") or gen_config.get("width"),
-                        "height": prompt.get("height") or gen_config.get("height"),
+                        "width": width,
+                        "height": height,
                         "seed": seed,
                         "condition_id": condition["id"],
                         "condition_name": condition["name"],
@@ -525,6 +562,14 @@ def main():
     parser.add_argument("--skip-existing", action="store_true", help="Skip a job when its target image already exists.")
     args = parser.parse_args()
 
+    try:
+        run(args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+
+def run(args):
     config_path = Path(args.config).resolve()
     config = load_json(config_path)
     output_dir, prompts, conditions, seeds, jobs = generate_jobs(config_path, config)
