@@ -433,6 +433,9 @@ class LoRAModule(torch.nn.Module):
         self.dq_stats_manager: Optional[DQStatsManager] = None
         self.dq_scope = "te" if lora_name.startswith("lora_te") else "unet"
 
+    def is_effectively_disabled(self):
+        return self.multiplier == 0 or self.lbw_multiplier == 0
+
     # no EMA buffers/statistics for delta quantization (ema_* removed)
 
     def apply_to(self):
@@ -503,6 +506,9 @@ class LoRAModule(torch.nn.Module):
 
     def forward(self, x):
         org_forwarded = self.org_forward(x)
+
+        if self.is_effectively_disabled():
+            return org_forwarded
 
         # module dropout
         if self.module_dropout is not None and self.training:
@@ -707,10 +713,14 @@ class LoRAInfModule(LoRAModule):
 
     def default_forward(self, x):
         # logger.info(f"default_forward {self.lora_name} {x.size()}")
+        if self.is_effectively_disabled():
+            return self.org_forward(x)
         return self.org_forward(x) + self.lora_up(self.lora_down(x)) * self.multiplier * self.scale * self.lbw_multiplier
 
     def forward(self, x):
         if not self.enabled:
+            return self.org_forward(x)
+        if self.is_effectively_disabled():
             return self.org_forward(x)
 
         if self.network is None or self.network.sub_prompt_index is None:
