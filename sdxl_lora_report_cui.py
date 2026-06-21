@@ -555,6 +555,139 @@ render();
         f.write(report)
 
 
+def write_blind_report(output_dir: Path, metadata: dict):
+    data_json = json.dumps(metadata, ensure_ascii=False)
+    report = """<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SDXL LoRA Blind Report</title>
+<style>
+:root { color-scheme: light dark; --image-width: 50%; }
+body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #f5f5f2; color: #202124; }
+header { position: sticky; top: 0; z-index: 3; background: #ffffffee; border-bottom: 1px solid #d8d8d0; padding: 12px 18px; backdrop-filter: blur(8px); }
+h1 { font-size: 18px; margin: 0 0 10px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; font-size: 13px; }
+main { padding: 18px; }
+.group { margin: 0 0 22px; background: white; border: 1px solid #d8d8d0; box-shadow: 0 1px 3px #0001; }
+.group h2 { margin: 0; padding: 10px 12px; font-size: 13px; background: #ecece6; border-bottom: 1px solid #d8d8d0; }
+.choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; padding: 14px; }
+.choice { border: 1px solid #d8d8d0; background: #fbfbf8; padding: 10px; }
+.choice img { width: var(--image-width); max-width: 100%; height: auto; display: block; cursor: zoom-in; border: 1px solid #ccc; background: #eee; }
+.choice label { display: inline-flex; gap: 7px; align-items: center; margin-top: 8px; font-weight: 650; }
+.missing { min-height: 140px; display: grid; place-items: center; border: 1px dashed #aaa; color: #777; font-size: 12px; }
+.answer { display: none; margin-top: 7px; font-size: 12px; color: #555; line-height: 1.35; }
+body.revealed .answer { display: block; }
+#results { margin: 0 18px 22px; padding: 12px; border: 1px solid #d8d8d0; background: white; display: none; }
+#results table { border-collapse: collapse; }
+#results th, #results td { border: 1px solid #d8d8d0; padding: 6px 10px; text-align: left; }
+dialog { max-width: 96vw; max-height: 96vh; border: 0; padding: 0; background: transparent; }
+dialog img { max-width: 96vw; max-height: 92vh; display: block; background: #111; }
+dialog::backdrop { background: rgba(0,0,0,.78); }
+button, input { font: inherit; }
+@media (prefers-color-scheme: dark) {
+  body { background: #1f211f; color: #eee; }
+  header, .group, .choice, #results { background: #282b28; }
+  .group h2 { background: #343832; }
+  header, .group, .group h2, .choice, #results, #results th, #results td { border-color: #474b43; }
+  .answer { color: #bbb; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>SDXL LoRA Blind Report</h1>
+  <div class="toolbar">
+    <label>Image size <input id="size" type="range" min="20" max="120" value="50"> <span id="sizeLabel">50%</span></label>
+    <button id="reveal">Reveal / 答え合わせ</button>
+  </div>
+</header>
+<section id="results"></section>
+<main id="report"></main>
+<dialog id="viewer"><img id="viewerImage" alt=""></dialog>
+<script>
+const reportData = __REPORT_DATA__;
+const byId = id => document.getElementById(id);
+const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => {
+  if (ch === "&") return "&amp;";
+  if (ch === "<") return "&lt;";
+  if (ch === ">") return "&gt;";
+  if (ch === '"') return "&quot;";
+  return "&#39;";
+});
+const caseId = job => `${job.prompt_id} / seed ${job.seed}`;
+function shuffle(items) {
+  const result = [...items];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+}
+function conditionLabel(job) {
+  const items = (job.condition_items || []).map(item => `${esc(item.name || item.path)} x${esc(item.strength)} lbw=${esc(item.lbw ?? "")}`).join("<br>");
+  return `${esc(job.condition_name)}${items ? "<br>" + items : ""}`;
+}
+function buildGroups() {
+  const groups = new Map();
+  for (const job of reportData.jobs) {
+    if (!groups.has(caseId(job))) groups.set(caseId(job), []);
+    groups.get(caseId(job)).push(job);
+  }
+  return [...groups.entries()].map(([label, jobs], index) => ({ label, index, jobs: shuffle(jobs) }));
+}
+function choice(job, groupIndex, choiceIndex) {
+  const image = job.status === "done"
+    ? `<img src="${esc(job.image)}" alt="" loading="lazy">`
+    : `<div class="missing">${esc(job.status)}</div>`;
+  return `<article class="choice" data-condition="${esc(job.condition_id)}">
+    ${image}
+    <label><input type="radio" name="best_${groupIndex}" value="${esc(job.condition_id)}"> Best</label>
+    <div class="answer">#${choiceIndex + 1}<br>${conditionLabel(job)}</div>
+  </article>`;
+}
+function render() {
+  const groups = buildGroups();
+  byId("report").innerHTML = groups.map(group => `
+    <section class="group">
+      <h2>${esc(group.label)}</h2>
+      <div class="choices">${group.jobs.map((job, index) => choice(job, group.index, index)).join("")}</div>
+    </section>
+  `).join("");
+  byId("report").querySelectorAll("img").forEach(img => img.addEventListener("click", () => {
+    byId("viewerImage").src = img.src;
+    byId("viewer").showModal();
+  }));
+}
+function reveal() {
+  document.body.classList.add("revealed");
+  const votes = new Map(reportData.conditions.map(condition => [condition.id, { name: condition.name, count: 0 }]));
+  document.querySelectorAll('input[type="radio"]:checked').forEach(input => {
+    if (votes.has(input.value)) votes.get(input.value).count += 1;
+  });
+  const rows = [...votes.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  byId("results").style.display = "block";
+  byId("results").innerHTML = `<strong>Vote results</strong>
+    <table><thead><tr><th>LoRA</th><th>Votes</th></tr></thead><tbody>
+    ${rows.map(row => `<tr><td>${esc(row.name)}</td><td>${row.count}</td></tr>`).join("")}
+    </tbody></table>`;
+}
+byId("size").addEventListener("input", event => {
+  document.documentElement.style.setProperty("--image-width", `${event.target.value}%`);
+  byId("sizeLabel").textContent = `${event.target.value}%`;
+});
+byId("reveal").addEventListener("click", reveal);
+byId("viewer").addEventListener("click", () => byId("viewer").close());
+render();
+</script>
+</body>
+</html>
+""".replace("__REPORT_DATA__", data_json)
+    with (output_dir / "blind_report.html").open("w", encoding="utf-8") as f:
+        f.write(report)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate SDXL LoRA comparison images and an HTML report.")
     parser.add_argument("--config", required=True, help="Path to report JSON config.")
@@ -586,11 +719,14 @@ def run(args):
     if returncode != 0:
         metadata = write_metadata(output_dir, prompts, conditions, seeds, jobs)
         write_report(output_dir, metadata)
+        write_blind_report(output_dir, metadata)
         raise SystemExit(returncode)
 
     metadata = write_metadata(output_dir, prompts, conditions, seeds, jobs)
     write_report(output_dir, metadata)
+    write_blind_report(output_dir, metadata)
     print(f"Report: {output_dir / 'report.html'}")
+    print(f"Blind report: {output_dir / 'blind_report.html'}")
 
 
 if __name__ == "__main__":
