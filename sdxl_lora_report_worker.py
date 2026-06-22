@@ -9,6 +9,8 @@ from pathlib import Path
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+DEFAULT_LBW = "ALL"
+REPORT_LORA_MODULE = "networks.lora_lbw"
 
 
 def load_json(path: Path) -> dict:
@@ -33,8 +35,19 @@ def list_images(directory: Path) -> set[Path]:
     return {p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS}
 
 
+def normalize_lora_slot_item(item: dict) -> dict:
+    normalized = dict(item)
+    module = normalized.get("module")
+    lbw = normalized.get("lbw")
+    if module in (None, "networks.lora", REPORT_LORA_MODULE):
+        normalized["module"] = REPORT_LORA_MODULE
+        normalized["lbw"] = lbw or DEFAULT_LBW
+    return normalized
+
+
 def lora_slot_key(item: dict) -> tuple[str, str, str | None]:
-    return (item["module"], item["path"], item.get("lbw"))
+    normalized = normalize_lora_slot_item(item)
+    return (normalized["module"], normalized["path"], normalized.get("lbw"))
 
 
 def build_lora_slots(conditions: list[dict]) -> list[dict]:
@@ -45,10 +58,8 @@ def build_lora_slots(conditions: list[dict]) -> list[dict]:
             key = lora_slot_key(item)
             if key in slot_by_key:
                 continue
-            if item.get("lbw") is None:
-                raise ValueError("LoRA report worker requires lbw for every LoRA item")
             slot_by_key[key] = len(slots)
-            slots.append(dict(item))
+            slots.append(normalize_lora_slot_item(item))
     return slots
 
 
@@ -99,29 +110,44 @@ def build_command(script_dir: Path, job_plan: dict, prompt_file: Path, outdir: P
         command.extend(slot["path"] for slot in slots)
         command.append("--network_mul")
         command.extend("1.0" for _ in slots)
-        command.append("--network_lbw")
-        command.extend(str(slot["lbw"]) for slot in slots)
+        if any(slot.get("lbw") is not None for slot in slots):
+            command.append("--network_lbw")
+            command.extend(str(slot.get("lbw") or DEFAULT_LBW) for slot in slots)
 
     command.extend(["--from_file", str(prompt_file), "--sequential_file_name"])
     return command
 
 
+def select_job_output_images(created: list[Path], job_count: int) -> tuple[list[Path], str | None]:
+    highres_final = [path for path in created if path.name.startswith("im_1")]
+    if len(highres_final) == job_count:
+        return highres_final, None
+    if len(created) == job_count:
+        return created, None
+    if len(created) < job_count:
+        return [], f"expected {job_count} images but found {len(created)}"
+    if highres_final:
+        return [], f"expected {job_count} final highres images but found {len(highres_final)} final images and {len(created)} total images"
+    return [], f"expected {job_count} images but found {len(created)}; extra images make output pairing ambiguous"
+
+
 def move_outputs(outdir: Path, before: set[Path], jobs: list[dict]) -> list[dict]:
     after = list_images(outdir)
     created = sorted(after - before, key=lambda p: p.name)
-    if len(created) < len(jobs):
+    images, error = select_job_output_images(created, len(jobs))
+    if error is not None:
         return [
             {
                 "job_index": job["job_index"],
                 "status": "missing_image",
                 "output": job["target_path"],
-                "error": f"expected {len(jobs)} images but found {len(created)}",
+                "error": error,
             }
             for job in jobs
         ]
 
     results = []
-    for image, job in zip(created, jobs):
+    for image, job in zip(images, jobs):
         target = Path(job["target_path"])
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
