@@ -204,7 +204,8 @@ def run_worker(job_plan: dict, dry_run: bool) -> dict:
 
     results = move_outputs(outdir, before, jobs)
     status = "done" if all(r["status"] == "done" for r in results) else "missing_image"
-    return {"status": status, "returncode": 0, "command": command, "slots": slots, "results": results}
+    returncode = 0 if status == "done" else 1
+    return {"status": status, "returncode": returncode, "command": command, "slots": slots, "results": results}
 
 
 def main():

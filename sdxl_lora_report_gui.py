@@ -547,12 +547,7 @@ class MainWindow(QMainWindow):
             resolved = path.resolve()
             if resolved in existing:
                 continue
-            asset_id = sanitize_id(path.stem, f"lora_{len(self.assets) + 1:02d}")
-            base_id = asset_id
-            counter = 2
-            while any(asset.asset_id == asset_id for asset in self.assets):
-                asset_id = f"{base_id}_{counter}"
-                counter += 1
+            asset_id = self.unique_asset_id(path.stem)
             asset = LoraAsset(
                 asset_id=asset_id,
                 name=path_to_name(str(path)),
@@ -573,6 +568,16 @@ class MainWindow(QMainWindow):
                 item.setSelected(False)
         if paths and not added_items:
             self.log("No new .safetensors files were added.")
+
+    def unique_asset_id(self, name: str, current: str | None = None, used_ids: set[str] | None = None) -> str:
+        base = sanitize_id(name, f"lora_{len(self.assets) + 1:02d}")
+        asset_id = base
+        used = set(used_ids) if used_ids is not None else {asset.asset_id for asset in self.assets if asset.asset_id != current}
+        counter = 2
+        while asset_id in used:
+            asset_id = f"{base}_{counter}"
+            counter += 1
+        return asset_id
 
     def remove_selected_assets(self):
         selected_ids = {item.data(Qt.UserRole) for item in self.asset_list.selectedItems()}
@@ -712,12 +717,15 @@ class MainWindow(QMainWindow):
 
     def rebuild_assets_from_conditions(self):
         by_path: dict[str, LoraAsset] = {}
+        used_asset_ids: set[str] = set()
         for condition in self.conditions:
             for item in condition.items:
                 key = str(Path(item.path).resolve())
                 if key not in by_path:
+                    asset_id = self.unique_asset_id(Path(item.path).stem, used_ids=used_asset_ids)
+                    used_asset_ids.add(asset_id)
                     by_path[key] = LoraAsset(
-                        asset_id=sanitize_id(Path(item.path).stem, f"lora_{len(by_path) + 1:02d}"),
+                        asset_id=asset_id,
                         name=item.name or path_to_name(item.path),
                         path=key,
                         strength=item.strength,
@@ -1102,7 +1110,7 @@ class MainWindow(QMainWindow):
                 name = raw_item.get("name") or path_to_name(path) or f"lora_{item_index:02d}"
                 items.append(
                     ConditionItem(
-                        asset_id=sanitize_id(Path(path).stem, f"lora_{item_index:02d}"),
+                        asset_id="",
                         name=name,
                         path=path,
                         strength=float(raw_item.get("strength", 1.0)),
