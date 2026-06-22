@@ -1056,6 +1056,9 @@ class MainWindow(QMainWindow):
         self.refresh_queue_tree()
 
     def clear_done_queue_items(self):
+        if self.process_mode == "queue" and self.running_queue_index is not None:
+            QMessageBox.warning(self, "Queue is running", "Clear done items after the current queue run has stopped.")
+            return
         self.queue = [item for item in self.queue if item.get("status") != "Done"]
         self.save_queue()
         self.refresh_queue_tree()
@@ -1135,6 +1138,7 @@ class MainWindow(QMainWindow):
         self.stop_after_current_button.setEnabled(queue_running and not self.stop_after_current_requested)
         self.cancel_running_button.setEnabled(queue_running)
         self.add_queue_button.setEnabled(self.process is None)
+        self.clear_done_button.setEnabled(not queue_running)
         self.run_button.setEnabled(self.process is None)
 
     def run_report(self):

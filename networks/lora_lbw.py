@@ -720,8 +720,6 @@ class LoRAInfModule(LoRAModule):
     def forward(self, x):
         if not self.enabled:
             return self.org_forward(x)
-        if self.is_effectively_disabled():
-            return self.org_forward(x)
 
         if self.network is None or self.network.sub_prompt_index is None:
             return self.default_forward(x)
@@ -759,15 +757,19 @@ class LoRAInfModule(LoRAModule):
         if self.network.mask_dic is None:  # sub_prompt_index >= 3
             return self.default_forward(x)
 
-        # apply mask for LoRA result
-        lx = self.lora_up(self.lora_down(x)) * self.multiplier * self.scale * self.lbw_multiplier
+        x_in = x
+        x = self.org_forward(x_in)
+        if self.is_effectively_disabled():
+            lx = torch.zeros_like(x)
+        else:
+            lx = self.lora_up(self.lora_down(x_in)) * self.multiplier * self.scale * self.lbw_multiplier
+
         mask = self.get_mask_for_x(lx)
         # print("regional", self.lora_name, self.network.sub_prompt_index, lx.size(), mask.size())
         # if mask.ndim > lx.ndim:  # in some resolution, lx is 2d and mask is 3d (the reason is not checked)
         #     mask = mask.squeeze(-1)
         lx = lx * mask
 
-        x = self.org_forward(x)
         x = x + lx
 
         if "attn2_to_q" in self.lora_name and self.network.is_last_network:
@@ -804,13 +806,17 @@ class LoRAInfModule(LoRAModule):
         if not self.text_encoder:
             emb_idx += self.network.batch_size
 
-        # apply sub prompt of X
-        lx = x[emb_idx :: self.network.num_sub_prompts]
-        lx = self.lora_up(self.lora_down(lx)) * self.multiplier * self.scale * self.lbw_multiplier
+        x_in = x
+        x = self.org_forward(x_in)
+        if self.is_effectively_disabled():
+            lx = torch.zeros_like(x[emb_idx :: self.network.num_sub_prompts])
+        else:
+            # apply sub prompt of X
+            lx = x_in[emb_idx :: self.network.num_sub_prompts]
+            lx = self.lora_up(self.lora_down(lx)) * self.multiplier * self.scale * self.lbw_multiplier
 
         # logger.info(f"sub_prompt_forward {self.lora_name} {x.size()} {lx.size()} {emb_idx}")
 
-        x = self.org_forward(x)
         x[emb_idx :: self.network.num_sub_prompts] += lx
 
         return x
@@ -826,7 +832,10 @@ class LoRAInfModule(LoRAModule):
 
         # call own LoRA
         x1 = x[self.network.batch_size + self.network.sub_prompt_index :: self.network.num_sub_prompts]
-        lx1 = self.lora_up(self.lora_down(x1)) * self.multiplier * self.scale * self.lbw_multiplier
+        if self.is_effectively_disabled():
+            lx1 = torch.zeros_like(self.org_forward(x1))
+        else:
+            lx1 = self.lora_up(self.lora_down(x1)) * self.multiplier * self.scale * self.lbw_multiplier
 
         if self.network.is_last_network:
             lx = torch.zeros(

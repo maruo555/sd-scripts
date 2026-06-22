@@ -63,6 +63,10 @@ def build_lora_slots(conditions: list[dict]) -> list[dict]:
     return slots
 
 
+def build_lora_slots_from_jobs(jobs: list[dict]) -> list[dict]:
+    return build_lora_slots([{"items": job.get("condition_items", [])} for job in jobs])
+
+
 def prompt_line(job: dict, slots: list[dict]) -> str:
     text = job["prompt"]
     if job.get("negative"):
@@ -166,8 +170,7 @@ def run_worker(job_plan: dict, dry_run: bool) -> dict:
     outdir = Path(job_plan["work_outdir"]).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     jobs = job_plan["jobs"]
-    conditions = job_plan["conditions"]
-    slots = build_lora_slots(conditions)
+    slots = build_lora_slots_from_jobs(jobs)
 
     with tempfile.TemporaryDirectory(prefix="lora_report_worker_") as tmpdir:
         prompt_file = Path(tmpdir) / "prompts.txt"
