@@ -268,17 +268,8 @@ def run_report_worker(
     conditions: list[dict],
     jobs: list[dict],
     dry_run: bool,
-    skip_existing: bool,
 ) -> int:
-    active_jobs = []
-    for job in jobs:
-        target_path = Path(job["target_path"])
-        if skip_existing and target_path.exists():
-            job["status"] = "done"
-            job["returncode"] = 0
-            continue
-        active_jobs.append(job)
-
+    active_jobs = list(jobs)
     if not active_jobs:
         return 0
 
@@ -326,17 +317,32 @@ def run_report_worker(
 
     result = subprocess.run(command, cwd=Path(__file__).resolve().parent)
     if result_path.exists():
-        with result_path.open("r", encoding="utf-8") as f:
-            worker_result = json.load(f)
-        for item in worker_result.get("results", []):
-            job = jobs[item["job_index"]]
-            job["status"] = item.get("status", "failed")
-            job["returncode"] = worker_result.get("returncode")
-            job["worker_command"] = worker_result.get("command", [])
-            job["worker_slots"] = worker_result.get("slots", [])
-            if item.get("error"):
-                job["error"] = item["error"]
+        try:
+            with result_path.open("r", encoding="utf-8") as f:
+                worker_result = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            mark_worker_failed(jobs, result.returncode, command, f"worker result JSON could not be read: {exc}")
+        else:
+            for item in worker_result.get("results", []):
+                job = jobs[item["job_index"]]
+                job["status"] = item.get("status", "failed")
+                job["returncode"] = worker_result.get("returncode")
+                job["worker_command"] = worker_result.get("command", [])
+                job["worker_slots"] = worker_result.get("slots", [])
+                if item.get("error"):
+                    job["error"] = item["error"]
+    elif result.returncode != 0:
+        mark_worker_failed(jobs, result.returncode, command, "worker did not write result JSON")
     return result.returncode
+
+
+def mark_worker_failed(jobs: list[dict], returncode: int, command: list[str], error: str):
+    for job in jobs:
+        job["status"] = "failed"
+        job["returncode"] = returncode
+        job["worker_command"] = command
+        job["worker_slots"] = []
+        job["error"] = error
 
 
 def order_jobs_for_generation(jobs: list[dict], conditions: list[dict]) -> list[dict]:
@@ -371,7 +377,8 @@ def generate_jobs(config_path: Path, config: dict) -> tuple[Path, list[dict], li
     config_dir = config_path.parent
     output_root = resolve_path(config.get("output_root", "lora_reports"), config_dir)
     run_name = sanitize_id(config.get("run_name"), "lora_report")
-    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    now = dt.datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S_") + f"{now.microsecond // 1000:03d}"
     output_dir = output_root / f"{timestamp}_{run_name}"
 
     prompt_path = resolve_path(config.get("prompt_file"), config_dir)
@@ -740,7 +747,6 @@ def main():
     parser = argparse.ArgumentParser(description="Generate SDXL LoRA comparison images and an HTML report.")
     parser.add_argument("--config", required=True, help="Path to report JSON config.")
     parser.add_argument("--dry-run", action="store_true", help="Write metadata/report without running image generation.")
-    parser.add_argument("--skip-existing", action="store_true", help="Skip a job when its target image already exists.")
     args = parser.parse_args()
 
     try:
@@ -763,7 +769,7 @@ def run(args):
     print(f"Jobs: {len(jobs)}")
     gen_config = config.get("sdxl_gen_img", {})
     print(f"[1/1] worker ({len(jobs)} jobs, {len(conditions)} conditions)")
-    returncode = run_report_worker(output_dir, gen_config, conditions, jobs, args.dry_run, args.skip_existing)
+    returncode = run_report_worker(output_dir, gen_config, conditions, jobs, args.dry_run)
     if returncode != 0:
         metadata = write_metadata(output_dir, prompts, conditions, seeds, jobs)
         write_report(output_dir, metadata)

@@ -225,7 +225,26 @@ def main():
 
     job_plan_path = Path(args.job_json).resolve()
     result_path = Path(args.result_json).resolve()
-    result = run_worker(load_json(job_plan_path), args.dry_run)
+    job_plan = load_json(job_plan_path)
+    try:
+        result = run_worker(job_plan, args.dry_run)
+    except Exception as exc:
+        result = {
+            "status": "failed",
+            "returncode": 1,
+            "command": [],
+            "slots": [],
+            "error": str(exc),
+            "results": [
+                {
+                    "job_index": job["job_index"],
+                    "status": "failed",
+                    "output": job["target_path"],
+                    "error": str(exc),
+                }
+                for job in job_plan.get("jobs", [])
+            ],
+        }
     write_json(result_path, result)
     raise SystemExit(int(result.get("returncode", 1)))
 

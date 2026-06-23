@@ -57,6 +57,13 @@ def path_to_name(path: str) -> str:
     return Path(path).stem
 
 
+def absolutize_gui_path(path: str) -> str:
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = SCRIPT_DIR / p
+    return str(p.resolve())
+
+
 @dataclass
 class LoraAsset:
     asset_id: str
@@ -836,6 +843,10 @@ class MainWindow(QMainWindow):
         if not self.conditions and not self.baseline_check.isChecked():
             raise ValueError("Add at least one condition or enable baseline.")
 
+        model = absolutize_gui_path(model)
+        output_root = absolutize_gui_path(output_root)
+        prompt_file = absolutize_gui_path(prompt_file)
+
         seeds = self.parse_seed_values()
         random_count = self.random_count_spin.value()
         if not seeds and random_count <= 0:
@@ -851,7 +862,7 @@ class MainWindow(QMainWindow):
                 item = condition.items[0]
                 entry.update(
                     {
-                        "path": item.path,
+                        "path": absolutize_gui_path(item.path),
                         "strength": item.strength,
                         "lbw": item.lbw,
                     }
@@ -860,7 +871,7 @@ class MainWindow(QMainWindow):
                 entry["items"] = [
                     {
                         "name": item.name,
-                        "path": item.path,
+                        "path": absolutize_gui_path(item.path),
                         "strength": item.strength,
                         "lbw": item.lbw,
                     }

@@ -190,11 +190,6 @@ python sdxl_lora_report_cui.py --config lora_report_samples\lora_report_sample.j
 python sdxl_lora_report_cui.py --config path\to\config.json
 ```
 
-既存画像をスキップする場合:
-
-```powershell
-python sdxl_lora_report_cui.py --config path\to\config.json --skip-existing
-```
 
 ## Config JSON
 
