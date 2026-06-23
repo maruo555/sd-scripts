@@ -4,6 +4,7 @@ import csv
 import datetime as dt
 import html
 import json
+import os
 import random
 import re
 import shutil
@@ -349,6 +350,10 @@ def make_image_name(prompt: dict, prompt_index: int, seed: int) -> str:
     return f"p{prompt_index:04d}_{prompt['id']}_seed{seed}.png"
 
 
+def target_path_key(path: Path) -> str:
+    return os.path.normcase(str(path))
+
+
 def generate_jobs(config_path: Path, config: dict) -> tuple[Path, list[dict], list[dict], list[int], list[dict]]:
     config_dir = config_path.parent
     output_root = resolve_path(config.get("output_root", "lora_reports"), config_dir)
@@ -369,6 +374,7 @@ def generate_jobs(config_path: Path, config: dict) -> tuple[Path, list[dict], li
     validate_image_size(base_width, base_height, "sdxl_gen_img")
 
     jobs = []
+    seen_target_paths = {}
     for prompt_index, prompt in enumerate(prompts, 1):
         width = prompt.get("width") or base_width
         height = prompt.get("height") or base_height
@@ -377,6 +383,21 @@ def generate_jobs(config_path: Path, config: dict) -> tuple[Path, list[dict], li
             for condition in conditions:
                 condition_dir = output_dir / "images" / condition["id"]
                 target_path = condition_dir / make_image_name(prompt, prompt_index, seed)
+                path_key = target_path_key(target_path)
+                if path_key in seen_target_paths:
+                    other = seen_target_paths[path_key]
+                    raise ValueError(
+                        "Multiple report jobs resolve to the same image path: "
+                        f"{target_path}. "
+                        f"First: condition='{other['condition_id']}', prompt='{other['prompt_id']}', seed={other['seed']}. "
+                        f"Second: condition='{condition['id']}', prompt='{prompt['id']}', seed={seed}. "
+                        "Use unique LoRA condition ids/names and avoid duplicate seeds for the same prompt."
+                    )
+                seen_target_paths[path_key] = {
+                    "condition_id": condition["id"],
+                    "prompt_id": prompt["id"],
+                    "seed": seed,
+                }
                 jobs.append(
                     {
                         "prompt_id": prompt["id"],
