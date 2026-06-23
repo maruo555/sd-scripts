@@ -1046,8 +1046,8 @@ class MainWindow(QMainWindow):
             self.process.kill()
 
     def remove_selected_queue_items(self):
-        if self.process_mode == "queue" and self.running_queue_index in self.selected_queue_indexes():
-            QMessageBox.warning(self, "Queue item is running", "Cancel the running job before removing it.")
+        if self.process_mode == "queue" and self.running_queue_index is not None:
+            QMessageBox.warning(self, "Queue is running", "Remove queue items after the current queue run has stopped.")
             return
         for index in self.selected_queue_indexes():
             if 0 <= index < len(self.queue):
@@ -1138,6 +1138,7 @@ class MainWindow(QMainWindow):
         self.stop_after_current_button.setEnabled(queue_running and not self.stop_after_current_requested)
         self.cancel_running_button.setEnabled(queue_running)
         self.add_queue_button.setEnabled(self.process is None)
+        self.remove_queue_button.setEnabled(not queue_running)
         self.clear_done_button.setEnabled(not queue_running)
         self.run_button.setEnabled(self.process is None)
 

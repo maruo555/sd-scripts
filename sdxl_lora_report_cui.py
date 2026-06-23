@@ -345,8 +345,8 @@ def copy_run_inputs(config_path: Path, prompt_path: Path, output_dir: Path, conf
         json.dump({"source": str(config_path), "prompts": prompts}, f, ensure_ascii=False, indent=2)
 
 
-def make_image_name(prompt: dict, seed: int) -> str:
-    return f"{prompt['id']}_seed{seed}.png"
+def make_image_name(prompt: dict, prompt_index: int, seed: int) -> str:
+    return f"p{prompt_index:04d}_{prompt['id']}_seed{seed}.png"
 
 
 def generate_jobs(config_path: Path, config: dict) -> tuple[Path, list[dict], list[dict], list[int], list[dict]]:
@@ -369,14 +369,14 @@ def generate_jobs(config_path: Path, config: dict) -> tuple[Path, list[dict], li
     validate_image_size(base_width, base_height, "sdxl_gen_img")
 
     jobs = []
-    for prompt in prompts:
+    for prompt_index, prompt in enumerate(prompts, 1):
         width = prompt.get("width") or base_width
         height = prompt.get("height") or base_height
         validate_image_size(width, height, f"{prompt_path}:{prompt['line_no']} ({prompt['id']})")
         for seed in seeds:
             for condition in conditions:
                 condition_dir = output_dir / "images" / condition["id"]
-                target_path = condition_dir / make_image_name(prompt, seed)
+                target_path = condition_dir / make_image_name(prompt, prompt_index, seed)
                 jobs.append(
                     {
                         "prompt_id": prompt["id"],
