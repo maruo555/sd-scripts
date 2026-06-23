@@ -413,6 +413,7 @@ def generate_jobs(config_path: Path, config: dict) -> tuple[Path, list[dict], li
                 }
                 jobs.append(
                     {
+                        "prompt_index": prompt_index,
                         "prompt_id": prompt["id"],
                         "prompt": prompt["prompt"],
                         "negative": prompt.get("negative", ""),
@@ -525,7 +526,8 @@ const reportData = {data_json};
 const state = {{ axis: "condition", conditions: new Set(), prompts: new Set(), seeds: new Set(), size: 50 }};
 const byId = id => document.getElementById(id);
 const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}}[ch]));
-const caseId = job => `${{job.prompt_id}} / seed ${{job.seed}}`;
+const promptPosition = job => `p${{String(job.prompt_index ?? 0).padStart(4, "0")}}`;
+const caseId = job => `${{promptPosition(job)}} / ${{job.prompt_id}} / seed ${{job.seed}}`;
 function initState() {{
   reportData.conditions.forEach(c => state.conditions.add(c.id));
   reportData.prompts.forEach(p => state.prompts.add(p.id));
@@ -550,7 +552,7 @@ function cell(job) {{
   if (!job) return `<td class="cell"><div class="missing">no job</div></td>`;
   const image = job.status === "done" ? `<img src="${{esc(job.image)}}" alt="" loading="lazy">` : `<div class="missing">${{esc(job.status)}}</div>`;
   const items = (job.condition_items || []).map(item => `${{esc(item.name || item.path)}} x${{esc(item.strength)}} lbw=${{esc(item.lbw ?? "")}}`).join("<br>");
-  return `<td class="cell">${{image}}<div class="meta">${{esc(job.condition_name)}}<br>${{items}}<br>${{esc(job.prompt_id)}} / seed ${{esc(job.seed)}}<br>${{esc(job.width)}}x${{esc(job.height)}}</div></td>`;
+  return `<td class="cell">${{image}}<div class="meta">${{esc(job.condition_name)}}<br>${{items}}<br>${{esc(caseId(job))}}<br>${{esc(job.width)}}x${{esc(job.height)}}</div></td>`;
 }}
 function render() {{
   document.documentElement.style.setProperty("--image-width", `${{state.size}}%`);
@@ -661,7 +663,8 @@ const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => {
   if (ch === '"') return "&quot;";
   return "&#39;";
 });
-const caseId = job => `${job.prompt_id} / seed ${job.seed}`;
+const promptPosition = job => `p${String(job.prompt_index ?? 0).padStart(4, "0")}`;
+const caseId = job => `${promptPosition(job)} / ${job.prompt_id} / seed ${job.seed}`;
 function shuffle(items) {
   const result = [...items];
   for (let i = result.length - 1; i > 0; i--) {
