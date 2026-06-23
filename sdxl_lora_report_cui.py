@@ -416,8 +416,19 @@ def write_metadata(output_dir: Path, prompts: list[dict], conditions: list[dict]
     return metadata
 
 
+def json_for_script(data: dict) -> str:
+    return (
+        json.dumps(data, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
 def write_report(output_dir: Path, metadata: dict):
-    data_json = json.dumps(metadata, ensure_ascii=False)
+    data_json = json_for_script(metadata)
     report = f"""<!doctype html>
 <html lang="ja">
 <head>
@@ -556,7 +567,7 @@ render();
 
 
 def write_blind_report(output_dir: Path, metadata: dict):
-    data_json = json.dumps(metadata, ensure_ascii=False)
+    data_json = json_for_script(metadata)
     report = """<!doctype html>
 <html lang="ja">
 <head>

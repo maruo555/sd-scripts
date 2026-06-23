@@ -67,6 +67,11 @@ def build_lora_slots_from_jobs(jobs: list[dict]) -> list[dict]:
     return build_lora_slots([{"items": job.get("condition_items", [])} for job in jobs])
 
 
+def format_multiplier(value: float) -> str:
+    text = f"{float(value):.12f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def prompt_line(job: dict, slots: list[dict]) -> str:
     text = job["prompt"]
     if job.get("negative"):
@@ -82,7 +87,7 @@ def prompt_line(job: dict, slots: list[dict]) -> str:
         slot_by_key = {lora_slot_key(slot): index for index, slot in enumerate(slots)}
         for item in job["condition_items"]:
             multipliers[slot_by_key[lora_slot_key(item)]] = item["strength"]
-        text += " --am " + ",".join(str(v) for v in multipliers)
+        text += " --am " + ",".join(format_multiplier(v) for v in multipliers)
 
     return text
 
