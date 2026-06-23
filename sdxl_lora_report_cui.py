@@ -104,14 +104,27 @@ def parse_prompt_pipe_text(path: Path) -> list[dict]:
 def parse_prompt_tsv(path: Path) -> list[dict]:
     prompts = []
     with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f, delimiter="\t")
+        lines = []
+        line_numbers = []
+        found_header = False
+        for line_no, raw_line in enumerate(f, 1):
+            if not found_header:
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                found_header = True
+            lines.append(raw_line)
+            line_numbers.append(line_no)
+
+        reader = csv.DictReader(lines, delimiter="\t")
         if reader.fieldnames is None:
             raise ValueError(f"No TSV header found: {path}")
         normalized_fields = {normalize_prompt_field(name): name for name in reader.fieldnames}
         if "prompt" not in normalized_fields:
             raise ValueError(f"TSV prompt file requires a 'prompt' column: {path}")
 
-        for row_index, row in enumerate(reader, 2):
+        for row_offset, row in enumerate(reader, 1):
+            row_index = line_numbers[row_offset] if row_offset < len(line_numbers) else row_offset + 1
             if is_empty_prompt_row(row):
                 continue
             prompt = cell(row, normalized_fields, "prompt")

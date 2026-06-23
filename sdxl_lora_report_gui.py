@@ -2,6 +2,7 @@
 import json
 import random
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -1043,7 +1044,7 @@ class MainWindow(QMainWindow):
     def cancel_running(self):
         if self.process is not None and self.process_mode == "queue":
             self.cancel_running_requested = True
-            self.process.kill()
+            self.terminate_process_tree()
 
     def remove_selected_queue_items(self):
         if self.process_mode == "queue" and self.running_queue_index is not None:
@@ -1229,7 +1230,26 @@ class MainWindow(QMainWindow):
         if self.process is not None:
             if self.process_mode == "queue":
                 self.cancel_running_requested = True
-            self.process.kill()
+            self.terminate_process_tree()
+
+    def terminate_process_tree(self):
+        if self.process is None:
+            return
+
+        pid = int(self.process.processId())
+        if sys.platform == "win32" and pid > 0:
+            self.log(f"Stopping process tree: PID {pid}")
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0:
+                return
+            self.log("Process tree stop failed; killing direct process.")
+
+        self.process.kill()
 
     def open_report(self):
         if self.current_report and self.current_report.exists():
