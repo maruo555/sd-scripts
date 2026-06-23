@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 import json
+import os
 import random
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -252,8 +254,6 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout()
         main.addLayout(bottom)
         self.dry_run_check = QCheckBox("Dry run")
-        self.skip_existing_check = QCheckBox("Skip existing")
-        self.skip_existing_check.setChecked(True)
         self.run_button = QPushButton("Run report")
         self.add_queue_button = QPushButton("Add to queue")
         self.stop_button = QPushButton("Stop")
@@ -261,7 +261,6 @@ class MainWindow(QMainWindow):
         self.open_report_button = QPushButton("Open report")
         self.open_report_button.setEnabled(False)
         bottom.addWidget(self.dry_run_check)
-        bottom.addWidget(self.skip_existing_check)
         bottom.addStretch(1)
         bottom.addWidget(self.run_button)
         bottom.addWidget(self.add_queue_button)
@@ -931,7 +930,6 @@ class MainWindow(QMainWindow):
             "summary": self.queue_summary(config),
             "options": {
                 "dry_run": self.dry_run_check.isChecked(),
-                "skip_existing": self.skip_existing_check.isChecked(),
             },
             "report_path": "",
             "exit_code": None,
@@ -1025,7 +1023,6 @@ class MainWindow(QMainWindow):
             self.queue_config_path(item),
             "queue",
             dry_run=bool(options.get("dry_run")),
-            skip_existing=bool(options.get("skip_existing", True)),
         )
 
     def queue_config_path(self, item: dict) -> Path:
@@ -1160,20 +1157,21 @@ class MainWindow(QMainWindow):
             config_path,
             "single",
             dry_run=self.dry_run_check.isChecked(),
-            skip_existing=self.skip_existing_check.isChecked(),
         )
 
-    def start_process_for_config(self, config_path: Path, mode: str, dry_run: bool, skip_existing: bool):
+    def start_process_for_config(self, config_path: Path, mode: str, dry_run: bool):
         args = [str(SCRIPT_DIR / "sdxl_lora_report_cui.py"), "--config", str(config_path)]
         if dry_run:
             args.append("--dry-run")
-        if skip_existing:
-            args.append("--skip-existing")
 
         self.process = QProcess(self)
         self.process.setWorkingDirectory(str(SCRIPT_DIR))
         self.process.setProgram(sys.executable)
-        self.process.setArguments(args)
+        if sys.platform == "win32":
+            self.process.setArguments(args)
+        else:
+            wrapper = "import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])"
+            self.process.setArguments(["-c", wrapper, sys.executable, *args])
         self.process.setProcessChannelMode(QProcess.MergedChannels)
         self.process.readyReadStandardOutput.connect(self.read_process_output)
         self.process.finished.connect(self.process_finished)
@@ -1248,6 +1246,13 @@ class MainWindow(QMainWindow):
             if result.returncode == 0:
                 return
             self.log("Process tree stop failed; killing direct process.")
+        elif pid > 0:
+            self.log(f"Stopping process group: PID {pid}")
+            try:
+                os.killpg(pid, signal.SIGTERM)
+                return
+            except OSError:
+                self.log("Process group stop failed; killing direct process.")
 
         self.process.kill()
 
