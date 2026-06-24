@@ -324,7 +324,7 @@ baseline:     --am 0.0 0.0
 
 - `width` と `height` は64の倍数である必要があります。
 - 現在のworkerは `images_per_prompt=1` を前提にしています。GUIではこの値を表示せず、常に1としてconfigを生成します。
-- SDXL LoRA LBW利用を主目的にしているため、LBWを使う場合は `networks.lora_lbw` が使われます。
+- SDXL LoRA LBW利用を主目的にしているため、network moduleは `networks.lora_lbw` のみをサポート対象にします。`networks.dylora` など他のnetwork moduleとの混在は非対応です。
 - GUIの前回復元対象はモデルと生成設定だけです。LoRA条件やprompt fileは自動復元しません。
 - `.tmp/` は個人環境のパスを含むためコミット対象外です。
 
