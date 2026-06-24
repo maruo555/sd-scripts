@@ -19,6 +19,7 @@
    - LoRA の `state_dict` を `cp_window`（最大 `avg_window`）に追加。
    - 窓が満杯になったら `average_state_dicts` で平均し、**平均後の重みをそのまま学習モデルにロード**。
    - `--avg_reset_stats` 指定時、Optimizer の `exp_avg` / `exp_avg_sq` / `exp_avg_max` をゼロ化（`step` は保持）。
+     - 注: `AdamW8bit`（bitsandbytes）は optimizer state に `state1` / `state2` 等を使い、上記の `exp_avg` 系キーを持たないため、現行実装では実質何もリセットされない。
 4. 次エポックは **平均後の重み** から開始。
 
 ### `--avg_mode ema` の重みのかかり方（窓サイズ N の例）
@@ -262,6 +263,7 @@ epoch 終端の順番は以下:
 - `avg_cp_mode=live`
   - 従来どおり `average_state_dicts()` で平均し、**平均後重みを学習モデルにロード**
   - `avg_reset_stats` も従来どおり有効
+    - 注: `AdamW8bit` では現行のリセット対象キーが optimizer state に存在しないため、`--avg_reset_stats` / `--no-avg_reset_stats` の差は実質ない
 - `avg_cp_mode=shadow`
   - **学習モデルは raw のまま**
   - `cp_window` が `avg_window` に満ち、かつ final bank 完成後のみ採点する
@@ -527,6 +529,7 @@ epoch end の流れ:
 ### optimizer state
 
 初版では、promote 時に `avg_reset_stats` 相当を使うことを推奨する。
+ただし `AdamW8bit` では現行のリセット対象キーが optimizer state に存在しないため、このリセットは実質何もしない。
 
 理由:
 
@@ -537,6 +540,7 @@ epoch end の流れ:
 
 - `avg_cp_mode=promote` で promote が実行されたときのみ
   - `args.avg_reset_stats=True` なら optimizer state をリセットする
+    - 注: `AdamW8bit` の `state1` / `state2` 等は現行実装ではリセット対象外
 - promote が起きなかった epoch では何もしない
 
 ### score
