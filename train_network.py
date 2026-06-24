@@ -3760,6 +3760,8 @@ class NetworkTrainer:
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
             save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+            if args.avg_cp and getattr(args, "avg_save_final_raw", False) and final_avg_raw_sd is not None:
+                _save_avg_candidate("final_raw", final_avg_raw_sd, num_train_epochs, global_step)
             if proxy_scoring_mode and getattr(args, "avg_save_last_candidates", False):
                 if final_avg_raw_sd is not None:
                     _save_avg_candidate("raw", final_avg_raw_sd, num_train_epochs, global_step)
@@ -3981,6 +3983,12 @@ def setup_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="save final raw/center LoRA candidates as extra files in shadow/promote mode / shadow/promote 時に最終 raw/center の LoRA を追加保存する",
+    )
+    parser.add_argument(
+        "--avg_save_final_raw",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="save final epoch raw LoRA before avg_cp averaging/promote adoption as <output_name>_final_raw.safetensors / avg_cp の平均反映・promote 採用前の最終 epoch raw LoRA を保存する",
     )
     # LoRA delta fake-quantization (on forward only)
     parser.add_argument(
