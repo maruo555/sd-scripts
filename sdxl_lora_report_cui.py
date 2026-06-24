@@ -199,11 +199,19 @@ def validate_image_size(width: int | None, height: int | None, source: str):
 
 def build_seeds(seed_config: dict) -> list[int]:
     values = [int(v) for v in seed_config.get("values", [])]
+    negative_values = [value for value in values if value < 0]
+    if negative_values:
+        raise ValueError(f"Seed values must be non-negative because sdxl_gen_img.py prompt seeds do not accept negatives: {negative_values}")
+
     random_count = int(seed_config.get("random_count", 0) or 0)
     if random_count > 0:
         rnd = random.Random(seed_config.get("random_source_seed"))
         min_seed = int(seed_config.get("random_min", 0))
         max_seed = int(seed_config.get("random_max", 2**32 - 1))
+        if min_seed < 0:
+            raise ValueError(f"seeds.random_min must be non-negative: {min_seed}")
+        if max_seed < min_seed:
+            raise ValueError(f"seeds.random_max must be greater than or equal to seeds.random_min: {max_seed} < {min_seed}")
         values.extend(rnd.randint(min_seed, max_seed) for _ in range(random_count))
     if not values:
         raise ValueError("At least one seed is required. Set seeds.values or seeds.random_count.")
@@ -774,11 +782,16 @@ def run(args):
         metadata = write_metadata(output_dir, prompts, conditions, seeds, jobs)
         write_report(output_dir, metadata)
         write_blind_report(output_dir, metadata)
+        print_report_paths(output_dir)
         raise SystemExit(returncode)
 
     metadata = write_metadata(output_dir, prompts, conditions, seeds, jobs)
     write_report(output_dir, metadata)
     write_blind_report(output_dir, metadata)
+    print_report_paths(output_dir)
+
+
+def print_report_paths(output_dir: Path):
     print(f"Report: {output_dir / 'report.html'}")
     print(f"Blind report: {output_dir / 'blind_report.html'}")
 
