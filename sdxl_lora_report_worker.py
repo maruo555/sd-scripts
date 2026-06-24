@@ -11,6 +11,7 @@ from pathlib import Path
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 DEFAULT_LBW = "ALL"
 REPORT_LORA_MODULE = "networks.lora_lbw"
+BLOCKED_COMMON_ARGS = {"--network_merge", "--network_merge_n_models"}
 
 
 def load_json(path: Path) -> dict:
@@ -110,6 +111,13 @@ def build_command(script_dir: Path, job_plan: dict, prompt_file: Path, outdir: P
     common_args = gen_config.get("common_args", [])
     if not isinstance(common_args, list):
         raise ValueError("sdxl_gen_img.common_args must be a list")
+    for arg in common_args:
+        option = str(arg).split("=", 1)[0]
+        if option in BLOCKED_COMMON_ARGS:
+            raise ValueError(
+                f"{option} cannot be used in sdxl_lora_report common_args because it merges LoRA weights "
+                "and prevents per-job LoRA switching."
+            )
     command.extend(str(arg) for arg in common_args)
 
     if slots:

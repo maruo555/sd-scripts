@@ -87,6 +87,7 @@ python sdxl_lora_report_gui.py
 `Attention` は `none`、`sdpa`、`xformers` から選びます。`sdpa` と `xformers` は通常どちらか一方だけを使うため、GUIでは同時指定できない選択式にしています。
 
 `Extra args` には、GUIに専用欄がない追加オプションをスペース区切りで指定できます。
+ただし `--network_merge` / `--network_merge_n_models` は使えません。LoRAをモデルへマージしてしまうと、レポート用のLoRA条件切り替えができなくなるためです。
 
 `Batch size` を2以上にすると高速化できる場合がありますが、同じseedでも生成結果が微妙に変わることがあります。LoRA差分を厳密に比較したい場合は `Batch size = 1` を推奨します。
 
