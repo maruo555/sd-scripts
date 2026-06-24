@@ -52,6 +52,9 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 |---|---|---|
 | `sdxl_tokenize.py` | SDXLのTE1/TE2トークン分割の表示と候補探索 | [docs/sdxl_tokenize_tool-ja.md](docs/sdxl_tokenize_tool-ja.md) |
 | `make_lora_diagnostic_report.py` | LoRA学習ログ（`grad_norm` / `dq_delta`）とLoRA重みを診断し、グラフ内蔵HTMLを生成 | 使い方とオプション詳細: [docs/make_lora_diagnostic_report-ja.md](docs/make_lora_diagnostic_report-ja.md) |
+| `sdxl_lora_report_gui.py` | SDXL LoRAの一括生成・比較HTMLレポートをGUIで作成 | [docs/sdxl_lora_report_README-ja.md](docs/sdxl_lora_report_README-ja.md) |
+| `sdxl_lora_report_cui.py` | JSON設定からSDXL LoRA比較レポートをCUI生成。GUIの下請けとしても使用 | [docs/sdxl_lora_report_README-ja.md](docs/sdxl_lora_report_README-ja.md) |
+| `sdxl_gen_img.py` | SDXL画像生成スクリプト。本フォークでは `--network_lbw` でLoRA Block Weight指定に対応 | [docs/sdxl_gen_img_README-ja.md](docs/sdxl_gen_img_README-ja.md) |
 
 ---
 

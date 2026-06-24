@@ -7,3 +7,4 @@ build
 .vscode
 wandb
 analyze_lora_result
+.tmp/

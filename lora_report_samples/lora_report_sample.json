@@ -1,0 +1,60 @@
+{
+  "output_root": "../../lora_reports",
+  "run_name": "sample_lora_compare",
+  "prompt_file": "lora_report_prompts_sample.txt",
+  "sdxl_gen_img": {
+    "ckpt": "D:/models/sdxl_model.safetensors",
+    "width": 1024,
+    "height": 1024,
+    "steps": 30,
+    "sampler": "euler_a",
+    "scale": 7.0,
+    "batch_size": 1,
+    "images_per_prompt": 1,
+    "common_args": [
+      "--bf16",
+      "--sdpa"
+    ]
+  },
+  "seeds": {
+    "values": [
+      12345
+    ],
+    "random_count": 0
+  },
+  "include_baseline": true,
+  "loras": [
+    {
+      "id": "sample_all",
+      "name": "Sample LoRA ALL",
+      "path": "D:/loras/sample_lora.safetensors",
+      "strength": 1.0,
+      "lbw": "ALL"
+    },
+    {
+      "id": "sample_xlmlt1",
+      "name": "Sample LoRA XLMLT1",
+      "path": "D:/loras/sample_lora.safetensors",
+      "strength": 1.0,
+      "lbw": "XLMLT1"
+    },
+    {
+      "id": "sample_stack",
+      "name": "Sample LoRA stack",
+      "items": [
+        {
+          "name": "character",
+          "path": "D:/loras/sample_character.safetensors",
+          "strength": 0.8,
+          "lbw": "XLMLT1"
+        },
+        {
+          "name": "style",
+          "path": "D:/loras/sample_style.safetensors",
+          "strength": 0.5,
+          "lbw": "ALL"
+        }
+      ]
+    }
+  ]
+}
