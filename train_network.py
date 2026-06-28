@@ -1,5 +1,6 @@
 import importlib
 import argparse
+import inspect
 import math
 import os
 import sys
@@ -343,6 +344,8 @@ class NetworkTrainer:
         self._te_lr_after_resume_state = None
         self._te_lr_after_resumed = False
         self._te_lr_after_resume_step = None
+        self._te_freeze_cfg = None
+        self._te_frozen_param_ids = set()
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -495,6 +498,28 @@ class NetworkTrainer:
             "applied_step": None,
         }
 
+    def _parse_te_freeze_options(self, args):
+        cfg = {}
+        for te_index, option_name in (
+            (0, "te1_freeze_at"),
+            (1, "te2_freeze_at"),
+        ):
+            value = getattr(args, option_name, None)
+            if value is None:
+                continue
+            freeze_at = float(value)
+            if freeze_at < 0.0:
+                raise ValueError(f"--{option_name} must be >= 0.")
+            cfg[te_index] = {
+                "freeze_at": freeze_at,
+                "threshold_step": None,
+                "group_indices": [],
+                "group_labels": [],
+                "applied": False,
+                "applied_step": None,
+            }
+        return cfg or None
+
     @staticmethod
     def _te_group_matches_description(description: str, te_index: int) -> bool:
         if not description:
@@ -599,6 +624,74 @@ class NetworkTrainer:
                         self._update_optimizer_group_lr(opt, group_idx, new_lr)
             elif hasattr(sched, "optimizer"):
                 self._update_optimizer_group_lr(getattr(sched, "optimizer"), group_idx, new_lr)
+
+    def _freeze_optimizer_group_params(self, optimizer, group_idx: int) -> int:
+        frozen = 0
+        stack = [optimizer]
+        visited = set()
+        seen_params = set()
+        while stack:
+            opt = stack.pop()
+            if opt is None:
+                continue
+            if id(opt) in visited:
+                continue
+            visited.add(id(opt))
+            param_groups = getattr(opt, "param_groups", None)
+            if param_groups is not None and len(param_groups) > group_idx:
+                for param in param_groups[group_idx].get("params", []):
+                    if id(param) in seen_params:
+                        continue
+                    seen_params.add(id(param))
+                    param.requires_grad_(False)
+                    param.grad = None
+                    self._te_frozen_param_ids.add(id(param))
+                    frozen += 1
+            if hasattr(opt, "optimizer"):
+                stack.append(getattr(opt, "optimizer"))
+            if hasattr(opt, "optimizers"):
+                inners = getattr(opt, "optimizers")
+                if inners:
+                    stack.extend(inners)
+        return frozen
+
+    def _apply_te_freeze_if_ready(self, optimizer, global_step: int):
+        if not self._te_freeze_cfg:
+            return
+
+        for te_index, cfg in sorted(self._te_freeze_cfg.items()):
+            if cfg.get("applied"):
+                continue
+            threshold_step = cfg.get("threshold_step")
+            group_indices = cfg.get("group_indices") or []
+            if threshold_step is None or not group_indices:
+                continue
+            if global_step < threshold_step:
+                continue
+
+            frozen_params = 0
+            for group_idx in group_indices:
+                frozen_params += self._freeze_optimizer_group_params(optimizer, group_idx)
+            cfg["applied"] = True
+            cfg["applied_step"] = global_step
+            labels = cfg.get("group_labels") or [f"TE{te_index + 1}"]
+            logger.info(
+                "froze %s at step %d (threshold=%d, params=%d) / TE freeze: %s step=%d threshold=%d params=%d",
+                ", ".join(labels),
+                global_step,
+                threshold_step,
+                frozen_params,
+                ", ".join(labels),
+                global_step,
+                threshold_step,
+                frozen_params,
+            )
+
+    def _apply_max_norm_regularization(self, network, max_norm_value, device):
+        apply_fn = network.apply_max_norm_regularization
+        if "exclude_param_ids" in inspect.signature(apply_fn).parameters:
+            return apply_fn(max_norm_value, device, exclude_param_ids=self._te_frozen_param_ids)
+        return apply_fn(max_norm_value, device)
 
     def _apply_te_lr_after_if_ready(self, optimizer, lr_scheduler, next_step_idx: int):
         cfg = self._te_lr_after_cfg
@@ -818,6 +911,8 @@ class NetworkTrainer:
         except ValueError as exc:
             logger.error(str(exc))
             raise
+        self._te_freeze_cfg = self._parse_te_freeze_options(args)
+        self._te_frozen_param_ids = set()
         dq_begin_after_lr_warmup = bool(getattr(args, "dq_delta_begin_after_lr_warmup", False))
         if dq_begin_after_lr_warmup:
             lr_warmup_steps = getattr(args, "lr_warmup_steps", 0)
@@ -1458,6 +1553,24 @@ class NetworkTrainer:
             else:
                 self._te_lr_after_cfg["target_indices"] = active_targets
 
+        if self._te_freeze_cfg:
+            active_freeze_cfg = {
+                idx: cfg for idx, cfg in self._te_freeze_cfg.items() if idx in te_selection_indices
+            }
+            if not active_freeze_cfg:
+                logger.warning(
+                    "ignore te freeze options because the specified text encoder target(s) are not selected"
+                )
+                self._te_freeze_cfg = None
+            else:
+                skipped = sorted(set(self._te_freeze_cfg.keys()) - set(active_freeze_cfg.keys()))
+                if skipped:
+                    logger.warning(
+                        "ignore te freeze option(s) for unselected target(s): %s",
+                        ", ".join(f"TE{idx + 1}" for idx in skipped),
+                    )
+                self._te_freeze_cfg = active_freeze_cfg
+
         # Configure LoRA delta fake-quantization if available
         if (((getattr(args, "dq_delta_step", None) is not None and args.dq_delta_step) or (getattr(args, "dq_delta_bits", None) is not None and args.dq_delta_bits) or dq_bits_sched) and hasattr(network, "set_delta_fake_quant")):
             unwrapped = accelerator.unwrap_model(network)
@@ -1591,6 +1704,24 @@ class NetworkTrainer:
                     self._te_lr_after_cfg["group_indices"] = te_group_indices
                     self._te_lr_after_cfg["group_labels"] = [lr_descriptions[i] for i in te_group_indices]
 
+        if self._te_freeze_cfg:
+            if lr_descriptions is None:
+                logger.warning("te freeze options require optimizer group descriptions; disabling option")
+                self._te_freeze_cfg = None
+            else:
+                active_freeze_cfg = {}
+                for te_idx, cfg in sorted(self._te_freeze_cfg.items()):
+                    matches = [
+                        idx for idx, desc in enumerate(lr_descriptions) if self._te_group_matches_description(desc, te_idx)
+                    ]
+                    if not matches:
+                        logger.warning("te freeze: TE%d has no optimizer groups; skipping", te_idx + 1)
+                        continue
+                    cfg["group_indices"] = sorted(set(matches))
+                    cfg["group_labels"] = [lr_descriptions[i] for i in cfg["group_indices"]]
+                    active_freeze_cfg[te_idx] = cfg
+                self._te_freeze_cfg = active_freeze_cfg or None
+
         # dataloaderを準備する
         # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
@@ -1649,10 +1780,29 @@ class NetworkTrainer:
                 )
 
         # データセット側にも学習ステップを送信
+        if self._te_freeze_cfg:
+            total_steps = args.max_train_steps
+            if total_steps is None or total_steps <= 0:
+                logger.warning("disable te freeze options because max_train_steps is not a positive number")
+                self._te_freeze_cfg = None
+            else:
+                for te_idx, cfg in sorted(self._te_freeze_cfg.items()):
+                    freeze_at = cfg["freeze_at"]
+                    threshold = math.floor(total_steps * freeze_at) if freeze_at <= 1.0 else int(freeze_at)
+                    threshold = max(0, threshold)
+                    cfg["threshold_step"] = threshold
+                    labels = cfg.get("group_labels") or [f"TE{te_idx + 1}"]
+                    logger.info(
+                        "te freeze ready: freeze %s at step >= %d (value=%.4f)",
+                        ", ".join(labels),
+                        threshold,
+                        freeze_at,
+                    )
+
         train_dataset_group.set_max_train_steps(args.max_train_steps)
 
         # lr schedulerを用意する
-        lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+        lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes, lr_descriptions=lr_descriptions)
 
         dq_delta_begin_step = None
         if dq_begin_after_lr_warmup:
@@ -1925,6 +2075,10 @@ class NetworkTrainer:
             "ss_output_name": args.output_name,
             "ss_learning_rate": args.learning_rate,
             "ss_text_encoder_lr": args.text_encoder_lr,
+            "ss_te1_lr_warmup_steps": args.te1_lr_warmup_steps,
+            "ss_te2_lr_warmup_steps": args.te2_lr_warmup_steps,
+            "ss_te1_freeze_at": args.te1_freeze_at,
+            "ss_te2_freeze_at": args.te2_freeze_at,
             "ss_unet_lr": args.unet_lr,
             "ss_num_train_images": train_dataset_group.num_train_images,
             "ss_num_reg_images": train_dataset_group.num_reg_images,
@@ -2941,6 +3095,8 @@ class NetworkTrainer:
                                 target=target,
                             )
 
+                    self._apply_te_freeze_if_ready(optimizer, global_step)
+
                     on_step_start(text_encoder, unet)
 
                     if "latents" in batch and batch["latents"] is not None:
@@ -3054,12 +3210,13 @@ class NetworkTrainer:
                                     accelerator.unwrap_model(network).get_trainable_params(),
                                     step=args.round_lora_step,
                                     mode=args.round_lora_mode,
+                                    exclude_param_ids=self._te_frozen_param_ids,
                                 )
                 current_loss = loss_scalar
 
                 if args.scale_weight_norms:
-                    keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
-                        args.scale_weight_norms, accelerator.device
+                    keys_scaled, mean_norm, maximum_norm = self._apply_max_norm_regularization(
+                        accelerator.unwrap_model(network), args.scale_weight_norms, accelerator.device
                     )
                     max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
                 else:
@@ -3772,6 +3929,20 @@ class NetworkTrainer:
 
 
 def setup_parser() -> argparse.ArgumentParser:
+    def int_or_float_or_percent(value):
+        if value.endswith("%"):
+            try:
+                return float(value[:-1]) / 100.0
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"Value '{value}' is not a valid percentage")
+        try:
+            float_value = float(value)
+            if float_value >= 1:
+                return int(value)
+            return float_value
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"'{value}' is not an int or float")
+
     parser = argparse.ArgumentParser()
 
     add_logging_arguments(parser)
@@ -3854,6 +4025,37 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="Drops neurons out of training every step (0 or None is default behavior (no dropout), 1 would drop all neurons) / 訓練時に毎ステップでニューロンをdropする（0またはNoneはdropoutなし、1は全ニューロンをdropout）",
     )
+    parser.add_argument(
+        "--te1_lr_warmup_steps",
+        type=int_or_float_or_percent,
+        default=None,
+        help=(
+            "warmup steps for Text Encoder 1 when using --lr_scheduler constant_with_warmup. "
+            "Use an int for steps, a float below 1 for train-step ratio, or a percentage like 5%."
+        ),
+    )
+    parser.add_argument(
+        "--te2_lr_warmup_steps",
+        type=int_or_float_or_percent,
+        default=None,
+        help=(
+            "warmup steps for Text Encoder 2 when using --lr_scheduler constant_with_warmup. "
+            "Use an int for steps, a float below 1 for train-step ratio, or a percentage like 5%."
+        ),
+    )
+    parser.add_argument(
+        "--te1_freeze_at",
+        type=int_or_float_or_percent,
+        default=None,
+        help="freeze Text Encoder 1 training at this progress ratio or absolute optimizer step.",
+    )
+    parser.add_argument(
+        "--te2_freeze_at",
+        type=int_or_float_or_percent,
+        default=None,
+        help="freeze Text Encoder 2 training at this progress ratio or absolute optimizer step.",
+    )
+
     parser.add_argument(
         "--network_args",
         type=str,
