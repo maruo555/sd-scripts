@@ -91,7 +91,7 @@ class GradNormGuardian:
 
         self.moving_avg_window = deque(maxlen=config.moving_avg_window)
         self.log_buffer: List[str] = []
-        self.prev_grad_list = None
+        self.prev_grad_map = None
         self.prev_grad_norm = None
 
         if self.config.log_grad_norm and self.log_file_path is not None:
@@ -107,25 +107,37 @@ class GradNormGuardian:
         device = next(model.parameters()).device
         grad_norm_sqr = torch.tensor(0.0, device=device)
         use_cosine = self.config.log_grad_cosine
-        dot_sum = torch.tensor(0.0, device=device) if (use_cosine and self.prev_grad_list is not None) else None
-        cur_grads = [] if use_cosine else None
+        dot_sum = torch.tensor(0.0, device=device) if (use_cosine and self.prev_grad_map is not None) else None
+        cur_grads = {} if use_cosine else None
+        grad_topology_changed = False
 
         with torch.no_grad():
-            idx = 0
             for param in model.parameters():
                 if param.grad is not None:
                     grad = param.grad  # NOTE: keep scaler-applied grads (pre-unscale) to retain fp16 scaling behavior
                     grad_norm_sqr += (grad.detach() * grad.detach()).sum()
                     if use_cosine:
-                        if self.prev_grad_list is not None and idx < len(self.prev_grad_list):
-                            dot_sum += (grad.detach() * self.prev_grad_list[idx]).sum()
-                        cur_grads.append(grad.detach().clone())
-                        idx += 1
+                        param_id = id(param)
+                        if self.prev_grad_map is not None:
+                            prev_grad = self.prev_grad_map.get(param_id)
+                            if prev_grad is None or prev_grad.shape != grad.shape:
+                                grad_topology_changed = True
+                            else:
+                                dot_sum += (grad.detach() * prev_grad).sum()
+                        cur_grads[param_id] = grad.detach().clone()
+
+            if use_cosine and self.prev_grad_map is not None:
+                grad_topology_changed = grad_topology_changed or set(cur_grads.keys()) != set(self.prev_grad_map.keys())
 
         current_grad_norm = torch.sqrt(grad_norm_sqr).item()
         cosine_sim = None
         if use_cosine:
-            if self.prev_grad_list is not None and dot_sum is not None and self.prev_grad_norm is not None:
+            if (
+                self.prev_grad_map is not None
+                and dot_sum is not None
+                and self.prev_grad_norm is not None
+                and not grad_topology_changed
+            ):
                 denom = current_grad_norm * (self.prev_grad_norm + 1e-12)
                 if denom == 0.0:
                     cosine_sim = float("nan")
@@ -133,7 +145,7 @@ class GradNormGuardian:
                     cosine_sim = (dot_sum / denom).item()
             else:
                 cosine_sim = float("nan")
-            self.prev_grad_list = cur_grads
+            self.prev_grad_map = cur_grads
             self.prev_grad_norm = current_grad_norm
 
         is_nan = math.isnan(current_grad_norm)
