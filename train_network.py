@@ -358,6 +358,7 @@ class NetworkTrainer:
         self._te_lr_after_resume_step = None
         self._te_freeze_cfg = None
         self._te_frozen_param_ids = set()
+        self._te_frozen_state_dict = {}
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -667,7 +668,30 @@ class NetworkTrainer:
                     stack.extend(inners)
         return frozen
 
-    def _apply_te_freeze_if_ready(self, optimizer, global_step: int):
+    def _capture_frozen_te_state_dict(self, network) -> int:
+        if not self._te_frozen_param_ids:
+            return 0
+
+        captured = 0
+        for name, param in network.named_parameters():
+            if id(param) not in self._te_frozen_param_ids:
+                continue
+            if name in self._te_frozen_state_dict:
+                continue
+            self._te_frozen_state_dict[name] = param.detach().cpu().clone()
+            captured += 1
+        return captured
+
+    def _restore_frozen_te_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if not self._te_frozen_state_dict:
+            return state_dict
+
+        for key, frozen_tensor in self._te_frozen_state_dict.items():
+            if key in state_dict:
+                state_dict[key] = frozen_tensor.clone()
+        return state_dict
+
+    def _apply_te_freeze_if_ready(self, optimizer, network, global_step: int):
         if not self._te_freeze_cfg:
             return
 
@@ -684,19 +708,22 @@ class NetworkTrainer:
             frozen_params = 0
             for group_idx in group_indices:
                 frozen_params += self._freeze_optimizer_group_params(optimizer, group_idx)
+            frozen_state_keys = self._capture_frozen_te_state_dict(network)
             cfg["applied"] = True
             cfg["applied_step"] = global_step
             labels = cfg.get("group_labels") or [f"TE{te_index + 1}"]
             logger.info(
-                "froze %s at step %d (threshold=%d, params=%d) / TE freeze: %s step=%d threshold=%d params=%d",
+                "froze %s at step %d (threshold=%d, params=%d, state_keys=%d) / TE freeze: %s step=%d threshold=%d params=%d state_keys=%d",
                 ", ".join(labels),
                 global_step,
                 threshold_step,
                 frozen_params,
+                frozen_state_keys,
                 ", ".join(labels),
                 global_step,
                 threshold_step,
                 frozen_params,
+                frozen_state_keys,
             )
 
     def _apply_max_norm_regularization(self, network, max_norm_value, device):
@@ -925,6 +952,7 @@ class NetworkTrainer:
             raise
         self._te_freeze_cfg = self._parse_te_freeze_options(args)
         self._te_frozen_param_ids = set()
+        self._te_frozen_state_dict = {}
         dq_begin_after_lr_warmup = bool(getattr(args, "dq_delta_begin_after_lr_warmup", False))
         if dq_begin_after_lr_warmup:
             lr_warmup_steps = getattr(args, "lr_warmup_steps", 0)
@@ -3107,7 +3135,7 @@ class NetworkTrainer:
                                 target=target,
                             )
 
-                    self._apply_te_freeze_if_ready(optimizer, global_step)
+                    self._apply_te_freeze_if_ready(optimizer, accelerator.unwrap_model(network), global_step)
 
                     on_step_start(text_encoder, unet)
 
@@ -3776,7 +3804,9 @@ class NetworkTrainer:
                     cp_window.append(raw_sd)
                     cp_window_epochs.append(epoch + 1)
                     if len(cp_window) >= args.avg_window:
-                        final_avg_center_sd = average_state_dicts(list(cp_window), args.avg_mode)
+                        final_avg_center_sd = self._restore_frozen_te_state_dict(
+                            average_state_dicts(list(cp_window), args.avg_mode)
+                        )
 
                     if proxy_scoring_mode:
                         shadow_log_payload["window_epochs"] = list(cp_window_epochs)
@@ -3793,11 +3823,17 @@ class NetworkTrainer:
                             shadow_log_payload["status"] = "waiting_window"
                         elif accelerator.is_main_process:
                             candidate_state_dicts: Dict[str, Dict[str, torch.Tensor]] = {
-                                "ema": average_state_dicts(list(cp_window), "ema"),
-                                "uniform": average_state_dicts(list(cp_window), "uniform"),
+                                "ema": self._restore_frozen_te_state_dict(
+                                    average_state_dicts(list(cp_window), "ema")
+                                ),
+                                "uniform": self._restore_frozen_te_state_dict(
+                                    average_state_dicts(list(cp_window), "uniform")
+                                ),
                             }
                             if args.avg_mode not in candidate_state_dicts:
-                                candidate_state_dicts[args.avg_mode] = average_state_dicts(list(cp_window), args.avg_mode)
+                                candidate_state_dicts[args.avg_mode] = self._restore_frozen_te_state_dict(
+                                    average_state_dicts(list(cp_window), args.avg_mode)
+                                )
 
                             rng_state = _capture_torch_rng_state()
                             raw_score = None
@@ -3892,7 +3928,9 @@ class NetworkTrainer:
                             if start_ep < 1:
                                 start_ep = 1
                             logger.info(f"averaging checkpoints from epoch {start_ep} to {epoch + 1}")
-                            avg_sd = average_state_dicts(list(cp_window), args.avg_mode)
+                            avg_sd = self._restore_frozen_te_state_dict(
+                                average_state_dicts(list(cp_window), args.avg_mode)
+                            )
                             final_avg_center_sd = avg_sd
                             unwrapped_network.load_state_dict(avg_sd, strict=False)
                             if args.avg_reset_stats:
