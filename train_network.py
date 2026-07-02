@@ -1610,6 +1610,11 @@ class NetworkTrainer:
                         ", ".join(f"TE{idx + 1}" for idx in skipped),
                     )
                 self._te_freeze_cfg = active_freeze_cfg
+                if args.network_train_text_encoder_only and set(active_freeze_cfg.keys()) >= set(te_selection_indices):
+                    raise ValueError(
+                        "te freeze cannot freeze all selected Text Encoders when --network_train_text_encoder_only is used. "
+                        "At least one trainable LoRA group must remain after freeze."
+                    )
 
         # Configure LoRA delta fake-quantization if available
         if (((getattr(args, "dq_delta_step", None) is not None and args.dq_delta_step) or (getattr(args, "dq_delta_bits", None) is not None and args.dq_delta_bits) or dq_bits_sched) and hasattr(network, "set_delta_fake_quant")):
