@@ -185,7 +185,7 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | ActiveClipBand/Low/High | 現在のclip目標帯 | clip_rate_low_autoのescape前後の目標帯を追う。 |
 | ClipRateLowAutoState | clip_rate_low_auto 状態 | clip_rate_low_auto以外は空欄。 |
 | ClipRateLowAutoDecision | clip_rate_low_auto判断 | `observe`/`keep_low`/`bad_count`/`escape_to_mid`/`mid_lock`/`frozen`。 |
-| ClipRateLowAutoReason | clip_rate_low_auto判断理由 | `min_steps`/`low_bad`/`bad_streak_met`/`escaped_once`/`freeze_progress`/`insufficient_qerr_stats`。 |
+| ClipRateLowAutoReason | clip_rate_low_auto判断理由 | `min_progress`/`low_bad`/`bad_streak_met`/`escaped_once`/`freeze_progress`/`insufficient_qerr_stats`。 |
 | ClipRateLowAutoBad/ClipRateLowAutoBadStreak | bad判定と連続回数 | `mid` に逃がした根拠を追う。 |
 補足（読み解きの目安）:
 - `ClipRate` が低いのに `QuantErrRatio` が高い場合、**レンジが広く刻みが粗い**可能性がある（`range_mul` 高め / `bits` 低め）。
@@ -245,7 +245,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 - `--dq_delta_auto_warmup_updates <int>` : warmup 回数の上書き（0=内部デフォルト）
 - `--dq_delta_auto_log_file <path>` : 省略時は `--output_dir/dq_delta_auto+<output_name>.txt`（auto イベントのみ記録）
 - `--dq_delta_auto_log_format {minimal,full_schema}` : auto ログの列形式（デフォルト minimal）
-- `--dq_delta_clip_rate_low_auto_min_steps <int>` : `clip_rate_low_auto` の観測期間（デフォルト 6000 optimizer step）
+- `--dq_delta_clip_rate_low_auto_min_progress <float>` : `clip_rate_low_auto` の判定開始進捗（デフォルト 0.25）
 - `--dq_delta_clip_rate_low_auto_bad_streak <int>` : `clip_rate_low_auto` が `mid` へ逃がすまでのbad連続回数（デフォルト 3）
 - `--dq_delta_clip_rate_low_auto_freeze_progress <float>` : この学習進捗以降は `clip_rate_low_auto` のband切替を凍結（デフォルト 0.55）
 - `--dq_delta_clip_rate_low_auto_qerr_ratio <float>` : `clip_rate_low_auto` bad判定の `QuantErrRatioEMA` 閾値（デフォルト 0.25）
@@ -282,7 +282,7 @@ low_bad =
   and QErrPerClip >= dq_delta_clip_rate_low_auto_qerr_per_clip
 ```
 
-既定値は `QuantErrRatioEMA >= 0.25` かつ `QErrPerClip >= 130`。`dq_delta_clip_rate_low_auto_min_steps` 経過後に `low_bad` が `dq_delta_clip_rate_low_auto_bad_streak` 回連続したら、目標bandを `clip_rate_mid`（0.002〜0.004）へ切り替える。一度 `mid` に逃げた後は `low` へ戻さない。`dq_delta_clip_rate_low_auto_freeze_progress` 以降は新規のband切替を行わない。
+既定値は `QuantErrRatioEMA >= 0.25` かつ `QErrPerClip >= 130`。`dq_delta_clip_rate_low_auto_min_progress` 経過後に `low_bad` が `dq_delta_clip_rate_low_auto_bad_streak` 回連続したら、目標bandを `clip_rate_mid`（0.002〜0.004）へ切り替える。一度 `mid` に逃げた後は `low` へ戻さない。`dq_delta_clip_rate_low_auto_freeze_progress` 以降は新規のband切替を行わない。
 
 `QErrPerClip` は clip_rate_low_auto 以外でも診断列として出力される。これは preset 比較時に、clip率に対して量子化誤差が重くなっていないかを見るため。
 

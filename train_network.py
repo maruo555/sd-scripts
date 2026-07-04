@@ -1048,7 +1048,7 @@ class NetworkTrainer:
         dq_auto_use_raw = bool(getattr(args, "dq_delta_auto_use_raw", False))
         dq_qerr_per_clip_floor = max(1e-12, float(getattr(args, "dq_delta_qerr_per_clip_floor", 0.001)))
         dq_log_error_parts = bool(getattr(args, "dq_delta_log_error_parts", False))
-        dq_low_auto_min_steps = max(0, int(getattr(args, "dq_delta_clip_rate_low_auto_min_steps", 6000)))
+        dq_low_auto_min_progress = max(0.0, min(1.0, float(getattr(args, "dq_delta_clip_rate_low_auto_min_progress", 0.25))))
         dq_low_auto_bad_streak_threshold = max(1, int(getattr(args, "dq_delta_clip_rate_low_auto_bad_streak", 3)))
         dq_low_auto_freeze_progress = float(getattr(args, "dq_delta_clip_rate_low_auto_freeze_progress", 0.55))
         dq_low_auto_qerr_ratio_threshold = float(getattr(args, "dq_delta_clip_rate_low_auto_qerr_ratio", 0.25))
@@ -3534,13 +3534,23 @@ class NetworkTrainer:
                                                     low_auto_reason = "warmup"
                                             else:
                                                 if dq_low_auto_enabled:
-                                                    low_auto_elapsed = (
-                                                        step_idx - dq_low_auto_start_step
-                                                        if dq_low_auto_start_step is not None
-                                                        else 0
-                                                    )
                                                     low_auto_frozen = progress_frac >= dq_low_auto_freeze_progress
-                                                    if dq_low_auto_escaped:
+                                                    low_auto_stats_ready = (
+                                                        dq_low_auto_quant_err_ratio_ema_state is not None
+                                                        and low_auto_qerr_per_clip is not None
+                                                    )
+                                                    low_auto_is_bad = (
+                                                        low_auto_stats_ready
+                                                        and dq_low_auto_quant_err_ratio_ema_state >= dq_low_auto_qerr_ratio_threshold
+                                                        and low_auto_qerr_per_clip >= dq_low_auto_qerr_per_clip_threshold
+                                                    )
+                                                    low_auto_bad = 1 if low_auto_is_bad else (0 if low_auto_stats_ready else "")
+                                                    if progress_frac < dq_low_auto_min_progress:
+                                                        dq_low_auto_state = "observe"
+                                                        low_auto_decision = "observe"
+                                                        low_auto_reason = "min_progress"
+                                                        dq_low_auto_bad_streak = 0
+                                                    elif dq_low_auto_escaped:
                                                         dq_low_auto_state = "mid_lock"
                                                         low_auto_decision = "mid_lock"
                                                         low_auto_reason = "escaped_once"
@@ -3549,23 +3559,16 @@ class NetworkTrainer:
                                                         dq_low_auto_state = "frozen"
                                                         low_auto_decision = "frozen"
                                                         low_auto_reason = "freeze_progress"
-                                                        dq_low_auto_bad_streak = 0
-                                                    elif low_auto_elapsed < dq_low_auto_min_steps:
-                                                        dq_low_auto_state = "observe"
-                                                        low_auto_decision = "observe"
-                                                        low_auto_reason = "min_steps"
-                                                        dq_low_auto_bad_streak = 0
-                                                    elif dq_low_auto_quant_err_ratio_ema_state is None or low_auto_qerr_per_clip is None:
+                                                        if low_auto_is_bad:
+                                                            dq_low_auto_bad_streak += 1
+                                                        else:
+                                                            dq_low_auto_bad_streak = 0
+                                                    elif not low_auto_stats_ready:
                                                         dq_low_auto_state = "observe"
                                                         low_auto_decision = "observe"
                                                         low_auto_reason = "insufficient_qerr_stats"
                                                         dq_low_auto_bad_streak = 0
                                                     else:
-                                                        low_auto_is_bad = (
-                                                            dq_low_auto_quant_err_ratio_ema_state >= dq_low_auto_qerr_ratio_threshold
-                                                            and low_auto_qerr_per_clip >= dq_low_auto_qerr_per_clip_threshold
-                                                        )
-                                                        low_auto_bad = 1 if low_auto_is_bad else 0
                                                         if low_auto_is_bad:
                                                             dq_low_auto_bad_streak += 1
                                                             low_auto_decision = "bad_count"
@@ -4769,10 +4772,10 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Auto log format / auto ログ形式（minimal/full_schema）",
     )
     parser.add_argument(
-        "--dq_delta_clip_rate_low_auto_min_steps",
-        type=int,
-        default=6000,
-        help="clip_rate_low_auto observation steps before escape checks / clip_rate_low_auto の判定開始までの観測step数",
+        "--dq_delta_clip_rate_low_auto_min_progress",
+        type=float,
+        default=0.25,
+        help="Training progress before clip_rate_low_auto escape checks / clip_rate_low_auto の判定開始までの学習進捗",
     )
     parser.add_argument(
         "--dq_delta_clip_rate_low_auto_bad_streak",
