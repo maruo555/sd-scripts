@@ -1204,6 +1204,12 @@ class NetworkTrainer:
                 "ClipRateLowAutoState",
                 "ClipRateLowAutoBad",
                 "ClipRateLowAutoBadStreak",
+                "TrainProgress",
+                "ClipRateLowAutoMinProgress",
+                "ClipRateLowAutoFreezeProgress",
+                "ClipRateLowAutoThresholdQErrRatio",
+                "ClipRateLowAutoThresholdQErrPerClip",
+                "ClipRateLowAutoPhase",
             ]
             if dq_log_error_parts:
                 cols += [
@@ -1267,7 +1273,10 @@ class NetworkTrainer:
                 "TrainStep,Scope,Target,Bits,ClipRateRaw,ClipRateEMA,RangeMulBefore,RangeMulAfter,AutoApplied,"
                 "WarmupActive,WarmupRemain,AutoReason,AutoInitMulApplied,AutoInitMulValue,AutoInitClipTarget,"
                 "QErrPerClip,QErrPerClipClipFloor,ActiveClipBand,ActiveClipLow,ActiveClipHigh,"
-                "ClipRateLowAutoState,ClipRateLowAutoDecision,ClipRateLowAutoReason,ClipRateLowAutoBad,ClipRateLowAutoBadStreak"
+                "ClipRateLowAutoState,ClipRateLowAutoDecision,ClipRateLowAutoReason,ClipRateLowAutoBad,ClipRateLowAutoBadStreak,"
+                "TrainProgress,ClipRateLowAutoMinProgress,ClipRateLowAutoFreezeProgress,"
+                "ClipRateLowAutoThresholdQErrRatio,ClipRateLowAutoThresholdQErrPerClip,"
+                "ClipRateLowAutoPhase,ClipRateLowAutoCanEscape"
             )
 
         def _dq_qerr_per_clip(quant_err_ratio, clip_rate):
@@ -3079,6 +3088,8 @@ class NetworkTrainer:
         dq_low_auto_reason = ""
         dq_low_auto_bad = ""
         dq_low_auto_qerr_per_clip = None
+        dq_low_auto_phase = "pre_min_progress" if dq_low_auto_enabled else ""
+        dq_low_auto_can_escape = 0 if dq_low_auto_enabled else ""
         dq_bits_changed_since_auto = False
         dq_auto_warmup_reset_updates = dq_auto_warmup_updates
         dq_auto_warmup_remaining = dq_auto_warmup_reset_updates
@@ -3107,6 +3118,20 @@ class NetworkTrainer:
                 row[col_idx["ActiveClipLow"]] = dq_auto_active_clip_low
             if "ActiveClipHigh" in col_idx:
                 row[col_idx["ActiveClipHigh"]] = dq_auto_active_clip_high
+            if "TrainProgress" in col_idx:
+                row[col_idx["TrainProgress"]] = 0
+            if "ClipRateLowAutoMinProgress" in col_idx:
+                row[col_idx["ClipRateLowAutoMinProgress"]] = dq_low_auto_min_progress
+            if "ClipRateLowAutoFreezeProgress" in col_idx:
+                row[col_idx["ClipRateLowAutoFreezeProgress"]] = dq_low_auto_freeze_progress
+            if "ClipRateLowAutoThresholdQErrRatio" in col_idx:
+                row[col_idx["ClipRateLowAutoThresholdQErrRatio"]] = dq_low_auto_qerr_ratio_threshold
+            if "ClipRateLowAutoThresholdQErrPerClip" in col_idx:
+                row[col_idx["ClipRateLowAutoThresholdQErrPerClip"]] = dq_low_auto_qerr_per_clip_threshold
+            if "ClipRateLowAutoPhase" in col_idx:
+                row[col_idx["ClipRateLowAutoPhase"]] = "pre_min_progress" if dq_low_auto_enabled else ""
+            if "ClipRateLowAutoCanEscape" in col_idx:
+                row[col_idx["ClipRateLowAutoCanEscape"]] = 0 if dq_low_auto_enabled else ""
             _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
 
         def _dq_bits_for_progress(progress_frac: float, default_bits: Optional[int]):
@@ -3461,6 +3486,8 @@ class NetworkTrainer:
                                 low_auto_bad = ""
                                 low_auto_bad_streak = dq_low_auto_bad_streak
                                 low_auto_qerr_per_clip = None
+                                low_auto_phase = dq_low_auto_phase
+                                low_auto_can_escape = dq_low_auto_can_escape
 
                                 if dq_stats["do_auto"]:
                                     auto_scope = dq_stats["auto_scope"]
@@ -3532,6 +3559,8 @@ class NetworkTrainer:
                                                     low_auto_state = "observe"
                                                     low_auto_decision = "observe"
                                                     low_auto_reason = "warmup"
+                                                    low_auto_phase = "warmup"
+                                                    low_auto_can_escape = 0
                                             else:
                                                 if dq_low_auto_enabled:
                                                     low_auto_frozen = progress_frac >= dq_low_auto_freeze_progress
@@ -3545,20 +3574,28 @@ class NetworkTrainer:
                                                         and low_auto_qerr_per_clip >= dq_low_auto_qerr_per_clip_threshold
                                                     )
                                                     low_auto_bad = 1 if low_auto_is_bad else (0 if low_auto_stats_ready else "")
+                                                    low_auto_can_escape = 1 if (
+                                                        progress_frac >= dq_low_auto_min_progress
+                                                        and not low_auto_frozen
+                                                        and not dq_low_auto_escaped
+                                                    ) else 0
                                                     if progress_frac < dq_low_auto_min_progress:
                                                         dq_low_auto_state = "observe"
                                                         low_auto_decision = "observe"
                                                         low_auto_reason = "min_progress"
+                                                        low_auto_phase = "pre_min_progress"
                                                         dq_low_auto_bad_streak = 0
                                                     elif dq_low_auto_escaped:
                                                         dq_low_auto_state = "mid_lock"
                                                         low_auto_decision = "mid_lock"
                                                         low_auto_reason = "escaped_once"
+                                                        low_auto_phase = "escaped"
                                                         dq_low_auto_bad_streak = 0
                                                     elif low_auto_frozen:
                                                         dq_low_auto_state = "frozen"
                                                         low_auto_decision = "frozen"
                                                         low_auto_reason = "freeze_progress"
+                                                        low_auto_phase = "frozen"
                                                         if low_auto_is_bad:
                                                             dq_low_auto_bad_streak += 1
                                                         else:
@@ -3567,8 +3604,10 @@ class NetworkTrainer:
                                                         dq_low_auto_state = "observe"
                                                         low_auto_decision = "observe"
                                                         low_auto_reason = "insufficient_qerr_stats"
+                                                        low_auto_phase = "active"
                                                         dq_low_auto_bad_streak = 0
                                                     else:
+                                                        low_auto_phase = "active"
                                                         if low_auto_is_bad:
                                                             dq_low_auto_bad_streak += 1
                                                             low_auto_decision = "bad_count"
@@ -3584,8 +3623,12 @@ class NetworkTrainer:
                                                             dq_low_auto_state = "escape_to_mid"
                                                             low_auto_decision = "escape_to_mid"
                                                             low_auto_reason = "bad_streak_met"
+                                                            low_auto_phase = "escaped"
+                                                            low_auto_can_escape = 0
                                                 low_auto_state = dq_low_auto_state
                                                 low_auto_bad_streak = dq_low_auto_bad_streak
+                                                dq_low_auto_phase = low_auto_phase
+                                                dq_low_auto_can_escape = low_auto_can_escape
 
                                                 if dq_auto_use_raw:
                                                     clip_high_hit = (
@@ -3755,6 +3798,12 @@ class NetworkTrainer:
                                                     low_auto_state if dq_low_auto_enabled else "",
                                                     low_auto_bad if dq_low_auto_enabled else "",
                                                     low_auto_bad_streak if dq_low_auto_enabled else "",
+                                                    progress_frac,
+                                                    dq_low_auto_min_progress if dq_low_auto_enabled else "",
+                                                    dq_low_auto_freeze_progress if dq_low_auto_enabled else "",
+                                                    dq_low_auto_qerr_ratio_threshold if dq_low_auto_enabled else "",
+                                                    dq_low_auto_qerr_per_clip_threshold if dq_low_auto_enabled else "",
+                                                    low_auto_phase if dq_low_auto_enabled else "",
                                                 ]
                                                 if dq_log_error_parts:
                                                     row += [
@@ -3807,6 +3856,12 @@ class NetworkTrainer:
                                                 low_auto_state if dq_low_auto_enabled else "",
                                                 low_auto_bad if dq_low_auto_enabled else "",
                                                 low_auto_bad_streak if dq_low_auto_enabled else "",
+                                                progress_frac,
+                                                dq_low_auto_min_progress if dq_low_auto_enabled else "",
+                                                dq_low_auto_freeze_progress if dq_low_auto_enabled else "",
+                                                dq_low_auto_qerr_ratio_threshold if dq_low_auto_enabled else "",
+                                                dq_low_auto_qerr_per_clip_threshold if dq_low_auto_enabled else "",
+                                                low_auto_phase if dq_low_auto_enabled else "",
                                             ]
                                             if dq_log_error_parts:
                                                 row += [
@@ -3876,6 +3931,12 @@ class NetworkTrainer:
                                             low_auto_state if dq_low_auto_enabled else "",
                                             low_auto_bad if dq_low_auto_enabled else "",
                                             low_auto_bad_streak if dq_low_auto_enabled else "",
+                                            progress_frac,
+                                            dq_low_auto_min_progress if dq_low_auto_enabled else "",
+                                            dq_low_auto_freeze_progress if dq_low_auto_enabled else "",
+                                            dq_low_auto_qerr_ratio_threshold if dq_low_auto_enabled else "",
+                                            dq_low_auto_qerr_per_clip_threshold if dq_low_auto_enabled else "",
+                                            low_auto_phase if dq_low_auto_enabled else "",
                                         ]
                                         if dq_log_error_parts:
                                             row += ["", "", "", "", "", ""]
@@ -3919,6 +3980,13 @@ class NetworkTrainer:
                                             low_auto_reason if dq_low_auto_enabled else "",
                                             low_auto_bad if dq_low_auto_enabled else "",
                                             low_auto_bad_streak if dq_low_auto_enabled else "",
+                                            progress_frac,
+                                            dq_low_auto_min_progress if dq_low_auto_enabled else "",
+                                            dq_low_auto_freeze_progress if dq_low_auto_enabled else "",
+                                            dq_low_auto_qerr_ratio_threshold if dq_low_auto_enabled else "",
+                                            dq_low_auto_qerr_per_clip_threshold if dq_low_auto_enabled else "",
+                                            low_auto_phase if dq_low_auto_enabled else "",
+                                            low_auto_can_escape if dq_low_auto_enabled else "",
                                         ]
                                         _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
                     if rank_log_enabled and accelerator.is_main_process and rank_log_path and (not skip_step_flag):

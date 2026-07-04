@@ -167,6 +167,12 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | ClipRateLowAutoState | clip_rate_low_auto 状態 | `observe`/`keep_low`/`escape_to_mid`/`mid_lock`/`frozen`。clip_rate_low_auto以外は空欄。 |
 | ClipRateLowAutoBad | clip_rate_low_auto bad判定 | `QuantErrRatioEMA>=0.25` かつ `QErrPerClip>=130` の時 1。clip_rate_low_auto以外は空欄。 |
 | ClipRateLowAutoBadStreak | bad連続回数 | 既定では3回連続で `mid` へ逃がす。clip_rate_low_auto以外は空欄。 |
+| TrainProgress | 学習進捗 | `global_step / max_train_steps`。min/freeze境界を後から確認するための列。 |
+| ClipRateLowAutoMinProgress | low_auto判定開始進捗 | `--dq_delta_clip_rate_low_auto_min_progress` の値。clip_rate_low_auto以外は空欄。 |
+| ClipRateLowAutoFreezeProgress | low_auto切替凍結進捗 | `--dq_delta_clip_rate_low_auto_freeze_progress` の値。clip_rate_low_auto以外は空欄。 |
+| ClipRateLowAutoThresholdQErrRatio | low_auto QuantErrRatio閾値 | `--dq_delta_clip_rate_low_auto_qerr_ratio` の値。clip_rate_low_auto以外は空欄。 |
+| ClipRateLowAutoThresholdQErrPerClip | low_auto QErrPerClip閾値 | `--dq_delta_clip_rate_low_auto_qerr_per_clip` の値。clip_rate_low_auto以外は空欄。 |
+| ClipRateLowAutoPhase | low_auto判定フェーズ | `warmup`/`pre_min_progress`/`active`/`frozen`/`escaped`。clip_rate_low_auto以外は空欄。 |
 | ClipErrRMS | clip誤差RMS | `--dq_delta_log_error_parts`時のみ。range外でclampされた成分。 |
 | RoundErrRMS | round誤差RMS | `--dq_delta_log_error_parts`時のみ。range内で量子化丸めされた成分。 |
 | ClipErrRatio/RoundErrRatio | 各誤差RMS/RMS | clip/round どちらが重いかを見る。 |
@@ -187,6 +193,11 @@ Epoch,TrainStep,Scope,Target,Bits,DQStepSize,RangeMul,Stat,Granularity,Mode,RMS,
 | ClipRateLowAutoDecision | clip_rate_low_auto判断 | `observe`/`keep_low`/`bad_count`/`escape_to_mid`/`mid_lock`/`frozen`。 |
 | ClipRateLowAutoReason | clip_rate_low_auto判断理由 | `min_progress`/`low_bad`/`bad_streak_met`/`escaped_once`/`freeze_progress`/`insufficient_qerr_stats`。 |
 | ClipRateLowAutoBad/ClipRateLowAutoBadStreak | bad判定と連続回数 | `mid` に逃がした根拠を追う。 |
+| TrainProgress | 学習進捗 | `global_step / max_train_steps`。 |
+| ClipRateLowAutoMinProgress/ClipRateLowAutoFreezeProgress | low_auto進捗閾値 | min/freeze境界をログ単体から復元する。 |
+| ClipRateLowAutoThresholdQErrRatio/ClipRateLowAutoThresholdQErrPerClip | low_auto bad判定閾値 | CLIで指定した閾値をログ単体から復元する。 |
+| ClipRateLowAutoPhase | low_auto判定フェーズ | `warmup`/`pre_min_progress`/`active`/`frozen`/`escaped`。 |
+| ClipRateLowAutoCanEscape | low_auto切替可能状態 | min_progress以降、freeze_progress前、未escapeなら1。minimal autoログのみ。 |
 補足（読み解きの目安）:
 - `ClipRate` が低いのに `QuantErrRatio` が高い場合、**レンジが広く刻みが粗い**可能性がある（`range_mul` 高め / `bits` 低め）。
 - `QuantErrRatio` が低いのに `ClipRate` が高い場合、**クリップ歪み**が支配的な可能性がある。
