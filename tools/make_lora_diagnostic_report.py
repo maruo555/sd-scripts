@@ -496,7 +496,8 @@ def parse_dq_logs(
             variance = sum((x - tail_mean) ** 2 for x in tail) / len(tail)
             clip_ema_cv = math.sqrt(variance) / tail_mean
 
-    low_diag_source = auto_rows if auto_rows else parsed_rows
+    auto_has_qerr_per_clip = any(item.get("QErrPerClip") is not None for item in auto_rows)
+    low_diag_source = auto_rows if auto_has_qerr_per_clip else parsed_rows
     qerr_per_clip_values = [item["QErrPerClip"] for item in low_diag_source if item.get("QErrPerClip") is not None]
     qerr_tail_mean = mean_tail(qerr_per_clip_values, 0.25, True) if qerr_per_clip_values else None
     qerr_max = max(qerr_per_clip_values) if qerr_per_clip_values else None
