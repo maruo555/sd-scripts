@@ -295,6 +295,12 @@ low_bad =
 
 既定値は `QuantErrRatioEMA >= 0.25` かつ `QErrPerClip >= 130`。`dq_delta_clip_rate_low_auto_min_progress` 経過後に `low_bad` が `dq_delta_clip_rate_low_auto_bad_streak` 回連続したら、目標bandを `clip_rate_mid`（0.002〜0.004）へ切り替える。一度 `mid` に逃げた後は `low` へ戻さない。`dq_delta_clip_rate_low_auto_freeze_progress` 以降は新規のband切替を行わない。
 
+#### 既定閾値の前提
+
+`clip_rate_low_auto` の既定閾値（`QuantErrRatioEMA=0.25`, `QErrPerClip=130`）は、主に `--dq_quantize_z` を使わない delta 量子化、`--dq_delta_mode stoch`、`8bit/channel/rms` のログを基準にした経験的な値。
+
+`--dq_quantize_z` や `--dq_delta_mode det` を使う場合、`ZeroRate` や `QErrPerClip` の分布が変わるため、同じ閾値は保守的な警告として扱う。特に z 量子化では `QErrPerClip` が高めに出ることがあり、`clip_rate_low_auto` が `mid` へ逃がす挙動は安全側に働く可能性がある。
+
 `QErrPerClip` は clip_rate_low_auto 以外でも診断列として出力される。これは preset 比較時に、clip率に対して量子化誤差が重くなっていないかを見るため。
 
 ### 発動条件（重要）
