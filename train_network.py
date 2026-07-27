@@ -247,7 +247,7 @@ GRAD_NORM_PRESETS = {
     "stable": {
         "skip_grad_norm": True,
         "log_grad_norm": True,
-        "log_grad_cosine": True,
+        "log_grad_cosine": False,
         "skip_grad_norm_max": 200000.0,
         "nan_to_window": True,
         "inf_to_window": True,
@@ -257,7 +257,7 @@ GRAD_NORM_PRESETS = {
     "stable_no_threshoff": {
         "skip_grad_norm": True,
         "log_grad_norm": True,
-        "log_grad_cosine": True,
+        "log_grad_cosine": False,
         "skip_grad_norm_max": 200000.0,
         "nan_to_window": False,
         "inf_to_window": False,
@@ -267,7 +267,7 @@ GRAD_NORM_PRESETS = {
     "gamble": {
         "skip_grad_norm": True,
         "log_grad_norm": True,
-        "log_grad_cosine": True,
+        "log_grad_cosine": False,
         "skip_grad_norm_max": None,
         "nan_to_window": False,
         "inf_to_window": False,
@@ -863,6 +863,8 @@ class NetworkTrainer:
         return noise_pred
 
     def all_reduce_network(self, accelerator, network):
+        if accelerator.num_processes <= 1:
+            return
         for param in network.parameters():
             if param.grad is not None:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")
