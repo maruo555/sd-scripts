@@ -4,13 +4,32 @@ from types import SimpleNamespace
 import torch
 
 from tools.make_lora_diagnostic_report import build_chart_payload, parse_grad_log, sanitize_json
-from train_network import NetworkTrainer, resolve_grad_norm_settings
+from train_network import NetworkTrainer, resolve_avg_proxy_candidate_modes, resolve_grad_norm_settings
 
 
 def test_all_grad_norm_presets_disable_cosine_logging():
     for mode in ("stable", "stable_no_threshoff", "gamble"):
         settings = resolve_grad_norm_settings(SimpleNamespace(grad_norm_mode=mode))
         assert settings[3] is False
+
+
+def test_fixed_avg_promote_scores_only_selected_mode():
+    assert resolve_avg_proxy_candidate_modes("promote", "fixed", "ema") == ["ema"]
+    assert resolve_avg_proxy_candidate_modes("promote", "fixed", "uniform") == ["uniform"]
+    assert resolve_avg_proxy_candidate_modes("promote", "fixed", "metric") == ["metric"]
+
+
+def test_best_avg_promote_keeps_comparison_candidates():
+    assert resolve_avg_proxy_candidate_modes("promote", "best", "ema") == ["ema", "uniform"]
+    assert resolve_avg_proxy_candidate_modes("promote", "best", "uniform") == ["ema", "uniform"]
+    assert resolve_avg_proxy_candidate_modes("promote", "best", "metric") == ["ema", "uniform", "metric"]
+
+
+def test_shadow_keeps_comparison_candidates():
+    assert resolve_avg_proxy_candidate_modes("shadow", "fixed", "ema") == ["ema", "uniform"]
+    assert resolve_avg_proxy_candidate_modes("shadow", "fixed", "uniform") == ["ema", "uniform"]
+    assert resolve_avg_proxy_candidate_modes("shadow", "fixed", "metric") == ["ema", "uniform", "metric"]
+    assert resolve_avg_proxy_candidate_modes("shadow", "best", "ema") == ["ema", "uniform"]
 
 
 class _SingleProcessAccelerator:
