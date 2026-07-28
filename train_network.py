@@ -62,16 +62,219 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+DQ_DELTA_SCOPE_TARGETS = {
+    "unet": frozenset({"unet"}),
+    "te": frozenset({"te"}),
+    "both": frozenset({"unet", "te"}),
+}
+
+
+@dataclass(frozen=True)
+class DQDeltaRuntimeOptions:
+    apply_scope_requested: str
+    apply_scope_resolved: str
+    log_scope_requested: str
+    log_scope_resolved: str
+    auto_scope_requested: str
+    auto_scope_resolved: str
+    fused_up_mode_requested: str
+    fused_up_mode_resolved: str
+    fused_up_scope_requested: str
+    fused_up_scope_resolved: str
+    fused_up_diagnostics: bool
+    use_triton: bool
+    triton_stats: bool
+    log_scope_adjustment_reason: Optional[str] = None
+    fused_up_disabled_reason: Optional[str] = None
+
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "ss_dq_scope_semantics_version": "2",
+            "ss_dq_delta_apply_scope_requested": self.apply_scope_requested,
+            "ss_dq_delta_apply_scope_resolved": self.apply_scope_resolved,
+            "ss_dq_delta_log_scope_requested": self.log_scope_requested,
+            "ss_dq_delta_log_scope_resolved": self.log_scope_resolved,
+            "ss_dq_delta_auto_scope_requested": self.auto_scope_requested,
+            "ss_dq_delta_auto_scope_resolved": self.auto_scope_resolved,
+            "ss_dq_delta_triton_fused_up_mode_requested": self.fused_up_mode_requested,
+            "ss_dq_delta_triton_fused_up_mode_resolved": self.fused_up_mode_resolved,
+            "ss_dq_delta_triton_fused_up_scope_requested": self.fused_up_scope_requested,
+            "ss_dq_delta_triton_fused_up_scope_resolved": self.fused_up_scope_resolved,
+            "ss_dq_delta_triton_fused_up_diagnostics": self.fused_up_diagnostics,
+            "ss_dq_delta_use_triton": self.use_triton,
+            "ss_dq_delta_triton_stats": self.triton_stats,
+        }
+
+
+def _validate_dq_delta_scope(name: str, value: str) -> str:
+    if value not in DQ_DELTA_SCOPE_TARGETS:
+        choices = ", ".join(DQ_DELTA_SCOPE_TARGETS)
+        raise ValueError(f"{name} must be one of: {choices}. got {value!r}")
+    return value
+
+
+def _dq_delta_scope_for_targets(targets) -> str:
+    if targets == DQ_DELTA_SCOPE_TARGETS["both"]:
+        return "both"
+    if targets == DQ_DELTA_SCOPE_TARGETS["unet"]:
+        return "unet"
+    if targets == DQ_DELTA_SCOPE_TARGETS["te"]:
+        return "te"
+    return "none"
+
+
+def resolve_dq_delta_runtime_options(args) -> DQDeltaRuntimeOptions:
+    apply_scope = _validate_dq_delta_scope(
+        "--dq_delta_scope",
+        getattr(args, "dq_delta_scope", "both"),
+    )
+
+    log_scope_arg = getattr(args, "dq_delta_log_scope", None)
+    log_scope = _validate_dq_delta_scope(
+        "--dq_delta_log_scope",
+        apply_scope if log_scope_arg is None else log_scope_arg,
+    )
+    log_targets_requested = DQ_DELTA_SCOPE_TARGETS[log_scope]
+    log_targets = log_targets_requested & DQ_DELTA_SCOPE_TARGETS[apply_scope]
+    log_scope_resolved = _dq_delta_scope_for_targets(log_targets)
+    log_scope_adjustment_reason = None
+    if log_targets != log_targets_requested:
+        log_scope_adjustment_reason = (
+            "dq_delta log scope is restricted to the apply scope "
+            f"(apply={apply_scope}, log_requested={log_scope}, log_resolved={log_scope_resolved})."
+        )
+
+    auto_scope_arg = getattr(args, "dq_delta_auto_scope", None)
+    auto_scope = _validate_dq_delta_scope(
+        "--dq_delta_auto_scope",
+        apply_scope if auto_scope_arg is None else auto_scope_arg,
+    )
+    if not (DQ_DELTA_SCOPE_TARGETS[auto_scope] <= DQ_DELTA_SCOPE_TARGETS[apply_scope]):
+        raise ValueError(
+            "--dq_delta_auto_scope must be a subset of --dq_delta_scope "
+            f"(apply={apply_scope}, auto={auto_scope})."
+        )
+
+    fused_mode = getattr(args, "dq_delta_triton_fused_up_mode", "off")
+    if fused_mode not in ("off", "c0"):
+        raise ValueError(
+            "--dq_delta_triton_fused_up_mode must be one of: off, c0. "
+            f"got {fused_mode!r}"
+        )
+    fused_scope = _validate_dq_delta_scope(
+        "--dq_delta_triton_fused_up_scope",
+        getattr(args, "dq_delta_triton_fused_up_scope", "unet"),
+    )
+    if fused_mode != "off" and not bool(getattr(args, "dq_delta_use_triton", False)):
+        raise ValueError(
+            "--dq_delta_triton_fused_up_mode requires --dq_delta_use_triton "
+            "when it is not off."
+        )
+
+    fused_targets = DQ_DELTA_SCOPE_TARGETS[fused_scope] & DQ_DELTA_SCOPE_TARGETS[apply_scope]
+    fused_mode_resolved = fused_mode
+    fused_scope_resolved = _dq_delta_scope_for_targets(fused_targets)
+    fused_disabled_reason = None
+    if fused_mode == "off":
+        fused_scope_resolved = "none"
+    elif not fused_targets:
+        raise ValueError(
+            "--dq_delta_triton_fused_up_scope must overlap --dq_delta_scope when "
+            "--dq_delta_triton_fused_up_mode=c0 "
+            f"(apply={apply_scope}, fused={fused_scope})."
+        )
+
+    return DQDeltaRuntimeOptions(
+        apply_scope_requested=apply_scope,
+        apply_scope_resolved=apply_scope,
+        log_scope_requested="inherit" if log_scope_arg is None else log_scope_arg,
+        log_scope_resolved=log_scope_resolved,
+        auto_scope_requested="inherit" if auto_scope_arg is None else auto_scope_arg,
+        auto_scope_resolved=auto_scope,
+        fused_up_mode_requested=fused_mode,
+        fused_up_mode_resolved=fused_mode_resolved,
+        fused_up_scope_requested=fused_scope,
+        fused_up_scope_resolved=fused_scope_resolved,
+        fused_up_diagnostics=bool(getattr(args, "dq_delta_triton_fused_up_diagnostics", False)),
+        use_triton=bool(getattr(args, "dq_delta_use_triton", False)),
+        triton_stats=bool(getattr(args, "dq_delta_triton_stats", False)),
+        log_scope_adjustment_reason=log_scope_adjustment_reason,
+        fused_up_disabled_reason=fused_disabled_reason,
+    )
+
+
+def _dq_delta_is_configured(args) -> bool:
+    """Match the existing runtime activation check without parsing the schedule twice."""
+    return bool(
+        (getattr(args, "dq_delta_step", None) is not None and args.dq_delta_step)
+        or (getattr(args, "dq_delta_bits", None) is not None and args.dq_delta_bits)
+        or getattr(args, "dq_delta_bits_sched", None)
+    )
+
+
 def _set_delta_fake_quant_compat(network, step, mode, **kwargs):
     """Call older network implementations without Triton-only kwargs."""
     setter = network.set_delta_fake_quant
     parameters = inspect.signature(setter).parameters
     accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
     if not accepts_kwargs:
-        for name in ("use_triton", "triton_stats"):
+        for name in (
+            "use_triton",
+            "triton_stats",
+            "triton_fused_up_mode",
+            "triton_fused_up_scope",
+            "triton_fused_up_diagnostics",
+        ):
             if name not in parameters:
                 kwargs.pop(name, None)
     setter(step, mode, **kwargs)
+
+
+def _set_delta_quant_scope_compat(
+    network,
+    scope: str,
+    *,
+    runtime_enabled: Optional[bool] = None,
+    warn: bool = True,
+) -> str:
+    """Apply scope through the v2 API, with a best-effort legacy fallback."""
+
+    setter = getattr(network, "set_delta_quant_scope", None)
+    if callable(setter):
+        setter(scope)
+        return "native"
+
+    if hasattr(network, "text_encoder_loras") and hasattr(network, "unet_loras"):
+        te_allowed = scope in ("te", "both")
+        unet_allowed = scope in ("unet", "both")
+        for lora_module in network.text_encoder_loras:
+            if hasattr(lora_module, "delta_q_scope_allowed"):
+                lora_module.delta_q_scope_allowed = te_allowed
+            else:
+                lora_module.delta_q_enabled = te_allowed and (
+                    True if runtime_enabled is None else runtime_enabled
+                )
+        for lora_module in network.unet_loras:
+            if hasattr(lora_module, "delta_q_scope_allowed"):
+                lora_module.delta_q_scope_allowed = unet_allowed
+            else:
+                lora_module.delta_q_enabled = unet_allowed and (
+                    True if runtime_enabled is None else runtime_enabled
+                )
+        if warn:
+            logger.warning(
+                "network does not support set_delta_quant_scope; applying a legacy direct "
+                "scope assignment after runtime updates to preserve scope semantics version 2."
+            )
+        return "legacy"
+
+    if warn and scope != "both":
+        logger.warning(
+            "network does not support set_delta_quant_scope; "
+            "requested dq_delta apply scope=%s cannot be enforced.",
+            scope,
+        )
+    return "unsupported"
 
 
 def resolve_avg_proxy_candidate_modes(avg_cp_mode: str, avg_promote_pick: str, avg_mode: str) -> List[str]:
@@ -970,6 +1173,54 @@ class NetworkTrainer:
 
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
+        dq_runtime_options = resolve_dq_delta_runtime_options(args)
+        dq_apply_scope = dq_runtime_options.apply_scope_resolved
+        dq_log_scope = dq_runtime_options.log_scope_resolved
+        dq_auto_scope = dq_runtime_options.auto_scope_resolved
+        dq_fused_up_mode = dq_runtime_options.fused_up_mode_resolved
+        dq_fused_up_scope = dq_runtime_options.fused_up_scope_resolved
+        dq_scope_application = "not_configured"
+        if dq_runtime_options.fused_up_disabled_reason is not None:
+            logger.warning(dq_runtime_options.fused_up_disabled_reason)
+        if dq_runtime_options.log_scope_adjustment_reason is not None:
+            logger.warning(dq_runtime_options.log_scope_adjustment_reason)
+        if _dq_delta_is_configured(args) and getattr(args, "resume", None):
+            logger.warning(
+                "dq_delta scope semantics changed in version 2. Resumed training may differ from runs made "
+                "before the scope fix. To reproduce the former effective behavior as closely as possible, use "
+                "--dq_delta_scope both --dq_delta_log_scope unet --dq_delta_auto_scope unet "
+                "--dq_delta_triton_fused_up_mode off."
+            )
+        if dq_runtime_options.fused_up_mode_requested == "c0":
+            if not _dq_delta_is_configured(args):
+                logger.warning(
+                    "rank-4 Quantized LoRA-Up C0 was requested without dq_delta step/bits/bits_sched; "
+                    "C0 will remain inactive."
+                )
+            elif bool(getattr(args, "dq_quantize_z", False)):
+                logger.warning(
+                    "rank-4 Quantized LoRA-Up C0 is delta-only; dq_quantize_z uses the existing "
+                    "Triton/PyTorch route."
+                )
+        logger.info(
+            "dq_delta scopes: "
+            "apply(requested=%s,resolved=%s), "
+            "log(requested=%s,resolved=%s), "
+            "auto(requested=%s,resolved=%s), "
+            "fused_up(mode_requested=%s,mode_resolved=%s,"
+            "scope_requested=%s,scope_resolved=%s,diagnostics=%s)",
+            dq_runtime_options.apply_scope_requested,
+            dq_apply_scope,
+            dq_runtime_options.log_scope_requested,
+            dq_log_scope,
+            dq_runtime_options.auto_scope_requested,
+            dq_auto_scope,
+            dq_runtime_options.fused_up_mode_requested,
+            dq_fused_up_mode,
+            dq_runtime_options.fused_up_scope_requested,
+            dq_fused_up_scope,
+            dq_runtime_options.fused_up_diagnostics,
+        )
         logger.info(
             f"avg_cp: {args.avg_cp}, avg_window: {args.avg_window}, avg_begin: {args.avg_begin}, "
             f"avg_mode: {args.avg_mode}, avg_reset_stats: {args.avg_reset_stats}"
@@ -1032,8 +1283,13 @@ class NetworkTrainer:
             )
 
         dq_log_enabled = bool(getattr(args, "dq_delta_log", False))
+        if dq_log_enabled and dq_log_scope == "none":
+            logger.warning(
+                "dq_delta logging is disabled because the requested log scope has no overlap with "
+                "--dq_delta_scope."
+            )
+            dq_log_enabled = False
         dq_log_every = max(1, int(getattr(args, "dq_delta_log_every", 100)))
-        dq_log_scope = getattr(args, "dq_delta_log_scope", None) or getattr(args, "dq_delta_scope", "both")
         dq_log_mode = getattr(args, "dq_delta_log_mode", "summary")
         dq_log_detail = getattr(args, "dq_delta_log_detail", "basic")
         dq_log_extra = set(getattr(args, "dq_delta_log_extra", []) or [])
@@ -1057,8 +1313,8 @@ class NetworkTrainer:
                 unvalidated.append(f"mode={getattr(args, 'dq_delta_mode', None)}")
             if getattr(args, "dq_quantize_z", False):
                 unvalidated.append("target=z")
-            if getattr(args, "dq_delta_scope", None) != "unet":
-                unvalidated.append(f"scope={getattr(args, 'dq_delta_scope', None)}")
+            if dq_apply_scope != "unet":
+                unvalidated.append(f"scope={dq_apply_scope}")
             if getattr(args, "mixed_precision", None) != "fp16":
                 unvalidated.append(f"mixed_precision={getattr(args, 'mixed_precision', None)}")
             if unvalidated:
@@ -1871,20 +2127,14 @@ class NetworkTrainer:
                 on_z=getattr(args, "dq_quantize_z", False),
                 use_triton=getattr(args, "dq_delta_use_triton", False),
                 triton_stats=getattr(args, "dq_delta_triton_stats", False),
+                triton_fused_up_mode=dq_fused_up_mode,
+                triton_fused_up_scope=dq_fused_up_scope,
+                triton_fused_up_diagnostics=dq_runtime_options.fused_up_diagnostics,
             )
             # no EMA-based stats to propagate (ema_* removed)
-            # Scope control: unet / te / both
-            scope = getattr(args, "dq_delta_scope", "both")
-            if scope == "unet" and hasattr(unwrapped, "text_encoder_loras"):
-                for l in unwrapped.text_encoder_loras:
-                    l.delta_q_enabled = False
-                for l in unwrapped.unet_loras:
-                    l.delta_q_enabled = True
-            elif scope == "te" and hasattr(unwrapped, "unet_loras"):
-                for l in unwrapped.unet_loras:
-                    l.delta_q_enabled = False
-                for l in unwrapped.text_encoder_loras:
-                    l.delta_q_enabled = True
+            dq_scope_application = _set_delta_quant_scope_compat(unwrapped, dq_apply_scope)
+        elif _dq_delta_is_configured(args):
+            dq_scope_application = "unsupported"
 
         if args.network_weights is not None:
             # FIXME consider alpha of weights
@@ -2419,6 +2669,8 @@ class NetworkTrainer:
             "ss_huber_schedule": args.huber_schedule,
             "ss_huber_c": args.huber_c,
         }
+        metadata.update(dq_runtime_options.metadata())
+        metadata["ss_dq_delta_scope_application"] = dq_scope_application
 
         if use_user_config:
             # save metadata of multiple datasets
@@ -3365,7 +3617,15 @@ class NetworkTrainer:
                         if dq_configured:
                             progress_frac = (global_step / float(args.max_train_steps)) if args.max_train_steps > 0 else 1.0
                             quant_enabled = _dq_delta_quant_enabled(progress_frac, global_step)
-                            accelerator.unwrap_model(network).set_delta_quant_enabled(quant_enabled)
+                            dq_network = accelerator.unwrap_model(network)
+                            dq_network.set_delta_quant_enabled(quant_enabled)
+                            if dq_scope_application == "legacy":
+                                _set_delta_quant_scope_compat(
+                                    dq_network,
+                                    dq_apply_scope,
+                                    runtime_enabled=quant_enabled,
+                                    warn=False,
+                                )
 
                             # Apply bits scheduling if specified
                             if dq_bits_sched:
@@ -3387,7 +3647,17 @@ class NetworkTrainer:
                                         on_z=getattr(args, "dq_quantize_z", False),
                                         use_triton=getattr(args, "dq_delta_use_triton", False),
                                         triton_stats=getattr(args, "dq_delta_triton_stats", False),
+                                        triton_fused_up_mode=dq_fused_up_mode,
+                                        triton_fused_up_scope=dq_fused_up_scope,
+                                        triton_fused_up_diagnostics=dq_runtime_options.fused_up_diagnostics,
                                     )
+                                    if dq_scope_application == "legacy":
+                                        _set_delta_quant_scope_compat(
+                                            dq_network,
+                                            dq_apply_scope,
+                                            runtime_enabled=quant_enabled,
+                                            warn=False,
+                                        )
                                     last_applied_bits = cur_bits
                                     dq_bits_force_apply = False
                                     dq_bits_changed_this_step = True
@@ -3420,7 +3690,7 @@ class NetworkTrainer:
                                 collect_detail=collect_detail,
                                 log_mode=dq_log_mode,
                                 log_scope=dq_log_scope,
-                                auto_scope=getattr(args, "dq_delta_scope", "both"),
+                                auto_scope=dq_auto_scope,
                                 target=target,
                             )
                             dq_stats_state_fn = accelerator.unwrap_model(network).set_dq_stats_state
@@ -3835,7 +4105,17 @@ class NetworkTrainer:
                                             on_z=getattr(args, "dq_quantize_z", False),
                                             use_triton=getattr(args, "dq_delta_use_triton", False),
                                             triton_stats=getattr(args, "dq_delta_triton_stats", False),
+                                            triton_fused_up_mode=dq_fused_up_mode,
+                                            triton_fused_up_scope=dq_fused_up_scope,
+                                            triton_fused_up_diagnostics=dq_runtime_options.fused_up_diagnostics,
                                         )
+                                        if dq_scope_application == "legacy":
+                                            _set_delta_quant_scope_compat(
+                                                accelerator.unwrap_model(network),
+                                                dq_apply_scope,
+                                                runtime_enabled=quant_enabled,
+                                                warn=False,
+                                            )
 
                                 if dq_stats["do_log"] and accelerator.is_main_process and dq_log_path:
                                     log_full_detail = dq_log_detail == "full" or dq_log_mode == "per_module"
@@ -4481,8 +4761,77 @@ class NetworkTrainer:
                 f.writelines(grad_norm_guardian.log_buffer)
             grad_norm_guardian.log_buffer.clear()
 
+        fused_local_summary = None
+        fused_global_counts = None
+        if dq_runtime_options.fused_up_mode_requested == "c0":
+            diagnostic_network = accelerator.unwrap_model(network)
+            get_fused_up_diagnostics = getattr(
+                diagnostic_network,
+                "get_delta_triton_fused_up_diagnostics",
+                None,
+            )
+            if callable(get_fused_up_diagnostics):
+                fused_local_summary = get_fused_up_diagnostics()
+                if isinstance(fused_local_summary, dict):
+                    fused_counts = torch.tensor(
+                        [
+                            int(fused_local_summary.get("attempted_modules", 0)),
+                            int(fused_local_summary.get("successful_modules", 0)),
+                        ],
+                        device=accelerator.device,
+                        dtype=torch.int64,
+                    )
+                    if dist.is_available() and dist.is_initialized():
+                        dist.all_reduce(fused_counts, op=dist.ReduceOp.SUM)
+                    fused_global_counts = (
+                        int(fused_counts[0].item()),
+                        int(fused_counts[1].item()),
+                    )
+
         if is_main_process:
             network = accelerator.unwrap_model(network)
+            if dq_runtime_options.fused_up_mode_requested == "c0":
+                log_fused_up_diagnostics = getattr(
+                    network,
+                    "log_delta_triton_fused_up_diagnostics",
+                    None,
+                )
+                fused_summary = fused_local_summary
+                if callable(log_fused_up_diagnostics):
+                    try:
+                        log_parameters = inspect.signature(log_fused_up_diagnostics).parameters
+                    except (TypeError, ValueError):
+                        log_parameters = {}
+                    if "warn_on_zero" in log_parameters:
+                        fused_summary = log_fused_up_diagnostics(warn_on_zero=False)
+                    else:
+                        fused_summary = log_fused_up_diagnostics()
+
+                if fused_global_counts is not None:
+                    attempted_global, successful_global = fused_global_counts
+                    logger.info(
+                        "rank-4 Quantized LoRA-Up global result: "
+                        "attempted_modules_rank_sum=%d, successful_modules_rank_sum=%d",
+                        attempted_global,
+                        successful_global,
+                    )
+                    if successful_global == 0:
+                        inactive = (
+                            isinstance(fused_summary, dict)
+                            and fused_summary.get("mode") != "c0"
+                        )
+                        logger.warning(
+                            "rank-4 Quantized LoRA-Up C0 was requested but completed with "
+                            "zero successful C0 modules across all ranks; %s",
+                            "C0 remained inactive."
+                            if inactive
+                            else "the normal LoRA-Up + quantization route was used.",
+                        )
+                elif not callable(log_fused_up_diagnostics):
+                    logger.warning(
+                        "rank-4 Quantized LoRA-Up C0 was requested, but the selected network "
+                        "does not expose C0 runtime diagnostics."
+                    )
 
         accelerator.end_training()
 
@@ -4849,6 +5198,25 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fuse eligible dq_delta basic log/auto stats into the Triton stochastic fake-quant kernel; detail stats fall back to PyTorch",
     )
+    parser.add_argument(
+        "--dq_delta_triton_fused_up_mode",
+        type=str,
+        default="off",
+        choices=["off", "c0"],
+        help="Rank-4 Quantized LoRA-Up fusion mode. c0 requires --dq_delta_use_triton / rank 4 Quantized LoRA-Up 融合モード",
+    )
+    parser.add_argument(
+        "--dq_delta_triton_fused_up_scope",
+        type=str,
+        default="unet",
+        choices=["unet", "te", "both"],
+        help="Requested scope for rank-4 Quantized LoRA-Up fusion / rank 4 Quantized LoRA-Up 融合の対象",
+    )
+    parser.add_argument(
+        "--dq_delta_triton_fused_up_diagnostics",
+        action="store_true",
+        help="Collect fused-up shape, coverage, and fallback diagnostics; disable for benchmarks / fused-up 診断を収集",
+    )
     # dq_delta logging / auto-tuning
     parser.add_argument(
         "--dq_delta_log",
@@ -4923,6 +5291,13 @@ def setup_parser() -> argparse.ArgumentParser:
         "--dq_delta_auto_range_mul",
         action="store_true",
         help="Enable auto range_mul tuning / range_mul の自動調整を有効化",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_scope",
+        type=str,
+        default=None,
+        choices=["unet", "te", "both"],
+        help="Scope used for dq_delta auto statistics; defaults to dq_delta_scope / auto 統計対象（未指定時は dq_delta_scope）",
     )
     parser.add_argument(
         "--dq_delta_auto_preset",

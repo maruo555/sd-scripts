@@ -421,7 +421,11 @@ class LoRAModule(torch.nn.Module):
         # delta fake quantization (applied to LoRA delta output only)
         self.delta_q_step = float(delta_q_step) if (delta_q_step is not None) else None
         self.delta_q_mode = delta_q_mode
-        self.delta_q_enabled = True  # toggled by network if needed
+        # Keep runtime scheduling (for example warmup) independent from the
+        # configured UNet / text encoder scope.  ``delta_q_enabled`` remains
+        # the backwards-compatible effective flag exposed to callers.
+        self.delta_q_runtime_enabled = True
+        self.delta_q_scope_allowed = True
         self.delta_q_granularity = delta_q_granularity
         self.delta_q_stat = delta_q_stat
         self.delta_q_bits = delta_q_bits
@@ -437,6 +441,16 @@ class LoRAModule(torch.nn.Module):
         return self.multiplier == 0 or self.lbw_multiplier == 0
 
     # no EMA buffers/statistics for delta quantization (ema_* removed)
+
+    @property
+    def delta_q_enabled(self) -> bool:
+        return bool(self.delta_q_runtime_enabled and self.delta_q_scope_allowed)
+
+    @delta_q_enabled.setter
+    def delta_q_enabled(self, enabled: bool):
+        # Historical callers assign this attribute directly to control
+        # warmup/runtime state.  Scope is deliberately not changed here.
+        self.delta_q_runtime_enabled = bool(enabled)
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -1690,6 +1704,18 @@ class LoRANetwork(torch.nn.Module):
     def set_delta_quant_enabled(self, enabled: bool):
         for l in self.text_encoder_loras + self.unet_loras:
             l.delta_q_enabled = enabled
+
+    def set_delta_quant_scope(self, scope: str):
+        if scope not in ("unet", "te", "both"):
+            raise ValueError(f"invalid delta quantization scope: {scope!r}")
+
+        self.delta_q_scope = scope
+        te_allowed = scope in ("te", "both")
+        unet_allowed = scope in ("unet", "both")
+        for l in self.text_encoder_loras:
+            l.delta_q_scope_allowed = te_allowed
+        for l in self.unet_loras:
+            l.delta_q_scope_allowed = unet_allowed
 
     def set_dq_stats_state(
         self,

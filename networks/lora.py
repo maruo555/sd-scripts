@@ -23,6 +23,17 @@ try:
     from library.triton_quant import triton_fake_quantize_levels_stoch_with_stats
 except Exception:
     triton_fake_quantize_levels_stoch_with_stats = None
+try:
+    from library.triton_lora import (
+        get_triton_rank4_quantized_lora_up_diagnostics,
+        triton_rank4_delta_quant,
+    )
+except Exception as e:
+    triton_rank4_delta_quant = None
+    get_triton_rank4_quantized_lora_up_diagnostics = None
+    _TRITON_LORA_IMPORT_ERROR = e
+else:
+    _TRITON_LORA_IMPORT_ERROR = None
 from library.utils import setup_logging
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
 
@@ -59,6 +70,105 @@ def _fake_quantize_levels_with_q(
     q = torch.clamp(q, qmin, qmax)
     q_out = (q * s).to(x.dtype)
     return x + (q_out - x).detach(), q_clamp, s
+
+
+class DQFusedUpDiagnostics:
+    """Debug-only shape, coverage, and fallback counters for fused LoRA-Up."""
+
+    def __init__(self):
+        self._records: Dict[Tuple, Dict[str, int]] = {}
+        self._fallback_reasons: Dict[str, Dict[str, int]] = {}
+        self._modules_by_outcome: Dict[str, set] = {}
+
+    def record(
+        self,
+        *,
+        module_name: str,
+        scope: str,
+        z: torch.Tensor,
+        channels: int,
+        stats_mode: str,
+        outcome: str,
+    ):
+        key = (
+            scope,
+            int(z.shape[0]) if z.ndim >= 1 else 0,
+            int(z.shape[1]) if z.ndim >= 2 else 0,
+            int(channels),
+            int(z.shape[-1]) if z.ndim >= 1 else 0,
+            str(z.dtype),
+            stats_mode,
+            bool(z.is_contiguous()),
+            outcome,
+        )
+        record = self._records.setdefault(key, {"calls": 0, "output_numel": 0})
+        record["calls"] += 1
+        rows = int(z.numel() // max(1, z.shape[-1])) if z.ndim >= 1 else 0
+        record["output_numel"] += rows * int(channels)
+        self._modules_by_outcome.setdefault(outcome, set()).add(module_name)
+        if outcome != "c0":
+            reason = self._fallback_reasons.setdefault(outcome, {"calls": 0, "output_numel": 0})
+            reason["calls"] += 1
+            reason["output_numel"] += rows * int(channels)
+
+    def export(self) -> Dict[str, object]:
+        records = []
+        for key, values in sorted(self._records.items(), key=lambda item: item[0]):
+            (
+                scope,
+                batch,
+                length,
+                channels,
+                rank,
+                dtype,
+                stats_mode,
+                contiguous,
+                outcome,
+            ) = key
+            records.append(
+                {
+                    "scope": scope,
+                    "batch": batch,
+                    "length": length,
+                    "rows": batch * length,
+                    "channels": channels,
+                    "rank": rank,
+                    "dtype": dtype,
+                    "stats_mode": stats_mode,
+                    "contiguous": contiguous,
+                    "outcome": outcome,
+                    **values,
+                }
+            )
+        total_calls = sum(int(record["calls"]) for record in self._records.values())
+        total_output_numel = sum(int(record["output_numel"]) for record in self._records.values())
+        c0_calls = sum(
+            int(record["calls"])
+            for key, record in self._records.items()
+            if key[-1] == "c0"
+        )
+        c0_output_numel = sum(
+            int(record["output_numel"])
+            for key, record in self._records.items()
+            if key[-1] == "c0"
+        )
+        return {
+            "records": records,
+            "fallback_reasons": {
+                reason: dict(values) for reason, values in sorted(self._fallback_reasons.items())
+            },
+            "modules_by_outcome": {
+                outcome: len(modules) for outcome, modules in sorted(self._modules_by_outcome.items())
+            },
+            "total_calls": total_calls,
+            "total_output_numel": total_output_numel,
+            "c0_calls": c0_calls,
+            "c0_output_numel": c0_output_numel,
+            "c0_call_coverage": (c0_calls / total_calls) if total_calls else 0.0,
+            "c0_output_numel_coverage": (
+                c0_output_numel / total_output_numel
+            ) if total_output_numel else 0.0,
+        }
 
 
 class DQStatsAccumulator:
@@ -455,6 +565,9 @@ class LoRAModule(torch.nn.Module):
         delta_q_on_z: bool = False,
         delta_q_use_triton: bool = False,
         delta_q_triton_stats: bool = False,
+        delta_q_triton_fused_up_mode: str = "off",
+        delta_q_triton_fused_up_scope: str = "unet",
+        delta_q_triton_fused_up_diagnostics: bool = False,
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
         super().__init__()
@@ -502,7 +615,11 @@ class LoRAModule(torch.nn.Module):
         # delta fake quantization (applied to LoRA delta output only)
         self.delta_q_step = float(delta_q_step) if (delta_q_step is not None) else None
         self.delta_q_mode = delta_q_mode
-        self.delta_q_enabled = True  # toggled by network if needed
+        # Keep runtime scheduling (for example warmup) independent from the
+        # configured UNet / text encoder scope.  ``delta_q_enabled`` remains
+        # the backwards-compatible effective flag exposed to callers.
+        self.delta_q_runtime_enabled = True
+        self.delta_q_scope_allowed = True
         self.delta_q_granularity = delta_q_granularity
         self.delta_q_stat = delta_q_stat
         self.delta_q_bits = delta_q_bits
@@ -513,15 +630,231 @@ class LoRAModule(torch.nn.Module):
         self.delta_q_on_z = bool(delta_q_on_z)
         self.delta_q_use_triton = bool(delta_q_use_triton)
         self.delta_q_triton_stats = bool(delta_q_triton_stats)
+        self.delta_q_triton_fused_up_mode = delta_q_triton_fused_up_mode
+        self.delta_q_triton_fused_up_scope = delta_q_triton_fused_up_scope
+        self.delta_q_triton_fused_up_diagnostics = bool(delta_q_triton_fused_up_diagnostics)
+        self.delta_q_gradient_checkpointing = False
+        self.dq_fused_up_diagnostics_manager: Optional[DQFusedUpDiagnostics] = None
+        self.delta_q_fused_up_ever_attempted = False
+        self.delta_q_fused_up_ever_succeeded = False
+        self.delta_q_fused_up_last_fallback_reason: Optional[str] = None
         self.dq_stats_manager: Optional[DQStatsManager] = None
         self.dq_scope = "te" if lora_name.startswith("lora_te") else "unet"
 
     # no EMA buffers/statistics for delta quantization (ema_* removed)
 
+    @property
+    def delta_q_enabled(self) -> bool:
+        return bool(self.delta_q_runtime_enabled and self.delta_q_scope_allowed)
+
+    @delta_q_enabled.setter
+    def delta_q_enabled(self, enabled: bool):
+        # Historical callers assign this attribute directly to control
+        # warmup/runtime state.  Scope is deliberately not changed here.
+        self.delta_q_runtime_enabled = bool(enabled)
+
     def apply_to(self):
         self.org_forward = self.org_module.forward
         self.org_module.forward = self.forward
         del self.org_module
+
+    def _fused_up_scope_allows_module(self) -> bool:
+        scope = self.delta_q_triton_fused_up_scope
+        return scope == "both" or scope == self.dq_scope
+
+    def _fused_up_basic_stats_requested(self) -> bool:
+        mgr = self.dq_stats_manager
+        return bool(
+            mgr is not None
+            and mgr.active
+            and mgr.wants_scope(self.dq_scope)
+            and mgr.target == "delta"
+            and self.delta_q_triton_stats
+            and mgr.collect_full
+            and not mgr.collect_zero
+            and not mgr.collect_near_zero
+            and not mgr.collect_detail
+            and not mgr.collect_error_parts
+        )
+
+    def _fused_up_stats_need_fallback(self) -> bool:
+        mgr = self.dq_stats_manager
+        stats_required = bool(
+            mgr is not None
+            and mgr.active
+            and mgr.wants_scope(self.dq_scope)
+            and mgr.target == "delta"
+        )
+        return stats_required and not self._fused_up_basic_stats_requested()
+
+    def _rank4_fused_up_ineligible_reason(self, z: torch.Tensor) -> Optional[str]:
+        if self.delta_q_triton_fused_up_mode != "c0":
+            return "mode"
+        if not self._fused_up_scope_allows_module():
+            return "scope"
+        if self.delta_q_gradient_checkpointing:
+            return "gradient_checkpointing"
+        if not self.delta_q_use_triton or triton_rank4_delta_quant is None:
+            return "triton_unavailable"
+        if self.delta_q_on_z:
+            return "quantize_z"
+        if self.delta_q_bits != 8:
+            return "bits"
+        if self.delta_q_granularity != "channel" or self.delta_q_stat != "rms":
+            return "scale_mode"
+        if self.delta_q_mode != "stoch":
+            return "round_mode"
+        if (
+            self.lora_dim != 4
+            or not isinstance(self.lora_up, torch.nn.Linear)
+            or self.lora_up.bias is not None
+        ):
+            return "rank_or_module"
+        if z.ndim != 3 or z.shape[-1] != 4:
+            return "shape"
+        rows = int(z.shape[0] * z.shape[1])
+        if rows <= 0 or rows > 2048:
+            return "rows"
+        if not z.is_cuda or z.dtype != torch.float16 or not z.is_contiguous():
+            return "activation"
+        weight = self.lora_up.weight
+        if (
+            not weight.is_cuda
+            or weight.device != z.device
+            or weight.dtype != torch.float32
+            or not weight.is_contiguous()
+        ):
+            return "weight"
+        if self._fused_up_stats_need_fallback():
+            return "stats"
+        return None
+
+    def _should_attempt_rank4_fused_up(self) -> bool:
+        if not self._fused_up_scope_allows_module():
+            return False
+        # Diagnostics deliberately exercises the selector so every rejection
+        # is visible. In normal runs, reject static configurations here to
+        # avoid adding a Python fallback call to every LoRA forward.
+        if self.dq_fused_up_diagnostics_manager is not None:
+            return True
+        return bool(
+            not self.delta_q_gradient_checkpointing
+            and self.delta_q_use_triton
+            and triton_rank4_delta_quant is not None
+            and not self.delta_q_on_z
+            and self.delta_q_bits == 8
+            and self.delta_q_granularity == "channel"
+            and self.delta_q_stat == "rms"
+            and self.delta_q_mode == "stoch"
+            and self.lora_dim == 4
+            and isinstance(self.lora_up, torch.nn.Linear)
+            and self.lora_up.bias is None
+            and self.lora_up.weight.dtype == torch.float32
+            and self.lora_up.weight.is_contiguous()
+            and not self._fused_up_stats_need_fallback()
+        )
+
+    def _record_fused_up_diagnostic(
+        self,
+        z: torch.Tensor,
+        *,
+        channels: int,
+        stats_mode: str,
+        outcome: str,
+    ):
+        manager = self.dq_fused_up_diagnostics_manager
+        if manager is None:
+            return
+        manager.record(
+            module_name=self.lora_name,
+            scope=self.dq_scope,
+            z=z,
+            channels=channels,
+            stats_mode=stats_mode,
+            outcome=outcome,
+        )
+
+    def _try_rank4_fused_up(
+        self,
+        z: torch.Tensor,
+        *,
+        lora_scale: float,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        self.delta_q_fused_up_ever_attempted = True
+        reason = self._rank4_fused_up_ineligible_reason(z)
+        channels = int(self.lora_up.out_features) if isinstance(self.lora_up, torch.nn.Linear) else 0
+        collect_basic_stats = self._fused_up_basic_stats_requested()
+        stats_mode = "basic" if collect_basic_stats else "none"
+        if reason is not None:
+            self.delta_q_fused_up_last_fallback_reason = reason
+            self._record_fused_up_diagnostic(
+                z,
+                channels=channels,
+                stats_mode=stats_mode,
+                outcome=f"fallback:{reason}",
+            )
+            return None, None
+
+        rand_t = torch.rand(
+            (*z.shape[:-1], channels),
+            device=z.device,
+            dtype=torch.float32,
+        )
+        try:
+            fused = triton_rank4_delta_quant(
+                z,
+                self.lora_up.weight,
+                multiplier=float(self.multiplier),
+                lora_scale=float(lora_scale),
+                range_mul=float(self.delta_q_range_mul),
+                rand=rand_t,
+                collect_basic_stats=collect_basic_stats,
+            )
+        except Exception as exc:
+            # The public Triton wrapper is expected to contain failures, but
+            # keep the training route safe if an implementation regresses.
+            warning_key = type(exc).__name__
+            warned = getattr(LoRAModule, "_dq_fused_up_warned_exceptions", set())
+            if warning_key not in warned:
+                logger.warning(
+                    "rank-4 Quantized LoRA-Up failed (%s); falling back to the normal route: %s",
+                    warning_key,
+                    exc,
+                )
+                warned.add(warning_key)
+                LoRAModule._dq_fused_up_warned_exceptions = warned
+            fused = None
+        if fused is None:
+            self.delta_q_fused_up_last_fallback_reason = "kernel"
+            self._record_fused_up_diagnostic(
+                z,
+                channels=channels,
+                stats_mode=stats_mode,
+                outcome="fallback:kernel",
+            )
+            return None, rand_t
+
+        quantized_delta, packed_stats = fused
+        if collect_basic_stats:
+            if packed_stats is None:
+                self._record_fused_up_diagnostic(
+                    z,
+                    channels=channels,
+                    stats_mode=stats_mode,
+                    outcome="fallback:missing_stats",
+                )
+                self.delta_q_fused_up_last_fallback_reason = "missing_stats"
+                return None, rand_t
+            self.dq_stats_manager.add_basic_stats(scope=self.dq_scope, packed=packed_stats.detach())
+        self.delta_q_fused_up_ever_succeeded = True
+        self.delta_q_fused_up_last_fallback_reason = None
+        self._record_fused_up_diagnostic(
+            z,
+            channels=channels,
+            stats_mode=stats_mode,
+            outcome="c0",
+        )
+        return quantized_delta, rand_t
 
     def _record_dq_stats(
         self,
@@ -640,6 +973,7 @@ class LoRAModule(torch.nn.Module):
         scale: torch.Tensor,
         qmin: int,
         qmax: int,
+        rand: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         mgr = self.dq_stats_manager
         if not self._can_use_fused_triton_stats():
@@ -650,7 +984,11 @@ class LoRAModule(torch.nn.Module):
             return None
 
         with torch.no_grad():
-            rand_t = torch.rand_like(x_in, dtype=torch.float32)
+            rand_t = (
+                torch.rand_like(x_in, dtype=torch.float32)
+                if rand is None
+                else rand.to(device=x_in.device, dtype=torch.float32).contiguous()
+            )
             fused = triton_fake_quantize_levels_stoch_with_stats(
                 x_in,
                 scale=scale.to(device=x_in.device, dtype=torch.float32),
@@ -775,6 +1113,18 @@ class LoRAModule(torch.nn.Module):
             # ensure memory contiguity for faster lora_up (matmul/conv)
             lx = lx.contiguous()
 
+        fused_rand_t = None
+        if (
+            self.delta_q_triton_fused_up_mode == "c0"
+            and self.training
+            and torch.is_grad_enabled()
+            and self.delta_q_enabled
+            and self._should_attempt_rank4_fused_up()
+        ):
+            fused_delta, fused_rand_t = self._try_rank4_fused_up(lx, lora_scale=scale)
+            if fused_delta is not None:
+                return org_forwarded + fused_delta
+
         lx = self.lora_up(lx)
 
         delta = lx * self.multiplier * scale
@@ -803,6 +1153,7 @@ class LoRAModule(torch.nn.Module):
                         scale=d_scale,
                         qmin=-qmax,
                         qmax=qmax,
+                        rand=fused_rand_t,
                     )
                     if delta_fused is not None:
                         delta = delta_fused
@@ -814,6 +1165,7 @@ class LoRAModule(torch.nn.Module):
                             qmax=qmax,
                             mode=self.delta_q_mode,
                             use_triton=True,
+                            rand=fused_rand_t,
                         )
                         self._record_dq_stats_for_quantized(x_in, delta, d_scale, qmax)
                     else:
@@ -838,6 +1190,7 @@ class LoRAModule(torch.nn.Module):
                         qmax=qmax,
                         mode=self.delta_q_mode,
                         use_triton=self.delta_q_use_triton,
+                        rand=fused_rand_t,
                     )
             elif self.delta_q_step is not None and self.delta_q_step > 0:
                 if self.delta_q_granularity == "channel":
@@ -1642,6 +1995,9 @@ class LoRANetwork(torch.nn.Module):
         delta_q_on_z: bool = False,
         delta_q_use_triton: bool = False,
         delta_q_triton_stats: bool = False,
+        delta_q_triton_fused_up_mode: str = "off",
+        delta_q_triton_fused_up_scope: str = "unet",
+        delta_q_triton_fused_up_diagnostics: bool = False,
     ) -> None:
         """
         LoRA network: すごく引数が多いが、パターンは以下の通り
@@ -1671,7 +2027,14 @@ class LoRANetwork(torch.nn.Module):
         self.delta_q_on_z = bool(delta_q_on_z)
         self.delta_q_use_triton = bool(delta_q_use_triton)
         self.delta_q_triton_stats = bool(delta_q_triton_stats)
+        self.delta_q_triton_fused_up_mode = delta_q_triton_fused_up_mode
+        self.delta_q_triton_fused_up_scope = delta_q_triton_fused_up_scope
+        self.delta_q_triton_fused_up_diagnostics = bool(delta_q_triton_fused_up_diagnostics)
+        self.delta_q_gradient_checkpointing = False
         self.dq_stats_manager = DQStatsManager()
+        self.dq_fused_up_diagnostics_manager: Optional[DQFusedUpDiagnostics] = None
+        self._fused_up_config_logged = False
+        self._delta_q_scope_configured = False
 
         self.loraplus_lr_ratio = None
         self.loraplus_unet_lr_ratio = None
@@ -1778,6 +2141,9 @@ class LoRANetwork(torch.nn.Module):
                                 delta_q_on_z=self.delta_q_on_z,
                                 delta_q_use_triton=self.delta_q_use_triton,
                                 delta_q_triton_stats=self.delta_q_triton_stats,
+                                delta_q_triton_fused_up_mode=self.delta_q_triton_fused_up_mode,
+                                delta_q_triton_fused_up_scope=self.delta_q_triton_fused_up_scope,
+                                delta_q_triton_fused_up_diagnostics=self.delta_q_triton_fused_up_diagnostics,
                             )
                             lora.dq_stats_manager = self.dq_stats_manager
                             loras.append(lora)
@@ -1850,6 +2216,9 @@ class LoRANetwork(torch.nn.Module):
         on_z: Optional[bool] = None,
         use_triton: Optional[bool] = None,
         triton_stats: Optional[bool] = None,
+        triton_fused_up_mode: Optional[str] = None,
+        triton_fused_up_scope: Optional[str] = None,
+        triton_fused_up_diagnostics: Optional[bool] = None,
     ):
         self.delta_q_step = step
         self.delta_q_mode = mode
@@ -1867,6 +2236,17 @@ class LoRANetwork(torch.nn.Module):
             self.delta_q_use_triton = bool(use_triton)
         if triton_stats is not None:
             self.delta_q_triton_stats = bool(triton_stats)
+        if triton_fused_up_mode is not None:
+            self.delta_q_triton_fused_up_mode = triton_fused_up_mode
+        if triton_fused_up_scope is not None:
+            self.delta_q_triton_fused_up_scope = triton_fused_up_scope
+        if triton_fused_up_diagnostics is not None:
+            self.delta_q_triton_fused_up_diagnostics = bool(triton_fused_up_diagnostics)
+        if bool(getattr(self, "delta_q_triton_fused_up_diagnostics", False)):
+            if getattr(self, "dq_fused_up_diagnostics_manager", None) is None:
+                self.dq_fused_up_diagnostics_manager = DQFusedUpDiagnostics()
+        else:
+            self.dq_fused_up_diagnostics_manager = None
         for l in self.text_encoder_loras + self.unet_loras:
             l.delta_q_step = step
             l.delta_q_mode = mode
@@ -1884,10 +2264,168 @@ class LoRANetwork(torch.nn.Module):
                 l.delta_q_use_triton = bool(use_triton)
             if triton_stats is not None:
                 l.delta_q_triton_stats = bool(triton_stats)
+            if triton_fused_up_mode is not None:
+                l.delta_q_triton_fused_up_mode = triton_fused_up_mode
+            if triton_fused_up_scope is not None:
+                l.delta_q_triton_fused_up_scope = triton_fused_up_scope
+            if triton_fused_up_diagnostics is not None:
+                l.delta_q_triton_fused_up_diagnostics = bool(triton_fused_up_diagnostics)
+            l.delta_q_gradient_checkpointing = bool(getattr(self, "delta_q_gradient_checkpointing", False))
+            l.dq_fused_up_diagnostics_manager = self.dq_fused_up_diagnostics_manager
+
+        if hasattr(self, "_log_fused_up_configuration_if_ready"):
+            self._log_fused_up_configuration_if_ready()
 
     def set_delta_quant_enabled(self, enabled: bool):
         for l in self.text_encoder_loras + self.unet_loras:
             l.delta_q_enabled = enabled
+
+    def set_delta_quant_scope(self, scope: str):
+        if scope not in ("unet", "te", "both"):
+            raise ValueError(f"invalid delta quantization scope: {scope!r}")
+
+        self.delta_q_scope = scope
+        te_allowed = scope in ("te", "both")
+        unet_allowed = scope in ("unet", "both")
+        for l in self.text_encoder_loras:
+            l.delta_q_scope_allowed = te_allowed
+        for l in self.unet_loras:
+            l.delta_q_scope_allowed = unet_allowed
+        self._delta_q_scope_configured = True
+        if hasattr(self, "_log_fused_up_configuration_if_ready"):
+            self._log_fused_up_configuration_if_ready()
+
+    def _log_fused_up_configuration_if_ready(self):
+        if (
+            self._fused_up_config_logged
+            or not self._delta_q_scope_configured
+            or self.delta_q_triton_fused_up_mode != "c0"
+        ):
+            return
+
+        modules = self.text_encoder_loras + self.unet_loras
+        potential = [
+            l
+            for l in modules
+            if l.delta_q_scope_allowed
+            and l._fused_up_scope_allows_module()
+            and l.lora_dim == 4
+            and isinstance(l.lora_up, torch.nn.Linear)
+            and l.lora_up.bias is None
+            and l.lora_up.weight.dtype == torch.float32
+        ]
+        by_scope = {
+            "unet": sum(l.dq_scope == "unet" for l in potential),
+            "te": sum(l.dq_scope == "te" for l in potential),
+        }
+        logger.info(
+            "rank-4 Quantized LoRA-Up C0 configured: effective_scope=%s, "
+            "potential_fp32_linear_modules=%d (unet=%d, te=%d), diagnostics=%s",
+            self.delta_q_triton_fused_up_scope,
+            len(potential),
+            by_scope["unet"],
+            by_scope["te"],
+            self.delta_q_triton_fused_up_diagnostics,
+        )
+        if get_triton_rank4_quantized_lora_up_diagnostics is not None:
+            triton_info = get_triton_rank4_quantized_lora_up_diagnostics()
+            logger.info(
+                "rank-4 Quantized LoRA-Up Triton dispatch: triton=%s, "
+                "supported_capabilities=%s, supported_channels=%s, max_rows=%s",
+                triton_info.get("triton_version"),
+                triton_info.get("supported_capabilities"),
+                triton_info.get("supported_channel_counts"),
+                triton_info.get("max_rows"),
+            )
+        elif _TRITON_LORA_IMPORT_ERROR is not None:
+            logger.warning(
+                "rank-4 Quantized LoRA-Up could not import its Triton module and will use "
+                "the normal route: %s",
+                _TRITON_LORA_IMPORT_ERROR,
+            )
+        if not potential:
+            logger.warning(
+                "rank-4 Quantized LoRA-Up C0 has no structurally eligible FP32 rank-4 Linear modules; "
+                "runtime will use the normal route."
+            )
+        self._fused_up_config_logged = True
+
+    def get_delta_triton_fused_up_diagnostics(self) -> Dict[str, object]:
+        modules = self.text_encoder_loras + self.unet_loras
+        attempted = [l for l in modules if l.delta_q_fused_up_ever_attempted]
+        succeeded = [l for l in modules if l.delta_q_fused_up_ever_succeeded]
+        runtime_fallback_reasons: Dict[str, int] = {}
+        for l in attempted:
+            reason = l.delta_q_fused_up_last_fallback_reason
+            if reason is not None:
+                runtime_fallback_reasons[reason] = runtime_fallback_reasons.get(reason, 0) + 1
+
+        result: Dict[str, object] = {
+            "mode": self.delta_q_triton_fused_up_mode,
+            "scope": self.delta_q_triton_fused_up_scope,
+            "attempted_modules": len(attempted),
+            "successful_modules": len(succeeded),
+            "runtime_fallback_reasons": runtime_fallback_reasons,
+        }
+        if get_triton_rank4_quantized_lora_up_diagnostics is not None:
+            device = None
+            for lora in modules:
+                if lora.lora_up.weight.is_cuda:
+                    device = lora.lora_up.weight.device
+                    break
+            result["triton"] = get_triton_rank4_quantized_lora_up_diagnostics(device)
+        if self.dq_fused_up_diagnostics_manager is not None:
+            result.update(self.dq_fused_up_diagnostics_manager.export())
+        return result
+
+    def log_delta_triton_fused_up_diagnostics(
+        self,
+        *,
+        warn_on_zero: bool = True,
+    ) -> Dict[str, object]:
+        summary = self.get_delta_triton_fused_up_diagnostics()
+        if self.delta_q_triton_fused_up_mode != "c0":
+            return summary
+
+        successful_calls = summary.get("c0_calls")
+        if successful_calls is None:
+            logger.info(
+                "rank-4 Quantized LoRA-Up C0 result: attempted_modules=%d, "
+                "successful_modules=%d, per-call diagnostics=disabled",
+                summary["attempted_modules"],
+                summary["successful_modules"],
+            )
+        else:
+            logger.info(
+                "rank-4 Quantized LoRA-Up C0 result: attempted_modules=%d, "
+                "successful_modules=%d, successful_calls=%d, call_coverage=%.2f%%, "
+                "output_numel_coverage=%.2f%%",
+                summary["attempted_modules"],
+                summary["successful_modules"],
+                successful_calls,
+                float(summary["c0_call_coverage"]) * 100.0,
+                float(summary["c0_output_numel_coverage"]) * 100.0,
+            )
+        for reason, values in summary.get("fallback_reasons", {}).items():
+            logger.info(
+                "rank-4 Quantized LoRA-Up fallback: reason=%s, calls=%d, output_numel=%d",
+                reason,
+                values["calls"],
+                values["output_numel"],
+            )
+        if self.dq_fused_up_diagnostics_manager is None:
+            for reason, module_count in summary["runtime_fallback_reasons"].items():
+                logger.info(
+                    "rank-4 Quantized LoRA-Up runtime fallback: reason=%s, modules=%d",
+                    reason,
+                    module_count,
+                )
+        if warn_on_zero and int(summary["successful_modules"]) == 0:
+            logger.warning(
+                "rank-4 Quantized LoRA-Up C0 was requested but completed with zero successful C0 modules; "
+                "the normal LoRA-Up + quantization route was used."
+            )
+        return summary
 
     def set_dq_stats_state(
         self,
@@ -2218,8 +2756,17 @@ class LoRANetwork(torch.nn.Module):
         return all_params, lr_descriptions
 
     def enable_gradient_checkpointing(self):
-        # not supported
-        pass
+        # This network has no checkpointing implementation of its own, but
+        # the surrounding U-Net/TE may recompute LoRA forwards.  C0 currently
+        # falls back to the established route in that configuration.
+        self.delta_q_gradient_checkpointing = True
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.delta_q_gradient_checkpointing = True
+        if self.delta_q_triton_fused_up_mode == "c0":
+            logger.warning(
+                "rank-4 Quantized LoRA-Up C0 is disabled while gradient checkpointing is enabled; "
+                "the normal LoRA-Up + quantization route will be used."
+            )
 
     def prepare_grad_etc(self, text_encoder, unet):
         self.requires_grad_(True)
