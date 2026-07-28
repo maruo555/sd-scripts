@@ -34,7 +34,7 @@
     
 ### dq\_delta オプション一覧（基本）
 
-※ `--dq_delta_log` / `--dq_delta_auto_range_mul` 系は [dq_delta_autotune_spec-ja.md](dq_delta_autotune_spec-ja.md) に記載。
+※ `--dq_delta_log` / `--dq_delta_auto_range_mul` 系は [dq_delta_autotune_spec-ja.md](dq_delta_autotune_spec-ja.md)、rank 4 Quantized LoRA-Up（C0）と scope semantics version 2 は [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md) に記載。
 
 | オプション | 説明 |
 | --- | --- |
@@ -51,8 +51,27 @@
 | `--dq_quantize_z` | Δ ではなく `z=A(x)` を量子化（`B(Q(z))`）。rank r の z を対象に統計を取るため軽量化。 |
 | `--dq_delta_use_triton` | 対応するdq_delta scale/fake quantをoptional Triton kernelで高速化。未対応時はPyTorchへfallback。 |
 | `--dq_delta_triton_stats` | `--dq_delta_use_triton`と併用し、対応するbasic log/auto statsをfake quant Bへ融合。 |
+| `--dq_delta_triton_fused_up_mode {off,c0}` | `c0`でrank 4専用Quantized LoRA-Upを要求（既定OFF）。 |
+| `--dq_delta_triton_fused_up_scope {unet,te,both}` | C0の対象。既定はUNetで、実効対象は`dq_delta_scope`との共通部分。 |
 
 Tritonの導入方法、コード上の対応条件、長時間学習で検証済みの範囲は [triton_windows_setup.md](triton_windows_setup.md) を参照。
+
+### scope semantics version 2
+
+旧実装では、起動時に`--dq_delta_scope unet`でTEを対象外にしても、step更新の`set_delta_quant_enabled(True)`がその状態を上書きし、dq_delta開始後にTEを再有効化する場合がありました。version 2ではruntimeのON/OFFとscope許可を分離し、両方が有効なmoduleだけを量子化します。
+
+apply、log、auto、C0のscopeは起動時にrequested/resolvedを表示し、metadataへ`ss_dq_scope_semantics_version=2`とともに保存します。scopeの適用方式も`ss_dq_delta_scope_application`（`native` / `legacy` / `unsupported` / `not_configured`）へ保存します。dq_deltaを使うresumeでは旧runとの挙動差を警告します。
+
+旧実動作を近似再現する場合は、次を明示してください。
+
+```text
+--dq_delta_scope both
+--dq_delta_log_scope unet
+--dq_delta_auto_scope unet
+--dq_delta_triton_fused_up_mode off
+```
+
+詳細と注意点は [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md#scope-semantics-version-2) を参照してください。
 
 ### 量子化モードの前提
 

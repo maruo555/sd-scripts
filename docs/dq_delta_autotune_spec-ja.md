@@ -3,6 +3,8 @@
 本ドキュメントは、`--dq_delta_step / --dq_delta_bits` のフェイク量子化に対して、
 「ログ追加」と「range_mul のフィードバック制御（自動調律）」を導入するための仕様です。
 
+scope semantics version 2とrank 4 Quantized LoRA-Up（C0）の詳細は [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md) を参照してください。
+
 ## 目的
 
 - dq_delta の当たり外れ要因（特に clip 過多/過少）をログで可視化する
@@ -27,6 +29,8 @@
 - `--dq_delta_log_file <path>` : 省略時は `--output_dir/dq_delta_logs+<output_name>.txt`
 - `--dq_delta_log_extra {near_zero_rate}` : 追加ログ項目（デフォルト無効）
 - `--dq_delta_log_error_parts` は削除。clip/round成分分解は常用診断から外し、新規ログでは出力しない。
+
+`dq_delta_log_scope`のresolved値はapply scope（`dq_delta_scope`）との共通部分です。指定がapplyより広い場合はwarningを出して縮小し、共通部分が空ならログを無効化します。起動時ログとmetadataにはrequested/resolvedを分けて残します。
 
 ### 計測ポイント
 
@@ -442,7 +446,9 @@ auto_every | auto_ema | 実効履歴(更新回) | 実効履歴(optimizer step)
 ## 既存オプションとの組み合わせ
 
 - `--dq_delta_bits_sched` : 有効。bits はスケジュールに従い、range_mul は自動調整
-- `--dq_delta_scope` : ログ/制御対象の範囲
+- `--dq_delta_scope` : dq_deltaを適用する範囲
+- `--dq_delta_log_scope` : ログ対象。未指定時はapplyを継承し、resolved値はapplyとの共通部分
+- `--dq_delta_auto_scope` : auto統計対象。未指定時はapplyを継承し、applyの部分集合でない指定は起動時エラー
 - `--dq_quantize_z` : 対象テンソルが z に切り替わるのみ（挙動は同じ）
 - `--dq_delta_granularity` : tensor / channel 両対応。clip_rate は **全要素で集計**
 
@@ -456,6 +462,18 @@ auto_every | auto_ema | 実効履歴(更新回) | 実効履歴(optimizer step)
 
 - 既定は **初期値に戻す**（挙動が変わるため、ログに明記する）
 - 将来拡張として、trainer state に range_mul を保存して復元する方式を検討
+- dq_delta有効時は、scope semantics version 2より前のrunから再開すると実効scopeが変わる可能性をwarningで通知する
+
+旧実装では`dq_delta_scope=unet`でもstep開始後にTEが再有効化される不具合がありました。その旧実動作を近似再現する場合は次を使用します。
+
+```text
+--dq_delta_scope both
+--dq_delta_log_scope unet
+--dq_delta_auto_scope unet
+--dq_delta_triton_fused_up_mode off
+```
+
+経緯、metadataの`ss_dq_scope_semantics_version=2`、`ss_dq_delta_scope_application`、requested/resolvedの定義は [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md#scope-semantics-version-2) を参照してください。
 
 ## 計算量・VRAM 見積もり
 

@@ -2,6 +2,8 @@
 
 この文書は、dq_delta fake quantのoptional Triton高速化について、利用方法、コード上の対応範囲、実際に学習で検証した範囲、fallback、検証手順をまとめたものです。
 
+rank 4専用のQuantized LoRA-Up（C0）、scope semantics version 2、C0専用検証ツールは [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md) を参照してください。
+
 ## 基本方針
 
 - Tritonはoptionalとし、`requirements.txt`には追加しない。
@@ -31,14 +33,26 @@ python -c "import triton; print(triton.__version__)"
 
 公開requirementsへは追加しないため、環境ごとに互換性のあるTritonを別途導入してください。
 
+WindowsでTriton kernelを初回compileするときは、実行中のPythonと版・アーキテクチャが一致するPython開発ヘッダとimport library（例: `Python.h`と`python310.lib`）、およびVisual Studio 2022 C++ toolchain / Windows SDKが必要になる場合があります。組み込みPythonにこれらが入っていない環境では、Tritonのimport自体が成功しても初回compileに失敗することがあります。C0はwarningを記録して既存Triton A/BまたはPyTorchへfallbackしますが、高速経路を有効にするには開発ファイルとtoolchainを揃えてください。compile済みcacheがある環境だけで成功している状態と、cacheなしの初回起動を区別して確認します。
+
 ## CLIオプション
 
-正式な学習CLIは2つです。
+既存A/B用の正式な学習CLIは2つです。C0のCLIは後述します。
 
 | オプション | 既定 | 動作 |
 | --- | --- | --- |
 | `--dq_delta_use_triton` | OFF | 対応するscale計算とstochastic fake quantをTritonで処理する。 |
 | `--dq_delta_triton_stats` | OFF | 対応するbasic log/auto statsをBと同じTriton kernelへ融合する。`--dq_delta_use_triton`が必要。 |
+
+C0用の追加CLI:
+
+| オプション | 既定 | 動作 |
+| --- | --- | --- |
+| `--dq_delta_triton_fused_up_mode {off,c0}` | OFF | rank 4 LoRA-Up、channel RMS、stochastic fake quantの専用pipelineを要求する。 |
+| `--dq_delta_triton_fused_up_scope {unet,te,both}` | `unet` | C0を試すscope。apply scopeとの共通部分が実効対象。 |
+| `--dq_delta_triton_fused_up_diagnostics` | OFF | C0 coverage、shape、fallback理由を収集する。正式ベンチではOFF推奨。 |
+
+C0の経路優先順位は`C0 → 既存Triton A/B → PyTorch`です。`mode=c0`には`--dq_delta_use_triton`が必要です。未知GPU、未対応shape、kernel失敗は学習を止めずに後段へfallbackします。
 
 XL18相当の推奨指定:
 
@@ -298,6 +312,37 @@ python tools/benchmark_triton_quant.py --warmup 50 --iterations 1000 --repeats 7
 `--quick`は起動確認用です。正式測定では代表shapeについて、通常B、PyTorch basic stats、fused B+stats、PyTorch乱数とaccumulator更新を含む本番相当処理をCUDA Eventsで比較します。
 
 過去の採否測定では、fused statsはseparate statsより対象module処理で約2.09～2.59倍速く、本番相当比較でも約2.15～2.47倍でした。これはstats対象処理だけの倍率で、学習全体の倍率ではありません。
+
+### rank 4 Quantized LoRA-Up（C0）
+
+correctness、fixed rand、native backward oracle、fallback、`eps=1e-8`、basic statsの非微分性:
+
+```bash
+python tools/check_triton_lora.py --quick
+python tools/check_triton_lora.py
+```
+
+既存A/B baselineとC0のCUDA Events比較:
+
+```bash
+python tools/benchmark_triton_lora.py --quick
+python tools/benchmark_triton_lora.py --warmup 50 --iterations 1000 --repeats 7
+python tools/benchmark_triton_lora.py --basic-stats --warmup 50 --iterations 1000 --repeats 7
+```
+
+`benchmark_triton_lora.py`の既定はproduction RNGで、各forwardのPyTorch乱数生成・確保をbaselineとC0の両方に含めます。`--basic-stats`はpacked basic statsありの経路を比較します。`--fixed-rand`は乱数tensorを事前生成して再利用するkernel-only調査用であり、正式な性能判定には使いません。
+
+RTX 5080 / capability `(12, 0)` の正式performance dispatchは、rows bucket `1..128` / `129..512` / `513..2048`、channel `320, 640, 768, 1280, 2560, 3072, 5120, 10240`、stats mode `none` / `basic`です。activation=`float16`、LoRA-Up weight=`float32`を前提とし、各bucketの代表・境界shapeについてproduction RNG込みforward+backwardが既存A/Bに対して`1.05x`以上になることを採用条件にしています。
+
+C0成功caseが0件の場合、両ツールは成功扱いにしません。correctness relative L2は約`1e-6`〜`7e-5`、勾配はbitwise一致でした。production RNG込みforward+backwardのgrid最小speedupはstatsなし`1.139x`、basic statsあり`1.088x`で、basic stats最小条件の再測定は`1.131x`でした。
+
+このdispatchは学習のforward+backward専用です。forward-onlyへ流用せず、学習中のサンプル生成など`torch.no_grad()`のforwardも通常経路へ戻します。basic statsの`rows=513, channel=10240`でforward-onlyが`0.865x`だった例があるため、推論などを対象にする場合は別tableで採否を測ります。上記はC0対象処理の倍率であり、学習全体で3〜8%という候補値は未検証です。実学習のA/C交互測定が必要です。
+
+VRAMはbaseline/C0を別processで測り、peak allocatedを正式値、peak reservedを参考値にします。適用条件、memory-modeコマンド、errorとfallbackの区別は [C0ガイド](rank4_quantized_lora_up-ja.md#検証コマンド) を参照してください。
+
+production RNG込みの別process測定では、`rows=468, channel=1280`のabsolute peak allocatedがbaseline `26,663,936`、C0 `18,599,936 bytes`（`-30.2%`）、`rows=468, channel=10240`がbaseline `94,007,296`、C0 `85,364,736 bytes`（`-9.2%`）でした。
+
+ただし、`peak allocated - allocated before`で求めるcall増分は、1280が`6,005,760 → 6,461,440 bytes`（`+7.6%`）、10240が`48,046,080 → 47,923,200 bytes`（`-0.26%`）です。routeごとのpersistent allocationが異なるため、absolute peakの減少だけをC0 kernel単体の削減率とは解釈しません。production RNGではcall増分は概ね同等で、1280は少し増えています。学習全体のVRAM効果は実学習processで確認します。
 
 ### PyTorch基準テスト
 
