@@ -1,6 +1,6 @@
 # rank 4 Quantized LoRA-Up（C0）設計・利用・検証ガイド
 
-この文書は、dq_delta の rank 4 専用高速経路「Quantized LoRA-Up（C0）」と、同時に導入した scope semantics version 2 をまとめたものです。
+この文書は、dq_delta の rank 4 専用高速経路「Quantized LoRA-Up（C0）」をまとめたものです。scope semantics version 2の経緯と旧実動作の再現設定は [dq_deltaの仕組み](dq_delta_mechanism-ja.md#scope-semantics-version-2) を参照してください。
 
 - dq_delta 全体の仕組み: [dq_delta_mechanism-ja.md](dq_delta_mechanism-ja.md)
 - ログと auto の仕様: [dq_delta_autotune_spec-ja.md](dq_delta_autotune_spec-ja.md)
@@ -156,45 +156,13 @@ Windows の初回 Triton compile では、Python 開発ヘッダ / import librar
 
 失敗した kernel 構成は failure cache に記録し、同じ構成を毎回再試行しません。C0 を要求したのに学習終了まで成功が0回だった場合は、全rankの成功件数を集約して warning を出します。ベンチマークでは C0 成功が0件なら測定成功とはせず、非0の終了コードで失敗させます。
 
-## scope semantics version 2
+## scope semantics version 2との関係
 
-### 修正前の不具合
+C0の実効対象は`--dq_delta_scope`と`--dq_delta_triton_fused_up_scope`の共通部分です。現行版でU-Netだけを量子化する場合は、`--dq_delta_scope unet`のままで問題ありません。
 
-旧実装では、起動時に `--dq_delta_scope unet` を適用して TE を無効化しても、step 更新の `set_delta_quant_enabled(True)` が module の有効状態を直接上書きしていました。そのため dq_delta 開始後は TE が再有効化され、実際には `both` に近い適用になる場合がありました。
+旧版の`unet`指定でTEも量子化されていた不具合の経緯、metadata、resume時の注意、旧実動作の近似再現設定は [dq_deltaの仕組み](dq_delta_mechanism-ja.md#scope-semantics-version-2) に集約しています。C0のA/C比較で旧実動作にscopeを揃える場合も、同節の設定を共通条件とし、C0のmodeだけを切り替えてください。`--dq_delta_triton_fused_up_scope unet`なら、TEはC0ではなく既存Triton A/BまたはPyTorch経路を使います。
 
-version 2 では次を分離し、実効状態を論理積で決めます。
-
-```text
-effective_enabled = runtime_enabled AND scope_allowed
-```
-
-step による ON/OFF は `runtime_enabled` だけを更新し、scope 制約を上書きしません。`networks/lora_lbw.py` に入るのはこの scope 修正だけで、C0 は実装しません。また、`lora_lbw.py` は C0 性能 baseline の対象外です。
-
-### requested と resolved
-
-起動時ログと保存 metadata には scope の指定値（requested）と実際の値（resolved）を分けて記録します。metadata には `ss_dq_scope_semantics_version=2` も保存します。`ss_dq_delta_scope_application` は適用方式を記録し、組み込みのversion 2 APIは `native`、旧networkへの再適用fallbackは `legacy`、適用不能は `unsupported`、dq_delta未設定は `not_configured` です。
-
-- apply: `--dq_delta_scope`
-- log: `--dq_delta_log_scope`。未指定時は apply を継承し、指定時も apply との共通部分へ制限
-- auto: `--dq_delta_auto_scope`。未指定時は apply を継承し、apply の部分集合でなければ起動エラー
-- C0: `--dq_delta_triton_fused_up_scope`。実際の対象は apply との共通部分
-
-log scope が apply scope より広い場合は resolved scope を共通部分へ縮小し、warning を出します。共通部分が空なら dq_delta log を無効化します。
-
-### resume と旧実動作の近似再現
-
-dq_delta 有効時に `--resume` を使うと、version 2 より前の run から scope の実効動作が変わる可能性があるため、起動時に警告します。
-
-旧実装で「指定は UNet だったが、step 開始後は TE も量子化されていた」状態をできるだけ近く再現する設定は次です。
-
-```text
---dq_delta_scope both
---dq_delta_log_scope unet
---dq_delta_auto_scope unet
---dq_delta_triton_fused_up_mode off
-```
-
-これは旧バグの実効 scope を明示的な正常設定へ置き換えるものです。コード版、乱数列、optimizer state など他の差まで完全再現する保証ではありません。
+`networks/lora_lbw.py`にはscope修正だけが入り、C0は実装されません。また、`lora_lbw.py`はC0性能baselineの対象外です。
 
 ## RTX 5080 synthetic 検証結果
 

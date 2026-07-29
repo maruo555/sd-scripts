@@ -86,13 +86,18 @@
 | `--dq_delta_range_mul`（独自） | 3.0 | dq_delta のレンジ倍率 | 量子化レンジの広さ |
 | `--dq_delta_mode`（独自） | stoch | dq_delta の丸め方式 | 確率的丸め |
 | `--dq_delta_begin_after_lr_warmup`（独自） | 有効 | 学習率のwarmup完了後からdq_delta を開始 | 事前に学習率のwarmupをすることで量子化を安定させる |
-| `--dq_delta_scope`（独自） | unet | dq_delta の適用対象 | U-Net のみ |
+| `--dq_delta_scope`（独自） | unet | dq_delta の適用対象 | 現行のscope semantics version 2ではU-Netのみ。旧版にはTEが再有効化される不具合があったため、下記の注意を参照 |
 | `--dq_delta_bits_sched`（独自） | `0.0:8,0.9:10` | 進行率で bits を切替 | 終盤で刻みを細かくする 効果があるか不明　途中でbit数を増やすのと破綻しやすくなる可能性もありそう |
 | `--dq_delta_log`（独自） | 有効 | dq_delta の統計ログを出力 | クリップ率等の確認用 |
 | `--dq_delta_auto_range_mul`（独自） | 有効 | clip_rate を見て range_mul を自動調整 | 過/不足クリップを自動補正 データセットによっては初期値から変わらないこともある |
+| `--dq_delta_auto_scope`（独自） | 未指定 | auto 統計の対象 | 未指定時は`--dq_delta_scope`を継承。旧版の実動作を近似再現する場合は`unet`を明示 |
 | `--dq_delta_auto_preset`（独自） | clip_rate_high | auto 調整のプリセット | clip_low/high を選択。`clip_rate_low_auto` はlow帯で開始し、`QErrPerClip` が高い状態が続くとmid帯へ逃がす |
 | `--dq_delta_auto_init_range_mul_from_band`（独自） | 有効 | clip 帯中心から range_mul 初期値を算出 | `stat=rms` 前提 適正なrange_mulからスタートすることで安定させる |
 | `--dq_delta_auto_use_raw`（独自） | 有効 | auto 判定に ema だけでなくraw も併用 | range_mulの変化をなだらかにする |
+
+### `dq_delta_scope=unet`の互換性
+
+現行版の`--dq_delta_scope unet`は指定どおりU-Netだけを量子化します。旧版ではstep開始後にTEも量子化される不具合があったため、過去の学習結果を近似再現する場合やC0のA/C比較を旧実動作に揃える場合は、[scope互換性の説明](dq_delta_mechanism-ja.md#scope-semantics-version-2) にある設定を使用してください。
 
 ### 量子化のヒント
 

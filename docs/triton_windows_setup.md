@@ -2,7 +2,7 @@
 
 この文書は、dq_delta fake quantのoptional Triton高速化について、利用方法、コード上の対応範囲、実際に学習で検証した範囲、fallback、検証手順をまとめたものです。
 
-rank 4専用のQuantized LoRA-Up（C0）、scope semantics version 2、C0専用検証ツールは [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md) を参照してください。
+rank 4専用のQuantized LoRA-Up（C0）とC0専用検証ツールは [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md)、scope semantics version 2は [dq_deltaの仕組み](dq_delta_mechanism-ja.md#scope-semantics-version-2) を参照してください。
 
 ## 基本方針
 
@@ -53,6 +53,8 @@ C0用の追加CLI:
 | `--dq_delta_triton_fused_up_diagnostics` | OFF | C0 coverage、shape、fallback理由を収集する。正式ベンチではOFF推奨。 |
 
 C0の経路優先順位は`C0 → 既存Triton A/B → PyTorch`です。`mode=c0`には`--dq_delta_use_triton`が必要です。未知GPU、未対応shape、kernel失敗は学習を止めずに後段へfallbackします。
+
+scope semantics version 2より前は、`--dq_delta_scope unet`でもstep開始後にTEが再有効化される不具合がありました。現行版のU-Net限定設定は`unet`のままです。旧実動作の近似再現設定とC0のA/C比較条件は [scope互換性の説明](dq_delta_mechanism-ja.md#scope-semantics-version-2) を参照してください。
 
 XL18相当の推奨指定:
 

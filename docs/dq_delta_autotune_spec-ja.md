@@ -3,7 +3,7 @@
 本ドキュメントは、`--dq_delta_step / --dq_delta_bits` のフェイク量子化に対して、
 「ログ追加」と「range_mul のフィードバック制御（自動調律）」を導入するための仕様です。
 
-scope semantics version 2とrank 4 Quantized LoRA-Up（C0）の詳細は [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md) を参照してください。
+scope semantics version 2の詳細は [dq_deltaの仕組み](dq_delta_mechanism-ja.md#scope-semantics-version-2)、rank 4 Quantized LoRA-Up（C0）は [C0ガイド](rank4_quantized_lora_up-ja.md) を参照してください。
 
 ## 目的
 
@@ -464,16 +464,7 @@ auto_every | auto_ema | 実効履歴(更新回) | 実効履歴(optimizer step)
 - 将来拡張として、trainer state に range_mul を保存して復元する方式を検討
 - dq_delta有効時は、scope semantics version 2より前のrunから再開すると実効scopeが変わる可能性をwarningで通知する
 
-旧実装では`dq_delta_scope=unet`でもstep開始後にTEが再有効化される不具合がありました。その旧実動作を近似再現する場合は次を使用します。
-
-```text
---dq_delta_scope both
---dq_delta_log_scope unet
---dq_delta_auto_scope unet
---dq_delta_triton_fused_up_mode off
-```
-
-経緯、metadataの`ss_dq_scope_semantics_version=2`、`ss_dq_delta_scope_application`、requested/resolvedの定義は [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md#scope-semantics-version-2) を参照してください。
+旧実装では`dq_delta_scope=unet`でもstep開始後にTEが再有効化される不具合がありました。現行版でU-Netだけを量子化する通常設定は`unet`のままです。旧実動作の近似再現設定と、metadata・requested/resolvedの定義は [scope互換性の説明](dq_delta_mechanism-ja.md#scope-semantics-version-2) を参照してください。
 
 ## 計算量・VRAM 見積もり
 

@@ -34,7 +34,7 @@
     
 ### dq\_delta オプション一覧（基本）
 
-※ `--dq_delta_log` / `--dq_delta_auto_range_mul` 系は [dq_delta_autotune_spec-ja.md](dq_delta_autotune_spec-ja.md)、rank 4 Quantized LoRA-Up（C0）と scope semantics version 2 は [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md) に記載。
+※ `--dq_delta_log` / `--dq_delta_auto_range_mul` 系は [dq_delta_autotune_spec-ja.md](dq_delta_autotune_spec-ja.md)、rank 4 Quantized LoRA-Up（C0）は [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md) に記載。
 
 | オプション | 説明 |
 | --- | --- |
@@ -53,16 +53,28 @@
 | `--dq_delta_triton_stats` | `--dq_delta_use_triton`と併用し、対応するbasic log/auto statsをfake quant Bへ融合。 |
 | `--dq_delta_triton_fused_up_mode {off,c0}` | `c0`でrank 4専用Quantized LoRA-Upを要求（既定OFF）。 |
 | `--dq_delta_triton_fused_up_scope {unet,te,both}` | C0の対象。既定はUNetで、実効対象は`dq_delta_scope`との共通部分。 |
+| `--dq_delta_triton_fused_up_diagnostics` | C0のshape、coverage、fallback理由を収集。正式な速度測定ではOFF推奨。 |
 
 Tritonの導入方法、コード上の対応条件、長時間学習で検証済みの範囲は [triton_windows_setup.md](triton_windows_setup.md) を参照。
 
 ### scope semantics version 2
 
-旧実装では、起動時に`--dq_delta_scope unet`でTEを対象外にしても、step更新の`set_delta_quant_enabled(True)`がその状態を上書きし、dq_delta開始後にTEを再有効化する場合がありました。version 2ではruntimeのON/OFFとscope許可を分離し、両方が有効なmoduleだけを量子化します。
+旧実装では、起動時に`--dq_delta_scope unet`でTEを対象外にしても、step更新の`set_delta_quant_enabled(True)`がその状態を上書きし、dq_delta開始後にTEを再有効化する場合がありました。そのため、設定上は`unet`でも量子化の適用先は実質`both`に近く、logとauto統計はUNetだけを見るという不一致が生じていました。
 
-apply、log、auto、C0のscopeは起動時にrequested/resolvedを表示し、metadataへ`ss_dq_scope_semantics_version=2`とともに保存します。scopeの適用方式も`ss_dq_delta_scope_application`（`native` / `legacy` / `unsupported` / `not_configured`）へ保存します。dq_deltaを使うresumeでは旧runとの挙動差を警告します。
+version 2ではruntimeのON/OFFとscope許可を分離し、実効状態を次の論理積で決めます。step更新は`runtime_enabled`だけを変更するため、scope制約を上書きしません。
 
-旧実動作を近似再現する場合は、次を明示してください。
+```text
+effective_enabled = runtime_enabled AND scope_allowed
+```
+
+apply、log、auto、C0のscopeは起動時にrequested/resolvedを表示し、metadataへ`ss_dq_scope_semantics_version=2`とともに保存します。scopeの適用方式も`ss_dq_delta_scope_application`（組み込みのversion 2 APIは`native`、旧networkへの再適用fallbackは`legacy`、適用不能は`unsupported`、dq_delta未設定は`not_configured`）へ保存します。dq_deltaを使うresumeでは旧runとの挙動差を警告します。
+
+- apply: `--dq_delta_scope`
+- log: `--dq_delta_log_scope`。未指定時はapplyを継承し、指定時もapplyとの共通部分へ制限
+- auto: `--dq_delta_auto_scope`。未指定時はapplyを継承し、applyの部分集合でなければ起動エラー
+- C0: `--dq_delta_triton_fused_up_scope`。実効対象はapplyとの共通部分
+
+旧実装で「指定はUNetだったが、step開始後はTEも量子化されていた」実動作を近似再現する場合は、次を明示してください。
 
 ```text
 --dq_delta_scope both
@@ -71,7 +83,11 @@ apply、log、auto、C0のscopeは起動時にrequested/resolvedを表示し、m
 --dq_delta_triton_fused_up_mode off
 ```
 
-詳細と注意点は [rank4_quantized_lora_up-ja.md](rank4_quantized_lora_up-ja.md#scope-semantics-version-2) を参照してください。
+これは旧バグの実効scopeを明示的な正常設定へ置き換えるものです。コード版、乱数列、optimizer stateなど他の差まで完全再現する保証はありません。
+
+現行版で本来の意図どおりU-Netだけを量子化する場合は、`--dq_delta_scope unet`のままで問題ありません。`both`への変更が必要なのは、旧版の不具合を含む実動作に寄せたい場合だけです。過去の`unet`指定runをresumeする場合や、気に入った旧runと比較する場合は、この違いを学習条件の変更として扱ってください。
+
+C0のA/C比較で旧実動作に適用scopeを揃える場合は、上記4設定のうち`--dq_delta_triton_fused_up_mode`以外を共通にし、`--dq_delta_triton_fused_up_scope unet`を追加します。Aは`mode off`、Cは`mode c0`とします。この場合、TEも量子化されますが、C0の対象はUNetだけで、TEは既存Triton A/BまたはPyTorch経路を使います。
 
 ### 量子化モードの前提
 
