@@ -9,6 +9,7 @@
 
 | オプション | 既定値 | 主な効果 | 実装箇所／備考 |
 |------------|:------:|----------|----------------|
+| `--optimizer_type AdamW8bitFast` | 無効 | **LoRA向けAdamW8bit同期集約版**。bitsandbytesと同じ更新・stateを維持し、parameterごとのCUDA同期をstep末尾の1回へまとめる。 | 実験用。単GPU・non-paged CUDAで自動高速化し、非対応条件はstock AdamW8bitへfallback。fork不要。詳細: [docs/adamw8bit_fast-ja.md](docs/adamw8bit_fast-ja.md) |
 | `--downscale_freq_shift` | `0.0` | **時間埋め込みの周波数ダウンスケール**を 1.0 (従来値) に戻す。キャラクター LoRA で *identity* が定着しやすい傾向。 | `library/sdxl_original_unet.py`<br>本家 PR #1187 で 1.0→0.0 に変更された挙動を選択式に復活。|
 | `--te_mlp_fc_only` | 全層 | Text Encoder の学習対象を **MLP (全結合) 層だけ**に限定。キーワードベースのキャラ LoRA で“語彙を固めつつ柔軟性を保つ”目的。 | 本家 PR #1964 以前の挙動を再現。|
 | `--fp16_safe_norms` | `False` | 縮約系（LayerNorm/GroupNorm/Softmax）だけ **fp32 で演算**し、重みと他演算は fp16 のまま。fp16 + 小バッチ（例: `batch_size=1`）で学習安定性を向上。 | `library/sdxl_original_unet.py` にラッパ実装。<br>注意: Softmax の fp32 化は通常のAttention経路のみ（`--xformers`/`--sdpa` 使用時は各実装に依存）。Normは全経路でfp32化。|
