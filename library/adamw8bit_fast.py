@@ -1,5 +1,10 @@
+# The optimizer step control flow in this file is adapted from bitsandbytes,
+# which is distributed under the MIT License.
+# See third_party/bitsandbytes-LICENSE.txt.
+
 from __future__ import annotations
 
+import logging
 from typing import Callable, Optional
 
 import torch
@@ -8,6 +13,9 @@ try:
     import bitsandbytes as bnb
 except ImportError as exc:  # pragma: no cover - handled by optimizer selection
     raise ImportError("AdamW8bitFast requires bitsandbytes") from exc
+
+logger = logging.getLogger(__name__)
+BITSANDBYTES_VERSION = getattr(bnb, "__version__", "unknown")
 
 
 class AdamW8bitFast(bnb.optim.AdamW8bit):
@@ -24,13 +32,40 @@ class AdamW8bitFast(bnb.optim.AdamW8bit):
     closure-based calls use the unmodified bitsandbytes implementation.
     """
 
-    def _fast_path_device(self) -> tuple[bool, Optional[torch.device]]:
+    def _log_fast_path_once(self, device: torch.device) -> None:
+        if getattr(self, "_adamw8bit_fast_path_logged", False):
+            return
+        logger.info(
+            "AdamW8bitFast: fast path enabled on %s (bitsandbytes %s)",
+            device,
+            BITSANDBYTES_VERSION,
+        )
+        self._adamw8bit_fast_path_logged = True
+
+    def _log_stock_fallback_once(self, reason: str) -> None:
+        if getattr(self, "_adamw8bit_stock_fallback_logged", False):
+            return
+        logger.warning(
+            "AdamW8bitFast: using stock AdamW8bit step (reason: %s, bitsandbytes %s)",
+            reason,
+            BITSANDBYTES_VERSION,
+        )
+        self._adamw8bit_stock_fallback_logged = True
+
+    def _has_active_gradients(self) -> bool:
+        return any(param.grad is not None for group in self.param_groups for param in group["params"])
+
+    def _fast_path_device(self) -> tuple[bool, Optional[torch.device], Optional[str]]:
         if self.is_paged:
-            return False, None
+            return False, None, "paged optimizer"
+        if getattr(self.args, "percentile_clipping", 100) < 100:
+            return False, None, "percentile_clipping is enabled"
+        if getattr(self.args, "max_unorm", 0.0) > 0.0:
+            return False, None, "max_unorm is enabled"
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_world_size() > 1:
-                return False, None
+                return False, None, f"distributed world size {torch.distributed.get_world_size()}"
 
         active_device: Optional[torch.device] = None
         for group in self.param_groups:
@@ -39,17 +74,19 @@ class AdamW8bitFast(bnb.optim.AdamW8bit):
                 if grad is None:
                     continue
                 if type(param) is not torch.nn.Parameter or type(grad) is not torch.Tensor:
-                    return False, None
-                if param.device.type != "cuda" or grad.device != param.device:
-                    return False, None
+                    return False, None, "parameter or gradient uses a Tensor subclass"
+                if param.device.type != "cuda":
+                    return False, None, f"parameter is on {param.device.type}"
+                if grad.device != param.device:
+                    return False, None, "gradient and parameter are on different devices"
                 if param.layout != torch.strided or grad.layout != torch.strided or grad.is_sparse:
-                    return False, None
+                    return False, None, "parameter or gradient is not dense strided"
                 if active_device is None:
                     active_device = param.device
                 elif param.device != active_device:
-                    return False, None
+                    return False, None, "active gradients span multiple CUDA devices"
 
-        return True, active_device
+        return True, active_device, None
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], torch.Tensor]] = None):
@@ -57,11 +94,17 @@ class AdamW8bitFast(bnb.optim.AdamW8bit):
         # control of closure evaluation and route selection in that uncommon
         # case.
         if closure is not None:
+            self._log_stock_fallback_once("optimizer closure")
             return super().step(closure)
 
-        can_use_fast_path, device = self._fast_path_device()
+        can_use_fast_path, device, fallback_reason = self._fast_path_device()
         if not can_use_fast_path:
+            if self._has_active_gradients():
+                self._log_stock_fallback_once(fallback_reason or "unsupported configuration")
             return super().step()
+
+        if device is not None:
+            self._log_fast_path_once(device)
 
         if not self.initialized:
             self.check_overrides()

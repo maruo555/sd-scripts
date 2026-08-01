@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -26,7 +28,7 @@ def _assert_optimizer_state_equal(stock, fast, stock_params, fast_params) -> Non
                 assert stock_value == fast_value, key
 
 
-def test_cpu_parameters_use_stock_bitsandbytes_step(monkeypatch):
+def test_cpu_parameters_use_stock_bitsandbytes_step_and_log_once(monkeypatch, caplog):
     param = torch.nn.Parameter(torch.ones(8))
     param.grad = torch.ones_like(param)
     optimizer = AdamW8bitFast([param], lr=1e-3)
@@ -38,8 +40,16 @@ def test_cpu_parameters_use_stock_bitsandbytes_step(monkeypatch):
 
     monkeypatch.setattr(bnb.optim.AdamW8bit, "step", stock_step)
 
-    assert optimizer.step() == "stock-route"
-    assert calls == [None]
+    with caplog.at_level(logging.WARNING, logger="library.adamw8bit_fast"):
+        assert optimizer.step() == "stock-route"
+        assert optimizer.step() == "stock-route"
+
+    assert calls == [None, None]
+    messages = [record.getMessage() for record in caplog.records if record.name == "library.adamw8bit_fast"]
+    assert len(messages) == 1
+    assert "using stock AdamW8bit step" in messages[0]
+    assert "parameter is on cpu" in messages[0]
+    assert f"bitsandbytes {bnb.__version__}" in messages[0]
 
 
 def test_optimizer_selection_accepts_adamw8bit_fast():
@@ -65,7 +75,12 @@ def test_optimizer_selection_accepts_adamw8bit_fast():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-def test_fast_step_matches_stock_parameters_and_all_states(dtype):
+@pytest.mark.parametrize(
+    "optimizer_options",
+    [{}, {"block_wise": False}],
+    ids=["default", "non-blockwise"],
+)
+def test_fast_step_matches_stock_parameters_and_all_states(dtype, optimizer_options):
     generator = torch.Generator(device="cuda").manual_seed(20260801)
     shapes = [(64, 80), (32, 80), (64, 128), (48, 64)]  # both sides of min_8bit_size=4096
     initial = [torch.randn(shape, device="cuda", dtype=dtype, generator=generator) * 0.01 for shape in shapes]
@@ -80,7 +95,12 @@ def test_fast_step_matches_stock_parameters_and_all_states(dtype):
         {"params": fast_params[:2], "lr": 3.5e-4},
         {"params": fast_params[2:], "lr": 2.0e-4},
     ]
-    kwargs = {"lr": 1e-3, "betas": (0.9, 0.995), "weight_decay": 0.01}
+    kwargs = {
+        "lr": 1e-3,
+        "betas": (0.9, 0.995),
+        "weight_decay": 0.01,
+        **optimizer_options,
+    }
     stock = bnb.optim.AdamW8bit(stock_groups, **kwargs)
     fast = AdamW8bitFast(fast_groups, **kwargs)
 
@@ -114,6 +134,98 @@ def test_fast_step_matches_stock_parameters_and_all_states(dtype):
     }
     assert torch.uint8 in state_dtypes
     assert torch.float32 in state_dtypes
+
+
+def test_percentile_clipping_uses_stock_step_and_logs_once(monkeypatch, caplog):
+    param = torch.nn.Parameter(torch.ones(8))
+    optimizer = AdamW8bitFast([param], lr=1e-3, percentile_clipping=50)
+    calls = []
+
+    def stock_step(self, closure=None):
+        calls.append(closure)
+        return "stock-route"
+
+    monkeypatch.setattr(bnb.optim.AdamW8bit, "step", stock_step)
+
+    with caplog.at_level(logging.WARNING, logger="library.adamw8bit_fast"):
+        assert optimizer.step() == "stock-route"
+        assert not [record for record in caplog.records if record.name == "library.adamw8bit_fast"]
+        param.grad = torch.ones_like(param)
+        assert optimizer.step() == "stock-route"
+        assert optimizer.step() == "stock-route"
+
+    assert calls == [None, None, None]
+    messages = [record.getMessage() for record in caplog.records if record.name == "library.adamw8bit_fast"]
+    assert len(messages) == 1
+    assert "percentile_clipping is enabled" in messages[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("source_class", "target_class"),
+    [
+        (bnb.optim.AdamW8bit, AdamW8bitFast),
+        (AdamW8bitFast, bnb.optim.AdamW8bit),
+    ],
+    ids=["stock-to-fast", "fast-to-stock"],
+)
+def test_state_dict_can_resume_between_stock_and_fast(source_class, target_class):
+    generator = torch.Generator(device="cuda").manual_seed(20260802)
+    initial = [
+        torch.randn((64, 80), device="cuda", dtype=torch.float32, generator=generator) * 0.01,
+        torch.randn((32, 80), device="cuda", dtype=torch.float32, generator=generator) * 0.01,
+    ]
+    source_params = [torch.nn.Parameter(value.clone()) for value in initial]
+    source_groups = [
+        {"params": source_params[:1], "lr": 3.5e-4},
+        {"params": source_params[1:], "lr": 2.0e-4},
+    ]
+    kwargs = {"lr": 1e-3, "betas": (0.9, 0.995), "weight_decay": 0.01}
+    source = source_class(source_groups, **kwargs)
+
+    for _ in range(3):
+        for param in source_params:
+            param.grad = torch.randn(param.shape, device="cuda", dtype=param.dtype, generator=generator)
+        source.step()
+
+    target_params = [torch.nn.Parameter(param.detach().clone()) for param in source_params]
+    target_groups = [
+        {"params": target_params[:1], "lr": 3.5e-4},
+        {"params": target_params[1:], "lr": 2.0e-4},
+    ]
+    target = target_class(target_groups, **kwargs)
+    target.load_state_dict(copy.deepcopy(source.state_dict()))
+    _assert_optimizer_state_equal(source, target, source_params, target_params)
+
+    for source_param, target_param in zip(source_params, target_params):
+        grad = torch.randn(source_param.shape, device="cuda", dtype=source_param.dtype, generator=generator)
+        source_param.grad = grad.clone()
+        target_param.grad = grad.clone()
+
+    source.step()
+    target.step()
+
+    for source_param, target_param in zip(source_params, target_params):
+        assert torch.equal(source_param, target_param)
+    _assert_optimizer_state_equal(source, target, source_params, target_params)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fast_path_logs_device_and_bitsandbytes_version_once(caplog):
+    param = torch.nn.Parameter(torch.randn((64, 80), device="cuda", dtype=torch.float32))
+    optimizer = AdamW8bitFast([param], lr=1e-3)
+
+    with caplog.at_level(logging.INFO, logger="library.adamw8bit_fast"):
+        optimizer.step()
+        assert not [record for record in caplog.records if record.name == "library.adamw8bit_fast"]
+        for _ in range(2):
+            param.grad = torch.randn_like(param)
+            optimizer.step()
+
+    messages = [record.getMessage() for record in caplog.records if record.name == "library.adamw8bit_fast"]
+    assert len(messages) == 1
+    assert "fast path enabled on cuda:0" in messages[0]
+    assert f"bitsandbytes {bnb.__version__}" in messages[0]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

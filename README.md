@@ -150,7 +150,7 @@ accelerate config
 
 If `python -m venv` shows only `python`, change `python` to `py`.
 
-Note: Now `bitsandbytes==0.44.0`, `prodigyopt==1.0` and `lion-pytorch==0.0.6` are included in the requirements.txt. If you'd like to use the another version, please install it manually.
+Note: The original version used `bitsandbytes==0.44.0` (`0.48.2` in this fork). The latest upstream no longer pins the bitsandbytes version, while this fork pins the GPU-tested `0.48.2` in requirements.txt. `prodigyopt==1.0` and `lion-pytorch==0.0.6` are also included. If you'd like to use another version, please install it manually.
 
 This installation is for CUDA 11.8. If you use a different version of CUDA, please install the appropriate version of PyTorch and xformers. For example, if you use CUDA 12, please install `pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu121` and `pip install xformers==0.0.23.post1 --index-url https://download.pytorch.org/whl/cu121`.
 
@@ -209,7 +209,7 @@ The majority of scripts is licensed under ASL 2.0 (including codes from Diffuser
 
 [Memory Efficient Attention Pytorch](https://github.com/lucidrains/memory-efficient-attention-pytorch): MIT
 
-[bitsandbytes](https://github.com/TimDettmers/bitsandbytes): MIT
+[bitsandbytes](https://github.com/TimDettmers/bitsandbytes): MIT ([license](third_party/bitsandbytes-LICENSE.txt))
 
 [BLIP](https://github.com/salesforce/BLIP): BSD-3-Clause
 
