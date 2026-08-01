@@ -199,18 +199,21 @@ Note: Some user reports ``ValueError: fp16 mixed precision requires a GPU`` is o
 
 When a new release comes out you can upgrade your repo with the following command:
 
+Important: If your virtual environment was created with the previous PyTorch 2.1.2 / torchvision 0.16.2 instructions, do not upgrade it by installing only `requirements.txt`. `bitsandbytes==0.48.2` requires PyTorch 2.3 or later. Create a new virtual environment and follow the current [Windows Installation](#windows-installation) steps so that PyTorch and torchvision are upgraded as a compatible pair. The commands below are for an environment that has already been migrated to the tested PyTorch 2.9.1 / torchvision 0.24.1 setup.
+
 ```powershell
 cd sd-scripts
 git pull
 .\venv\Scripts\activate
-pip install --use-pep517 --upgrade -r requirements.txt
+python -m pip install --use-pep517 --upgrade -r requirements.txt
+python -m pip check
 ```
 
 Once the commands have completed successfully you should be ready to use the new version.
 
 ### Upgrade PyTorch
 
-If you want to upgrade PyTorch, you can upgrade it with `pip install` command in [Windows Installation](#windows-installation) section. `xformers` is also required to be upgraded when PyTorch is upgraded.
+When changing PyTorch versions, install a compatible PyTorch and torchvision pair together. xformers is not required when using SDPA. If you use xformers, update it to a build compatible with the selected PyTorch and CUDA versions.
 
 ## Credits
 

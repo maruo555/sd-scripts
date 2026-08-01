@@ -109,11 +109,14 @@ accelerate configの質問には以下のように答えてください。（bf1
 
 新しいリリースがあった場合、以下のコマンドで更新できます。
 
+重要：以前の手順に従ってPyTorch 2.1.2 / torchvision 0.16.2で作成した仮想環境は、`requirements.txt`だけで更新しないでください。`bitsandbytes==0.48.2`にはPyTorch 2.3以降が必要です。PyTorchとtorchvisionを互換性のある組み合わせで更新するため、新しい仮想環境を作成し、現在の[Windows環境でのインストール](#windows環境でのインストール)手順を実行してください。以下の更新コマンドは、動作確認済みのPyTorch 2.9.1 / torchvision 0.24.1環境へ移行済みの場合に使用します。
+
 ```powershell
 cd sd-scripts
 git pull
 .\venv\Scripts\activate
-pip install --use-pep517 --upgrade -r requirements.txt
+python -m pip install --use-pep517 --upgrade -r requirements.txt
+python -m pip check
 ```
 
 コマンドが成功すれば新しいバージョンが使用できます。
