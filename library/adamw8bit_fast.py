@@ -55,6 +55,34 @@ class AdamW8bitFast(bnb.optim.AdamW8bit):
     def _has_active_gradients(self) -> bool:
         return any(param.grad is not None for group in self.param_groups for param in group["params"])
 
+    def _unsafe_active_override_reason(self) -> Optional[str]:
+        # GlobalOptimManager stores only overridden parameters here. Keep the
+        # common path O(1), and inspect this usually-empty mapping instead of
+        # rebuilding the effective config for every LoRA parameter each step.
+        parameter_overrides = self.mng.index2config
+        if not parameter_overrides:
+            return None
+
+        for (group_index, param_index), override in parameter_overrides.items():
+            if override.get("percentile_clipping", 100) < 100:
+                reason = "parameter override enables percentile_clipping"
+            elif override.get("max_unorm", 0.0) > 0.0:
+                reason = "parameter override enables max_unorm"
+            else:
+                continue
+
+            # Ignore entries whose indices do not exist in this optimizer.
+            # GlobalOptimManager is a singleton and may retain such entries.
+            if group_index >= len(self.param_groups):
+                continue
+            params = self.param_groups[group_index]["params"]
+            if param_index >= len(params):
+                continue
+            if params[param_index].grad is not None:
+                return reason
+
+        return None
+
     def _fast_path_device(self) -> tuple[bool, Optional[torch.device], Optional[str]]:
         if self.is_paged:
             return False, None, "paged optimizer"
@@ -62,6 +90,9 @@ class AdamW8bitFast(bnb.optim.AdamW8bit):
             return False, None, "percentile_clipping is enabled"
         if getattr(self.args, "max_unorm", 0.0) > 0.0:
             return False, None, "max_unorm is enabled"
+        override_reason = self._unsafe_active_override_reason()
+        if override_reason is not None:
+            return False, None, override_reason
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_world_size() > 1:
@@ -97,6 +128,12 @@ class AdamW8bitFast(bnb.optim.AdamW8bit):
             self._log_stock_fallback_once("optimizer closure")
             return super().step(closure)
 
+        # Module-based GlobalOptimManager overrides are mapped to parameter
+        # indices by check_overrides(). Apply them before deciding whether the
+        # effective per-parameter clipping configuration is safe for fast mode.
+        if not self.initialized:
+            self.check_overrides()
+
         can_use_fast_path, device, fallback_reason = self._fast_path_device()
         if not can_use_fast_path:
             if self._has_active_gradients():
@@ -107,7 +144,6 @@ class AdamW8bitFast(bnb.optim.AdamW8bit):
             self._log_fast_path_once(device)
 
         if not self.initialized:
-            self.check_overrides()
             self.to_gpu()
             self.initialized = True
 

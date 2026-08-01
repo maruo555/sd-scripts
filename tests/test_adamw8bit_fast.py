@@ -12,6 +12,17 @@ bnb = pytest.importorskip("bitsandbytes")
 from library.adamw8bit_fast import AdamW8bitFast
 
 
+@pytest.fixture
+def isolated_global_optim_manager(monkeypatch):
+    manager = bnb.optim.GlobalOptimManager.get_instance()
+    monkeypatch.setattr(manager, "pid2config", {})
+    monkeypatch.setattr(manager, "index2config", {})
+    monkeypatch.setattr(manager, "optimizer", None)
+    monkeypatch.setattr(manager, "uses_config_override", False)
+    monkeypatch.setattr(manager, "module_weight_config_triple", [])
+    return manager
+
+
 def _assert_optimizer_state_equal(stock, fast, stock_params, fast_params) -> None:
     for stock_param, fast_param in zip(stock_params, fast_params):
         stock_state = stock.state[stock_param]
@@ -158,6 +169,89 @@ def test_percentile_clipping_uses_stock_step_and_logs_once(monkeypatch, caplog):
     messages = [record.getMessage() for record in caplog.records if record.name == "library.adamw8bit_fast"]
     assert len(messages) == 1
     assert "percentile_clipping is enabled" in messages[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("key", "value", "expected_reason"),
+    [
+        ("percentile_clipping", 50, "parameter override enables percentile_clipping"),
+        ("max_unorm", 1.0, "parameter override enables max_unorm"),
+    ],
+)
+def test_unsafe_parameter_overrides_use_stock_step(
+    monkeypatch,
+    caplog,
+    isolated_global_optim_manager,
+    key,
+    value,
+    expected_reason,
+):
+    param = torch.nn.Parameter(torch.ones(4096, device="cuda"))
+    isolated_global_optim_manager.override_config(param, key=key, value=value)
+    isolated_global_optim_manager.register_parameters([param])
+    optimizer = AdamW8bitFast([param], lr=1e-3)
+    param.grad = torch.ones_like(param)
+    calls = []
+
+    def stock_step(self, closure=None):
+        calls.append(closure)
+        return "stock-route"
+
+    monkeypatch.setattr(bnb.optim.AdamW8bit, "step", stock_step)
+
+    with caplog.at_level(logging.WARNING, logger="library.adamw8bit_fast"):
+        assert optimizer.step() == "stock-route"
+
+    assert calls == [None]
+    messages = [record.getMessage() for record in caplog.records if record.name == "library.adamw8bit_fast"]
+    assert len(messages) == 1
+    assert expected_reason in messages[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_inactive_unsafe_parameter_override_does_not_disable_fast_path(
+    isolated_global_optim_manager,
+):
+    overridden = torch.nn.Parameter(torch.ones(4096, device="cuda"))
+    active = torch.nn.Parameter(torch.ones(4096, device="cuda"))
+    isolated_global_optim_manager.override_config(overridden, key="percentile_clipping", value=50)
+    isolated_global_optim_manager.register_parameters([overridden, active])
+    optimizer = AdamW8bitFast([overridden, active], lr=1e-3)
+
+    active.grad = torch.ones_like(active)
+    can_use_fast_path, device, reason = optimizer._fast_path_device()
+    assert can_use_fast_path
+    assert device == active.device
+    assert reason is None
+
+    overridden.grad = torch.ones_like(overridden)
+    can_use_fast_path, device, reason = optimizer._fast_path_device()
+    assert not can_use_fast_path
+    assert device is None
+    assert reason == "parameter override enables percentile_clipping"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_module_override_is_applied_before_fast_path_guard(
+    monkeypatch,
+    isolated_global_optim_manager,
+):
+    module = torch.nn.Linear(64, 64, bias=False, device="cuda")
+    isolated_global_optim_manager.register_module_override(module, "weight", {"max_unorm": 1.0})
+    optimizer = AdamW8bitFast(module.parameters(), lr=1e-3)
+    module.weight.grad = torch.ones_like(module.weight)
+    calls = []
+
+    def stock_step(self, closure=None):
+        calls.append(closure)
+        return "stock-route"
+
+    monkeypatch.setattr(bnb.optim.AdamW8bit, "step", stock_step)
+
+    assert optimizer.step() == "stock-route"
+    assert calls == [None]
+    assert isolated_global_optim_manager.index2config[(0, 0)]["max_unorm"] == 1.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -51,7 +51,7 @@ GPU全体を1回だけ同期
 次をすべて満たすと同期集約経路を使います。
 
 - non-paged AdamW8bit
-- `percentile_clipping=100`（既定値）かつ`max_unorm=0`
+- optimizer全体およびParameter別overrideの実効設定が`percentile_clipping=100`（既定値）かつ`max_unorm=0`
 - そのstepで`grad is not None`の更新対象が、通常の`torch.nn.Parameter`とdense strided gradient
 - 更新対象のparameterとgradientが同じ1台のCUDA device上
 - 分散world sizeが1
