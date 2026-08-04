@@ -39,6 +39,13 @@ def test_fp16_safe_norms_rejects_legacy_flag_with_explicit_off():
         )
 
 
+def test_fp16_safe_norms_rejects_invalid_mode_loaded_from_config():
+    with pytest.raises(ValueError, match="must be one of"):
+        resolve_fp16_safe_norms_mode(
+            SimpleNamespace(fp16_safe_norms=False, fp16_safe_norms_mode="native_acum")
+        )
+
+
 def test_native_accum_falls_back_to_strict_layer_norm_on_cpu():
     norm = torch.nn.LayerNorm(16, dtype=torch.float16)
     x = torch.randn((2, 7, 16), dtype=torch.float16)

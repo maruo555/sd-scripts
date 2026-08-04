@@ -19,6 +19,10 @@ FP16_SAFE_NORMS_MODES = ("off", "strict", "native_accum")
 def resolve_fp16_safe_norms_mode(args: argparse.Namespace) -> str:
     legacy_enabled = bool(getattr(args, "fp16_safe_norms", False))
     requested_mode = getattr(args, "fp16_safe_norms_mode", None)
+    if requested_mode is not None and requested_mode not in FP16_SAFE_NORMS_MODES:
+        raise ValueError(
+            f"--fp16_safe_norms_mode must be one of {', '.join(FP16_SAFE_NORMS_MODES)}, got {requested_mode!r}"
+        )
     if legacy_enabled and requested_mode == "off":
         raise ValueError("--fp16_safe_norms conflicts with --fp16_safe_norms_mode off")
     if requested_mode is not None:
