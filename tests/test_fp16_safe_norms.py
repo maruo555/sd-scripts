@@ -102,6 +102,26 @@ def test_native_fp16_layer_norm_keeps_statistics_in_fp32():
     assert rstd.dtype == torch.float32
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not hasattr(torch, "compile") or not hasattr(torch, "compiler"),
+    reason="CUDA and torch.compile are required",
+)
+def test_native_fp16_layer_norm_compiles_as_fullgraph():
+    torch.manual_seed(4321)
+    norm = torch.nn.LayerNorm(640, device="cuda", dtype=torch.float16).requires_grad_(False)
+    x = torch.randn((1, 64, 640), device="cuda", dtype=torch.float16)
+
+    def run(value):
+        return sdxl_original_unet._native_fp16_layer_norm(value, norm)
+
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        expected = run(x)
+        actual = torch.compile(run, backend="eager", fullgraph=True)(x)
+
+    assert actual.dtype == torch.float16
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dim,heads,tokens", [(640, 10, 128), (1280, 20, 64)])
 def test_native_accum_matches_strict_sdpa_transformer_block(dim, heads, tokens):

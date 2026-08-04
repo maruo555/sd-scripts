@@ -322,6 +322,21 @@ def _strict_fp16_layer_norm(x: torch.Tensor, norm: nn.LayerNorm) -> torch.Tensor
     ).to(dtype=x.dtype)
 
 
+def _native_fp16_layer_norm(x: torch.Tensor, norm: nn.LayerNorm) -> torch.Tensor:
+    is_compiling = (
+        hasattr(torch, "compiler")
+        and hasattr(torch.compiler, "is_compiling")
+        and torch.compiler.is_compiling()
+    )
+    if is_compiling or _DISABLE_AUTOCAST is None:
+        # The private eager guard cannot be traced by TorchDynamo. The public
+        # context is traceable and its Python overhead is paid only while compiling.
+        with torch.autocast(device_type="cuda", enabled=False):
+            return F.layer_norm(x, norm.normalized_shape, norm.weight, norm.bias, norm.eps)
+    with _DISABLE_AUTOCAST():
+        return F.layer_norm(x, norm.normalized_shape, norm.weight, norm.bias, norm.eps)
+
+
 def _fp16_safe_layer_norm(x: torch.Tensor, norm: nn.LayerNorm) -> torch.Tensor:
     global _NATIVE_FP16_LAYER_NORM_FALLBACK_LOGGED
 
@@ -329,11 +344,7 @@ def _fp16_safe_layer_norm(x: torch.Tensor, norm: nn.LayerNorm) -> torch.Tensor:
         if _can_use_native_fp16_layer_norm(x, norm):
             # CUDA LayerNorm keeps mean/rstd and fp16 reduction accumulation in fp32,
             # while avoiding materialized fp32 activation/parameter copies.
-            if _DISABLE_AUTOCAST is not None:
-                with _DISABLE_AUTOCAST():
-                    return F.layer_norm(x, norm.normalized_shape, norm.weight, norm.bias, norm.eps)
-            with torch.autocast(device_type="cuda", enabled=False):
-                return F.layer_norm(x, norm.normalized_shape, norm.weight, norm.bias, norm.eps)
+            return _native_fp16_layer_norm(x, norm)
         if not _NATIVE_FP16_LAYER_NORM_FALLBACK_LOGGED:
             logger.warning(
                 "fp16_safe_norms native_accum LayerNorm is unavailable for device=%s, input=%s, weight=%s, bias=%s; "

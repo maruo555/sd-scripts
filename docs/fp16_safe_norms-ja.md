@@ -11,10 +11,14 @@
 モードは次の3種類です。
 
 - `off`: 安全正規化を無効化。
-- `strict`: 従来の `--fp16_safe_norms` と同じ。LayerNorm/GroupNorm/Softmaxを明示的にfp32で計算し、出力をfp16へ戻す。
-- `native_accum`: CUDA LayerNormだけ、fp16入出力のnative kernelとfp32のmean/rstdを使用する。GroupNorm/Softmaxは安全性のため `strict` のまま。
+- `strict`: 従来の `--fp16_safe_norms` と同じ。LayerNorm/GroupNormと通常Attention経路のSoftmaxを明示的にfp32で計算し、出力をfp16へ戻す。
+- `native_accum`: CUDA LayerNormだけ、fp16入出力のnative kernelとfp32のmean/rstdを使用する。GroupNormと通常Attention経路のSoftmaxは安全性のため `strict` のまま。
+
+Softmaxのstrict処理は通常Attention経路だけに適用されます。`--sdpa` / `--xformers` 使用時のSoftmax内部精度は、それぞれのAttention実装に依存します。
 
 従来の `--fp16_safe_norms` だけを指定した場合は、互換性のため `strict` になります。実際に解決されたモードは起動時ログと保存モデルの `ss_fp16_safe_norms_mode` metadataに記録されます。
+
+`--torch_compile` 使用時は、コンパイル中だけTorchDynamoが追跡できるpublic autocast contextへ切り替えます。通常のeager実行では、オーバーヘッドの小さいprivate guardを引き続き使用します。
 
 ## 2026-08-03 検証結果
 
@@ -58,4 +62,4 @@ LayerNormと直後のQ/K/V Linearを10回実行したProfilerでは、`aten::_to
 - native GroupNormは保存統計もfp16になり、出力・勾配に最大0.00390625の差が出たため高速化対象にしていません。
 - 短時間実学習でNaN/Infはなく、最終表示lossも一致。独立run間のLoRA重み差は、同一モードを繰り返した通常の非決定性の範囲内でした。
 
-対応条件外（CPU、fp16以外、LayerNorm affineのdevice/dtype不一致）では、自動的に `strict` へフォールバックし、初回だけwarningを出します。
+CPU上のfp16入力、またはLayerNorm affineのdevice/dtype不一致では、自動的に `strict` へフォールバックし、初回だけwarningを出します。bf16/fp32入力ではnative高速経路を使用せず、通常のLayerNormを実行します（warningは出ません）。
