@@ -16,7 +16,7 @@ def run_profile_mode(
     training_argv: Sequence[str],
     *,
     preset_name: str = "canonical-v1",
-    execution_mode_name: str = "strict",
+    execution_mode_name: str = "standard",
     output_base: Path = DEFAULT_OUTPUT_BASE,
     profile_name: str | None = None,
     preflight_only: bool = False,

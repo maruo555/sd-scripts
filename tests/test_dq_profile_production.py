@@ -48,7 +48,7 @@ def test_minimal_cli_uses_versioned_preset_and_japanese_paths() -> None:
     request = resolve_training_cli(minimal_cli())
     assert request.preset.name == "canonical-v1"
     assert request.local_measurement.name == "local-body-tail-v1"
-    assert request.execution_mode.name == "strict"
+    assert request.execution_mode.name == "standard"
     assert request.dataset_config.name == "dataset.toml"
     assert request.output_name == "dataset"
     assert {row["action"] for row in request.dispositions} == {"consumed"}
@@ -689,7 +689,7 @@ def test_direct_module_entry_preserves_training_vector(monkeypatch: pytest.Monke
     assert captured["training_argv"] == training
     assert captured["kwargs"] == {
         "preset_name": "canonical-v1",
-        "execution_mode_name": "strict",
+        "execution_mode_name": "standard",
         "output_base": DEFAULT_OUTPUT_BASE,
         "profile_name": "test",
         "preflight_only": False,

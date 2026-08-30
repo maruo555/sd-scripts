@@ -166,7 +166,7 @@ def resolve_training_cli(
     argv: Sequence[str],
     *,
     preset_name: str = "canonical-v1",
-    execution_mode_name: str = "strict",
+    execution_mode_name: str = "standard",
 ) -> ResolvedProfileRequest:
     preset = get_preset(preset_name)
     local_measurement = get_local_measurement_contract()
