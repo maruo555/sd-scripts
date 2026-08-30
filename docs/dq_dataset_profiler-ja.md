@@ -48,7 +48,8 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 最初にGPUを使わず、次を確認します。
 
 - model、dataset TOML、各`image_dir`が存在する。
-- 学習loaderと同じ非再帰探索で、各`image_dir`直下に画像があり、dataset全体で8画像以上ある。
+- 学習loaderと同じ非再帰探索で、各`image_dir`直下に画像があり、dataset全体で8画像以上、独立した`image_dir`が4 group以上ある。
+- TOMLの`[general]`／dataset／subset fallbackを解決し、batch・bucket設定が`canonical-v1`と一致することを確認する。
 - CLIが`canonical-v1`と互換である。
 - 通常checkpoint、dataset、repositoryと診断出力先が重ならない。
 - Git HEAD、ソースhash、preset、model内容のSHA-256、dataset、source inventoryからprotocol fingerprintを作る。
@@ -320,7 +321,7 @@ python -m dq_profile ^
 | `--dq-profile-dry-run` | 任意 | false | 解決済みCore commandを`dry_run_command.json`へ書き、GPUを起動しない |
 | `--dq-profile-open-report` | 任意 | false | Windowsで正常完了した場合に`report.html`を開く |
 
-`image_dir`の子孫フォルダだけにある画像は、通常のDreamBooth学習loaderから見えないため診断でも数えません。子フォルダを個別subsetとしてTOMLへ列挙するか、画像を`image_dir`直下へ配置してください。
+`image_dir`は絶対パスで指定し、4つ以上の独立したsource groupを用意してください。子孫フォルダだけにある画像は通常のDreamBooth学習loaderから見えないため診断でも数えません。子フォルダを個別subsetとしてTOMLへ列挙するか、画像を`image_dir`直下へ配置してください。`num_repeats`は1以上が必要です。画像inventoryがworkerごとに変わり得る`cache_info=true`は現在のdiagnostic contractでは拒否します。
 
 事前検査だけ行う例です。検査結果も新しいrunディレクトリへ保存します。
 
@@ -348,6 +349,8 @@ python -m dq_profile ^
 
 次の値は、省略すればpresetが自動挿入します。同じ値を明示した場合は
 `matched_preset`、異なる値を明示した場合はGPU開始前に`rejected`となります。
+TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、bucket範囲を
+上書きした場合も、fallback解決後の実効値をこの表と比較します。
 
 | 分類 | 学習オプション | 固定値 |
 |---|---|---|

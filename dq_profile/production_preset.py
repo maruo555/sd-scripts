@@ -25,6 +25,7 @@ class DiagnosticPreset:
     sketch_width: int
     sketch_seeds: int
     max_edge_extension_rounds: int
+    minimum_source_groups: int
     num_cpu_threads_per_process: int
 
     def contract(self) -> dict[str, Any]:
@@ -46,6 +47,7 @@ class DiagnosticPreset:
             "sketch_width": self.sketch_width,
             "sketch_seeds": self.sketch_seeds,
             "max_edge_extension_rounds": self.max_edge_extension_rounds,
+            "minimum_source_groups": self.minimum_source_groups,
             "num_cpu_threads_per_process": self.num_cpu_threads_per_process,
             "diagnostic_target": "numerical_gradient_acceptance_by_fixed_range_mul",
             "not_quality_or_utility": True,
@@ -203,6 +205,7 @@ CANONICAL_V1 = DiagnosticPreset(
     sketch_width=512,
     sketch_seeds=2,
     max_edge_extension_rounds=2,
+    minimum_source_groups=4,
     num_cpu_threads_per_process=8,
 )
 

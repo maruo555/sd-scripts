@@ -617,6 +617,16 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
 
 
 def _preflight(args: argparse.Namespace) -> dict[str, Any]:
+    minimum_source_groups = (
+        4
+        if args.dq_profile_protocol
+        in {
+            "v24-acceptance-local",
+            "v24-acceptance-formal",
+            "v24-trajectory-descriptive",
+        }
+        else 1
+    )
     summary = inspect_dataset_config(
         args.dataset_config,
         max_train_epochs=getattr(args, "max_train_epochs", None),
@@ -626,6 +636,13 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         max_images=args.dq_profile_max_images,
         timestep_bins=args.dq_profile_timestep_bins,
         stochastic_repeats=args.dq_profile_stochastic_repeats,
+        train_batch_size=int(getattr(args, "train_batch_size", 1)),
+        enable_bucket=bool(getattr(args, "enable_bucket", False)),
+        min_bucket_reso=int(getattr(args, "min_bucket_reso", 256)),
+        max_bucket_reso=int(getattr(args, "max_bucket_reso", 1024)),
+        dataset_repeats=int(getattr(args, "dataset_repeats", 1)),
+        cache_info=bool(getattr(args, "cache_info", False)),
+        minimum_source_groups=minimum_source_groups,
     )
     args.dq_profile_branch_steps_resolved = summary.branch_steps
     args.dq_profile_probe_replicas_resolved = (

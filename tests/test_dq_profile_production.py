@@ -147,6 +147,8 @@ def test_source_dirs_follow_toml_order_and_reject_duplicates(tmp_path: Path) -> 
     second = tmp_path / "画像 B"
     first.mkdir()
     second.mkdir()
+    (first / "first.png").write_bytes(b"image")
+    (second / "second.png").write_bytes(b"image")
     config = tmp_path / "dataset.toml"
     config.write_text(
         "[[datasets]]\n"
@@ -167,6 +169,26 @@ def test_source_dirs_follow_toml_order_and_reject_duplicates(tmp_path: Path) -> 
     )
     with pytest.raises(ValueError, match="duplicate image_dir"):
         source_dirs_from_dataset_config(config)
+
+
+def test_source_dirs_reject_too_few_active_source_groups(tmp_path: Path) -> None:
+    source_dirs = []
+    for index in range(3):
+        source = tmp_path / f"source-{index}"
+        source.mkdir()
+        (source / "image.png").write_bytes(b"image")
+        source_dirs.append(source)
+    config = tmp_path / "dataset.toml"
+    config.write_text(
+        "[[datasets]]\n"
+        + "".join(
+            "[[datasets.subsets]]\n" + f"image_dir = {json.dumps(str(source))}\n"
+            for source in source_dirs
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="at least 4 active image_dir groups"):
+        source_dirs_from_dataset_config(config, minimum_source_groups=4)
 
 
 def test_source_map_rejects_images_visible_only_recursively(

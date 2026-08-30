@@ -13,9 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import toml
-
 from dq_profile.production_cli import ResolvedProfileRequest
+from dq_profile.protocol import resolve_dataset_layout, training_image_extensions
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -166,48 +165,30 @@ def sanitize_profile_name(value: str) -> str:
     return name[:80].rstrip(" .") or "dq_profile"
 
 
-def source_dirs_from_dataset_config(dataset_config: Path) -> tuple[Path, ...]:
-    payload = toml.load(dataset_config)
-    datasets = payload.get("datasets")
-    if not isinstance(datasets, list) or not datasets:
-        raise ValueError("dataset TOML must contain at least one [[datasets]] entry")
-    source_dirs: list[Path] = []
-    seen: set[str] = set()
-    for dataset_index, dataset in enumerate(datasets):
-        subsets = dataset.get("subsets") if isinstance(dataset, dict) else None
-        if not isinstance(subsets, list) or not subsets:
-            raise ValueError(f"datasets[{dataset_index}] has no [[datasets.subsets]] entries")
-        for subset_index, subset in enumerate(subsets):
-            image_dir = subset.get("image_dir") if isinstance(subset, dict) else None
-            if not image_dir:
-                raise ValueError(
-                    f"datasets[{dataset_index}].subsets[{subset_index}] has no image_dir; "
-                    "metadata-only datasets are not supported by canonical-v1"
-                )
-            source_dir = Path(str(image_dir)).expanduser()
-            if not source_dir.is_absolute():
-                source_dir = dataset_config.parent / source_dir
-            source_dir = source_dir.resolve()
-            if not source_dir.is_dir():
-                raise FileNotFoundError(f"dataset image_dir was not found: {source_dir}")
-            folded = str(source_dir).casefold()
-            if folded in seen:
-                raise ValueError(f"duplicate image_dir is ambiguous for source bootstrap: {source_dir}")
-            for existing in source_dirs:
-                if existing in source_dir.parents or source_dir in existing.parents:
-                    raise ValueError(f"nested image_dir values are ambiguous: {existing} and {source_dir}")
-            seen.add(folded)
-            source_dirs.append(source_dir)
-    return tuple(source_dirs)
+def source_dirs_from_dataset_config(
+    dataset_config: Path,
+    *,
+    train_batch_size: int = 1,
+    enable_bucket: bool = True,
+    min_bucket_reso: int = 384,
+    max_bucket_reso: int = 1024,
+    minimum_source_groups: int = 1,
+) -> tuple[Path, ...]:
+    layout = resolve_dataset_layout(
+        dataset_config,
+        train_batch_size=train_batch_size,
+        enable_bucket=enable_bucket,
+        min_bucket_reso=min_bucket_reso,
+        max_bucket_reso=max_bucket_reso,
+        dataset_repeats=1,
+        cache_info=False,
+        minimum_source_groups=minimum_source_groups,
+    )
+    return tuple(subset.image_dir for subset in layout.subsets)
 
 
 def _training_image_extensions() -> frozenset[str]:
-    # Import lazily so `python -m dq_profile --help` remains lightweight. The
-    # production request resolver has already loaded the same training parser
-    # before preflight reaches this point.
-    from library.train_util import IMAGE_EXTENSIONS
-
-    return frozenset(str(extension).casefold() for extension in IMAGE_EXTENSIONS)
+    return training_image_extensions()
 
 
 def _inventory(
@@ -852,8 +833,12 @@ def preflight(request: ResolvedProfileRequest, source_dirs: Sequence[Path]) -> N
         raise FileNotFoundError(f"DQ profile preflight is missing required files: {missing}")
     if not request.model_path.exists():
         raise FileNotFoundError(f"pretrained model path was not found: {request.model_path}")
-    if not source_dirs:
-        raise ValueError("dataset has no image_dir source groups")
+    if len(source_dirs) < request.preset.minimum_source_groups:
+        raise ValueError(
+            "canonical diagnostic source bootstrap requires at least "
+            f"{request.preset.minimum_source_groups} active image_dir groups; "
+            f"found {len(source_dirs)}"
+        )
     if importlib.util.find_spec("accelerate.commands.launch") is None:
         raise ModuleNotFoundError(
             f"accelerate is not available in the selected Python runtime: {sys.executable}"
@@ -896,7 +881,14 @@ def run_profile_request(
     request: ResolvedProfileRequest,
     options: ProductionRunOptions,
 ) -> ProductionRunResult:
-    source_dirs = source_dirs_from_dataset_config(request.dataset_config)
+    source_dirs = source_dirs_from_dataset_config(
+        request.dataset_config,
+        train_batch_size=int(request.preset.expected_explicit["train_batch_size"]),
+        enable_bucket=bool(request.preset.expected_explicit["enable_bucket"]),
+        min_bucket_reso=int(request.preset.expected_explicit["min_bucket_reso"]),
+        max_bucket_reso=int(request.preset.expected_explicit["max_bucket_reso"]),
+        minimum_source_groups=request.preset.minimum_source_groups,
+    )
     preflight(request, source_dirs)
     output_base = validate_output_base(
         options.output_base,

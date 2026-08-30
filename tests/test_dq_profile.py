@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+import dq_profile.protocol as protocol
 from dq_profile.metrics import CountSketch, ExactGradient, error_decomposition, gram_and_rank
 from dq_profile.protocol import (
     AutoRangeController,
@@ -113,6 +114,133 @@ def test_full_profile_expands_only_probe_replicas_within_budget(tmp_path: Path):
     assert result.estimated_full_steps <= result.full_budget_steps
     assert result.branch_steps == 256
     assert result.probe_images == 16
+
+
+@pytest.mark.parametrize(
+    ("dataset_lines", "message"),
+    (
+        ("[general]\nbatch_size=2\n", "batch_size=2"),
+        ("[[datasets]]\nenable_bucket=false\n", "enable_bucket=False"),
+        ("[[datasets]]\nenable_bucket=true\nmin_bucket_reso=256\n", "min_bucket_reso=256"),
+    ),
+)
+def test_dataset_preflight_rejects_effective_canonical_overrides(
+    tmp_path: Path,
+    dataset_lines: str,
+    message: str,
+) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "image.png").write_bytes(b"image")
+    config = tmp_path / "dataset.toml"
+    if dataset_lines.startswith("[general]"):
+        dataset_lines += "[[datasets]]\n"
+    config.write_text(
+        dataset_lines
+        + "[[datasets.subsets]]\n"
+        + f"image_dir={json.dumps(str(image_dir))}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=message):
+        inspect_dataset_config(
+            config,
+            max_train_epochs=40,
+            max_train_steps=None,
+            lr_warmup_steps=0.05,
+            branch_steps_override=None,
+            max_images=32,
+            timestep_bins=4,
+            stochastic_repeats=2,
+            train_batch_size=1,
+            enable_bucket=True,
+            min_bucket_reso=384,
+            max_bucket_reso=1024,
+        )
+
+
+@pytest.mark.parametrize(
+    ("subset_line", "message"),
+    (
+        ("cache_info=true", "does not support cache_info=true"),
+        ("num_repeats=0", "num_repeats=0"),
+    ),
+)
+def test_dataset_preflight_rejects_loader_ignored_or_cached_subsets(
+    tmp_path: Path,
+    subset_line: str,
+    message: str,
+) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "image.png").write_bytes(b"image")
+    config = tmp_path / "dataset.toml"
+    config.write_text(
+        "[[datasets]]\n"
+        "[[datasets.subsets]]\n"
+        f"image_dir={json.dumps(str(image_dir))}\n"
+        f"{subset_line}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=message):
+        inspect_dataset_config(
+            config,
+            max_train_epochs=40,
+            max_train_steps=None,
+            lr_warmup_steps=0.05,
+            branch_steps_override=None,
+            max_images=32,
+            timestep_bins=4,
+            stochastic_repeats=2,
+        )
+
+
+def test_dataset_preflight_rejects_relative_image_dir(tmp_path: Path) -> None:
+    config = tmp_path / "dataset.toml"
+    config.write_text(
+        "[[datasets]]\n"
+        "[[datasets.subsets]]\n"
+        'image_dir="relative/images"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="requires absolute image_dir"):
+        inspect_dataset_config(
+            config,
+            max_train_epochs=40,
+            max_train_steps=None,
+            lr_warmup_steps=0.05,
+            branch_steps_override=None,
+            max_images=32,
+            timestep_bins=4,
+            stochastic_repeats=2,
+        )
+
+
+def test_dataset_preflight_uses_loader_optional_extensions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "image.avif").write_bytes(b"image")
+    config = tmp_path / "dataset.toml"
+    config.write_text(
+        "[[datasets]]\n"
+        "[[datasets.subsets]]\n"
+        f"image_dir={json.dumps(str(image_dir))}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(protocol, "training_image_extensions", lambda: frozenset({".avif"}))
+    result = inspect_dataset_config(
+        config,
+        max_train_epochs=40,
+        max_train_steps=None,
+        lr_warmup_steps=0.05,
+        branch_steps_override=None,
+        max_images=32,
+        timestep_bins=4,
+        stochastic_repeats=2,
+    )
+    assert result.unique_images == 1
 
 
 def test_error_decomposition_identity_and_exact_gradient_cosine():
