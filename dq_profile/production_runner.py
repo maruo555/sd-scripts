@@ -173,6 +173,7 @@ def source_dirs_from_dataset_config(
     bucket_no_upscale: bool = False,
     min_bucket_reso: int = 384,
     max_bucket_reso: int = 1024,
+    bucket_reso_steps: int = 64,
     minimum_source_groups: int = 1,
 ) -> tuple[Path, ...]:
     layout = resolve_dataset_layout(
@@ -182,6 +183,7 @@ def source_dirs_from_dataset_config(
         bucket_no_upscale=bucket_no_upscale,
         min_bucket_reso=min_bucket_reso,
         max_bucket_reso=max_bucket_reso,
+        bucket_reso_steps=bucket_reso_steps,
         dataset_repeats=1,
         cache_info=False,
         minimum_source_groups=minimum_source_groups,
@@ -907,6 +909,7 @@ def run_profile_request(
         ),
         min_bucket_reso=int(request.preset.expected_explicit["min_bucket_reso"]),
         max_bucket_reso=int(request.preset.expected_explicit["max_bucket_reso"]),
+        bucket_reso_steps=int(request.preset.expected_explicit["bucket_reso_steps"]),
         minimum_source_groups=request.preset.minimum_source_groups,
     )
     preflight(request, source_dirs)

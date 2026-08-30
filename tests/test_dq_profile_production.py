@@ -111,7 +111,11 @@ def test_canonical_long_training_command_can_be_reused() -> None:
 
 @pytest.mark.parametrize(
     ("option", "required"),
-    (("--optimizer_type=AdamW8bit", "AdamW8bitFast"), ("--network_dim=8", "network_dim=4")),
+    (
+        ("--optimizer_type=AdamW8bit", "AdamW8bitFast"),
+        ("--network_dim=8", "network_dim=4"),
+        ("--bucket_reso_steps=32", "bucket_reso_steps=64"),
+    ),
 )
 def test_conflicting_canonical_option_is_rejected(option: str, required: str) -> None:
     with pytest.raises(ProfileCompatibilityError, match=required):
@@ -145,6 +149,15 @@ def test_fp16_safe_norms_alias_is_accepted() -> None:
 def test_bucket_no_upscale_is_rejected_by_canonical_preset() -> None:
     with pytest.raises(ProfileCompatibilityError, match="bucket_no_upscale"):
         resolve_training_cli(minimal_cli("--bucket_no_upscale"))
+
+
+def test_canonical_bucket_resolution_steps_are_accepted() -> None:
+    request = resolve_training_cli(minimal_cli("--bucket_reso_steps=64"))
+    assert any(
+        row["destination"] == "bucket_reso_steps"
+        and row["action"] == "matched_preset"
+        for row in request.dispositions
+    )
 
 
 def test_source_dirs_follow_toml_order_and_reject_duplicates(tmp_path: Path) -> None:

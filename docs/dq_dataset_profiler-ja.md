@@ -385,6 +385,7 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | bucket | `bucket_no_upscale` | disabled。画像由来bucketへ切り替わるため`true`は拒否 |
 | bucket | `min_bucket_reso` | `384` |
 | bucket | `max_bucket_reso` | `1024` |
+| bucket | `bucket_reso_steps` | `64` |
 | noise | `noise_offset` | `0.15` |
 | noise | `adaptive_noise_scale` | `0.1` |
 | latent | `cache_latents` | enabled |

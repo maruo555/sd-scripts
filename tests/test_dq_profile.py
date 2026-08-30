@@ -124,6 +124,8 @@ def test_full_profile_expands_only_probe_replicas_within_budget(tmp_path: Path):
         ("[[datasets]]\nenable_bucket=false\n", "enable_bucket=False"),
         ("[[datasets]]\nbucket_no_upscale=true\n", "bucket_no_upscale=True"),
         ("[[datasets]]\nenable_bucket=true\nmin_bucket_reso=256\n", "min_bucket_reso=256"),
+        ("[[datasets]]\nbucket_reso_steps=32\n", "bucket_reso_steps=32"),
+        ("[general]\nbucket_reso_steps=128\n", "bucket_reso_steps=128"),
     ),
 )
 def test_dataset_preflight_rejects_effective_canonical_overrides(
@@ -158,6 +160,40 @@ def test_dataset_preflight_rejects_effective_canonical_overrides(
             min_bucket_reso=384,
             max_bucket_reso=1024,
         )
+
+
+def test_dataset_preflight_can_match_an_explicit_noncanonical_bucket_step(
+    tmp_path: Path,
+) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "image.png").write_bytes(b"image")
+    config = tmp_path / "dataset.toml"
+    config.write_text(
+        "[[datasets]]\n"
+        "enable_bucket=true\n"
+        "min_bucket_reso=384\n"
+        "max_bucket_reso=1024\n"
+        "bucket_reso_steps=32\n"
+        "[[datasets.subsets]]\n"
+        f"image_dir={json.dumps(str(image_dir))}\n",
+        encoding="utf-8",
+    )
+    result = inspect_dataset_config(
+        config,
+        max_train_epochs=40,
+        max_train_steps=None,
+        lr_warmup_steps=0.05,
+        branch_steps_override=None,
+        max_images=32,
+        timestep_bins=4,
+        stochastic_repeats=2,
+        enable_bucket=True,
+        min_bucket_reso=384,
+        max_bucket_reso=1024,
+        bucket_reso_steps=32,
+    )
+    assert result.unique_images == 1
 
 
 @pytest.mark.parametrize(

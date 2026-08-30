@@ -57,6 +57,7 @@ class ResolvedDatasetSettings:
     bucket_no_upscale: bool
     min_bucket_reso: int
     max_bucket_reso: int
+    bucket_reso_steps: int
 
 
 @dataclass(frozen=True)
@@ -330,6 +331,7 @@ def resolve_dataset_layout(
     bucket_no_upscale: bool = False,
     min_bucket_reso: int = 256,
     max_bucket_reso: int = 1024,
+    bucket_reso_steps: int = 64,
     dataset_repeats: int = 1,
     cache_info: bool = False,
     minimum_source_groups: int = 1,
@@ -377,6 +379,10 @@ def resolve_dataset_layout(
             _fallback_value("max_bucket_reso", (dataset, general), max_bucket_reso),
             label=f"datasets[{dataset_index}].max_bucket_reso",
         )
+        effective_bucket_steps = _int_setting(
+            _fallback_value("bucket_reso_steps", (dataset, general), bucket_reso_steps),
+            label=f"datasets[{dataset_index}].bucket_reso_steps",
+        )
         mismatches: list[str] = []
         if batch_size != int(train_batch_size):
             mismatches.append(f"batch_size={batch_size} (required {int(train_batch_size)})")
@@ -396,6 +402,11 @@ def resolve_dataset_layout(
                 mismatches.append(
                     f"max_bucket_reso={effective_max_bucket} (required {int(max_bucket_reso)})"
                 )
+            if effective_bucket_steps != int(bucket_reso_steps):
+                mismatches.append(
+                    "bucket_reso_steps="
+                    f"{effective_bucket_steps} (required {int(bucket_reso_steps)})"
+                )
         if mismatches:
             raise ValueError(
                 "dataset TOML overrides canonical effective settings in "
@@ -409,6 +420,7 @@ def resolve_dataset_layout(
                 bucket_no_upscale=effective_bucket_no_upscale,
                 min_bucket_reso=effective_min_bucket,
                 max_bucket_reso=effective_max_bucket,
+                bucket_reso_steps=effective_bucket_steps,
             )
         )
 
@@ -555,6 +567,7 @@ def inspect_dataset_config(
     bucket_no_upscale: bool = False,
     min_bucket_reso: int = 256,
     max_bucket_reso: int = 1024,
+    bucket_reso_steps: int = 64,
     dataset_repeats: int = 1,
     cache_info: bool = False,
     minimum_source_groups: int = 1,
@@ -566,6 +579,7 @@ def inspect_dataset_config(
         bucket_no_upscale=bucket_no_upscale,
         min_bucket_reso=min_bucket_reso,
         max_bucket_reso=max_bucket_reso,
+        bucket_reso_steps=bucket_reso_steps,
         dataset_repeats=dataset_repeats,
         cache_info=cache_info,
         minimum_source_groups=minimum_source_groups,

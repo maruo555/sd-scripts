@@ -641,6 +641,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         bucket_no_upscale=bool(getattr(args, "bucket_no_upscale", False)),
         min_bucket_reso=int(getattr(args, "min_bucket_reso", 256)),
         max_bucket_reso=int(getattr(args, "max_bucket_reso", 1024)),
+        bucket_reso_steps=int(getattr(args, "bucket_reso_steps", 64)),
         dataset_repeats=int(getattr(args, "dataset_repeats", 1)),
         cache_info=bool(getattr(args, "cache_info", False)),
         minimum_source_groups=minimum_source_groups,
