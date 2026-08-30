@@ -113,6 +113,92 @@ def test_source_group_map_supports_exact_and_longest_prefix(tmp_path):
     assert mapping.resolve(r"D:\images\c\crop3.png") == "all"
 
 
+class _ReplayLoader:
+    def __init__(self, batches):
+        self.batches = tuple(batches)
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self):
+        return len(self.batches)
+
+
+def _source_batch(source: str, index: int):
+    return {"image_keys": [f"{source}/image-{index}.png"]}
+
+
+def test_capture_extends_fixed_prefix_only_for_missing_source_groups():
+    runtime = object.__new__(DiagnosticProfileRuntime)
+    batches = [
+        _source_batch("a", 0),
+        _source_batch("a", 1),
+        _source_batch("a", 2),
+        _source_batch("b", 0),
+        _source_batch("c", 0),
+        _source_batch("d", 0),
+    ]
+    current_epoch = SimpleNamespace(value=1)
+    current_step = SimpleNamespace(value=0)
+    sequence, metadata = runtime._capture_batches(
+        first_batch=batches[0],
+        epoch_iterator=iter(batches[1:]),
+        train_dataloader=_ReplayLoader(batches),
+        current_epoch=current_epoch,
+        current_step=current_step,
+        global_step=100,
+        epoch=0,
+        data_step=0,
+        count=2,
+        source_group_resolver=lambda key: key.split("/", 1)[0],
+        required_source_groups=("a", "b", "c", "d"),
+    )
+    assert [item.index for item in sequence] == [0, 1, 3, 4, 5]
+    assert [item.image_keys[0].split("/", 1)[0] for item in sequence] == [
+        "a",
+        "a",
+        "b",
+        "c",
+        "d",
+    ]
+    assert metadata["requested_batches"] == 2
+    assert metadata["retained_batches"] == 5
+    assert metadata["coverage_scan_batches"] == 4
+    assert metadata["coverage_appended_batches"] == 3
+    assert metadata["coverage_complete"] is True
+    selected = sequence.unique_image_items(
+        4,
+        source_group_resolver=lambda key: key.split("/", 1)[0],
+        source_group_order=("a", "b", "c", "d"),
+        minimum_source_groups=4,
+    )
+    assert [item.image_keys[0].split("/", 1)[0] for item in selected] == [
+        "a",
+        "b",
+        "c",
+        "d",
+    ]
+
+
+def test_capture_fails_if_required_source_is_absent_after_bounded_scan():
+    runtime = object.__new__(DiagnosticProfileRuntime)
+    batches = [_source_batch("a", 0), _source_batch("b", 0), _source_batch("c", 0)]
+    with pytest.raises(ValueError, match="missing=.*d"):
+        runtime._capture_batches(
+            first_batch=batches[0],
+            epoch_iterator=iter(batches[1:]),
+            train_dataloader=_ReplayLoader(batches),
+            current_epoch=SimpleNamespace(value=1),
+            current_step=SimpleNamespace(value=0),
+            global_step=100,
+            epoch=0,
+            data_step=0,
+            count=1,
+            source_group_resolver=lambda key: key.split("/", 1)[0],
+            required_source_groups=("a", "b", "c", "d"),
+        )
+
+
 class _FakeAccelerator:
     device = torch.device("cpu")
     scaler = None

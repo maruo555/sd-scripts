@@ -198,21 +198,18 @@ def test_source_dirs_reject_too_few_active_source_groups(tmp_path: Path) -> None
 
 def test_source_map_rejects_images_visible_only_recursively(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "dataset"
     nested = source / "nested"
     nested.mkdir(parents=True)
     for index in range(8):
         (nested / f"image_{index:02d}.png").write_bytes(b"image")
-    monkeypatch.setattr(production_runner, "_training_image_extensions", lambda: frozenset({".png"}))
     with pytest.raises(ValueError, match="non-recursive image discovery"):
         build_source_map((source,), dataset_key="example")
 
 
 def test_source_map_counts_only_loader_visible_root_images(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "dataset"
     nested = source / "nested"
@@ -221,7 +218,6 @@ def test_source_map_counts_only_loader_visible_root_images(
         (source / f"image_{index:02d}.png").write_bytes(b"image")
     (source / "caption.txt").write_text("caption", encoding="utf-8")
     (nested / "hidden.png").write_bytes(b"image")
-    monkeypatch.setattr(production_runner, "_training_image_extensions", lambda: frozenset({".png"}))
     payload, image_count = build_source_map((source,), dataset_key="example")
     assert image_count == 8
     assert payload[0]["image_count"] == 8
@@ -229,6 +225,18 @@ def test_source_map_counts_only_loader_visible_root_images(
         "caption.txt",
         *(f"image_{index:02d}.png" for index in range(8)),
     }
+
+
+def test_source_probe_capacity_rejects_partial_group_coverage() -> None:
+    with pytest.raises(ValueError, match="source_groups=33 exceeds probe_budget=32"):
+        production_runner._validate_source_probe_capacity(
+            source_group_count=33,
+            probe_budget=32,
+        )
+    production_runner._validate_source_probe_capacity(
+        source_group_count=32,
+        probe_budget=32,
+    )
 
 
 def test_output_base_policy_and_unique_run_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

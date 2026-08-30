@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import stat
 import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -275,7 +276,30 @@ def training_image_extensions() -> frozenset[str]:
     # plugins when they are installed.
     from library.train_util import IMAGE_EXTENSIONS as LOADER_IMAGE_EXTENSIONS
 
-    return frozenset(str(extension).casefold() for extension in LOADER_IMAGE_EXTENSIONS)
+    return frozenset(str(extension) for extension in LOADER_IMAGE_EXTENSIONS)
+
+
+def loader_visible_image_files(directory: str | os.PathLike[str]) -> tuple[Path, ...]:
+    """Return exactly the files DreamBoothDataset's non-recursive glob sees."""
+
+    from library.train_util import glob_images
+
+    return tuple(Path(value) for value in glob_images(str(directory), "*"))
+
+
+def _first_symlink_or_reparse_component(path: Path) -> Optional[Path]:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            if current.is_symlink():
+                return current
+            attributes = int(getattr(current.lstat(), "st_file_attributes", 0))
+        except OSError:
+            continue
+        if attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+            return current
+    return None
 
 
 def _fallback_value(key: str, sources: Sequence[Mapping[str, Any]], default: Any) -> Any:
@@ -321,7 +345,6 @@ def resolve_dataset_layout(
     if not isinstance(general, Mapping):
         raise ValueError("dataset [general] must be a table")
 
-    extensions = training_image_extensions()
     settings: list[ResolvedDatasetSettings] = []
     resolved_subsets: list[ResolvedDatasetSubset] = []
     source_dirs: list[Path] = []
@@ -409,6 +432,13 @@ def resolve_dataset_layout(
                     "canonical diagnostic requires absolute image_dir paths because the training "
                     f"loader resolves relative paths from its process cwd: {raw_dir!r}"
                 )
+            linked_component = _first_symlink_or_reparse_component(raw_image_dir)
+            if linked_component is not None:
+                raise ValueError(
+                    "canonical diagnostic rejects image_dir paths containing symlink or reparse "
+                    "components because source-group prefixes must match worker-visible image keys: "
+                    f"{linked_component}"
+                )
             image_dir = raw_image_dir.resolve()
             if not image_dir.is_dir():
                 raise FileNotFoundError(f"dataset image_dir was not found: {image_dir}")
@@ -443,20 +473,15 @@ def resolve_dataset_layout(
 
             image_files = tuple(
                 sorted(
-                    (
-                        item.resolve()
-                        for item in image_dir.iterdir()
-                        if item.is_file() and item.suffix.casefold() in extensions
-                    ),
+                    (item.resolve() for item in loader_visible_image_files(image_dir)),
                     key=lambda item: (str(item).casefold(), str(item)),
                 )
             )
             if not image_files:
                 nested_count = sum(
-                    item.is_file()
-                    and item.parent != image_dir
-                    and item.suffix.casefold() in extensions
+                    len(loader_visible_image_files(item))
                     for item in image_dir.rglob("*")
+                    if item.is_dir()
                 )
                 if nested_count:
                     raise ValueError(

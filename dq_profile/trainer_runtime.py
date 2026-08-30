@@ -6,7 +6,7 @@ import math
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -404,13 +404,28 @@ class DiagnosticProfileRuntime:
         source_group_map = SourceGroupMap.load(
             getattr(self.args, "dq_profile_source_group_map", None)
         )
-        minimum_source_groups = 4 if self.profile_protocol.startswith("v24-") else 1
+        source_group_order = self._source_group_order(source_group_map)
+        minimum_source_groups = (
+            max(4, len(source_group_order))
+            if self.profile_protocol.startswith("v24-")
+            else 1
+        )
         selected = sequence.unique_image_items(
             int(self.args.dq_profile_max_images),
             source_group_resolver=source_group_map.resolve,
+            source_group_order=source_group_order,
             minimum_source_groups=minimum_source_groups,
         )
         return selected, source_group_map
+
+    @staticmethod
+    def _source_group_order(source_group_map: SourceGroupMap) -> tuple[str, ...]:
+        result: list[str] = []
+        for rule in source_group_map.rules:
+            group = str(rule.source_group)
+            if group not in result:
+                result.append(group)
+        return tuple(result)
 
     def _capture_batches(
         self,
@@ -424,38 +439,113 @@ class DiagnosticProfileRuntime:
         epoch: int,
         data_step: int,
         count: int,
-    ) -> ReplaySequence:
+        source_group_resolver: Optional[Callable[[str], str]] = None,
+        required_source_groups: Sequence[str] = (),
+    ) -> tuple[ReplaySequence, dict[str, Any]]:
         sequence = ReplaySequence()
         iterator = iter(epoch_iterator)
         current_batch = first_batch
         source_epoch = int(epoch)
         source_step = int(data_step)
-        for index in range(count):
-            if index > 0:
-                # Match the production for-loop/collator ordering: the next
-                # batch is collated while current_step still identifies the
-                # previously completed optimizer step.
-                current_step.value = global_step + index - 1
-                try:
-                    current_batch = next(iterator)
-                    source_step += 1
-                except StopIteration:
-                    source_epoch += 1
-                    current_epoch.value = source_epoch + 1
-                    source_step = 0
-                    iterator = iter(train_dataloader)
-                    current_batch = next(iterator)
+        represented_groups: set[str] = set()
+
+        def batch_groups(batch: Mapping[str, Any]) -> set[str]:
+            if source_group_resolver is None:
+                return set()
+            raw_keys = batch.get("image_keys", ())
+            if isinstance(raw_keys, str):
+                keys = (raw_keys,)
+            elif isinstance(raw_keys, (list, tuple)):
+                keys = tuple(str(value) for value in raw_keys)
+            else:
+                keys = ()
+            return {str(source_group_resolver(key)) for key in keys}
+
+        def advance(stream_index: int) -> None:
+            nonlocal iterator, current_batch, source_epoch, source_step
+            # Match the production for-loop/collator ordering: the next batch
+            # is collated while current_step still identifies the previously
+            # completed optimizer step.
+            current_step.value = global_step + stream_index - 1
+            try:
+                current_batch = next(iterator)
+                source_step += 1
+            except StopIteration:
+                source_epoch += 1
+                current_epoch.value = source_epoch + 1
+                source_step = 0
+                iterator = iter(train_dataloader)
+                current_batch = next(iterator)
+
+        def append_current(stream_index: int) -> None:
             sequence.append(
                 ReplayBatch(
-                    index=index,
+                    index=stream_index,
                     source_epoch=source_epoch,
                     source_step=source_step,
-                    global_step=global_step + index,
+                    global_step=global_step + stream_index,
                     batch=dict(current_batch),
                 )
             )
+            represented_groups.update(batch_groups(current_batch))
+
+        count = int(count)
+        if count <= 0:
+            raise ValueError("replay capture count must be positive")
+        for index in range(count):
+            if index > 0:
+                advance(index)
+            append_current(index)
+
+        ordered_required = tuple(dict.fromkeys(str(value) for value in required_source_groups))
+        missing = [group for group in ordered_required if group not in represented_groups]
+        coverage_scan_batches = 0
+        coverage_appended_batches = 0
+        coverage_scan_bound = 0
+        if missing:
+            try:
+                epoch_length = int(len(train_dataloader))  # type: ignore[arg-type]
+            except (TypeError, AttributeError) as error:
+                raise ValueError(
+                    "source coverage capture requires a sized training DataLoader"
+                ) from error
+            if epoch_length <= 0:
+                raise ValueError("source coverage capture requires a non-empty training DataLoader")
+            coverage_scan_bound = 2 * epoch_length
+            # From an arbitrary point in the current epoch, at most two epoch
+            # lengths contain one complete subsequent epoch. Only batches
+            # which add a missing source are retained, so memory stays bounded.
+            for offset in range(coverage_scan_bound):
+                stream_index = count + offset
+                advance(stream_index)
+                coverage_scan_batches += 1
+                groups = batch_groups(current_batch)
+                if not groups.intersection(missing):
+                    continue
+                append_current(stream_index)
+                coverage_appended_batches += 1
+                missing = [group for group in missing if group not in groups]
+                if not missing:
+                    break
+        if missing:
+            raise ValueError(
+                "probe replay could not capture every required source group after "
+                f"a bounded two-epoch scan: missing={missing!r}"
+            )
         sequence.seal()
-        return sequence
+        capture_metadata = {
+            "requested_batches": count,
+            "retained_batches": len(sequence),
+            "coverage_scan_batches": coverage_scan_batches,
+            "coverage_appended_batches": coverage_appended_batches,
+            "required_source_groups": list(ordered_required),
+            "represented_source_groups": [
+                group for group in ordered_required if group in represented_groups
+            ],
+            "coverage_complete": not missing,
+            "coverage_scan_bound": coverage_scan_bound,
+        }
+        return sequence, capture_metadata
 
     def _materialize_replay(
         self,
@@ -1970,7 +2060,18 @@ class DiagnosticProfileRuntime:
                 dq_delta_begin_step=dq_delta_begin_step,
                 num_train_epochs=num_train_epochs,
             )
-        sequence = self._capture_batches(
+        capture_source_group_map = SourceGroupMap.load(
+            getattr(self.args, "dq_profile_source_group_map", None)
+        )
+        capture_source_group_order = self._source_group_order(
+            capture_source_group_map
+        )
+        required_capture_groups = (
+            capture_source_group_order
+            if self.profile_protocol.startswith("v24-")
+            else ()
+        )
+        sequence, capture_metadata = self._capture_batches(
             first_batch=first_batch,
             epoch_iterator=epoch_iterator,
             train_dataloader=train_dataloader,
@@ -1984,6 +2085,8 @@ class DiagnosticProfileRuntime:
                 if self.profile_protocol == "v1"
                 else self.args.dq_profile_capture_steps
             ),
+            source_group_resolver=capture_source_group_map.resolve,
+            required_source_groups=required_capture_groups,
         )
         snapshot.restore(
             network=unwrapped,
@@ -2035,6 +2138,7 @@ class DiagnosticProfileRuntime:
                     ),
                     "worker_count": 0,
                     "live_dataloader_reused_by_branches": False,
+                    "capture_contract": capture_metadata,
                     "branch_batches": sequence.manifest(),
                     "structural_probe": {
                         "performed": self.profile_protocol != "v2-prefix-smoke",
@@ -2499,6 +2603,7 @@ class DiagnosticProfileRuntime:
                     else int(self.args.dq_profile_sweep_steps)
                 ),
                 "replay_capture_batches": len(sequence),
+                "replay_capture": capture_metadata,
                 "probe_images": (
                     0
                     if self.profile_protocol == "v2-prefix-smoke"

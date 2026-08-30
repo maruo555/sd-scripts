@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from dq_profile.production_cli import ResolvedProfileRequest
-from dq_profile.protocol import resolve_dataset_layout, training_image_extensions
+from dq_profile.protocol import loader_visible_image_files, resolve_dataset_layout
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -189,16 +189,20 @@ def source_dirs_from_dataset_config(
     return tuple(subset.image_dir for subset in layout.subsets)
 
 
-def _training_image_extensions() -> frozenset[str]:
-    return training_image_extensions()
-
-
 def _inventory(
     source_dir: Path,
     *,
-    image_extensions: frozenset[str] | None = None,
+    visible_images: Sequence[Path] | None = None,
 ) -> list[dict[str, Any]]:
-    image_extensions = _training_image_extensions() if image_extensions is None else image_extensions
+    visible_images = (
+        loader_visible_image_files(source_dir)
+        if visible_images is None
+        else tuple(visible_images)
+    )
+    visible_keys = {
+        os.path.normcase(os.path.normpath(str(path)))
+        for path in visible_images
+    }
     rows: list[dict[str, Any]] = []
     # DreamBoothDataset uses non-recursive glob_images(image_dir, "*"). Keep
     # the source inventory and preflight image count on exactly that topology.
@@ -210,7 +214,7 @@ def _inventory(
                 "name": str(path.relative_to(source_dir)).replace("\\", "/"),
                 "size": path.stat().st_size,
                 "sha256": sha256_file(path),
-                "is_image": path.suffix.casefold() in image_extensions,
+                "is_image": os.path.normcase(os.path.normpath(str(path))) in visible_keys,
             }
         )
     return rows
@@ -218,16 +222,15 @@ def _inventory(
 
 def build_source_map(source_dirs: Sequence[Path], *, dataset_key: str) -> tuple[list[dict[str, Any]], int]:
     payload: list[dict[str, Any]] = []
-    image_extensions = _training_image_extensions()
     for index, source_dir in enumerate(source_dirs, start=1):
-        files = _inventory(source_dir, image_extensions=image_extensions)
-        source_image_count = sum(bool(row["is_image"]) for row in files)
+        visible_images = loader_visible_image_files(source_dir)
+        files = _inventory(source_dir, visible_images=visible_images)
+        source_image_count = len(visible_images)
         if source_image_count == 0:
             nested_image_count = sum(
-                path.is_file()
-                and path.parent != source_dir
-                and path.suffix.casefold() in image_extensions
+                len(loader_visible_image_files(path))
                 for path in source_dir.rglob("*")
+                if path.is_dir()
             )
             if nested_image_count:
                 raise ValueError(
@@ -847,6 +850,16 @@ def preflight(request: ResolvedProfileRequest, source_dirs: Sequence[Path]) -> N
         )
 
 
+def _validate_source_probe_capacity(*, source_group_count: int, probe_budget: int) -> None:
+    if int(source_group_count) > int(probe_budget):
+        raise ValueError(
+            "canonical diagnostic must represent every active image_dir group in its "
+            f"structural probe, but source_groups={source_group_count} exceeds "
+            f"probe_budget={probe_budget}. Consolidate source groups or use a preset "
+            "with a larger validated probe budget."
+        )
+
+
 def _write_initial_artifacts(
     run_dir: Path,
     request: ResolvedProfileRequest,
@@ -905,6 +918,10 @@ def run_profile_request(
         dataset_key=sanitize_profile_name(options.profile_name or request.output_name).casefold(),
     )
     probe_budget = min(image_count, request.preset.max_images)
+    _validate_source_probe_capacity(
+        source_group_count=len(source_map_payload),
+        probe_budget=probe_budget,
+    )
     fingerprint = build_protocol_fingerprint(request, source_map_payload=source_map_payload)
     run_dir = allocate_run_directory(
         output_base,

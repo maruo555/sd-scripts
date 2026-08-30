@@ -4,7 +4,7 @@ import copy
 import hashlib
 import random
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -199,6 +199,7 @@ class ReplaySequence:
         limit: int,
         *,
         source_group_resolver: Optional[Callable[[str], str]] = None,
+        source_group_order: Optional[Sequence[str]] = None,
         minimum_source_groups: int = 1,
     ) -> list[ReplayBatch]:
         limit = int(limit)
@@ -230,6 +231,15 @@ class ReplaySequence:
                 "probe replay does not represent enough source groups: "
                 f"required={required_groups}, available={len(grouped)}"
             )
+
+        if source_group_order is not None:
+            prioritized: list[str] = []
+            for group in source_group_order:
+                group = str(group)
+                if group in grouped and group not in prioritized:
+                    prioritized.append(group)
+            prioritized.extend(group for group in group_order if group not in prioritized)
+            group_order = prioritized
 
         # First cover every represented source, then take another item from
         # each source in first-occurrence order. This keeps the selection

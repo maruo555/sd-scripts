@@ -48,7 +48,9 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 最初にGPUを使わず、次を確認します。
 
 - model、dataset TOML、各`image_dir`が存在する。
-- 学習loaderと同じ非再帰探索で、各`image_dir`直下に画像があり、dataset全体で8画像以上、独立した`image_dir`が4 group以上ある。
+- 学習loaderと同じ拡張子・大文字小文字規則および非再帰探索で、各`image_dir`直下に画像があり、dataset全体で8画像以上、独立した`image_dir`が4 group以上ある。
+- source-group prefixとworkerが返す画像keyを一致させるため、`image_dir`のどの階層にもsymlink、junctionなどのreparse pointを含めない。
+- すべての有効な`image_dir` groupをprobeへ最低1件ずつ含められることを確認する。group数が検証済みprobe上限を超える設定は、部分的なconfidenceを出さず開始前に拒否する。
 - TOMLの`[general]`／dataset／subset fallbackを解決し、batch・bucket設定（`bucket_no_upscale=false`を含む）が`canonical-v1`と一致することを確認する。
 - CLIが`canonical-v1`と互換である。
 - 通常checkpoint、dataset、repositoryと診断出力先が重ならない。
@@ -101,6 +103,13 @@ no-quantと各固定mulの勾配を比較します。
 - stateless量子化乱数を使い、共通候補間でcommon random numbersを保つ。
 - dropoutを無効にした`structural_dropout_off` regimeで測る。
 - module単位の勾配を集約し、Body、Tail、hard-safety、source別の不確実性を作る。
+
+比較用branchの先頭replay windowは固定したままです。この固定windowにrepeat数の少ない
+`image_dir` groupが含まれなかった場合だけ、DataLoaderを最大2 epoch分追加走査します。
+不足groupを初めて含んだbatchだけをprobe用に保持し、全source groupを揃えてから画像を
+round-robin選択します。追加batchはbranchの128-step prefixへ混ぜないため、候補間比較の
+再現契約は変わりません。極端にrepeatが偏るdatasetでは、このcoverage走査ぶんだけ
+Local計測開始前の時間が増える場合があります。
 
 このLocal結果だけを通常レポートのSafety/Fidelityと候補削減に使用します。dropout有効の
 128-step Trajectoryは研究専用の別channelであり、現在の製品入口では実行しません。

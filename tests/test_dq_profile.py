@@ -234,7 +234,11 @@ def test_dataset_preflight_uses_loader_optional_extensions(
         f"image_dir={json.dumps(str(image_dir))}\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(protocol, "training_image_extensions", lambda: frozenset({".avif"}))
+    monkeypatch.setattr(
+        protocol,
+        "loader_visible_image_files",
+        lambda _: (image_dir / "image.avif",),
+    )
     result = inspect_dataset_config(
         config,
         max_train_epochs=40,
@@ -246,6 +250,63 @@ def test_dataset_preflight_uses_loader_optional_extensions(
         stochastic_repeats=2,
     )
     assert result.unique_images == 1
+
+
+def test_dataset_preflight_uses_loader_result_instead_of_casefolded_suffix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "image.JpG").write_bytes(b"image")
+    config = tmp_path / "dataset.toml"
+    config.write_text(
+        "[[datasets]]\n"
+        "[[datasets.subsets]]\n"
+        f"image_dir={json.dumps(str(image_dir))}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(protocol, "loader_visible_image_files", lambda _: ())
+    with pytest.raises(ValueError, match="no loader-visible image files"):
+        inspect_dataset_config(
+            config,
+            max_train_epochs=40,
+            max_train_steps=None,
+            lr_warmup_steps=0.05,
+            branch_steps_override=None,
+            max_images=32,
+            timestep_bins=4,
+            stochastic_repeats=2,
+        )
+
+
+def test_dataset_preflight_rejects_symlinked_image_dir(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "image.png").write_bytes(b"image")
+    linked = tmp_path / "linked"
+    try:
+        linked.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    config = tmp_path / "dataset.toml"
+    config.write_text(
+        "[[datasets]]\n"
+        "[[datasets.subsets]]\n"
+        f"image_dir={json.dumps(str(linked))}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="symlink or reparse"):
+        inspect_dataset_config(
+            config,
+            max_train_epochs=40,
+            max_train_steps=None,
+            lr_warmup_steps=0.05,
+            branch_steps_override=None,
+            max_images=32,
+            timestep_bins=4,
+            stochastic_repeats=2,
+        )
 
 
 def test_error_decomposition_identity_and_exact_gradient_cosine():
@@ -438,13 +499,7 @@ def test_replay_sequence_is_sealed_and_has_no_loader_reference():
 def test_replay_probe_selection_is_source_stratified_and_deterministic():
     sequence = ReplaySequence()
     keys = [f"source-a/image-{index:02d}.png" for index in range(40)]
-    keys.extend(
-        (
-            "source-b/image.png",
-            "source-c/image.png",
-            "source-d/image.png",
-        )
-    )
+    keys.extend(("source-d/image.png", "source-c/image.png", "source-b/image.png"))
     for index, key in enumerate(keys):
         sequence.append(
             ReplayBatch(index, 0, index, index, {"image_keys": [key]})
@@ -455,11 +510,13 @@ def test_replay_probe_selection_is_source_stratified_and_deterministic():
     first = sequence.unique_image_items(
         8,
         source_group_resolver=resolver,
+        source_group_order=("source-a", "source-b", "source-c", "source-d"),
         minimum_source_groups=4,
     )
     second = sequence.unique_image_items(
         8,
         source_group_resolver=resolver,
+        source_group_order=("source-a", "source-b", "source-c", "source-d"),
         minimum_source_groups=4,
     )
     first_keys = [item.image_keys[0] for item in first]
