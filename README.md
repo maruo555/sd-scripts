@@ -55,11 +55,33 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 **ツール一覧**
 | ツール名 | 概要 | 説明 |
 |---|---|---|
+| `python -m dq_profile` | Experimental DQ Dataset Profilerを直接起動し、Local Body／Tailレポートを生成 | 既定出力は `lora_output/dq_dataset_profiler`。Safety/Fidelity診断であり最終画質推薦ではない。使い方: [docs/dq_dataset_profiler-ja.md](docs/dq_dataset_profiler-ja.md) |
 | `sdxl_tokenize.py` | SDXLのTE1/TE2トークン分割の表示と候補探索 | [docs/sdxl_tokenize_tool-ja.md](docs/sdxl_tokenize_tool-ja.md) |
 | `make_lora_diagnostic_report.py` | LoRA学習ログ（`grad_norm` / `dq_delta`）とLoRA重みを診断し、グラフ内蔵HTMLを生成 | 使い方とオプション詳細: [docs/make_lora_diagnostic_report-ja.md](docs/make_lora_diagnostic_report-ja.md) |
 | `sdxl_lora_report_gui.py` | SDXL LoRAの一括生成・比較HTMLレポートをGUIで作成 | [docs/sdxl_lora_report_README-ja.md](docs/sdxl_lora_report_README-ja.md) |
 | `sdxl_lora_report_cui.py` | JSON設定からSDXL LoRA比較レポートをCUI生成。GUIの下請けとしても使用 | [docs/sdxl_lora_report_README-ja.md](docs/sdxl_lora_report_README-ja.md) |
 | `sdxl_gen_img.py` | SDXL画像生成スクリプト。本フォークでは `--network_lbw` でLoRA Block Weight指定に対応 | [docs/sdxl_gen_img_README-ja.md](docs/sdxl_gen_img_README-ja.md) |
+
+### Experimental SDXL DQ Dataset Profiler
+
+`python -m dq_profile`は、SDXL LoRAの通常学習とは独立して、同じsnapshotと入力から
+複数の固定`range_mul`を比較する診断ツールです。各候補がno-quant勾配からどの程度
+変化するかをBody／Tailとして測り、hard safety、Fidelity retained set、候補内の
+相対的な強弱を自己完結HTMLへまとめます。
+
+この診断は最終画質、量子化の採用可否、best mulを自動判定するものではありません。
+比較可能性を保つため、初期Betaではrank 4、AdamW8bitFast、fp16 strictなどの
+検証済み条件を固定したExperimental strict referenceとして提供します。
+
+```bat
+.\venv\Scripts\python.exe -m dq_profile ^
+  --pretrained_model_name_or_path="D:\models\sdxl_base.safetensors" ^
+  --dataset_config="D:\datasets\example\dataset.toml"
+```
+
+既定では`lora_output/dq_dataset_profiler`以下へrunごとの新規フォルダを作ります。
+必要なCLI、固定条件、処理内容、所要時間、レポートの読み方は
+[SDXL DQ Dataset Profiler利用ガイド](docs/dq_dataset_profiler-ja.md)を参照してください。
 
 ---
 
