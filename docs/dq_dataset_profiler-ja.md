@@ -53,10 +53,12 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 - source-group prefixとworkerが返す画像keyを一致させるため、`image_dir`へ`.`／`..`のpath componentを含めず、どの階層にもsymlink、junctionなどのreparse pointを含めない。
 - すべての有効な`image_dir` groupをprobeへ最低1件ずつ含められることを確認する。group数が検証済みprobe上限を超える設定は、部分的なconfidenceを出さず開始前に拒否する。
 - `cache_latents`と両立しない`color_aug=true`または`random_crop=true`が、subset／dataset／`[general]`のfallback後に有効でないことを確認する。
+- DreamBooth loaderに必須の`resolution`が、datasetまたは`[general]`のfallback後に定義されていることを確認する。
 - TOMLの`[general]`／dataset／subset fallbackを解決し、batch・bucket設定（`bucket_no_upscale=false`を含む）が`canonical-v1`と一致することを確認する。
 - CLIが`canonical-v1`と互換である。
 - 通常checkpoint、dataset、repositoryと診断出力先が重ならない。
 - Git HEAD、ソースhash、preset、model内容のSHA-256、dataset、source inventoryからprotocol fingerprintを作る。
+- 各GPU workerの起動直前にmodel内容とsource inventoryを再度hash照合し、長い多段runの途中でmodel、画像、caption、cache sidecarが変化した場合は混在させず停止する。
 - repositoryに追跡済みの未コミット変更がある場合は、HEADとの差分全体もbinary diffとしてhash化する。未追跡ファイルは対象外と明記する。
 - 実画像数と`min(実画像数, 32)`であるprobe budgetを記録する。
 
@@ -324,7 +326,7 @@ python -m dq_profile ^
 | オプション | 必須 | 既定値 | 用途 |
 |---|:---:|---|---|
 | `--pretrained_model_name_or_path` | 必須 | なし | SDXL base modelのファイルまたはディレクトリ |
-| `--dataset_config` | 必須 | なし | kohya形式dataset TOML。各subsetに`image_dir`が必要 |
+| `--dataset_config` | 必須 | なし | kohya形式dataset TOML。実効`resolution`と各subsetの`image_dir`が必要 |
 | `--output_name` | 任意 | dataset TOMLのstem | 診断名のfallback。パス区切りを含まない名前 |
 | `--dq-profile-name` | 任意 | `output_name` | datasetごとの親フォルダ名 |
 | `--dq-profile-output-dir` | 任意 | repositoryの`..\lora_output\dq_dataset_profiler` | 診断runを格納する基底ディレクトリ |
@@ -333,7 +335,7 @@ python -m dq_profile ^
 | `--dq-profile-dry-run` | 任意 | false | 解決済みCore commandを`dry_run_command.json`へ書き、GPUを起動しない |
 | `--dq-profile-open-report` | 任意 | false | Windowsで正常完了した場合に`report.html`を開く |
 
-`image_dir`はドライブ名またはUNCから始まる絶対パスで指定し、4つ以上の独立したsource groupを用意してください。`~`は学習loaderが展開しないため使用できません。子孫フォルダだけにある画像は通常のDreamBooth学習loaderから見えないため診断でも数えません。子フォルダを個別subsetとしてTOMLへ列挙するか、画像を`image_dir`直下へ配置してください。`num_repeats`は1以上が必要です。画像inventoryがworkerごとに変わり得る`cache_info=true`は現在のdiagnostic contractでは拒否します。
+`resolution`はdataset sectionまたは`[general]`で指定してください（例: `resolution = 1024`）。`image_dir`はドライブ名またはUNCから始まる絶対パスで指定し、4つ以上の独立したsource groupを用意してください。`~`は学習loaderが展開しないため使用できません。子孫フォルダだけにある画像は通常のDreamBooth学習loaderから見えないため診断でも数えません。子フォルダを個別subsetとしてTOMLへ列挙するか、画像を`image_dir`直下へ配置してください。`num_repeats`は1以上が必要です。画像inventoryがworkerごとに変わり得る`cache_info=true`は現在のdiagnostic contractでは拒否します。
 
 事前検査だけ行う例です。検査結果も新しいrunディレクトリへ保存します。
 

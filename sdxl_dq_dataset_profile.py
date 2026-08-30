@@ -645,6 +645,8 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         dataset_repeats=int(getattr(args, "dataset_repeats", 1)),
         cache_info=bool(getattr(args, "cache_info", False)),
         minimum_source_groups=minimum_source_groups,
+        resolution=getattr(args, "resolution", None),
+        require_resolution=True,
     )
     args.dq_profile_branch_steps_resolved = summary.branch_steps
     args.dq_profile_probe_replicas_resolved = (

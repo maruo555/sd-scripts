@@ -187,6 +187,7 @@ def source_dirs_from_dataset_config(
         dataset_repeats=1,
         cache_info=False,
         minimum_source_groups=minimum_source_groups,
+        require_resolution=True,
     )
     return tuple(subset.image_dir for subset in layout.subsets)
 
@@ -372,6 +373,23 @@ def _model_identity(path: Path) -> dict[str, Any]:
             "inventory_sha256": canonical_sha256(inventory),
         }
     raise ValueError(f"pretrained model path is neither a file nor a directory: {path}")
+
+
+def validate_model_identity(model_path: Path, protocol_fingerprint: Path) -> None:
+    payload = read_json(protocol_fingerprint)
+    expected = payload.get("model")
+    if not isinstance(expected, Mapping):
+        raise ValueError(
+            f"protocol fingerprint has no model identity: {protocol_fingerprint}"
+        )
+    current = _model_identity(model_path)
+    if current != expected:
+        raise RuntimeError(
+            "pretrained model changed after protocol fingerprinting; refusing to mix "
+            "worker stages with stale provenance: "
+            f"expected_sha256={canonical_sha256(expected)}, "
+            f"current_sha256={canonical_sha256(current)}"
+        )
 
 
 def build_protocol_fingerprint(
@@ -578,6 +596,10 @@ def run_profile(
     gate: Path | None = None,
     snapshot_only: bool = False,
 ) -> Path:
+    validate_model_identity(
+        request.model_path,
+        launcher.run_dir / "protocol_fingerprint.json",
+    )
     # The subprocess reads the original image/caption/cache paths, not copies.
     # Re-hash them immediately before every worker so a long staged run cannot
     # silently combine bytes that differ from source_group_map.json.

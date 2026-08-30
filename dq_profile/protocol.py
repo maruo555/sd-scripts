@@ -52,6 +52,7 @@ class DatasetSubsetSummary:
 @dataclass(frozen=True)
 class ResolvedDatasetSettings:
     dataset_index: int
+    resolution: Optional[tuple[int, int]]
     batch_size: int
     enable_bucket: bool
     bucket_no_upscale: bool
@@ -323,6 +324,25 @@ def _int_setting(value: Any, *, label: str) -> int:
     return int(value)
 
 
+def _resolution_setting(value: Any, *, label: str) -> tuple[int, int]:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be an integer or two integers, got {value!r}")
+    if isinstance(value, int):
+        result = (int(value), int(value))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        if len(value) != 2:
+            raise ValueError(f"{label} must contain exactly two integers, got {value!r}")
+        result = (
+            _int_setting(value[0], label=f"{label}[0]"),
+            _int_setting(value[1], label=f"{label}[1]"),
+        )
+    else:
+        raise ValueError(f"{label} must be an integer or two integers, got {value!r}")
+    if min(result) <= 0:
+        raise ValueError(f"{label} must be positive, got {value!r}")
+    return result
+
+
 def resolve_dataset_layout(
     dataset_config: str | os.PathLike[str],
     *,
@@ -335,6 +355,8 @@ def resolve_dataset_layout(
     dataset_repeats: int = 1,
     cache_info: bool = False,
     minimum_source_groups: int = 1,
+    resolution: int | Sequence[int] | None = None,
+    require_resolution: bool = False,
 ) -> ResolvedDatasetLayout:
     path = Path(dataset_config).expanduser().resolve()
     if not path.is_file():
@@ -355,6 +377,20 @@ def resolve_dataset_layout(
         if not isinstance(raw_dataset, Mapping):
             raise ValueError(f"datasets[{dataset_index}] must be a table")
         dataset = raw_dataset
+        raw_resolution = _fallback_value("resolution", (dataset, general), resolution)
+        effective_resolution = (
+            _resolution_setting(
+                raw_resolution,
+                label=f"datasets[{dataset_index}].resolution",
+            )
+            if raw_resolution is not None
+            else None
+        )
+        if require_resolution and effective_resolution is None:
+            raise ValueError(
+                "resolution is required by the DreamBooth training loader after "
+                f"dataset/[general]/CLI fallback: datasets[{dataset_index}].resolution"
+            )
         batch_size = _int_setting(
             _fallback_value("batch_size", (dataset, general), train_batch_size),
             label=f"datasets[{dataset_index}].batch_size",
@@ -415,6 +451,7 @@ def resolve_dataset_layout(
         settings.append(
             ResolvedDatasetSettings(
                 dataset_index=dataset_index,
+                resolution=effective_resolution,
                 batch_size=batch_size,
                 enable_bucket=bucket_enabled,
                 bucket_no_upscale=effective_bucket_no_upscale,
@@ -571,6 +608,8 @@ def inspect_dataset_config(
     dataset_repeats: int = 1,
     cache_info: bool = False,
     minimum_source_groups: int = 1,
+    resolution: int | Sequence[int] | None = None,
+    require_resolution: bool = False,
 ) -> PreflightSummary:
     layout = resolve_dataset_layout(
         dataset_config,
@@ -583,6 +622,8 @@ def inspect_dataset_config(
         dataset_repeats=dataset_repeats,
         cache_info=cache_info,
         minimum_source_groups=minimum_source_groups,
+        resolution=resolution,
+        require_resolution=require_resolution,
     )
     path = layout.dataset_config
 

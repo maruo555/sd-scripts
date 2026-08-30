@@ -24,6 +24,7 @@ from dq_profile.production_runner import (
     sanitize_profile_name,
     source_dirs_from_dataset_config,
     subprocess_text_environment,
+    validate_model_identity,
     validate_source_map_inventory,
     validate_output_base,
 )
@@ -170,6 +171,8 @@ def test_source_dirs_follow_toml_order_and_reject_duplicates(tmp_path: Path) -> 
     (second / "second.png").write_bytes(b"image")
     config = tmp_path / "dataset.toml"
     config.write_text(
+        "[general]\n"
+        "resolution=1024\n"
         "[[datasets]]\n"
         "  [[datasets.subsets]]\n"
         f"  image_dir = {json.dumps(str(first))}\n"
@@ -179,6 +182,8 @@ def test_source_dirs_follow_toml_order_and_reject_duplicates(tmp_path: Path) -> 
     )
     assert source_dirs_from_dataset_config(config) == (first.resolve(), second.resolve())
     config.write_text(
+        "[general]\n"
+        "resolution=1024\n"
         "[[datasets]]\n"
         "  [[datasets.subsets]]\n"
         f"  image_dir = {json.dumps(str(first))}\n"
@@ -199,6 +204,8 @@ def test_source_dirs_reject_too_few_active_source_groups(tmp_path: Path) -> None
         source_dirs.append(source)
     config = tmp_path / "dataset.toml"
     config.write_text(
+        "[general]\n"
+        "resolution=1024\n"
         "[[datasets]]\n"
         + "".join(
             "[[datasets.subsets]]\n" + f"image_dir = {json.dumps(str(source))}\n"
@@ -208,6 +215,21 @@ def test_source_dirs_reject_too_few_active_source_groups(tmp_path: Path) -> None
     )
     with pytest.raises(ValueError, match="at least 4 active image_dir groups"):
         source_dirs_from_dataset_config(config, minimum_source_groups=4)
+
+
+def test_source_dirs_reject_missing_effective_resolution(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "image.png").write_bytes(b"image")
+    config = tmp_path / "dataset.toml"
+    config.write_text(
+        "[[datasets]]\n"
+        "[[datasets.subsets]]\n"
+        f"image_dir = {json.dumps(str(source))}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="resolution is required"):
+        source_dirs_from_dataset_config(config)
 
 
 def test_source_map_rejects_images_visible_only_recursively(
@@ -316,6 +338,23 @@ def test_model_directory_identity_hashes_nested_file_contents(tmp_path: Path) ->
     assert first["file_count"] == second["file_count"] == 1
     assert first["total_file_size"] == second["total_file_size"]
     assert first["inventory_sha256"] != second["inventory_sha256"]
+
+
+def test_model_identity_revalidation_detects_same_metadata_change(tmp_path: Path) -> None:
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"model-a")
+    original_stat = model.stat()
+    fingerprint = tmp_path / "protocol_fingerprint.json"
+    fingerprint.write_text(
+        json.dumps({"model": _model_identity(model)}),
+        encoding="utf-8",
+    )
+    validate_model_identity(model, fingerprint)
+
+    model.write_bytes(b"model-b")
+    os.utime(model, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    with pytest.raises(RuntimeError, match="model changed"):
+        validate_model_identity(model, fingerprint)
 
 
 def test_git_tracked_state_hashes_the_complete_dirty_diff(
@@ -443,6 +482,8 @@ def test_dry_run_serializes_the_required_prefix_gate(
         source_dirs.append(source)
     dataset = tmp_path / "dataset.toml"
     dataset.write_text(
+        "[general]\n"
+        "resolution=1024\n"
         "[[datasets]]\n"
         + "".join(
             "[[datasets.subsets]]\n" + f"image_dir = {json.dumps(str(source))}\n"
