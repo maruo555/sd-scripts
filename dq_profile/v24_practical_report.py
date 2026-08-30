@@ -202,6 +202,7 @@ def report_contract() -> dict[str, Any]:
             "internal_profile_level_field": "internal_profile_level",
             "measurement_contract_field": "measurement_contract",
             "sampling_depth_field": "sampling_depth",
+            "confidence_ceiling_field": "confidence_ceiling",
             "quick": (
                 "explicit reduced-sampling run with short prefix smoke, one "
                 "standalone snapshot, and the fixed five-point grid"

@@ -186,7 +186,7 @@ Fidelity retained set、robust dominance、source LOOなどを作ります。`re
 | 要因 | 時間への影響 |
 |---|---|
 | 通常学習相当の総step数 | 5% warmup境界が変わる。画像repeatやdataset設定が多いほど、各GPU stageの境界作成が長くなる |
-| 実画像数 | Local部分は8～32画像の範囲でほぼ比例する。32画像を超える分は直接増えない |
+| 実画像数 | Local部分はprobe上限までほぼ比例する。Quickは最大16画像、Standard／Strictは最大32画像 |
 | bucket解像度 | 高解像度bucketが多いほど各forward/backwardが重くなる |
 | edge延長回数 | 0～2回。現在は拡張grid全体を再測定するため、もっとも大きな可変要因 |
 | GPU、precision、backend | 同じprotocolでも1 probe当たりの時間が変わる |
@@ -196,11 +196,25 @@ Fidelity retained set、robust dominance、source LOOなどを作ります。`re
 
 | mode | 実行内容 | 実測例を基準にした概算 |
 |---|---|---:|
-| Quick | Snapshot 1回、8A／8B／16、最大16画像、固定5点、edgeなし | 約60～75分（37画像・warmup 1,480 step級での事前見積もり） |
 | Standard | 8A／8B／16、固定5点を1回、edgeなし | 約37分 |
 | Strict（edgeなし） | 64A／64B／128、core 3点 | 約46分 |
 | Strict（edge 1回） | 上記＋拡張grid再測定1回 | 約65分 |
 | Strict（edge 2回） | 上記＋拡張grid再測定2回 | 約88分 |
+
+別の37画像、29,600 training-step相当、warmup境界1,480 stepのdatasetでは、同じGPUで
+次の実測になりました。このdatasetは上の13画像例よりwarmupとLocalの両方が重いため、
+絶対時間を直接比較しないでください。
+
+| mode | probe画像数 | GPU process数 | 実測時間 | Standard比 |
+|---|---:|---:|---:|---:|
+| Quick | 16 | 3 | 約1時間07分32秒 | 約33.1%短縮（約1.50倍速） |
+| Standard | 32 | 4 | 約1時間40分59秒 | 基準 |
+
+Quickの事前計画値は約68.5分で、実測約67.5分と近い結果でした。共有する先頭16画像・3候補の
+raw probeを同一source contractで検算したところ、gradient-tail 828行とno-quant自然変動192行が
+全列exact一致しました。一方、Quickはsourceごとの標本が少ないためCIが広がり、Standardなら
+robustに除外できた候補を除外せず全候補をretainedとする場合がありました。これは故障ではなく、
+縮小sampling時に無理な候補削減を避ける意図したabstain動作です。
 
 これは保証値ではありません。実行中は`status.json`の`current_stage`と`run.log`の
 `RUN`／`DONE`時刻で進行を確認してください。
