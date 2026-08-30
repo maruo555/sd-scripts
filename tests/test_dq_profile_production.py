@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from dq_profile.production_runner import (
     _model_identity,
     allocate_run_directory,
     build_source_map,
+    git_tracked_state,
     profile_command,
     promote_analysis,
     promote_profile_provenance,
@@ -246,6 +248,48 @@ def test_model_directory_identity_hashes_nested_file_contents(tmp_path: Path) ->
     assert first["file_count"] == second["file_count"] == 1
     assert first["total_file_size"] == second["total_file_size"]
     assert first["inventory_sha256"] != second["inventory_sha256"]
+
+
+def test_git_tracked_state_hashes_the_complete_dirty_diff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    dependency = repo / "dq_profile" / "omitted_dependency.py"
+    dependency.parent.mkdir()
+    dependency.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", str(dependency)], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=DQ Profile Test",
+            "-c",
+            "user.email=dq-profile-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    monkeypatch.setattr(production_runner, "REPO_ROOT", repo)
+
+    clean = git_tracked_state()
+    dependency.write_text("VALUE = 2\n", encoding="utf-8")
+    first_dirty = git_tracked_state()
+    dependency.write_text("VALUE = 3\n", encoding="utf-8")
+    second_dirty = git_tracked_state()
+
+    assert clean["dirty"] is False
+    assert first_dirty["dirty"] is True
+    assert second_dirty["dirty"] is True
+    assert clean["state_sha256"] != first_dirty["state_sha256"]
+    assert first_dirty["diff_sha256"] != second_dirty["diff_sha256"]
+    assert first_dirty["state_sha256"] != second_dirty["state_sha256"]
 
 
 def test_windows_subprocess_text_environment_overrides_utf8_mode(

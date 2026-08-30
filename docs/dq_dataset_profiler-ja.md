@@ -52,6 +52,7 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 - CLIが`canonical-v1`と互換である。
 - 通常checkpoint、dataset、repositoryと診断出力先が重ならない。
 - Git HEAD、ソースhash、preset、model内容のSHA-256、dataset、source inventoryからprotocol fingerprintを作る。
+- repositoryに追跡済みの未コミット変更がある場合は、HEADとの差分全体もbinary diffとしてhash化する。未追跡ファイルは対象外と明記する。
 - 実画像数と`min(実画像数, 32)`であるprobe budgetを記録する。
 
 `--dq-profile-preflight`ではここまで実行し、GPU stageを起動しません。

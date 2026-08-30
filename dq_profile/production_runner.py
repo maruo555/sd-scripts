@@ -104,16 +104,56 @@ def git_head() -> str:
     return result.stdout.strip()
 
 
-def git_tracked_dirty() -> bool:
-    result = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no"],
+def git_tracked_state() -> dict[str, Any]:
+    status = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.quotePath=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+        ],
         cwd=REPO_ROOT,
         check=True,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    return bool(result.stdout.strip())
+    ).stdout
+    diff = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "diff.algorithm=myers",
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--no-indent-heuristic",
+            "HEAD",
+            "--",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout
+    combined = hashlib.sha256()
+    combined.update(b"status\0")
+    combined.update(status)
+    combined.update(b"\0diff\0")
+    combined.update(diff)
+    return {
+        "contract": "tracked-status-and-head-binary-diff-v1",
+        "dirty": bool(status),
+        "untracked_files": "excluded",
+        "status_sha256": hashlib.sha256(status).hexdigest(),
+        "diff_sha256": hashlib.sha256(diff).hexdigest(),
+        "state_sha256": combined.hexdigest(),
+    }
 
 
 def sanitize_profile_name(value: str) -> str:
@@ -324,10 +364,12 @@ def build_protocol_fingerprint(
         REPO_ROOT / "tools" / "analyze_dq_v24_local.py",
         REPO_ROOT / "tools" / "check_dq_calibration_gate.py",
     )
+    tracked_state = git_tracked_state()
     payload = {
         "schema_version": RUN_SCHEMA_VERSION,
         "git_head": git_head(),
-        "git_tracked_dirty": git_tracked_dirty(),
+        "git_tracked_dirty": tracked_state["dirty"],
+        "git_tracked_state": tracked_state,
         "preset": request.preset.contract(),
         "model": _model_identity(request.model_path),
         "dataset_config": {
