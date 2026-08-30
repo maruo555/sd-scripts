@@ -477,6 +477,8 @@ def accelerate_prefix(preset: Any) -> list[str]:
         sys.executable,
         "-m",
         "accelerate.commands.launch",
+        "--num_processes=1",
+        "--num_machines=1",
         "--num_cpu_threads_per_process",
         str(preset.num_cpu_threads_per_process),
         str(PROFILE_SCRIPT),

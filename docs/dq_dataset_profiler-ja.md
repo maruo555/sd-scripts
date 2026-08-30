@@ -30,6 +30,7 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 - 診断専用にコピーしたtrainerとLoRA実装を使用する。
 - 通常のモデル保存先、resume、tracker、sample生成へ書き込まない。
 - 診断出力ディレクトリ以外へ成果物を書かない。
+- 各Accelerate stageを`num_processes=1`、`num_machines=1`で起動し、ユーザー環境の分散設定を継承しない。
 - DataLoaderをworker 0に固定し、分岐には固定済みreplay batchを使う。
 - 同一snapshot、同一画像、同一noise、同一timestep、同一dropout条件で候補を比較する。
 - 量子化乱数を候補名に依存させず、mul間でcommon random numbersを使う。
@@ -51,6 +52,7 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 - 学習loaderと同じ拡張子・大文字小文字規則および非再帰探索で、各`image_dir`直下に画像があり、dataset全体で8画像以上、独立した`image_dir`が4 group以上ある。
 - source-group prefixとworkerが返す画像keyを一致させるため、`image_dir`のどの階層にもsymlink、junctionなどのreparse pointを含めない。
 - すべての有効な`image_dir` groupをprobeへ最低1件ずつ含められることを確認する。group数が検証済みprobe上限を超える設定は、部分的なconfidenceを出さず開始前に拒否する。
+- `cache_latents`と両立しない`color_aug=true`または`random_crop=true`が、subset／dataset／`[general]`のfallback後に有効でないことを確認する。
 - TOMLの`[general]`／dataset／subset fallbackを解決し、batch・bucket設定（`bucket_no_upscale=false`を含む）が`canonical-v1`と一致することを確認する。
 - CLIが`canonical-v1`と互換である。
 - 通常checkpoint、dataset、repositoryと診断出力先が重ならない。
@@ -128,7 +130,8 @@ total = I × 4 × (3 + 4M)
 ### 3.5 Bounded edge extension
 
 core gridは`2.70, 3.15, 3.45`です。候補集合が測定端に残る場合だけ、最大2段まで
-`3.75`、`4.05`を追加します。
+外側を追加します。下端側は`2.25`、なお未解決なら`1.80`、上端側は`3.75`、
+なお未解決なら`4.05`です。両端が残る場合は両方向を同じroundで追加します。
 
 現在のBeta実装は再現性を優先し、edge追加時に以前のmulも含む拡張grid全体を別processで
 再測定します。その後、共通mulの全probe行が以前のstageと一致することをexact parityで
@@ -385,6 +388,8 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | noise | `noise_offset` | `0.15` |
 | noise | `adaptive_noise_scale` | `0.1` |
 | latent | `cache_latents` | enabled |
+| latent互換 | dataset `color_aug` | fallback後にdisabledであることを要求 |
+| latent互換 | dataset `random_crop` | fallback後にdisabledであることを要求 |
 | Text Encoder | `text_encoder_lr` | `2e-4` |
 | Text Encoder | `text_encoder_lr1` | `3e-4` |
 | Text Encoder | `text_encoder_lr2` | `2e-4` |
@@ -424,7 +429,7 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 |---|---|
 | 製品scope | Local Body／Tail Safety/Fidelity。最終画質Utilityではない |
 | core mul grid | `2.70, 3.15, 3.45` |
-| edge extension | 端点が残った場合だけ`3.75`、次に`4.05`。最大2回 |
+| edge extension | 端点が残った場合だけ下側`2.25 → 1.80`、上側`3.75 → 4.05`。最大2回 |
 | probe画像数 | `min(dataset実画像数, 32)`、最低8画像 |
 | timestep bins | `4` |
 | no-quant replicas | noise 3回 |
@@ -434,6 +439,7 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | update branch | 製品Localでは0。128-step Trajectoryは研究専用で実行しない |
 | Guardian ablation | `common_only` |
 | CountSketch | 幅512、独立seed 2個 |
+| Accelerate process | `num_processes=1`、`num_machines=1`を各stageへ明示 |
 | CPU threads/process | `8` |
 | bootstrap | source単位、2,000回、固定seed |
 

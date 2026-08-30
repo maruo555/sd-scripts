@@ -383,7 +383,15 @@ def test_profile_command_uses_request_paths_and_python_module(tmp_path: Path) ->
         range_muls=(2.70, 3.15, 3.45),
         max_images=16,
     )
-    assert command[1:4] == ["-m", "accelerate.commands.launch", "--num_cpu_threads_per_process"]
+    assert command[1:3] == ["-m", "accelerate.commands.launch"]
+    assert "--num_processes=1" in command
+    assert "--num_machines=1" in command
+    assert "--num_cpu_threads_per_process" in command
+    from accelerate.commands.launch import launch_command_parser
+
+    launch_args = launch_command_parser().parse_args(command[3:])
+    assert launch_args.num_processes == 1
+    assert launch_args.num_machines == 1
     assert f"--pretrained_model_name_or_path={request.model_path}" in command
     assert f"--dataset_config={request.dataset_config}" in command
     assert "--dq_profile_protocol=v24-acceptance-local" in command

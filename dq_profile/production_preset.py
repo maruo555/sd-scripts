@@ -48,6 +48,8 @@ class DiagnosticPreset:
             "sketch_seeds": self.sketch_seeds,
             "max_edge_extension_rounds": self.max_edge_extension_rounds,
             "minimum_source_groups": self.minimum_source_groups,
+            "num_processes": 1,
+            "num_machines": 1,
             "num_cpu_threads_per_process": self.num_cpu_threads_per_process,
             "diagnostic_target": "numerical_gradient_acceptance_by_fixed_range_mul",
             "not_quality_or_utility": True,

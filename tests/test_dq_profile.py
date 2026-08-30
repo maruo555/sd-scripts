@@ -195,6 +195,70 @@ def test_dataset_preflight_rejects_loader_ignored_or_cached_subsets(
         )
 
 
+@pytest.mark.parametrize("setting", ("color_aug", "random_crop"))
+@pytest.mark.parametrize("level", ("general", "dataset", "subset"))
+def test_dataset_preflight_rejects_latent_incompatible_augmentations(
+    tmp_path: Path,
+    setting: str,
+    level: str,
+) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "image.png").write_bytes(b"image")
+    lines: list[str] = []
+    if level == "general":
+        lines.extend(("[general]", f"{setting}=true"))
+    lines.append("[[datasets]]")
+    if level == "dataset":
+        lines.append(f"{setting}=true")
+    lines.append("[[datasets.subsets]]")
+    lines.append(f"image_dir={json.dumps(str(image_dir))}")
+    if level == "subset":
+        lines.append(f"{setting}=true")
+    config = tmp_path / "dataset.toml"
+    config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=f"{setting}=true|{setting}=True"):
+        inspect_dataset_config(
+            config,
+            max_train_epochs=40,
+            max_train_steps=None,
+            lr_warmup_steps=0.05,
+            branch_steps_override=None,
+            max_images=32,
+            timestep_bins=4,
+            stochastic_repeats=2,
+        )
+
+
+def test_dataset_preflight_honors_subset_false_augmentation_override(tmp_path: Path) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "image.png").write_bytes(b"image")
+    config = tmp_path / "dataset.toml"
+    config.write_text(
+        "[general]\n"
+        "color_aug=true\n"
+        "random_crop=true\n"
+        "[[datasets]]\n"
+        "[[datasets.subsets]]\n"
+        f"image_dir={json.dumps(str(image_dir))}\n"
+        "color_aug=false\n"
+        "random_crop=false\n",
+        encoding="utf-8",
+    )
+    result = inspect_dataset_config(
+        config,
+        max_train_epochs=40,
+        max_train_steps=None,
+        lr_warmup_steps=0.05,
+        branch_steps_override=None,
+        max_images=32,
+        timestep_bins=4,
+        stochastic_repeats=2,
+    )
+    assert result.unique_images == 1
+
+
 @pytest.mark.parametrize("image_dir", ("relative/images", "~/images"))
 def test_dataset_preflight_rejects_relative_image_dir(
     tmp_path: Path,

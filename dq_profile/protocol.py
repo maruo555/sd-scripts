@@ -421,6 +421,25 @@ def resolve_dataset_layout(
             subset = raw_subset
             if subset.get("metadata_file") is not None:
                 raise ValueError("canonical diagnostic supports DreamBooth image_dir subsets only")
+            effective_color_aug = _bool_setting(
+                _fallback_value("color_aug", (subset, dataset, general), False),
+                label=(
+                    f"datasets[{dataset_index}].subsets[{subset_index}].color_aug"
+                ),
+            )
+            effective_random_crop = _bool_setting(
+                _fallback_value("random_crop", (subset, dataset, general), False),
+                label=(
+                    f"datasets[{dataset_index}].subsets[{subset_index}].random_crop"
+                ),
+            )
+            if effective_color_aug or effective_random_crop:
+                raise ValueError(
+                    "canonical diagnostic enables cache_latents and therefore requires "
+                    "color_aug=false and random_crop=false after dataset fallback: "
+                    f"datasets[{dataset_index}].subsets[{subset_index}] has "
+                    f"color_aug={effective_color_aug}, random_crop={effective_random_crop}"
+                )
             raw_dir = subset.get("image_dir")
             if raw_dir is None:
                 raise ValueError(
