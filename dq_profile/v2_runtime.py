@@ -108,7 +108,10 @@ class V2ExperimentRunner:
         self._repeat_sequences: dict[int, ReplaySequence] = {}
         # Run length and cohort are identity, not cache reuse hints.  A freshly
         # restored 128-step execution must never replace a 64-step cohort.
-        self._executions: dict[tuple[str, str, str, int, str, int], BranchExecution] = {}
+        self._executions: dict[
+            tuple[str, str, str, int, str, int, tuple[int, ...]],
+            BranchExecution,
+        ] = {}
 
     @staticmethod
     def _execution_id(
@@ -219,11 +222,23 @@ class V2ExperimentRunner:
         quant_phase: str = "v2_core",
         cohort_id: Optional[str] = None,
         capture_prefix_state: bool = False,
+        prefix_state_checkpoints: Optional[Sequence[int]] = None,
     ) -> BranchExecution:
         if guardian_mode not in {"common_skip", "native_guardian"}:
             raise ValueError(f"unknown Guardian mode: {guardian_mode}")
         cohort_id = str(cohort_id or f"{quant_phase}.steps_{int(max_steps)}.repeat_{int(repeat)}")
-        key = (cohort_id, guardian_mode, candidate.name, int(repeat), quant_phase, int(max_steps))
+        prefix_checkpoint_key = tuple(
+            sorted({int(value) for value in (prefix_state_checkpoints or ())})
+        )
+        key = (
+            cohort_id,
+            guardian_mode,
+            candidate.name,
+            int(repeat),
+            quant_phase,
+            int(max_steps),
+            prefix_checkpoint_key,
+        )
         existing = self._executions.get(key)
         if existing is not None:
             return existing
@@ -263,6 +278,10 @@ class V2ExperimentRunner:
         )
         if capture_prefix_state:
             self._capture_prefix_state(execution, 0)
+        state_checkpoints = set(
+            prefix_checkpoint_key if prefix_checkpoint_key else (1, 32, 64)
+        )
+        state_checkpoints.discard(0)
         checkpoints = {value for value in (32, 64, 128, int(max_steps)) if 0 < value <= int(max_steps)}
         replay_sequence = self._repeat_sequence(int(repeat))
         for branch_step, replay in enumerate(replay_sequence):
@@ -340,7 +359,7 @@ class V2ExperimentRunner:
                     ),
                 )
 
-            if capture_prefix_state and branch_step + 1 in {1, 32, 64}:
+            if capture_prefix_state and branch_step + 1 in state_checkpoints:
                 self._capture_prefix_state(execution, branch_step + 1)
         if len(execution.rows) < int(max_steps) and not execution.forced_safety_abort:
             execution.forced_safety_abort = True
@@ -358,6 +377,7 @@ class V2ExperimentRunner:
         quant_phase: str = "v2_core",
         cohort_id: Optional[str] = None,
         capture_prefix_state: bool = False,
+        prefix_state_checkpoints: Optional[Sequence[int]] = None,
     ) -> BranchExecution:
         return self._execute(
             candidate=_no_quant_candidate(),
@@ -368,6 +388,7 @@ class V2ExperimentRunner:
             quant_phase=quant_phase,
             cohort_id=cohort_id,
             capture_prefix_state=capture_prefix_state,
+            prefix_state_checkpoints=prefix_state_checkpoints,
         )
 
     @staticmethod
@@ -1117,8 +1138,16 @@ class V2ExperimentRunner:
 
 
     def _run_prefix_smoke(self) -> dict[str, Any]:
-        if len(self.sequence) < 128:
-            raise ValueError("v2-prefix-smoke requires at least 128 materialized replay batches")
+        short_steps = int(getattr(self.args, "dq_profile_prefix_short_steps", 64))
+        long_steps = int(getattr(self.args, "dq_profile_prefix_long_steps", 128))
+        prefix_checkpoints = tuple(
+            sorted({0, 1, short_steps // 2, short_steps})
+        )
+        if len(self.sequence) < long_steps:
+            raise ValueError(
+                "v2-prefix-smoke requires at least "
+                f"{long_steps} materialized replay batches"
+            )
         candidate = _candidate_for_mul(3.15)
         cohorts: dict[str, tuple[BranchExecution, BranchExecution]] = {}
 
@@ -1130,6 +1159,7 @@ class V2ExperimentRunner:
                 quant_phase="v2_prefix_smoke",
                 cohort_id=cohort_id,
                 capture_prefix_state=True,
+                prefix_state_checkpoints=prefix_checkpoints,
             )
             execution = self._execute(
                 candidate=candidate,
@@ -1140,30 +1170,43 @@ class V2ExperimentRunner:
                 quant_phase="v2_prefix_smoke",
                 cohort_id=cohort_id,
                 capture_prefix_state=True,
+                prefix_state_checkpoints=prefix_checkpoints,
             )
             return reference, execution
 
-        # Keep the 64A baseline in memory, compare each challenger immediately,
+        baseline_label = f"{short_steps}A"
+        repeated_label = f"{short_steps}B"
+        long_label = str(long_steps)
+        # Keep the short-A baseline in memory, compare each challenger immediately,
         # then release its numeric state tensors. Fingerprint rows remain, but
         # the smoke test never retains all six optimizer snapshots at once.
-        cohorts["64A"] = execute_cohort("64A", 64)
+        cohorts[baseline_label] = execute_cohort(baseline_label, short_steps)
         parity_rows: list[dict[str, Any]] = []
         pair_summaries: list[dict[str, Any]] = []
         for label, max_steps, comparison in (
-            ("64B", 64, "64A_vs_64B"),
-            ("128", 128, "64A_vs_128_at64"),
+            (
+                repeated_label,
+                short_steps,
+                f"{baseline_label}_vs_{repeated_label}",
+            ),
+            (
+                long_label,
+                long_steps,
+                f"{baseline_label}_vs_{long_label}_at{short_steps}",
+            ),
         ):
             cohorts[label] = execute_cohort(label, max_steps)
             for candidate_index, candidate_name in ((0, "no_quant"), (1, candidate.name)):
-                baseline = cohorts["64A"][candidate_index]
+                baseline = cohorts[baseline_label][candidate_index]
                 challenger = cohorts[label][candidate_index]
                 rows, summary = evaluate_prefix_pair(
-                    reference_rows=baseline.rows[:64],
-                    candidate_rows=challenger.rows[:64],
+                    reference_rows=baseline.rows[:short_steps],
+                    candidate_rows=challenger.rows[:short_steps],
                     reference_states=baseline.state_values,
                     candidate_states=challenger.state_values,
                     comparison=comparison,
                     candidate_name=candidate_name,
+                    required_checkpoints=prefix_checkpoints,
                 )
                 parity_provenance = {
                     "reference_execution_id": baseline.execution_id,
@@ -1180,6 +1223,19 @@ class V2ExperimentRunner:
                 pair_summaries.append(summary)
                 challenger.state_values.clear()
         gate = aggregate_prefix_gate(pair_summaries)
+        gate["execution_mode"] = str(
+            getattr(self.args, "dq_profile_execution_mode", "strict")
+        )
+        gate["qa_depth"] = str(
+            getattr(self.args, "dq_profile_qa_depth", "strict_reference")
+        )
+        gate["prefix_contract"] = {
+            "short_steps": short_steps,
+            "long_steps": long_steps,
+            "checkpoints": list(prefix_checkpoints),
+            "anchor_mul": 3.15,
+            "branch_updates": 2 * (short_steps * 2 + long_steps),
+        }
         gate["kernel_policy"] = dict(
             getattr(
                 self.args,
@@ -1199,7 +1255,7 @@ class V2ExperimentRunner:
             for row in execution.rows:
                 row["result_scope"] = f"prefix_{label}"
 
-        baseline_reference, baseline_candidate = cohorts["64A"]
+        baseline_reference, baseline_candidate = cohorts[baseline_label]
         branch_summaries = self._summarize_candidates(
             [baseline_candidate],
             self._direction_rows(baseline_candidate, baseline_reference, guardian_mode="common_skip"),
@@ -1211,7 +1267,7 @@ class V2ExperimentRunner:
 
         executions = [item for pair in cohorts.values() for item in pair]
         state_rows = [row for execution in executions for row in execution.state_records]
-        for execution in cohorts["64A"]:
+        for execution in cohorts[baseline_label]:
             execution.state_values.clear()
         execution_manifest_rows = [
             {

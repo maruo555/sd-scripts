@@ -15,13 +15,13 @@ import math
 from typing import Any, Mapping, Sequence
 
 
-PRACTICAL_REPORT_SCHEMA_VERSION = "2.4.2-practical-report-prototype"
+PRACTICAL_REPORT_SCHEMA_VERSION = "2.4.3-practical-report-beta"
 LOCAL_ACCEPTANCE_METRIC_VERSION = "2.4.0"
 
 # Compatibility aliases retained for existing report readers.
 SCHEMA_VERSION = PRACTICAL_REPORT_SCHEMA_VERSION
 METRIC_DEFINITION_VERSION = LOCAL_ACCEPTANCE_METRIC_VERSION
-REPORT_CONTRACT_VERSION = "1.2.0-prototype"
+REPORT_CONTRACT_VERSION = "1.3.0-beta"
 ABSOLUTE_REFERENCE_DISTANCE = 1.0
 AFFINITY_FIXED_Y_MAX = 4.0
 AFFINITY_SCALE_CALIBRATION = {
@@ -195,6 +195,14 @@ def report_contract() -> dict[str, Any]:
             "natural_baseline": (
                 "scale context only; never used as selector evidence"
             ),
+        },
+        "execution_mode": {
+            "field": "execution_mode",
+            "qa_depth_field": "qa_depth",
+            "internal_profile_level_field": "internal_profile_level",
+            "standard": "daily fixed-grid run with short prefix smoke",
+            "strict": "reference-depth run with long prefix and bounded edge extension",
+            "mode_is_not_internal_profile_level": True,
         },
         "relative_statuses": [
             "near_best_plateau",
@@ -772,14 +780,20 @@ def build_dataset_card(
         if gates_required
         else None
     )
+    detail_summary = dict(detail.get("summary") or {})
+    execution_mode = str(detail_summary.get("execution_mode", "strict"))
+    qa_depth = str(detail_summary.get("qa_depth", "strict_reference"))
+    internal_profile_level = str(
+        detail_summary.get("internal_profile_level", "standard")
+    )
     source_count = int(
-        detail.get("summary", {}).get(
+        detail_summary.get(
             "source_group_count",
             evaluation.get("source_group_count", 0),
         )
     )
     image_count = int(
-        detail.get("summary", {}).get(
+        detail_summary.get(
             "image_count",
             evaluation.get("image_count", 0),
         )
@@ -804,7 +818,7 @@ def build_dataset_card(
         edge_unresolved=edge_unresolved,
     )
     phenotype = str(
-        detail.get("summary", {}).get(
+        detail_summary.get(
             "local_phenotype",
             evaluation.get("phenotype", "unknown"),
         )
@@ -899,6 +913,14 @@ def build_dataset_card(
         if stronger_perturbation
         else None
     )
+    preset_nearest_reference = (
+        min(
+            hard_safety_pass_candidates,
+            key=lambda card: (abs(card["range_mul"] - 3.205), card["range_mul"]),
+        )
+        if hard_safety_pass_candidates
+        else None
+    )
     absolute_levels = {
         card["absolute_perturbation"] for card in hard_safety_pass_candidates
     }
@@ -945,9 +967,13 @@ def build_dataset_card(
             "no_quant",
             f"mul {single_representative['range_mul']:.2f}（暫定代表）",
         ]
+    elif representative_selection_state == "no_single_edge_unresolved":
+        minimum_comparison_set = ["no_quant"] + [
+            f"mul {card['range_mul']:.2f}（Fidelity retained）"
+            for card in fidelity_retained
+        ]
     elif (
-        representative_selection_state
-        in {"no_single_body_tail_tradeoff", "no_single_edge_unresolved"}
+        representative_selection_state == "no_single_body_tail_tradeoff"
         and body_representative
         and tail_representative
     ):
@@ -1012,6 +1038,9 @@ def build_dataset_card(
             if detail
             else "common_core_summary_only"
         ),
+        "execution_mode": execution_mode,
+        "qa_depth": qa_depth,
+        "internal_profile_level": internal_profile_level,
         "metric_definition_version": METRIC_DEFINITION_VERSION,
         "source_group_count": source_count,
         "image_count": image_count,
@@ -1070,6 +1099,11 @@ def build_dataset_card(
         "stronger_representative_mul": (
             stronger_representative["range_mul"]
             if stronger_representative
+            else None
+        ),
+        "preset_nearest_reference_mul": (
+            preset_nearest_reference["range_mul"]
+            if preset_nearest_reference
             else None
         ),
         "actions": actions,
@@ -1850,16 +1884,29 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
         if max_measured_mul >= 3.7
         else ""
     )
+    execution_mode_label = {
+        "standard": "Standard",
+        "strict": "Strict",
+    }.get(str(dataset.get("execution_mode")), str(dataset.get("execution_mode", "unknown")))
+    qa_depth_label = {
+        "standard_smoke": "Standard smoke",
+        "strict_reference": "Strict reference",
+    }.get(str(dataset.get("qa_depth")), str(dataset.get("qa_depth", "unknown")))
     return f"""
 <article id="dataset-{html.escape(dataset["dataset_id"])}" class="view dataset-view"{hidden}>
   <section class="dataset-intro">
     <div class="dataset-intro-main">
-      <div class="eyebrow">Dataset diagnostic card ・ {html.escape(dataset["protocol_scope"])}</div>
+      <div class="eyebrow">Dataset diagnostic card ・ {html.escape(dataset["protocol_scope"])} ・ {html.escape(execution_mode_label)}</div>
       <h1>{html.escape(dataset["label"])}</h1>
       <div class="tag-row">{tag_html}</div>
       <p class="lead">{html.escape(edge_message)}</p>
     </div>
     <div class="evidence-strip" aria-label="証拠の状態">
+      <div class="evidence-chip">
+        <span>Execution / QA depth</span>
+        <strong>{html.escape(execution_mode_label)}</strong>
+        <span>{html.escape(qa_depth_label)}</span>
+      </div>
       <div class="evidence-chip">
         <span>Measurement QA</span>
         <strong>{html.escape(dataset["measurement_quality"]["level"])}</strong>
@@ -1977,6 +2024,9 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
       <summary>QA / provenance</summary>
       <div class="qa-grid">
         <div><span>Protocol</span><strong>{html.escape(dataset["metric_definition_version"])}</strong></div>
+        <div><span>Execution mode</span><strong>{html.escape(execution_mode_label)}</strong></div>
+        <div><span>QA depth</span><strong>{html.escape(qa_depth_label)}</strong></div>
+        <div><span>Internal profile level</span><strong>{html.escape(dataset["internal_profile_level"])}</strong></div>
         <div><span>Source groups</span><strong>{dataset["source_group_count"]}</strong></div>
         <div><span>Images</span><strong>{dataset["image_count"]}</strong></div>
         <div><span>Hard safety</span><strong>{"PASS" if dataset["hard_safety_all_pass"] else "FAIL"}</strong></div>
@@ -2068,7 +2118,7 @@ def render_report(model: Mapping[str, Any]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SDXL DQ 診断カルテ v2.4.2 prototype</title>
+<title>SDXL DQ 診断カルテ v2.4.3 beta</title>
 <style>
 :root{{--ink:#172033;--muted:#607086;--line:#d9e1ec;--paper:#f5f7fb;--card:#fff;--blue:#2563eb;--blue-soft:#eaf1ff;--orange:#d97706;--orange-soft:#fff4e2;--purple:#7c3aed;--purple-soft:#f2ebff;--teal:#0f766e;--shadow:0 12px 34px rgba(25,38,70,.09)}}
 *{{box-sizing:border-box}} body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.65 system-ui,-apple-system,"Segoe UI","Yu Gothic UI",sans-serif}}
@@ -2082,7 +2132,7 @@ h1{{font-size:clamp(28px,4vw,48px);line-height:1.08;margin:5px 0 14px}} h2{{font
 .eyebrow{{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:#65758c;font-weight:800}} .lead{{font-size:17px;color:#3e4d62;max-width:72ch}}
 .dataset-intro{{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(380px,1fr);gap:20px;align-items:center;background:linear-gradient(130deg,#fff 0%,#f2f6ff 100%);padding:17px 22px;border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}}
 .dataset-intro h1{{font-size:clamp(25px,3vw,36px);margin:3px 0 9px}} .dataset-intro .lead{{font-size:14px;margin:8px 0 0}}
-.evidence-strip{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}} .evidence-chip{{display:grid;gap:2px;min-width:0;padding:10px 11px;background:white;border:1px solid var(--line);border-radius:10px}} .evidence-chip span{{font-size:10px;color:var(--muted);font-weight:750}} .evidence-chip strong{{font-size:17px;color:var(--purple);overflow-wrap:anywhere}}
+.evidence-strip{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}} .evidence-chip{{display:grid;gap:2px;min-width:0;padding:10px 11px;background:white;border:1px solid var(--line);border-radius:10px}} .evidence-chip span{{font-size:10px;color:var(--muted);font-weight:750}} .evidence-chip strong{{font-size:17px;color:var(--purple);overflow-wrap:anywhere}}
 .section-heading-inline{{display:flex;justify-content:space-between;gap:16px;align-items:end;margin:0 0 8px}} .section-heading-inline h2{{margin:0}} .section-heading-inline p{{margin:3px 0 0}}
 .scale-badge{{white-space:nowrap;border-radius:999px;padding:6px 11px;background:#e8eef8;color:#334155;font-size:12px;font-weight:800}}
 .primary-chart{{padding:10px 18px 14px}} .primary-chart>.chart{{width:100%;height:315px;max-width:1040px;margin:0 auto}} .primary-chart details .chart{{max-height:390px}}
@@ -2112,16 +2162,16 @@ details{{background:white;border:1px solid var(--line);border-radius:12px;paddin
 .overview-hero{{background:linear-gradient(135deg,#172554,#1e3a8a);color:white;border-radius:18px;padding:32px}} .overview-hero .eyebrow,.overview-hero .lead{{color:#d8e5ff}} .overview-kpis{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-top:20px}} .overview-kpis>div{{background:rgba(255,255,255,.1);padding:14px;border:1px solid rgba(255,255,255,.18);border-radius:11px}} .overview-kpis strong{{display:block;font-size:27px}}
 .link-button{{border:0;background:none;color:#1d4ed8;text-decoration:underline;cursor:pointer;padding:0;font:inherit}} .dataset-selector.is-single{{display:none}} footer{{color:var(--muted);font-size:12px;padding-top:30px}}
 @media(max-width:900px){{.hero,.dataset-intro,.chart-grid,.matrix-grid{{grid-template-columns:1fr}}.summary-grid,.callout-grid,.overview-kpis{{grid-template-columns:repeat(2,1fr)}}.dataset-grid{{grid-template-columns:1fr 1fr}}.dataset-intro{{gap:12px}}}}
-@media(max-width:580px){{main{{padding:12px 10px 55px}}.header-inner{{padding:9px 12px;align-items:flex-start;flex-direction:column}}.summary-grid,.callout-grid,.overview-kpis,.dataset-grid,.qa-grid,.qa-reason-grid,.representative-grid,.interpretation-strip{{grid-template-columns:1fr}}.evidence-strip{{grid-template-columns:repeat(3,minmax(0,1fr))}}.dataset-intro{{padding:13px}}.dataset-intro h1{{font-size:24px}}.evidence-chip{{padding:7px}}.evidence-chip strong{{font-size:13px}}.section-heading-inline{{align-items:flex-start;flex-direction:column;gap:6px}}.primary-chart{{padding:8px}}.primary-chart>.chart{{height:250px}}}}
+@media(max-width:580px){{main{{padding:12px 10px 55px}}.header-inner{{padding:9px 12px;align-items:flex-start;flex-direction:column}}.summary-grid,.callout-grid,.overview-kpis,.dataset-grid,.qa-grid,.qa-reason-grid,.representative-grid,.interpretation-strip{{grid-template-columns:1fr}}.evidence-strip{{grid-template-columns:repeat(2,minmax(0,1fr))}}.dataset-intro{{padding:13px}}.dataset-intro h1{{font-size:24px}}.evidence-chip{{padding:7px}}.evidence-chip strong{{font-size:13px}}.section-heading-inline{{align-items:flex-start;flex-direction:column;gap:6px}}.primary-chart{{padding:8px}}.primary-chart>.chart{{height:250px}}}}
 @media print{{header{{position:static}}.view[hidden]{{display:block!important;page-break-before:always}}button,select{{display:none}}body{{background:white}}main{{max-width:none}}}}
 </style>
 </head>
 <body>
-<header><div class="header-inner"><div class="brand">SDXL DQ 診断カルテ <small>v2.4.2 practical report prototype ・ Safety/Fidelity ≠ Utility</small></div><label class="{selector_class}">表示 <select id="dataset-select"><option value="overview"{overview_selected}>横断概要</option>{options}</select></label></div></header>
+<header><div class="header-inner"><div class="brand">SDXL DQ 診断カルテ <small>v2.4.3 practical report beta ・ Safety/Fidelity ≠ Utility</small></div><label class="{selector_class}">表示 <select id="dataset-select"><option value="overview"{overview_selected}>横断概要</option>{options}</select></label></div></header>
 <main>
 <section id="overview" class="view"{overview_hidden}>
   <div class="overview-hero">
-    <div class="eyebrow">Practical diagnostic report prototype</div>
+    <div class="eyebrow">Practical diagnostic report beta</div>
     <h1>結論から詳細へ潜れる、mul別の診断カルテ</h1>
     <p class="lead">数学基準1.0に対する絶対的な摂動帯と、同じdataset内の相対順位を分けて表示します。最終画質のbest mulや量子化採用可否は判定しません。</p>
     <div class="overview-kpis">
@@ -2141,7 +2191,7 @@ details{{background:white;border:1px solid var(--line);border-radius:12px;paddin
   <h2>同一mul 3.45の横断比較</h2>
   <p class="section-help">metric definition 2.4の共通coreだけを比較。同じmulでもTailがdatasetごとに大きく異なることを確認できます。</p>
   <div class="table-wrap"><table><thead><tr><th>Dataset</th><th>Body</th><th>Tail</th><th>Local gauge</th><th>絶対摂動</th><th>相対状態</th><th>Measurement QA</th><th>Local confidence</th></tr></thead><tbody>{common_rows}</tbody></table></div>
-  <h2>このprototypeで確認すること</h2>
+  <h2>このレポートで確認すること</h2>
   <div class="action-box"><ol><li>30秒で絶対摂動帯、Fidelity retained set、強い摂動候補、edgeが分かるか。</li><li>各mulの絶対値と相対状態を混同しないか。</li><li>Measurement QA・Local confidence・Recommendation maturityを混同しないか。</li><li>単一代表を選べない場合に、その理由が明示されるか。</li><li>初心者説明からbootstrap・source LOOまで段階的に潜れるか。</li></ol></div>
 </section>
 {dataset_sections}

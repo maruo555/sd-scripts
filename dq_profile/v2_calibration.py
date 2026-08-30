@@ -273,6 +273,7 @@ def evaluate_prefix_pair(
     candidate_states: Mapping[int, Mapping[str, Any]],
     comparison: str,
     candidate_name: str,
+    required_checkpoints: Sequence[int] = (0, 1, 32, 64),
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     exact = len(reference_rows) == len(candidate_rows)
@@ -320,18 +321,22 @@ def evaluate_prefix_pair(
             }
         )
 
-    required_checkpoints = {0, 1, 32, 64}
+    required_checkpoint_set = {int(value) for value in required_checkpoints}
     reference_checkpoints = set(reference_states)
     candidate_checkpoints = set(candidate_states)
     checkpoint_topology_matches = (
         reference_checkpoints == candidate_checkpoints
-        and required_checkpoints.issubset(reference_checkpoints)
+        and required_checkpoint_set.issubset(reference_checkpoints)
     )
     state_components_exact = checkpoint_topology_matches
     state_numeric = checkpoint_topology_matches
     if not checkpoint_topology_matches and first_divergence is None:
         missing_or_extra = sorted(reference_checkpoints.symmetric_difference(candidate_checkpoints))
-        required_missing = sorted(required_checkpoints.difference(reference_checkpoints.intersection(candidate_checkpoints)))
+        required_missing = sorted(
+            required_checkpoint_set.difference(
+                reference_checkpoints.intersection(candidate_checkpoints)
+            )
+        )
         first_divergence = {
             "step": (missing_or_extra or required_missing or [0])[0],
             "component": "state:checkpoint_presence",
@@ -401,6 +406,7 @@ def evaluate_prefix_pair(
         "step_count_reference": len(reference_rows),
         "step_count_candidate": len(candidate_rows),
         "state_checkpoints": sorted(reference_checkpoints.intersection(candidate_checkpoints)),
+        "required_state_checkpoints": sorted(required_checkpoint_set),
         "state_checkpoint_topology_matches": checkpoint_topology_matches,
     }
 

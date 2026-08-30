@@ -107,6 +107,7 @@ code{{background:#f3f5f6;padding:2px 4px}}
 <h1>DQ Profiler v2.4 — Local numerical acceptance</h1>
 <div class="grid">
 <div class="card"><b>Dataset</b><br>{html.escape(summary['dataset_id'])}<br>{summary['image_count']} images / {summary['source_group_count']} source groups</div>
+<div class="card"><b>Execution mode</b><br>{html.escape(str(summary.get('execution_mode', 'strict')))}<br><b>QA depth</b>: {html.escape(str(summary.get('qa_depth', 'strict_reference')))}</div>
 <div class="card"><b>Phenotype (local only)</b><br>{html.escape(summary['local_phenotype'])}</div>
 <div class="card"><b>Credible set</b><br>{credible}<br><b>Formal selection</b>: {selected}</div>
 <div class="card"><b>Edge</b><br>{html.escape(selection['selection_status'])}<br>next local-only: {edge}</div>
@@ -175,6 +176,7 @@ def main() -> int:
             bootstrap_iterations=int(args.iterations),
             bootstrap_seed=int(args.seed) + 1,
         )
+        profile_metadata = dict(raw_summary.get("profile") or {})
         analysis_summary = result["summary"]
         analysis_summary.update(
             {
@@ -184,6 +186,24 @@ def main() -> int:
                 "local_gradient_tail_sha256": sha256_file(tail_path),
                 "local_natural_gradient_sha256": sha256_file(natural_path),
                 "no_quant_natural_local_baseline": natural,
+                "execution_mode": str(
+                    profile_metadata.get("execution_mode", "strict")
+                ),
+                "qa_depth": str(
+                    profile_metadata.get("qa_depth", "strict_reference")
+                ),
+                "internal_profile_level": str(
+                    profile_metadata.get(
+                        "internal_profile_level",
+                        profile_metadata.get("level", "standard"),
+                    )
+                ),
+                "prefix_short_steps": int(
+                    profile_metadata.get("prefix_short_steps", 64)
+                ),
+                "prefix_long_steps": int(
+                    profile_metadata.get("prefix_long_steps", 128)
+                ),
             }
         )
         write_json(output_dir / "acceptance_contract.json", result["contract"])
@@ -209,6 +229,8 @@ def main() -> int:
             "not_quality_or_utility": True,
             "source_contract_sha256": source_contract,
             "local_profile_protocol": "v24-acceptance-local",
+            "execution_mode": analysis_summary["execution_mode"],
+            "qa_depth": analysis_summary["qa_depth"],
             "local_profile_dir": str(profile_dir),
             "local_summary_path": str(summary_path),
             "local_summary_sha256": sha256_file(summary_path),

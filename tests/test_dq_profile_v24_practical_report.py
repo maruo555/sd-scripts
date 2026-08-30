@@ -211,13 +211,16 @@ def test_dataset_card_keeps_local_only_and_edge_uncertainty() -> None:
     assert by_mul[3.15]["overall_fidelity_gauge"] is None
     assert "TRAJECTORY_NOT_MEASURED" in by_mul[3.15]["reason_codes"]
     assert card["measurement_quality"]["level"] == "PASS"
+    assert card["execution_mode"] == "strict"
+    assert card["qa_depth"] == "strict_reference"
     assert card["local_comparison_confidence"]["level"] == "Medium"
     assert card["recommendation_maturity"]["level"] == "Local-only"
     assert card["single_representative_mul"] is None
     assert card["representative_selection_state"] == "no_single_edge_unresolved"
     assert card["actions"]["minimum_comparison_set"] == [
         "no_quant",
-        "mul 3.15（観測上のBody／Tail代表）",
+        "mul 3.15（Fidelity retained）",
+        "mul 3.45（Fidelity retained）",
     ]
     assert card["not_quality_or_utility"] is True
 
@@ -243,6 +246,8 @@ def test_single_dataset_report_is_local_only_and_hides_trajectory_from_selection
     html = render_report(model)
     assert "dataset-selector is-single" in html
     assert "Safety/Fidelity ≠ Utility" in html
+    assert "Strict reference" in html
+    assert "v2.4.3 practical report beta" in html
 
 def test_all_retained_candidates_do_not_force_a_single_representative() -> None:
     rows = [
@@ -305,7 +310,7 @@ def test_edge_unresolved_with_one_retained_candidate_still_abstains() -> None:
     assert card["representative_selection_state"] == "no_single_edge_unresolved"
     assert card["actions"]["minimum_comparison_set"] == [
         "no_quant",
-        "mul 3.45（観測上のBody／Tail代表）",
+        "mul 3.45（Fidelity retained）",
     ]
 
 

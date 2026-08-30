@@ -17,6 +17,7 @@ from dq_profile.protocol import (
     canonical_sha256,
     default_candidates,
     deterministic_seed,
+    fixed_range_candidates,
     initial_range_mul,
     inspect_dataset_config,
 )
@@ -34,6 +35,51 @@ def test_stateless_seed_is_repeatable_and_candidate_free():
     assert deterministic_seed(39, **kwargs) != deterministic_seed(39, **{**kwargs, "repeat": 2})
     assert 0 <= deterministic_seed(39, **kwargs) < 2**64
     assert "candidate" not in deterministic_seed.__code__.co_varnames
+
+
+def test_local_quant_random_contract_is_grid_order_and_execution_mode_free():
+    grids = (
+        (2.70, 3.15, 3.45),
+        (2.70, 3.15, 3.45, 3.75, 4.05),
+        (4.05, 3.75, 3.45, 3.15, 2.70),
+    )
+    outputs = []
+    for execution_mode, grid in (
+        ("strict", grids[0]),
+        ("standard", grids[1]),
+        ("standard", grids[2]),
+    ):
+        candidates = fixed_range_candidates(grid)
+        assert any(candidate.name == "mul_3.150" for candidate in candidates)
+        context = ProfileQuantContext(39)
+        # execution_mode and the candidate collection are deliberately not
+        # accepted by begin_pass/rand_for.  Shared Local probes use the same
+        # phase and probe identity in Standard and Strict.
+        assert execution_mode in {"standard", "strict"}
+        context.begin_pass(
+            mode="candidate",
+            phase="v2_tail_probe",
+            probe_or_step="tail:0:3:1:image-a",
+            repeat=1,
+            dropout_enabled=False,
+        )
+        outputs.append(
+            context.rand_for(
+                torch.zeros(4, 4),
+                module_name="lora_unet.block.attn",
+                invocation=2,
+            )
+        )
+        context.finish_pass()
+    assert all(torch.equal(outputs[0], output) for output in outputs[1:])
+    excluded_seed_fields = {
+        "execution_mode",
+        "grid",
+        "candidate_index",
+        "candidate_name",
+        "range_mul",
+    }
+    assert excluded_seed_fields.isdisjoint(deterministic_seed.__code__.co_varnames)
 
 
 def test_band_initializers_and_boundary_match_production_values():

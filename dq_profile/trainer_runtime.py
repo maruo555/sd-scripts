@@ -2595,6 +2595,19 @@ class DiagnosticProfileRuntime:
             "profile": {
                 "protocol": self.profile_protocol,
                 "level": self.args.dq_profile_level,
+                "execution_mode": str(
+                    getattr(self.args, "dq_profile_execution_mode", "strict")
+                ),
+                "qa_depth": str(
+                    getattr(self.args, "dq_profile_qa_depth", "strict_reference")
+                ),
+                "internal_profile_level": self.args.dq_profile_level,
+                "prefix_short_steps": int(
+                    getattr(self.args, "dq_profile_prefix_short_steps", 64)
+                ),
+                "prefix_long_steps": int(
+                    getattr(self.args, "dq_profile_prefix_long_steps", 128)
+                ),
                 "branch_steps": (
                     len(sequence)
                     if self.profile_protocol == "v1"

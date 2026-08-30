@@ -38,6 +38,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="versioned compatibility preset (default: canonical-v1)",
     )
     parser.add_argument(
+        "--dq-profile-mode",
+        choices=("standard", "strict"),
+        default="strict",
+        help=(
+            "production execution/QA depth; strict preserves the reference workflow "
+            "while standard is the shorter daily workflow (development default: strict)"
+        ),
+    )
+    parser.add_argument(
         "--dq-profile-preflight",
         action="store_true",
         help="validate inputs and write provenance without starting GPU stages",
@@ -56,6 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return run_profile_mode(
         training_argv,
         preset_name=selectors.dq_profile_preset,
+        execution_mode_name=selectors.dq_profile_mode,
         output_base=selectors.dq_profile_output_dir,
         profile_name=selectors.dq_profile_name,
         preflight_only=bool(selectors.dq_profile_preflight),

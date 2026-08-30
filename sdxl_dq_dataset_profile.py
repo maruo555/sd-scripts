@@ -45,6 +45,18 @@ def setup_parser() -> argparse.ArgumentParser:
     group.add_argument("--dq_profile_name", type=str, default="dq_profile")
     group.add_argument("--dq_profile_level", choices=("standard", "full"), default="standard")
     group.add_argument(
+        "--dq_profile_execution_mode",
+        choices=("standard", "strict"),
+        default="strict",
+        help="production orchestration mode; distinct from --dq_profile_level",
+    )
+    group.add_argument(
+        "--dq_profile_qa_depth",
+        choices=("standard_smoke", "strict_reference"),
+        default="strict_reference",
+        help="production QA-depth provenance label",
+    )
+    group.add_argument(
         "--dq_profile_protocol",
         choices=(
             "v1",
@@ -68,6 +80,8 @@ def setup_parser() -> argparse.ArgumentParser:
     group.add_argument("--dq_profile_range_muls", type=str, default=",".join(str(value) for value in DEFAULT_V2_RANGE_MULS))
     group.add_argument("--dq_profile_sweep_steps", type=int, default=64)
     group.add_argument("--dq_profile_branch_repeats", type=int, default=2)
+    group.add_argument("--dq_profile_prefix_short_steps", type=int, default=64)
+    group.add_argument("--dq_profile_prefix_long_steps", type=int, default=128)
     group.add_argument("--dq_profile_guardian_ablation", choices=("common_then_native", "common_only", "native_only"), default="common_then_native")
     group.add_argument("--dq_profile_sketch_width", type=int, default=512)
     group.add_argument("--dq_profile_sketch_seeds", type=int, default=2)
@@ -141,6 +155,19 @@ def _resolved_candidate_definitions(args: argparse.Namespace) -> tuple[Candidate
 
 def _validate_and_isolate(args: argparse.Namespace) -> None:
     protocol = str(getattr(args, "dq_profile_protocol", "v1"))
+    # Preserve programmatic callers that construct an argparse.Namespace
+    # instead of going through setup_parser().  These are the historical
+    # strict-reference values and therefore do not silently opt into the
+    # shorter Standard QA contract.
+    compatibility_defaults = {
+        "dq_profile_execution_mode": "strict",
+        "dq_profile_qa_depth": "strict_reference",
+        "dq_profile_prefix_short_steps": 64,
+        "dq_profile_prefix_long_steps": 128,
+    }
+    for name, value in compatibility_defaults.items():
+        if not hasattr(args, name):
+            setattr(args, name, value)
     if bool(getattr(args, "dq_profile_snapshot_only", False)) and protocol != "v2-prefix-smoke":
         raise ValueError(
             "--dq_profile_snapshot_only is a diagnostic boundary check and "
@@ -172,6 +199,7 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
     for name in (
         "dq_profile_max_images", "dq_profile_timestep_bins", "dq_profile_stochastic_repeats",
         "dq_profile_sketch_width", "dq_profile_sketch_seeds", "dq_profile_sweep_steps", "dq_profile_branch_repeats",
+        "dq_profile_prefix_short_steps", "dq_profile_prefix_long_steps",
     ):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"--{name} must be positive")
@@ -180,6 +208,25 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
     profile_name = str(args.dq_profile_name).strip()
     if not profile_name or Path(profile_name).name != profile_name:
         raise ValueError("--dq_profile_name must be a single non-empty path component")
+    if protocol == "v2-prefix-smoke":
+        short_steps = int(args.dq_profile_prefix_short_steps)
+        long_steps = int(args.dq_profile_prefix_long_steps)
+        if short_steps < 2:
+            raise ValueError("--dq_profile_prefix_short_steps must be at least 2")
+        if long_steps != short_steps * 2:
+            raise ValueError(
+                "--dq_profile_prefix_long_steps must be exactly twice "
+                "--dq_profile_prefix_short_steps"
+            )
+        expected_qa_depth = {
+            "standard": "standard_smoke",
+            "strict": "strict_reference",
+        }[str(args.dq_profile_execution_mode)]
+        if str(args.dq_profile_qa_depth) != expected_qa_depth:
+            raise ValueError(
+                "--dq_profile_qa_depth does not match --dq_profile_execution_mode; "
+                f"expected {expected_qa_depth}"
+            )
     prefix_required_protocols = {
         "v2-tail-calibration",
         "v23-safety-local",
@@ -461,7 +508,7 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
     args.dq_profile_requested_range_muls = args.dq_profile_range_muls
     if protocol == "v2-prefix-smoke":
         args.dq_profile_range_muls_resolved = (3.15,)
-        args.dq_profile_sweep_steps = 128
+        args.dq_profile_sweep_steps = int(args.dq_profile_prefix_long_steps)
         args.dq_profile_branch_repeats = 1
         args.dq_profile_guardian_ablation = "common_only"
     elif protocol == "v2-tail-calibration":
@@ -606,7 +653,11 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
     }:
         args.dq_profile_capture_steps = max(
             int(args.dq_profile_branch_steps or 0),
-            128,
+            (
+                int(args.dq_profile_prefix_long_steps)
+                if protocol == "v2-prefix-smoke"
+                else 128
+            ),
         )
     else:
         args.dq_profile_capture_steps = max(
@@ -665,11 +716,13 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
     if args.dq_profile_protocol == "v2-prefix-smoke":
         args.dq_profile_probe_replicas_resolved = 0
         snapshot_only = bool(getattr(args, "dq_profile_snapshot_only", False))
-        branch_steps = 0 if snapshot_only else 2 * 64 * 2 + 2 * 128
+        short_steps = int(args.dq_profile_prefix_short_steps)
+        long_steps = int(args.dq_profile_prefix_long_steps)
+        branch_steps = 0 if snapshot_only else 2 * (short_steps * 2 + long_steps)
         estimated = int(summary.dq_begin_step) + branch_steps
         payload.update(
             {
-                "branch_steps": 0 if snapshot_only else 128,
+                "branch_steps": 0 if snapshot_only else long_steps,
                 "standard_probe_replicas": 0,
                 "full_probe_replicas": 0,
                 "estimated_standard_steps": estimated,
@@ -682,6 +735,13 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
             "warmup_steps": int(summary.dq_begin_step),
             "prefix_branch_steps": branch_steps,
             "structural_probe_steps": 0,
+        }
+        payload["v2"]["prefix_contract"] = {
+            "execution_mode": str(args.dq_profile_execution_mode),
+            "qa_depth": str(args.dq_profile_qa_depth),
+            "short_steps": short_steps,
+            "long_steps": long_steps,
+            "checkpoints": sorted({0, 1, short_steps // 2, short_steps}),
         }
         payload["v2"]["snapshot_only"] = snapshot_only
         args.dq_profile_preflight = payload
