@@ -66,14 +66,16 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 通常のpreflight／dry-runを含む全runで`execution_plan.json`も作り、GPU process数、
 warmup境界、Prefix update数、Local probe数、固定grid、参考時間の算出条件を記録します。
 
-### 3.2 量子化開始境界とSnapshot A/B
+### 3.2 量子化開始境界とsnapshot検算
 
 通常学習コードと同じ規則で`dq_delta_begin_step`を求め、量子化開始直前までno-quantで
 warmupします。`canonical-v1`では40 epoch相当の総stepと5% LR warmupから境界が決まります。
 
-同じ初期状態からSnapshot AとSnapshot Bを別processで作り、LoRA重み、optimizer、scheduler、
-GradScaler、Guardian、RNG、replay位置などのfingerprintを比較します。一致しなければ、mul比較を
-開始しません。
+`standard`と`strict`は、同じ初期状態からSnapshot AとSnapshot Bを別processで作り、LoRA重み、
+optimizer、scheduler、GradScaler、Guardian、RNG、replay位置などのfingerprintを比較します。
+`quick`はSnapshot Aを1回だけ作り、後続のPrefix processが同じ境界を再現できたかを比較します。
+どのmodeでも境界fingerprintが一致しなければmul比較を開始しません。Quickは独立snapshotを
+1回減らすぶん速い一方、同じstageを2回作る検算深度はStandardより低くなります。
 
 以下で時間例に使う小規模datasetは、通常学習が8,400 stepだったため、境界は
 `8,400 × 0.05 = 420 step`でした。
@@ -84,14 +86,15 @@ GradScaler、Guardian、RNG、replay位置などのfingerprintを比較します
 
 | execution mode | short A | short B | long | 比較checkpoint | 合計branch update |
 |---|---:|---:|---:|---|---:|
+| `quick` | 8 | 8 | 16 | `0, 1, 4, 8` | 64 |
 | `standard` | 8 | 8 | 16 | `0, 1, 4, 8` | 64 |
 | `strict` | 64 | 64 | 128 | `0, 1, 32, 64` | 512 |
 
 各modeでA対B、およびA対long runの同じ先頭prefixを比較します。sample、noise、timestep、
 rank／network dropout、量子化乱数、Loss、LR、skip、勾配、LoRA重み、optimizer、scheduler、
 GradScaler、Guardian、replay cursorを検査します。このstageは通常学習に近い経路を検査するため
-dropout有効です。`standard`は日常利用の短いsmoke QA、`strict`は環境変更・リリース前・
-再現性調査用のreference QAです。同じ`PASS`でも深度が異なるため、`execution_mode`と
+dropout有効です。`quick`と`standard`は短いsmoke QA、`strict`は環境変更・リリース前・
+再現性調査用のreference QAです。Quickは独立snapshot検算を1回減らします。同じ`PASS`でも深度が異なるため、`execution_mode`と
 `qa_depth`をJSONとレポートへ別々に記録します。prefix gateまたはsource contractが失敗した場合、
 Local計測へ進みません。
 
@@ -100,7 +103,7 @@ Local計測へ進みません。
 ここが製品レポートの診断本体です。optimizer更新を行わず、同じ画像、noise、timestepで
 no-quantと各固定mulの勾配を比較します。
 
-- 画像数: 8～32。32画像を超えてもprobe budgetは32。
+- 画像数: Standard／Strictは8～32、Quickは8～16。各上限を超えてもprobe budgetは増えない。
 - timestep: 4帯。
 - no-quant: 3 noise replicas。
 - 各mul: 2 noise replicas × 2 stochastic quant repeats。
@@ -129,11 +132,17 @@ total = I × 4 × (3 + 4M)
 各probeにはforward、backward、activation/gradient hook、module集計が含まれます。そのため、
 通常学習の単純な1 stepと完全に同じ費用ではありません。
 
-### 3.5 StandardとStrictの候補探索
+### 3.5 Quick、Standard、Strictの候補探索
 
-`standard`は`2.70, 3.15, 3.45, 3.75, 4.05`を1 processで一度だけ測ります。
+`quick`と`standard`は`2.70, 3.15, 3.45, 3.75, 4.05`を1 processで一度だけ測ります。
 端点でも改善傾向が続く場合は`edge_unresolved`と表示しますが、範囲外を追跡しません。
 この場合、単一代表を出さず、Fidelity retained候補を1点へ自動縮約しません。
+
+両者の違いはLocal画像上限です。Standardは最大32画像、Quickは最大16画像です。Quickでも
+4 timestep帯、no-quant 3 replicas、candidate 2 noise × 2 quant repeatsを維持するため、Body／Tailの
+定義は変えません。ただしsamplingが薄いため、レポートのconfidence上限をMediumとし、
+`reduced_descriptive`と明示します。独立source groupが16を超えるdatasetは、全groupを最低1件ずつ
+含められないためQuickを開始前に拒否します。その場合はStandardを使用してください。
 
 `strict`はcore grid `2.70, 3.15, 3.45`から開始します。候補集合が測定端に残る場合だけ、
 最大2段まで外側を追加します。下端側は`2.25`、なお未解決なら`1.80`、上端側は`3.75`、
@@ -187,6 +196,7 @@ Fidelity retained set、robust dominance、source LOOなどを作ります。`re
 
 | mode | 実行内容 | 実測例を基準にした概算 |
 |---|---|---:|
+| Quick | Snapshot 1回、8A／8B／16、最大16画像、固定5点、edgeなし | 約60～75分（37画像・warmup 1,480 step級での事前見積もり） |
 | Standard | 8A／8B／16、固定5点を1回、edgeなし | 約37分 |
 | Strict（edgeなし） | 64A／64B／128、core 3点 | 約46分 |
 | Strict（edge 1回） | 上記＋拡張grid再測定1回 | 約65分 |
@@ -197,12 +207,14 @@ Fidelity retained set、robust dominance、source LOOなどを作ります。`re
 
 ### 3.9 軽量化の境界
 
-`standard`は、画像数、4 timestep帯、no-quant 3 replicas、candidate 2 noise × 2 quant repeatsを
-Strictと同じまま保ちます。短縮したのは長いPrefix検算とedge再測定です。そのため、
-「物差しを粗くしたQuick」ではなく「同じLocal物差しを短いQAで使う日常mode」です。
+`standard`は、最大32画像、4 timestep帯、no-quant 3 replicas、candidate 2 noise × 2 quant repeatsを
+Strictと同じまま保ちます。短縮したのは長いPrefix検算とedge再測定です。そのためStandardは、
+同じLocal物差しを短いQAで使う日常modeです。
 
-画像数やreplicaを減らす本当のQuick modeは未実装です。まずStandardとStrictの共通raw probeが
-一致し、所要時間短縮が確認できてから別段階で検討します。
+`quick`は4 timestep帯とreplica数を保ったまま、Local画像上限を16へ下げ、独立snapshotを
+2回から1回へ減らします。Body／Tailの定義やhard-safetyは変えませんが、sourceと画像のsamplingが
+薄くなるため、Standardと同じ証拠量とは扱いません。Quickは新しいdatasetの傾向を早く見る用途、
+Standardは通常の正式診断、Strictは環境・実装のreference検算に使い分けてください。
 
 ## 4. Mul affinity curveの読み方
 
@@ -302,6 +314,17 @@ python -m dq_profile ^
   --dataset_config="D:\datasets\example\dataset.toml"
 ```
 
+最初に短時間で傾向を確認したい場合は、modeだけ`quick`へ変えます。
+
+```bat
+python -m dq_profile ^
+  --dq-profile-mode=quick ^
+  --pretrained_model_name_or_path="D:\models\sdxl_base.safetensors" ^
+  --dataset_config="D:\datasets\example\dataset.toml"
+```
+
+Quickは最大16画像の縮小samplingです。正式な通常診断は既定のStandardを使用してください。
+
 診断名、出力先、完了後のレポート表示まで指定する推奨例です。
 
 ```bat
@@ -334,7 +357,7 @@ python -m dq_profile ^
 | `--dq-profile-name` | 任意 | `output_name` | datasetごとの親フォルダ名 |
 | `--dq-profile-output-dir` | 任意 | repositoryの`..\lora_output\dq_dataset_profiler` | 診断runを格納する基底ディレクトリ |
 | `--dq-profile-preset` | 任意 | `canonical-v1` | versioned互換性・計測契約。現在の対応presetは1つ |
-| `--dq-profile-mode` | 任意 | `standard` | `standard`: 日常用の短いQA＋固定5点、`strict`: 長いreference QA＋bounded edge再測定 |
+| `--dq-profile-mode` | 任意 | `standard` | `quick`: 最大16画像の短時間傾向確認、`standard`: 日常用の正式診断、`strict`: 長いreference QA＋bounded edge再測定 |
 | `--dq-profile-preflight` | 任意 | false | パス、source、CLI契約、fingerprintまで作りGPUを起動しない |
 | `--dq-profile-dry-run` | 任意 | false | `execution_plan.json`と解決済みCore commandを書き、GPUを起動しない |
 | `--dq-profile-open-report` | 任意 | false | Windowsで正常完了した場合に`report.html`を開く |
@@ -430,12 +453,12 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 現在の実測と同じ物差しではなくなります。既存presetの値を暗黙に変えず、別のversioned presetを
 追加し、snapshot／prefix／Local parityを検証してから使用します。
 
-### 6.4 mode間で共通のLocal測定契約
+### 6.4 Local測定契約
 
 | 項目 | 固定値・動作 |
 |---|---|
 | 製品scope | Local Body／Tail Safety/Fidelity。最終画質Utilityではない |
-| probe画像数 | `min(dataset実画像数, 32)`、最低8画像 |
+| probe画像数 | Standard／Strictは`min(dataset実画像数, 32)`、Quickは`min(dataset実画像数, 16)`。最低8画像 |
 | timestep bins | `4` |
 | no-quant replicas | noise 3回 |
 | candidate replicas | noise 2回 × stochastic quant 2回 |
@@ -448,18 +471,28 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | CPU threads/process | `8` |
 | bootstrap | source単位、2,000回、固定seed |
 
+QuickでもBody／Tailの数式、4 timestep帯、replica数、bootstrap、hard-safetyは変えません。
+`sampling_depth=reduced_16_image`、`confidence_ceiling=reduced_descriptive`を成果物へ保存し、
+証拠量が少ないことをStandard／Strictと区別します。
+
 ### 6.5 execution modeごとのQA・候補探索契約
 
-| 項目 | `standard` | `strict` |
-|---|---|---|
-| 用途 | 日常のdataset診断 | コード／CUDA／PyTorch／bitsandbytes変更後、リリース前、再現性調査 |
-| Prefix | 8A／8B／16@8 | 64A／64B／128@64 |
-| state checkpoints | `0, 1, 4, 8` | `0, 1, 32, 64` |
-| Prefix branch updates | 64 | 512 |
-| 最初のgrid | `2.70, 3.15, 3.45, 3.75, 4.05` | `2.70, 3.15, 3.45` |
-| edge extension | なし。端点傾向は未解決として表示 | 最大2 round、拡張gridを再測定してparity検査 |
-| GPU process数 | 4 | 4～6 |
-| QA表示 | `Standard smoke` | `Strict reference` |
+| 項目 | `quick` | `standard` | `strict` |
+|---|---|---|---|
+| 用途 | 新規datasetの短時間傾向確認 | 日常の正式dataset診断 | コード／CUDA／PyTorch／bitsandbytes変更後、リリース前、再現性調査 |
+| 独立snapshot | 1回。Prefix processとの境界一致を検査 | A/Bの2回 | A/Bの2回 |
+| Prefix | 8A／8B／16@8 | 8A／8B／16@8 | 64A／64B／128@64 |
+| state checkpoints | `0, 1, 4, 8` | `0, 1, 4, 8` | `0, 1, 32, 64` |
+| Prefix branch updates | 64 | 64 | 512 |
+| Local画像上限 | 16 | 32 | 32 |
+| 最初のgrid | `2.70, 3.15, 3.45, 3.75, 4.05` | `2.70, 3.15, 3.45, 3.75, 4.05` | `2.70, 3.15, 3.45` |
+| edge extension | なし。端点傾向は未解決として表示 | なし。端点傾向は未解決として表示 | 最大2 round、拡張gridを再測定してparity検査 |
+| GPU process数 | 3 | 4 | 4～6 |
+| QA表示 | `Quick smoke` | `Standard smoke` | `Strict reference` |
+| confidence上限 | Medium | 通常 | 通常 |
+
+Quickでは全source groupをprobeへ最低1件ずつ含める契約を維持します。独立groupが16を超える場合は、
+部分的な結果を黙って出さずpreflightで拒否します。Standardへ切り替えてください。
 
 `--dq_profile_level=standard`は低レベルprotocol内部の別概念です。公開CLIの
 `--dq-profile-mode=standard`と混同しないよう、成果物には`execution_mode`、`qa_depth`、

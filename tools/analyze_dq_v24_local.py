@@ -192,6 +192,21 @@ def main() -> int:
                 "qa_depth": str(
                     profile_metadata.get("qa_depth", "strict_reference")
                 ),
+                "measurement_contract": str(
+                    profile_metadata.get(
+                        "measurement_contract", "local-body-tail-v1"
+                    )
+                ),
+                "sampling_depth": str(
+                    profile_metadata.get(
+                        "sampling_depth", "reference_32_image"
+                    )
+                ),
+                "confidence_ceiling": str(
+                    profile_metadata.get(
+                        "confidence_ceiling", "data_driven_up_to_high"
+                    )
+                ),
                 "internal_profile_level": str(
                     profile_metadata.get(
                         "internal_profile_level",
@@ -231,6 +246,9 @@ def main() -> int:
             "local_profile_protocol": "v24-acceptance-local",
             "execution_mode": analysis_summary["execution_mode"],
             "qa_depth": analysis_summary["qa_depth"],
+            "measurement_contract": analysis_summary["measurement_contract"],
+            "sampling_depth": analysis_summary["sampling_depth"],
+            "confidence_ceiling": analysis_summary["confidence_ceiling"],
             "local_profile_dir": str(profile_dir),
             "local_summary_path": str(summary_path),
             "local_summary_sha256": sha256_file(summary_path),

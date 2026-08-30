@@ -2601,6 +2601,27 @@ class DiagnosticProfileRuntime:
                 "qa_depth": str(
                     getattr(self.args, "dq_profile_qa_depth", "strict_reference")
                 ),
+                "measurement_contract": str(
+                    getattr(
+                        self.args,
+                        "dq_profile_measurement_contract",
+                        "local-body-tail-v1",
+                    )
+                ),
+                "sampling_depth": str(
+                    getattr(
+                        self.args,
+                        "dq_profile_sampling_depth",
+                        "reference_32_image",
+                    )
+                ),
+                "confidence_ceiling": str(
+                    getattr(
+                        self.args,
+                        "dq_profile_confidence_ceiling",
+                        "data_driven_up_to_high",
+                    )
+                ),
                 "internal_profile_level": self.args.dq_profile_level,
                 "prefix_short_steps": int(
                     getattr(self.args, "dq_profile_prefix_short_steps", 64)

@@ -39,11 +39,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--dq-profile-mode",
-        choices=("standard", "strict"),
+        choices=("quick", "standard", "strict"),
         default="standard",
         help=(
-            "production execution/QA depth; standard is the daily default while "
-            "strict preserves the longer reference workflow"
+            "production execution/QA depth; standard is the daily default, quick "
+            "is an explicit reduced-sampling mode, and strict preserves the longer "
+            "reference workflow"
         ),
     )
     parser.add_argument(

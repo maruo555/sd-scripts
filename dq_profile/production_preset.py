@@ -5,8 +5,8 @@ from typing import Any, Mapping
 
 
 PRESET_SCHEMA_VERSION = "2.0"
-LOCAL_MEASUREMENT_SCHEMA_VERSION = "1.0"
-EXECUTION_MODE_SCHEMA_VERSION = "1.0"
+LOCAL_MEASUREMENT_SCHEMA_VERSION = "1.1"
+EXECUTION_MODE_SCHEMA_VERSION = "1.1"
 
 
 @dataclass(frozen=True)
@@ -56,6 +56,8 @@ class LocalMeasurementContract:
     minimum_source_groups: int
     bootstrap_iterations: int
     bootstrap_seed: int
+    sampling_depth: str
+    confidence_ceiling: str
 
     def contract(self) -> dict[str, Any]:
         return {
@@ -75,6 +77,8 @@ class LocalMeasurementContract:
             "minimum_source_groups": self.minimum_source_groups,
             "bootstrap_iterations": self.bootstrap_iterations,
             "bootstrap_seed": self.bootstrap_seed,
+            "sampling_depth": self.sampling_depth,
+            "confidence_ceiling": self.confidence_ceiling,
             "probe_regime": "structural_dropout_off",
             "diagnostic_target": "numerical_gradient_acceptance_by_fixed_range_mul",
             "not_quality_or_utility": True,
@@ -93,9 +97,15 @@ class ExecutionMode:
     edge_policy: str
     prefix_short_steps: int
     prefix_long_steps: int
+    local_measurement_name: str = "local-body-tail-v1"
+    standalone_snapshot_count: int = 2
     prefix_anchor_mul: float = 3.15
     snapshot_a_max_images: int = 8
     internal_profile_level: str = "standard"
+
+    def __post_init__(self) -> None:
+        if self.standalone_snapshot_count not in {1, 2}:
+            raise ValueError("standalone_snapshot_count must be 1 or 2")
 
     @property
     def prefix_checkpoints(self) -> tuple[int, ...]:
@@ -107,7 +117,7 @@ class ExecutionMode:
 
     @property
     def gpu_process_count_range(self) -> tuple[int, int]:
-        base = 4
+        base = self.standalone_snapshot_count + 2
         return base, base + self.max_edge_extension_rounds
 
     def contract(self) -> dict[str, Any]:
@@ -125,7 +135,9 @@ class ExecutionMode:
             "prefix_long_steps": self.prefix_long_steps,
             "prefix_checkpoints": list(self.prefix_checkpoints),
             "prefix_branch_updates": self.prefix_branch_updates,
-            "snapshot_replica_count": 2,
+            "local_measurement_name": self.local_measurement_name,
+            "standalone_snapshot_count": self.standalone_snapshot_count,
+            "snapshot_replica_count": self.standalone_snapshot_count,
             "snapshot_a_max_images": self.snapshot_a_max_images,
             "internal_profile_level": self.internal_profile_level,
             "gpu_process_count_min": minimum_processes,
@@ -296,6 +308,29 @@ LOCAL_BODY_TAIL_V1 = LocalMeasurementContract(
     minimum_source_groups=4,
     bootstrap_iterations=2000,
     bootstrap_seed=2401,
+    sampling_depth="reference_32_image",
+    confidence_ceiling="data_driven_up_to_high",
+)
+
+
+LOCAL_BODY_TAIL_QUICK_V1 = LocalMeasurementContract(
+    name="local-body-tail-quick-v1",
+    metric_definition_version="2.4.0",
+    max_images=16,
+    timestep_bins=4,
+    stochastic_repeats=2,
+    no_quant_noise_replicas=3,
+    candidate_noise_replicas=2,
+    stochastic_quant_repeats=2,
+    sweep_steps=128,
+    branch_repeats=5,
+    sketch_width=512,
+    sketch_seeds=2,
+    minimum_source_groups=4,
+    bootstrap_iterations=2000,
+    bootstrap_seed=2401,
+    sampling_depth="reduced_16_image",
+    confidence_ceiling="reduced_descriptive",
 )
 
 
@@ -323,9 +358,30 @@ STANDARD_MODE = ExecutionMode(
 )
 
 
+QUICK_MODE = ExecutionMode(
+    name="quick",
+    description=(
+        "Explicit faster workflow with short prefix parity, one standalone "
+        "snapshot check, and a reduced 16-image Local scan."
+    ),
+    qa_depth="quick_smoke",
+    core_grid=(2.70, 3.15, 3.45, 3.75, 4.05),
+    max_edge_extension_rounds=0,
+    edge_policy="fixed_tested_envelope_no_extension",
+    prefix_short_steps=8,
+    prefix_long_steps=16,
+    local_measurement_name=LOCAL_BODY_TAIL_QUICK_V1.name,
+    standalone_snapshot_count=1,
+)
+
+
 PRESETS = {CANONICAL_V1.name: CANONICAL_V1}
-LOCAL_MEASUREMENT_CONTRACTS = {LOCAL_BODY_TAIL_V1.name: LOCAL_BODY_TAIL_V1}
+LOCAL_MEASUREMENT_CONTRACTS = {
+    LOCAL_BODY_TAIL_V1.name: LOCAL_BODY_TAIL_V1,
+    LOCAL_BODY_TAIL_QUICK_V1.name: LOCAL_BODY_TAIL_QUICK_V1,
+}
 EXECUTION_MODES = {
+    QUICK_MODE.name: QUICK_MODE,
     STANDARD_MODE.name: STANDARD_MODE,
     STRICT_MODE.name: STRICT_MODE,
 }

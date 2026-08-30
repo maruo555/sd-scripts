@@ -23,6 +23,7 @@ from dq_profile.production_runner import (
     profile_command,
     promote_analysis,
     promote_profile_provenance,
+    run_local_pipeline,
     sanitize_profile_name,
     source_dirs_from_dataset_config,
     subprocess_text_environment,
@@ -68,6 +69,24 @@ def test_standard_mode_keeps_the_shared_local_ruler_and_shortens_only_qa() -> No
     assert strict.execution_mode.max_edge_extension_rounds == 2
 
 
+def test_quick_mode_uses_a_separate_reduced_sampling_contract() -> None:
+    standard = resolve_training_cli(minimal_cli(), execution_mode_name="standard")
+    quick = resolve_training_cli(minimal_cli(), execution_mode_name="quick")
+    assert quick.preset.contract() == standard.preset.contract()
+    assert quick.local_measurement.name == "local-body-tail-quick-v1"
+    assert quick.local_measurement.metric_definition_version == "2.4.0"
+    assert quick.local_measurement.max_images == 16
+    assert quick.local_measurement.timestep_bins == 4
+    assert quick.local_measurement.no_quant_noise_replicas == 3
+    assert quick.local_measurement.candidate_noise_replicas == 2
+    assert quick.local_measurement.stochastic_quant_repeats == 2
+    assert quick.local_measurement.sampling_depth == "reduced_16_image"
+    assert quick.execution_mode.core_grid == standard.execution_mode.core_grid
+    assert quick.execution_mode.prefix_checkpoints == (0, 1, 4, 8)
+    assert quick.execution_mode.standalone_snapshot_count == 1
+    assert quick.execution_mode.gpu_process_count_range == (3, 3)
+
+
 def test_cross_mode_fingerprints_split_shared_local_from_execution_qa(
     tmp_path: Path,
 ) -> None:
@@ -94,6 +113,17 @@ def test_cross_mode_fingerprints_split_shared_local_from_execution_qa(
     assert strict_hashes["local_probe_contract_sha256"] == standard_hashes["local_probe_contract_sha256"]
     assert strict_hashes["execution_qa_contract_sha256"] != standard_hashes["execution_qa_contract_sha256"]
     assert strict["full_protocol_fingerprint_sha256"] != standard["full_protocol_fingerprint_sha256"]
+
+    quick = build_protocol_fingerprint(
+        resolve_training_cli(argv, execution_mode_name="quick"),
+        source_map_payload=({"source_group": "source-01"},),
+    )
+    quick_hashes = quick["contract_hashes"]
+    assert quick_hashes["training_contract_sha256"] == standard_hashes["training_contract_sha256"]
+    assert quick_hashes["dataset_contract_sha256"] == standard_hashes["dataset_contract_sha256"]
+    assert quick_hashes["local_measurement_contract_sha256"] != standard_hashes["local_measurement_contract_sha256"]
+    assert quick_hashes["local_probe_contract_sha256"] != standard_hashes["local_probe_contract_sha256"]
+    assert quick_hashes["execution_qa_contract_sha256"] != standard_hashes["execution_qa_contract_sha256"]
 
 
 def test_full_legacy_style_cli_is_explicit_about_overrides() -> None:
@@ -539,6 +569,30 @@ def test_standard_profile_command_carries_distinct_execution_and_internal_levels
     assert "--dq_profile_range_muls=2.70,3.15,3.45,3.75,4.05" in command
 
 
+def test_quick_profile_command_carries_reduced_sampling_provenance(
+    tmp_path: Path,
+) -> None:
+    request = resolve_training_cli(
+        minimal_cli("--output_name=quick"),
+        execution_mode_name="quick",
+    )
+    command = profile_command(
+        request,
+        run_dir=tmp_path,
+        source_map=tmp_path / "source.json",
+        name="01_core",
+        protocol="v24-acceptance-local",
+        range_muls=request.execution_mode.core_grid,
+        max_images=request.local_measurement.max_images,
+    )
+    assert "--dq_profile_execution_mode=quick" in command
+    assert "--dq_profile_qa_depth=quick_smoke" in command
+    assert "--dq_profile_measurement_contract=local-body-tail-quick-v1" in command
+    assert "--dq_profile_sampling_depth=reduced_16_image" in command
+    assert "--dq_profile_confidence_ceiling=reduced_descriptive" in command
+    assert "--dq_profile_max_images=16" in command
+
+
 def test_dry_run_serializes_the_required_prefix_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -650,6 +704,89 @@ def test_execution_plan_matches_the_known_13_image_standard_work_volume(
     assert work["local"]["total_local_probes"] == 1196
     assert plan["reference_time_estimate"]["minutes"]["minimum"] > 0
 
+    quick_request = resolve_training_cli(
+        [
+            f"--pretrained_model_name_or_path={tmp_path / 'model.safetensors'}",
+            f"--dataset_config={dataset}",
+        ],
+        execution_mode_name="quick",
+    )
+    quick_plan = build_execution_plan(
+        quick_request,
+        image_count=13,
+        probe_budget=13,
+    )
+    quick_work = quick_plan["work_volume"]
+    assert quick_plan["measurement_contract"] == "local-body-tail-quick-v1"
+    assert quick_work["gpu_process_count"] == 3
+    assert quick_work["standalone_snapshot_count"] == 1
+    assert quick_work["total_warmup_updates"] == 3120
+    assert quick_work["prefix"]["total_branch_updates"] == 64
+
+
+def test_quick_pipeline_skips_the_redundant_second_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = resolve_training_cli(minimal_cli(), execution_mode_name="quick")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    profile_calls: list[tuple[str, bool]] = []
+    parity_calls: list[tuple[str, str, str]] = []
+
+    def fake_run_profile(_launcher, _request, **kwargs):
+        name = str(kwargs["name"])
+        profile_calls.append((name, bool(kwargs.get("snapshot_only"))))
+        output = run_dir / name
+        output.mkdir()
+        if name == production_runner.stage_names()["prefix"]:
+            (output / "calibration_gate.json").write_text("{}", encoding="utf-8")
+        return output
+
+    def fake_snapshot_parity(_launcher, left, right, output_name):
+        parity_calls.append((left.name, right.name, output_name))
+        return run_dir / output_name
+
+    def fake_analysis(_launcher, **kwargs):
+        output = run_dir / str(kwargs["output_name"])
+        output.mkdir()
+        (output / "local_selection.json").write_text(
+            json.dumps({"selection_valid": True}),
+            encoding="utf-8",
+        )
+        return output
+
+    class FakeLauncher:
+        dry_run = False
+
+        def __init__(self) -> None:
+            self.run_dir = run_dir
+
+        def run(self, _command, *, label: str) -> None:
+            assert label == "prefix/source contract gate"
+
+    monkeypatch.setattr(production_runner, "run_profile", fake_run_profile)
+    monkeypatch.setattr(production_runner, "run_snapshot_parity", fake_snapshot_parity)
+    monkeypatch.setattr(production_runner, "run_local_analysis", fake_analysis)
+    run_local_pipeline(
+        FakeLauncher(),
+        request,
+        source_map=tmp_path / "source-map.json",
+        probe_budget=16,
+        dataset_id="quick",
+    )
+    names = production_runner.stage_names()
+    assert profile_calls == [
+        (names["snapshot_a"], True),
+        (names["prefix"], False),
+        (names["core_raw"], False),
+    ]
+    assert parity_calls == [
+        (names["snapshot_a"], names["prefix"], names["prefix_snapshot_parity"])
+    ]
+    assert not (run_dir / names["snapshot_b"]).exists()
+    assert not (run_dir / names["snapshot_parity"]).exists()
+
 
 def test_product_artifacts_are_promoted_to_run_root(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
@@ -716,6 +853,26 @@ def test_direct_module_entry_selects_standard_execution_mode(
     assert production_main.main(["--dq-profile-mode=standard", *training]) == 0
     assert captured["training_argv"] == training
     assert captured["kwargs"]["execution_mode_name"] == "standard"
+
+
+def test_direct_module_entry_selects_quick_execution_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_profile_mode(training_argv: list[str], **kwargs: object) -> int:
+        captured["training_argv"] = training_argv
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(production_main, "run_profile_mode", fake_run_profile_mode)
+    training = [
+        f"--dataset_config={DATASET}",
+        f"--pretrained_model_name_or_path={MODEL}",
+    ]
+    assert production_main.main(["--dq-profile-mode=quick", *training]) == 0
+    assert captured["training_argv"] == training
+    assert captured["kwargs"]["execution_mode_name"] == "quick"
 
 
 def test_profile_name_sanitization_is_windows_safe() -> None:

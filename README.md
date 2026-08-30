@@ -55,7 +55,7 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 **ツール一覧**
 | ツール名 | 概要 | 説明 |
 |---|---|---|
-| `python -m dq_profile` | Experimental DQ Dataset Profilerを直接起動し、Local Body／Tailレポートを生成 | 既定は日常用`standard`（固定5点・短いQA）。`--dq-profile-mode=strict`でreference-depth検算。出力は`lora_output/dq_dataset_profiler`。Safety/Fidelity診断であり最終画質推薦ではない。使い方: [docs/dq_dataset_profiler-ja.md](docs/dq_dataset_profiler-ja.md) |
+| `python -m dq_profile` | Experimental DQ Dataset Profilerを直接起動し、Local Body／Tailレポートを生成 | 既定は正式診断用`standard`。短時間の傾向確認は`--dq-profile-mode=quick`、reference-depth検算は`strict`。出力は`lora_output/dq_dataset_profiler`。Safety/Fidelity診断であり最終画質推薦ではない。使い方: [docs/dq_dataset_profiler-ja.md](docs/dq_dataset_profiler-ja.md) |
 | `sdxl_tokenize.py` | SDXLのTE1/TE2トークン分割の表示と候補探索 | [docs/sdxl_tokenize_tool-ja.md](docs/sdxl_tokenize_tool-ja.md) |
 | `make_lora_diagnostic_report.py` | LoRA学習ログ（`grad_norm` / `dq_delta`）とLoRA重みを診断し、グラフ内蔵HTMLを生成 | 使い方とオプション詳細: [docs/make_lora_diagnostic_report-ja.md](docs/make_lora_diagnostic_report-ja.md) |
 | `sdxl_lora_report_gui.py` | SDXL LoRAの一括生成・比較HTMLレポートをGUIで作成 | [docs/sdxl_lora_report_README-ja.md](docs/sdxl_lora_report_README-ja.md) |
@@ -71,8 +71,9 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 
 この診断は最終画質、量子化の採用可否、best mulを自動判定するものではありません。
 比較可能性を保つため、初期Betaではrank 4、AdamW8bitFast、fp16 strictなどの
-検証済み条件を固定します。日常診断の`standard`と、環境変更・リリース前・再現性調査用の
-`strict`は同じLocal Body／Tail測定量を使い、Prefix検算とedge探索の深さだけが異なります。
+検証済み条件を固定します。既定の`standard`は最大32画像の正式診断、`quick`は最大16画像と
+独立snapshot 1回による短時間の傾向確認、`strict`は環境変更・リリース前・再現性調査用です。
+QuickもBody／Tailの定義とreplica数は維持しますが、samplingが少ないためconfidenceに上限を付けます。
 
 ```bat
 .\venv\Scripts\python.exe -m dq_profile ^

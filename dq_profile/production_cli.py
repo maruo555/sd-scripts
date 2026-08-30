@@ -169,8 +169,10 @@ def resolve_training_cli(
     execution_mode_name: str = "standard",
 ) -> ResolvedProfileRequest:
     preset = get_preset(preset_name)
-    local_measurement = get_local_measurement_contract()
     execution_mode = get_execution_mode(execution_mode_name)
+    local_measurement = get_local_measurement_contract(
+        execution_mode.local_measurement_name
+    )
     parser = _training_parser()
     namespace, unknown = parser.parse_known_args(list(argv))
     issues: list[CompatibilityIssue] = []

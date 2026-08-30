@@ -144,6 +144,8 @@ def test_fidelity_gauge_is_descriptive_worst_channel() -> None:
         contract["affinity_curve_scale"]["mode"]
         == "fixed_primary_with_dataset_auto_zoom"
     )
+    assert "quick" in contract["execution_mode"]
+    assert contract["execution_mode"]["sampling_depth_field"] == "sampling_depth"
 
 
 def test_absolute_perturbation_is_independent_of_relative_rank() -> None:
@@ -248,6 +250,43 @@ def test_single_dataset_report_is_local_only_and_hides_trajectory_from_selection
     assert "Safety/Fidelity ≠ Utility" in html
     assert "Strict reference" in html
     assert "v2.4.3 practical report beta" in html
+
+
+def test_quick_report_exposes_reduced_sampling_and_confidence_ceiling() -> None:
+    rows = [
+        _candidate(2.70, 1.2, 1.3, dominated_by=3.15),
+        _candidate(3.15, 0.7, 0.8),
+        _candidate(3.45, 0.8, 0.9),
+    ]
+    detail = _detail()
+    detail["summary"].update(
+        {
+            "execution_mode": "quick",
+            "qa_depth": "quick_smoke",
+            "measurement_contract": "local-body-tail-quick-v1",
+            "sampling_depth": "reduced_16_image",
+            "confidence_ceiling": "reduced_descriptive",
+        }
+    )
+    model = build_single_dataset_report_model(
+        dataset_id="SYN",
+        candidate_rows=rows,
+        detail=detail,
+    )
+    dataset = model["datasets"][0]
+    assert dataset["execution_mode"] == "quick"
+    assert dataset["qa_depth"] == "quick_smoke"
+    assert dataset["measurement_contract"] == "local-body-tail-quick-v1"
+    assert dataset["sampling_depth"] == "reduced_16_image"
+    assert dataset["confidence_ceiling"] == "reduced_descriptive"
+    assert any(
+        "最大16画像" in reason
+        for reason in dataset["local_comparison_confidence"]["reasons"]
+    )
+    html = render_report(model)
+    assert "Quick smoke" in html
+    assert "Reduced (max 16 images)" in html
+    assert "local-body-tail-quick-v1" in html
 
 def test_all_retained_candidates_do_not_force_a_single_representative() -> None:
     rows = [

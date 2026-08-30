@@ -46,15 +46,33 @@ def setup_parser() -> argparse.ArgumentParser:
     group.add_argument("--dq_profile_level", choices=("standard", "full"), default="standard")
     group.add_argument(
         "--dq_profile_execution_mode",
-        choices=("standard", "strict"),
+        choices=("quick", "standard", "strict"),
         default="strict",
         help="production orchestration mode; distinct from --dq_profile_level",
     )
     group.add_argument(
         "--dq_profile_qa_depth",
-        choices=("standard_smoke", "strict_reference"),
+        choices=("quick_smoke", "standard_smoke", "strict_reference"),
         default="strict_reference",
         help="production QA-depth provenance label",
+    )
+    group.add_argument(
+        "--dq_profile_measurement_contract",
+        type=str,
+        default="local-body-tail-v1",
+        help="versioned Local Body/Tail measurement-contract provenance",
+    )
+    group.add_argument(
+        "--dq_profile_sampling_depth",
+        type=str,
+        default="reference_32_image",
+        help="Local sampling-depth provenance label",
+    )
+    group.add_argument(
+        "--dq_profile_confidence_ceiling",
+        type=str,
+        default="data_driven_up_to_high",
+        help="descriptive confidence ceiling for the selected sampling contract",
     )
     group.add_argument(
         "--dq_profile_protocol",
@@ -219,6 +237,7 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
                 "--dq_profile_prefix_short_steps"
             )
         expected_qa_depth = {
+            "quick": "quick_smoke",
             "standard": "standard_smoke",
             "strict": "strict_reference",
         }[str(args.dq_profile_execution_mode)]

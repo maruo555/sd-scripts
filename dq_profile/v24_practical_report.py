@@ -200,6 +200,12 @@ def report_contract() -> dict[str, Any]:
             "field": "execution_mode",
             "qa_depth_field": "qa_depth",
             "internal_profile_level_field": "internal_profile_level",
+            "measurement_contract_field": "measurement_contract",
+            "sampling_depth_field": "sampling_depth",
+            "quick": (
+                "explicit reduced-sampling run with short prefix smoke, one "
+                "standalone snapshot, and the fixed five-point grid"
+            ),
             "standard": "daily fixed-grid run with short prefix smoke",
             "strict": "reference-depth run with long prefix and bounded edge extension",
             "mode_is_not_internal_profile_level": True,
@@ -783,6 +789,17 @@ def build_dataset_card(
     detail_summary = dict(detail.get("summary") or {})
     execution_mode = str(detail_summary.get("execution_mode", "strict"))
     qa_depth = str(detail_summary.get("qa_depth", "strict_reference"))
+    measurement_contract = str(
+        detail_summary.get("measurement_contract", "local-body-tail-v1")
+    )
+    sampling_depth = str(
+        detail_summary.get("sampling_depth", "reference_32_image")
+    )
+    confidence_ceiling = str(
+        detail_summary.get(
+            "confidence_ceiling", "data_driven_up_to_high"
+        )
+    )
     internal_profile_level = str(
         detail_summary.get("internal_profile_level", "standard")
     )
@@ -813,6 +830,12 @@ def build_dataset_card(
         detailed_bootstrap=bool(bootstrap_rows),
         absolute_norm_available=absolute_norm_available,
     )
+    if confidence_ceiling == "reduced_descriptive":
+        if local_comparison_confidence["level"] == "High":
+            local_comparison_confidence["level"] = "Medium"
+        local_comparison_confidence["reasons"].append(
+            "Quickは最大16画像の縮小samplingであり、Standardと同じ証拠量ではありません"
+        )
     recommendation_maturity = _recommendation_maturity(
         trajectory_available=trajectory_available,
         edge_unresolved=edge_unresolved,
@@ -1040,6 +1063,9 @@ def build_dataset_card(
         ),
         "execution_mode": execution_mode,
         "qa_depth": qa_depth,
+        "measurement_contract": measurement_contract,
+        "sampling_depth": sampling_depth,
+        "confidence_ceiling": confidence_ceiling,
         "internal_profile_level": internal_profile_level,
         "metric_definition_version": METRIC_DEFINITION_VERSION,
         "source_group_count": source_count,
@@ -1885,13 +1911,22 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
         else ""
     )
     execution_mode_label = {
+        "quick": "Quick",
         "standard": "Standard",
         "strict": "Strict",
     }.get(str(dataset.get("execution_mode")), str(dataset.get("execution_mode", "unknown")))
     qa_depth_label = {
+        "quick_smoke": "Quick smoke",
         "standard_smoke": "Standard smoke",
         "strict_reference": "Strict reference",
     }.get(str(dataset.get("qa_depth")), str(dataset.get("qa_depth", "unknown")))
+    sampling_depth_label = {
+        "reduced_16_image": "Reduced (max 16 images)",
+        "reference_32_image": "Reference (max 32 images)",
+    }.get(
+        str(dataset.get("sampling_depth")),
+        str(dataset.get("sampling_depth", "unknown")),
+    )
     return f"""
 <article id="dataset-{html.escape(dataset["dataset_id"])}" class="view dataset-view"{hidden}>
   <section class="dataset-intro">
@@ -1910,6 +1945,10 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
       <div class="evidence-chip">
         <span>Measurement QA</span>
         <strong>{html.escape(dataset["measurement_quality"]["level"])}</strong>
+      </div>
+      <div class="evidence-chip">
+        <span>Sampling depth</span>
+        <strong>{html.escape(sampling_depth_label)}</strong>
       </div>
       <div class="evidence-chip">
         <span>Local比較</span>
@@ -2026,6 +2065,8 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
         <div><span>Protocol</span><strong>{html.escape(dataset["metric_definition_version"])}</strong></div>
         <div><span>Execution mode</span><strong>{html.escape(execution_mode_label)}</strong></div>
         <div><span>QA depth</span><strong>{html.escape(qa_depth_label)}</strong></div>
+        <div><span>Measurement contract</span><strong>{html.escape(dataset["measurement_contract"])}</strong></div>
+        <div><span>Sampling depth</span><strong>{html.escape(sampling_depth_label)}</strong></div>
         <div><span>Internal profile level</span><strong>{html.escape(dataset["internal_profile_level"])}</strong></div>
         <div><span>Source groups</span><strong>{dataset["source_group_count"]}</strong></div>
         <div><span>Images</span><strong>{dataset["image_count"]}</strong></div>

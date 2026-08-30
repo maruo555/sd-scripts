@@ -568,7 +568,7 @@ def build_execution_plan(
         )
 
     base_seconds = (
-        2.0 * reference_warmup_seconds
+        execution.standalone_snapshot_count * reference_warmup_seconds
         + reference_warmup_seconds
         + execution.prefix_branch_updates * reference_prefix_update_seconds
         + estimated_local_seconds(len(execution.core_grid))
@@ -610,7 +610,8 @@ def build_execution_plan(
             ),
             "total_warmup_updates_min": warmup * minimum_processes,
             "total_warmup_updates_max": warmup * maximum_processes,
-            "snapshot_replica_count": 2,
+            "standalone_snapshot_count": execution.standalone_snapshot_count,
+            "snapshot_replica_count": execution.standalone_snapshot_count,
             "prefix": {
                 "candidates": ["no_quant", f"mul_{execution.prefix_anchor_mul:.2f}"],
                 "short_run_a_updates": execution.prefix_short_steps,
@@ -799,6 +800,9 @@ def profile_command(
         f"--dq_profile_protocol={protocol}",
         f"--dq_profile_execution_mode={execution.name}",
         f"--dq_profile_qa_depth={execution.qa_depth}",
+        f"--dq_profile_measurement_contract={local.name}",
+        f"--dq_profile_sampling_depth={local.sampling_depth}",
+        f"--dq_profile_confidence_ceiling={local.confidence_ceiling}",
         "--dq_profile_prefix_kernel_mode=deterministic",
         f"--dq_profile_prefix_short_steps={execution.prefix_short_steps}",
         f"--dq_profile_prefix_long_steps={execution.prefix_long_steps}",
@@ -954,18 +958,23 @@ def run_local_pipeline(
         max_images=execution.snapshot_a_max_images,
         snapshot_only=True,
     )
-    update_status(launcher.run_dir, status="running", current_stage="snapshot_b")
-    snapshot_b = run_profile(
-        launcher,
-        request,
-        source_map=source_map,
-        name=names["snapshot_b"],
-        protocol="v2-prefix-smoke",
-        range_muls=(execution.prefix_anchor_mul,),
-        max_images=probe_budget,
-        snapshot_only=True,
-    )
-    run_snapshot_parity(launcher, snapshot_a, snapshot_b, names["snapshot_parity"])
+    snapshot_reference = snapshot_a
+    if execution.standalone_snapshot_count >= 2:
+        update_status(launcher.run_dir, status="running", current_stage="snapshot_b")
+        snapshot_b = run_profile(
+            launcher,
+            request,
+            source_map=source_map,
+            name=names["snapshot_b"],
+            protocol="v2-prefix-smoke",
+            range_muls=(execution.prefix_anchor_mul,),
+            max_images=probe_budget,
+            snapshot_only=True,
+        )
+        run_snapshot_parity(
+            launcher, snapshot_a, snapshot_b, names["snapshot_parity"]
+        )
+        snapshot_reference = snapshot_b
 
     update_status(launcher.run_dir, status="running", current_stage="prefix_gate")
     prefix = run_profile(
@@ -977,7 +986,12 @@ def run_local_pipeline(
         range_muls=(execution.prefix_anchor_mul,),
         max_images=probe_budget,
     )
-    run_snapshot_parity(launcher, snapshot_b, prefix, names["prefix_snapshot_parity"])
+    run_snapshot_parity(
+        launcher,
+        snapshot_reference,
+        prefix,
+        names["prefix_snapshot_parity"],
+    )
     gate = prefix / "calibration_gate.json"
     launcher.run(
         [
@@ -1192,6 +1206,8 @@ def _write_initial_artifacts(
             "qa_depth": request.execution_mode.qa_depth,
             "internal_profile_level": request.execution_mode.internal_profile_level,
             "local_measurement_contract": request.local_measurement.name,
+            "sampling_depth": request.local_measurement.sampling_depth,
+            "confidence_ceiling": request.local_measurement.confidence_ceiling,
             "profile_scope": "local_body_tail_only",
             "image_count": image_count,
             "probe_budget": probe_budget,
