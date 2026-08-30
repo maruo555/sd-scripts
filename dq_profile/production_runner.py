@@ -260,6 +260,41 @@ def build_source_map(source_dirs: Sequence[Path], *, dataset_key: str) -> tuple[
     return payload, image_count
 
 
+def validate_source_map_inventory(source_map: Path) -> None:
+    """Refuse to mix worker stages that observed different dataset bytes."""
+
+    payload = json.loads(source_map.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, list) or not payload:
+        raise ValueError(f"source group map must contain a non-empty list: {source_map}")
+    for index, row in enumerate(payload, start=1):
+        if not isinstance(row, dict):
+            raise ValueError(f"source group map row {index} is not an object: {source_map}")
+        source_dir = Path(str(row.get("directory", ""))).expanduser().resolve()
+        if not source_dir.is_dir():
+            raise RuntimeError(
+                "dataset source inventory changed after preflight: "
+                f"source directory is unavailable: {source_dir}"
+            )
+        visible_images = loader_visible_image_files(source_dir)
+        current = {
+            "files": _inventory(source_dir, visible_images=visible_images),
+            "image_count": len(visible_images),
+        }
+        expected = {
+            "files": row.get("files"),
+            "image_count": row.get("image_count"),
+        }
+        if current != expected:
+            source_group = row.get("source_group", f"row-{index}")
+            raise RuntimeError(
+                "dataset source inventory changed after preflight; refusing to mix "
+                "worker stages with stale provenance: "
+                f"source_group={source_group!r}, "
+                f"expected_sha256={canonical_sha256(expected)}, "
+                f"current_sha256={canonical_sha256(current)}"
+            )
+
+
 def _is_within(path: Path, parent: Path) -> bool:
     path = path.resolve()
     parent = parent.resolve()
@@ -543,6 +578,10 @@ def run_profile(
     gate: Path | None = None,
     snapshot_only: bool = False,
 ) -> Path:
+    # The subprocess reads the original image/caption/cache paths, not copies.
+    # Re-hash them immediately before every worker so a long staged run cannot
+    # silently combine bytes that differ from source_group_map.json.
+    validate_source_map_inventory(source_map)
     output = launcher.run_dir / name
     if output.exists():
         raise RuntimeError(f"stage output already exists and will not be overwritten: {output}")
@@ -956,16 +995,30 @@ def run_profile_request(
             launcher.log("Preflight completed; GPU execution was not started")
             return ProductionRunResult(run_dir, "preflight_complete", None)
         if options.dry_run:
+            names = stage_names()
+            gate = run_dir / names["prefix"] / "calibration_gate.json"
             command = profile_command(
                 request,
                 run_dir=run_dir,
                 source_map=run_dir / "source_group_map.json",
-                name=stage_names()["core_raw"],
+                name=names["core_raw"],
                 protocol="v24-acceptance-local",
                 range_muls=request.preset.core_grid,
                 max_images=probe_budget,
+                gate=gate,
             )
-            write_json(run_dir / "dry_run_command.json", {"argv": command})
+            write_json(
+                run_dir / "dry_run_command.json",
+                {
+                    "stage": names["core_raw"],
+                    "argv": command,
+                    "requires_prefix_gate": str(gate),
+                    "note": (
+                        "This is the resolved Core worker command. The normal runner first "
+                        "creates and validates the referenced prefix gate."
+                    ),
+                },
+            )
             update_status(
                 run_dir,
                 status="dry_run_complete",

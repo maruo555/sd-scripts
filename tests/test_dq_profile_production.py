@@ -24,6 +24,7 @@ from dq_profile.production_runner import (
     sanitize_profile_name,
     source_dirs_from_dataset_config,
     subprocess_text_environment,
+    validate_source_map_inventory,
     validate_output_base,
 )
 
@@ -240,6 +241,25 @@ def test_source_map_counts_only_loader_visible_root_images(
     }
 
 
+def test_source_inventory_revalidation_detects_same_size_caption_change(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "dataset"
+    source.mkdir()
+    for index in range(8):
+        (source / f"image_{index:02d}.png").write_bytes(b"image")
+    caption = source / "caption.txt"
+    caption.write_text("caption-a", encoding="utf-8")
+    payload, _ = build_source_map((source,), dataset_key="example")
+    source_map = tmp_path / "source_group_map.json"
+    source_map.write_text(json.dumps(payload), encoding="utf-8")
+
+    validate_source_map_inventory(source_map)
+    caption.write_text("caption-b", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="changed after preflight"):
+        validate_source_map_inventory(source_map)
+
+
 def test_source_probe_capacity_rejects_partial_group_coverage() -> None:
     with pytest.raises(ValueError, match="source_groups=33 exceeds probe_budget=32"):
         production_runner._validate_source_probe_capacity(
@@ -408,6 +428,65 @@ def test_profile_command_uses_request_paths_and_python_module(tmp_path: Path) ->
     assert f"--pretrained_model_name_or_path={request.model_path}" in command
     assert f"--dataset_config={request.dataset_config}" in command
     assert "--dq_profile_protocol=v24-acceptance-local" in command
+
+
+def test_dry_run_serializes_the_required_prefix_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dirs = []
+    for source_index in range(4):
+        source = tmp_path / f"source-{source_index}"
+        source.mkdir()
+        for image_index in range(2):
+            (source / f"image-{image_index}.png").write_bytes(b"image")
+        source_dirs.append(source)
+    dataset = tmp_path / "dataset.toml"
+    dataset.write_text(
+        "[[datasets]]\n"
+        + "".join(
+            "[[datasets.subsets]]\n" + f"image_dir = {json.dumps(str(source))}\n"
+            for source in source_dirs
+        ),
+        encoding="utf-8",
+    )
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"model")
+    request = resolve_training_cli(
+        [
+            f"--pretrained_model_name_or_path={model}",
+            f"--dataset_config={dataset}",
+            "--output_name=dry-run",
+        ]
+    )
+    monkeypatch.setattr(production_runner, "preflight", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        production_runner,
+        "build_protocol_fingerprint",
+        lambda *_args, **_kwargs: {"fingerprint_sha256": "a" * 64},
+    )
+    output_base = tmp_path / "reports"
+    output_base.mkdir()
+    monkeypatch.setattr(
+        production_runner,
+        "validate_output_base",
+        lambda value, **_kwargs: value.resolve(),
+    )
+    result = production_runner.run_profile_request(
+        request,
+        production_runner.ProductionRunOptions(
+            output_base=output_base,
+            dry_run=True,
+        ),
+    )
+    payload = json.loads((result.run_dir / "dry_run_command.json").read_text(encoding="utf-8"))
+    expected_gate = (
+        result.run_dir
+        / production_runner.stage_names()["prefix"]
+        / "calibration_gate.json"
+    )
+    assert payload["requires_prefix_gate"] == str(expected_gate)
+    assert f"--dq_profile_prefix_gate_file={expected_gate}" in payload["argv"]
 
 
 def test_product_artifacts_are_promoted_to_run_root(tmp_path: Path) -> None:
