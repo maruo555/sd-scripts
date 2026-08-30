@@ -160,7 +160,7 @@ def sanitize_profile_name(value: str) -> str:
     name = re.sub(r"\s+", "_", name)
     if not name or name in {".", ".."}:
         name = "dq_profile"
-    if name.upper() in WINDOWS_RESERVED:
+    if name.split(".", 1)[0].upper() in WINDOWS_RESERVED:
         name = f"dq_{name}"
     return name[:80].rstrip(" .") or "dq_profile"
 

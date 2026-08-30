@@ -445,11 +445,24 @@ def resolve_dataset_layout(
                 raise ValueError(
                     f"datasets[{dataset_index}].subsets[{subset_index}] has no image_dir"
                 )
-            raw_image_dir = Path(str(raw_dir))
+            raw_dir_text = str(raw_dir)
+            raw_image_dir = Path(raw_dir_text)
             if not raw_image_dir.is_absolute():
                 raise ValueError(
                     "canonical diagnostic requires absolute image_dir paths because the training "
                     f"loader resolves relative paths from its process cwd: {raw_dir!r}"
+                )
+            lexical_text = (
+                raw_dir_text.replace(os.altsep, os.sep)
+                if os.altsep is not None
+                else raw_dir_text
+            )
+            lexical_parts = lexical_text.split(os.sep)
+            if any(part in {".", ".."} for part in lexical_parts):
+                raise ValueError(
+                    "canonical diagnostic requires image_dir paths without lexical '.' or '..' "
+                    "components because source-group prefixes must match worker-visible image "
+                    f"keys: {raw_dir!r}"
                 )
             linked_component = _first_symlink_or_reparse_component(raw_image_dir)
             if linked_component is not None:

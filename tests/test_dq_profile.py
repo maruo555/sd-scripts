@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -272,6 +273,37 @@ def test_dataset_preflight_rejects_relative_image_dir(
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="requires absolute image_dir"):
+        inspect_dataset_config(
+            config,
+            max_train_epochs=40,
+            max_train_steps=None,
+            lr_warmup_steps=0.05,
+            branch_steps_override=None,
+            max_images=32,
+            timestep_bins=4,
+            stochastic_repeats=2,
+        )
+
+
+@pytest.mark.parametrize("dot_component", (".", ".."))
+def test_dataset_preflight_rejects_lexical_dot_components(
+    tmp_path: Path,
+    dot_component: str,
+) -> None:
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "image.png").write_bytes(b"image")
+    raw_image_dir = (
+        f"{tmp_path}{os.sep}staging{os.sep}{dot_component}{os.sep}images"
+    )
+    config = tmp_path / "dataset.toml"
+    config.write_text(
+        "[[datasets]]\n"
+        "[[datasets.subsets]]\n"
+        f"image_dir={json.dumps(raw_image_dir)}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="without lexical"):
         inspect_dataset_config(
             config,
             max_train_epochs=40,

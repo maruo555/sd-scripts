@@ -446,3 +446,6 @@ def test_direct_module_entry_preserves_training_vector(monkeypatch: pytest.Monke
 def test_profile_name_sanitization_is_windows_safe() -> None:
     assert sanitize_profile_name("  A/B: test  ") == "A_B__test"
     assert sanitize_profile_name("CON") == "dq_CON"
+    assert sanitize_profile_name("CON.txt") == "dq_CON.txt"
+    assert sanitize_profile_name("LPT1.run") == "dq_LPT1.run"
+    assert sanitize_profile_name("COM10.txt") == "COM10.txt"
