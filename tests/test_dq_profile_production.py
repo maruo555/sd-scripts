@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,9 @@ from dq_profile.production_runner import (
     DEFAULT_OUTPUT_BASE,
     Launcher,
     ProductionRunOptions,
+    _model_identity,
     allocate_run_directory,
+    build_source_map,
     profile_command,
     promote_analysis,
     promote_profile_provenance,
@@ -164,6 +167,41 @@ def test_source_dirs_follow_toml_order_and_reject_duplicates(tmp_path: Path) -> 
         source_dirs_from_dataset_config(config)
 
 
+def test_source_map_rejects_images_visible_only_recursively(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "dataset"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    for index in range(8):
+        (nested / f"image_{index:02d}.png").write_bytes(b"image")
+    monkeypatch.setattr(production_runner, "_training_image_extensions", lambda: frozenset({".png"}))
+    with pytest.raises(ValueError, match="non-recursive image discovery"):
+        build_source_map((source,), dataset_key="example")
+
+
+def test_source_map_counts_only_loader_visible_root_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "dataset"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    for index in range(8):
+        (source / f"image_{index:02d}.png").write_bytes(b"image")
+    (source / "caption.txt").write_text("caption", encoding="utf-8")
+    (nested / "hidden.png").write_bytes(b"image")
+    monkeypatch.setattr(production_runner, "_training_image_extensions", lambda: frozenset({".png"}))
+    payload, image_count = build_source_map((source,), dataset_key="example")
+    assert image_count == 8
+    assert payload[0]["image_count"] == 8
+    assert {row["name"] for row in payload[0]["files"]} == {
+        "caption.txt",
+        *(f"image_{index:02d}.png" for index in range(8)),
+    }
+
+
 def test_output_base_policy_and_unique_run_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -182,6 +220,32 @@ def test_output_base_policy_and_unique_run_ids(tmp_path: Path, monkeypatch: pyte
 
 def test_default_output_location_is_project_lora_output() -> None:
     assert DEFAULT_OUTPUT_BASE.parts[-2:] == ("lora_output", "dq_dataset_profiler")
+
+
+def test_model_file_identity_hashes_contents_even_when_metadata_is_reused(tmp_path: Path) -> None:
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"model-a")
+    original_stat = model.stat()
+    first = _model_identity(model)
+    model.write_bytes(b"model-b")
+    os.utime(model, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    second = _model_identity(model)
+    assert first["size"] == second["size"]
+    assert first["mtime_ns"] == second["mtime_ns"]
+    assert first["sha256"] != second["sha256"]
+
+
+def test_model_directory_identity_hashes_nested_file_contents(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    weights = model / "unet" / "weights.bin"
+    weights.parent.mkdir(parents=True)
+    weights.write_bytes(b"weights-a")
+    first = _model_identity(model)
+    weights.write_bytes(b"weights-b")
+    second = _model_identity(model)
+    assert first["file_count"] == second["file_count"] == 1
+    assert first["total_file_size"] == second["total_file_size"]
+    assert first["inventory_sha256"] != second["inventory_sha256"]
 
 
 def test_windows_subprocess_text_environment_overrides_utf8_mode(

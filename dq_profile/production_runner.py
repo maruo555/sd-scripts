@@ -22,7 +22,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = REPO_ROOT.parent
 PROFILE_SCRIPT = REPO_ROOT / "sdxl_dq_dataset_profile.py"
 DEFAULT_OUTPUT_BASE = PROJECT_ROOT / "lora_output" / "dq_dataset_profiler"
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".avif", ".jxl"}
 RUN_SCHEMA_VERSION = "1.0-beta"
 INVALID_FILENAME = re.compile(r"[<>:\"/\\|?*\x00-\x1f]")
 WINDOWS_RESERVED = {
@@ -162,9 +161,25 @@ def source_dirs_from_dataset_config(dataset_config: Path) -> tuple[Path, ...]:
     return tuple(source_dirs)
 
 
-def _inventory(source_dir: Path) -> list[dict[str, Any]]:
+def _training_image_extensions() -> frozenset[str]:
+    # Import lazily so `python -m dq_profile --help` remains lightweight. The
+    # production request resolver has already loaded the same training parser
+    # before preflight reaches this point.
+    from library.train_util import IMAGE_EXTENSIONS
+
+    return frozenset(str(extension).casefold() for extension in IMAGE_EXTENSIONS)
+
+
+def _inventory(
+    source_dir: Path,
+    *,
+    image_extensions: frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    image_extensions = _training_image_extensions() if image_extensions is None else image_extensions
     rows: list[dict[str, Any]] = []
-    for path in sorted(source_dir.rglob("*"), key=lambda item: str(item).casefold()):
+    # DreamBoothDataset uses non-recursive glob_images(image_dir, "*"). Keep
+    # the source inventory and preflight image count on exactly that topology.
+    for path in sorted(source_dir.iterdir(), key=lambda item: (str(item).casefold(), str(item))):
         if not path.is_file():
             continue
         rows.append(
@@ -172,7 +187,7 @@ def _inventory(source_dir: Path) -> list[dict[str, Any]]:
                 "name": str(path.relative_to(source_dir)).replace("\\", "/"),
                 "size": path.stat().st_size,
                 "sha256": sha256_file(path),
-                "is_image": path.suffix.casefold() in IMAGE_SUFFIXES,
+                "is_image": path.suffix.casefold() in image_extensions,
             }
         )
     return rows
@@ -180,8 +195,24 @@ def _inventory(source_dir: Path) -> list[dict[str, Any]]:
 
 def build_source_map(source_dirs: Sequence[Path], *, dataset_key: str) -> tuple[list[dict[str, Any]], int]:
     payload: list[dict[str, Any]] = []
+    image_extensions = _training_image_extensions()
     for index, source_dir in enumerate(source_dirs, start=1):
-        files = _inventory(source_dir)
+        files = _inventory(source_dir, image_extensions=image_extensions)
+        source_image_count = sum(bool(row["is_image"]) for row in files)
+        if source_image_count == 0:
+            nested_image_count = sum(
+                path.is_file()
+                and path.parent != source_dir
+                and path.suffix.casefold() in image_extensions
+                for path in source_dir.rglob("*")
+            )
+            if nested_image_count:
+                raise ValueError(
+                    "canonical-v1 follows the training loader's non-recursive image discovery; "
+                    f"{source_dir} has {nested_image_count} image files only in descendant directories. "
+                    "Move them to the image_dir root or declare each child directory as a separate subset."
+                )
+            raise ValueError(f"dataset image_dir has no loader-visible image files: {source_dir}")
         payload.append(
             {
                 "pattern": str(source_dir.resolve()) + os.sep,
@@ -189,12 +220,15 @@ def build_source_map(source_dirs: Sequence[Path], *, dataset_key: str) -> tuple[
                 "match": "prefix",
                 "directory": str(source_dir.resolve()),
                 "files": files,
-                "image_count": sum(bool(row["is_image"]) for row in files),
+                "image_count": source_image_count,
             }
         )
     image_count = sum(int(row["image_count"]) for row in payload)
     if image_count < 8:
-        raise ValueError(f"canonical-v1 requires at least 8 images; found {image_count}")
+        raise ValueError(
+            "canonical-v1 requires at least 8 non-recursive loader-visible images; "
+            f"found {image_count}"
+        )
     return payload, image_count
 
 
@@ -234,13 +268,47 @@ def validate_output_base(
 def _model_identity(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"pretrained model path was not found: {path}")
+    path = path.resolve()
     stat = path.stat()
-    return {
-        "path": str(path.resolve()),
-        "kind": "directory" if path.is_dir() else "file",
+    common = {
+        "path": str(path),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
+    if path.is_file():
+        return {
+            **common,
+            "kind": "file",
+            "sha256": sha256_file(path),
+        }
+    if path.is_dir():
+        model_files = [item for item in path.rglob("*") if item.is_file()]
+        model_files.sort(
+            key=lambda item: (
+                item.relative_to(path).as_posix().casefold(),
+                item.relative_to(path).as_posix(),
+            )
+        )
+        inventory = []
+        for item in model_files:
+            item_stat = item.stat()
+            inventory.append(
+                {
+                    "name": item.relative_to(path).as_posix(),
+                    "size": item_stat.st_size,
+                    "sha256": sha256_file(item),
+                }
+            )
+        if not inventory:
+            raise ValueError(f"pretrained model directory contains no files: {path}")
+        return {
+            **common,
+            "kind": "directory",
+            "file_count": len(inventory),
+            "total_file_size": sum(int(row["size"]) for row in inventory),
+            "inventory_sha256": canonical_sha256(inventory),
+        }
+    raise ValueError(f"pretrained model path is neither a file nor a directory: {path}")
 
 
 def build_protocol_fingerprint(

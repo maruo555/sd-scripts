@@ -48,10 +48,10 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 最初にGPUを使わず、次を確認します。
 
 - model、dataset TOML、各`image_dir`が存在する。
-- datasetに8画像以上あり、source groupが重複・入れ子になっていない。
+- 学習loaderと同じ非再帰探索で、各`image_dir`直下に画像があり、dataset全体で8画像以上ある。
 - CLIが`canonical-v1`と互換である。
 - 通常checkpoint、dataset、repositoryと診断出力先が重ならない。
-- Git HEAD、ソースhash、preset、model、dataset、source inventoryからprotocol fingerprintを作る。
+- Git HEAD、ソースhash、preset、model内容のSHA-256、dataset、source inventoryからprotocol fingerprintを作る。
 - 実画像数と`min(実画像数, 32)`であるprobe budgetを記録する。
 
 `--dq-profile-preflight`ではここまで実行し、GPU stageを起動しません。
@@ -318,6 +318,8 @@ python -m dq_profile ^
 | `--dq-profile-preflight` | 任意 | false | パス、source、CLI契約、fingerprintまで作りGPUを起動しない |
 | `--dq-profile-dry-run` | 任意 | false | 解決済みCore commandを`dry_run_command.json`へ書き、GPUを起動しない |
 | `--dq-profile-open-report` | 任意 | false | Windowsで正常完了した場合に`report.html`を開く |
+
+`image_dir`の子孫フォルダだけにある画像は、通常のDreamBooth学習loaderから見えないため診断でも数えません。子フォルダを個別subsetとしてTOMLへ列挙するか、画像を`image_dir`直下へ配置してください。
 
 事前検査だけ行う例です。検査結果も新しいrunディレクトリへ保存します。
 
