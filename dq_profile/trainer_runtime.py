@@ -397,6 +397,21 @@ class DiagnosticProfileRuntime:
         self._stats_sequence += 1
         return self._stats_sequence
 
+    def _select_probe_items(
+        self,
+        sequence: ReplaySequence,
+    ) -> tuple[list[ReplayBatch], SourceGroupMap]:
+        source_group_map = SourceGroupMap.load(
+            getattr(self.args, "dq_profile_source_group_map", None)
+        )
+        minimum_source_groups = 4 if self.profile_protocol.startswith("v24-") else 1
+        selected = sequence.unique_image_items(
+            int(self.args.dq_profile_max_images),
+            source_group_resolver=source_group_map.resolve,
+            minimum_source_groups=minimum_source_groups,
+        )
+        return selected, source_group_map
+
     def _capture_batches(
         self,
         *,
@@ -804,7 +819,7 @@ class DiagnosticProfileRuntime:
             trainer=self.trainer,
             guardian=grad_norm_guardian,
         )
-        selected = sequence.unique_image_items(int(self.args.dq_profile_max_images))
+        selected, source_group_map = self._select_probe_items(sequence)
         protocol_minimum = (
             8 if self.profile_protocol.startswith("v24-") else 16
         )
@@ -866,7 +881,6 @@ class DiagnosticProfileRuntime:
             name: defaultdict(list) for name in sketchers
         }
         sketch_metadata: list[dict[str, Any]] = []
-        source_group_map = SourceGroupMap.load(getattr(self.args, "dq_profile_source_group_map", None))
         per_image_rows: list[dict[str, Any]] = []
         natural_gradient_enabled = self.profile_protocol.startswith("v24-")
         local_natural_gradient_rows: list[dict[str, Any]] = []
@@ -1278,7 +1292,7 @@ class DiagnosticProfileRuntime:
             trainer=self.trainer,
             guardian=grad_norm_guardian,
         )
-        selected = sequence.unique_image_items(int(self.args.dq_profile_max_images))
+        selected, source_group_map = self._select_probe_items(sequence)
         bins = int(self.args.dq_profile_timestep_bins)
         repeats = int(self.args.dq_profile_stochastic_repeats)
         probe_replicas = int(getattr(self.args, "dq_profile_probe_replicas_resolved", 1))
@@ -1307,7 +1321,6 @@ class DiagnosticProfileRuntime:
         }
         sketch_ids_by_bin: dict[int, list[str]] = defaultdict(list)
         sketch_metadata: list[dict[str, Any]] = []
-        source_group_map = SourceGroupMap.load(getattr(self.args, "dq_profile_source_group_map", None))
         per_image_rows: list[dict[str, Any]] = []
         raw_shadow_rows: list[dict[str, Any]] = []
         no_quant = self.candidates[0]
@@ -1990,14 +2003,17 @@ class DiagnosticProfileRuntime:
         )
         bin_count = int(self.args.dq_profile_timestep_bins)
         diffusion_steps = int(noise_scheduler.config.num_train_timesteps)
-        selected_probe_items = (
-            []
-            if self.profile_protocol == "v2-prefix-smoke"
-            else sequence.unique_image_items(int(self.args.dq_profile_max_images))
-        )
+        if self.profile_protocol == "v2-prefix-smoke":
+            selected_probe_items: list[ReplayBatch] = []
+            probe_source_group_map = SourceGroupMap()
+        else:
+            selected_probe_items, probe_source_group_map = self._select_probe_items(sequence)
         ordered_probe_contract = [
             {
                 "image_key": (
+                    item.image_keys[0] if item.image_keys else item.digest
+                ),
+                "source_group": probe_source_group_map.resolve(
                     item.image_keys[0] if item.image_keys else item.digest
                 ),
                 "batch_digest": item.batch_digest,
@@ -2486,7 +2502,7 @@ class DiagnosticProfileRuntime:
                 "probe_images": (
                     0
                     if self.profile_protocol == "v2-prefix-smoke"
-                    else len(sequence.unique_image_items(int(self.args.dq_profile_max_images)))
+                    else len(selected_probe_items)
                 ),
                 "timestep_bins": int(self.args.dq_profile_timestep_bins),
                 "stochastic_repeats": int(self.args.dq_profile_stochastic_repeats),

@@ -121,6 +121,7 @@ def test_full_profile_expands_only_probe_replicas_within_budget(tmp_path: Path):
     (
         ("[general]\nbatch_size=2\n", "batch_size=2"),
         ("[[datasets]]\nenable_bucket=false\n", "enable_bucket=False"),
+        ("[[datasets]]\nbucket_no_upscale=true\n", "bucket_no_upscale=True"),
         ("[[datasets]]\nenable_bucket=true\nmin_bucket_reso=256\n", "min_bucket_reso=256"),
     ),
 )
@@ -194,12 +195,16 @@ def test_dataset_preflight_rejects_loader_ignored_or_cached_subsets(
         )
 
 
-def test_dataset_preflight_rejects_relative_image_dir(tmp_path: Path) -> None:
+@pytest.mark.parametrize("image_dir", ("relative/images", "~/images"))
+def test_dataset_preflight_rejects_relative_image_dir(
+    tmp_path: Path,
+    image_dir: str,
+) -> None:
     config = tmp_path / "dataset.toml"
     config.write_text(
         "[[datasets]]\n"
         "[[datasets.subsets]]\n"
-        'image_dir="relative/images"\n',
+        f"image_dir={json.dumps(image_dir)}\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="requires absolute image_dir"):
@@ -428,6 +433,65 @@ def test_replay_sequence_is_sealed_and_has_no_loader_reference():
     with pytest.raises(RuntimeError):
         sequence.append(item)
     assert not any("loader" in name.lower() for name in vars(sequence))
+
+
+def test_replay_probe_selection_is_source_stratified_and_deterministic():
+    sequence = ReplaySequence()
+    keys = [f"source-a/image-{index:02d}.png" for index in range(40)]
+    keys.extend(
+        (
+            "source-b/image.png",
+            "source-c/image.png",
+            "source-d/image.png",
+        )
+    )
+    for index, key in enumerate(keys):
+        sequence.append(
+            ReplayBatch(index, 0, index, index, {"image_keys": [key]})
+        )
+    sequence.seal()
+
+    resolver = lambda key: key.split("/", 1)[0]
+    first = sequence.unique_image_items(
+        8,
+        source_group_resolver=resolver,
+        minimum_source_groups=4,
+    )
+    second = sequence.unique_image_items(
+        8,
+        source_group_resolver=resolver,
+        minimum_source_groups=4,
+    )
+    first_keys = [item.image_keys[0] for item in first]
+    assert first_keys == [item.image_keys[0] for item in second]
+    assert [resolver(key) for key in first_keys[:4]] == [
+        "source-a",
+        "source-b",
+        "source-c",
+        "source-d",
+    ]
+    assert len(first) == 8
+
+
+def test_replay_probe_selection_rejects_missing_source_coverage():
+    sequence = ReplaySequence()
+    for index, source in enumerate(("a", "b", "c")):
+        sequence.append(
+            ReplayBatch(
+                index,
+                0,
+                index,
+                index,
+                {"image_keys": [f"{source}/image.png"]},
+            )
+        )
+    sequence.seal()
+    with pytest.raises(ValueError, match="enough source groups"):
+        sequence.unique_image_items(
+            8,
+            source_group_resolver=lambda key: key.split("/", 1)[0],
+            minimum_source_groups=4,
+        )
 
 
 class _TrainerState:

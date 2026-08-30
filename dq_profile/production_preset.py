@@ -75,6 +75,7 @@ CANONICAL_V1 = DiagnosticPreset(
         "network_module": "networks.lora",
         "network_dim": 4,
         "enable_bucket": True,
+        "bucket_no_upscale": False,
         "min_bucket_reso": 384,
         "max_bucket_reso": 1024,
         "noise_offset": 0.15,

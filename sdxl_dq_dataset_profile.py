@@ -638,6 +638,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         stochastic_repeats=args.dq_profile_stochastic_repeats,
         train_batch_size=int(getattr(args, "train_batch_size", 1)),
         enable_bucket=bool(getattr(args, "enable_bucket", False)),
+        bucket_no_upscale=bool(getattr(args, "bucket_no_upscale", False)),
         min_bucket_reso=int(getattr(args, "min_bucket_reso", 256)),
         max_bucket_reso=int(getattr(args, "max_bucket_reso", 1024)),
         dataset_repeats=int(getattr(args, "dataset_repeats", 1)),

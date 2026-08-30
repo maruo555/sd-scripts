@@ -4,7 +4,7 @@ import copy
 import hashlib
 import random
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 import numpy as np
 import torch
@@ -194,15 +194,61 @@ class ReplaySequence:
             for item in self._items
         ]
 
-    def unique_image_items(self, limit: int) -> list[ReplayBatch]:
-        selected: list[ReplayBatch] = []
+    def unique_image_items(
+        self,
+        limit: int,
+        *,
+        source_group_resolver: Optional[Callable[[str], str]] = None,
+        minimum_source_groups: int = 1,
+    ) -> list[ReplayBatch]:
+        limit = int(limit)
+        if limit <= 0:
+            return []
+        required_groups = max(1, int(minimum_source_groups))
+        if limit < required_groups:
+            raise ValueError(
+                "probe image limit cannot represent the required source groups: "
+                f"limit={limit}, required_groups={required_groups}"
+            )
+
+        grouped: dict[str, list[ReplayBatch]] = {}
+        group_order: list[str] = []
         seen: set[str] = set()
         for item in self._items:
             key = item.image_keys[0] if item.image_keys else item.digest
             if key in seen:
                 continue
             seen.add(key)
-            selected.append(item)
-            if len(selected) >= limit:
+            group = str(source_group_resolver(key)) if source_group_resolver is not None else key
+            if group not in grouped:
+                grouped[group] = []
+                group_order.append(group)
+            grouped[group].append(item)
+
+        if len(grouped) < required_groups:
+            raise ValueError(
+                "probe replay does not represent enough source groups: "
+                f"required={required_groups}, available={len(grouped)}"
+            )
+
+        # First cover every represented source, then take another item from
+        # each source in first-occurrence order. This keeps the selection
+        # deterministic while preventing a high-repeat subset from consuming
+        # the entire probe budget before another source is represented.
+        selected: list[ReplayBatch] = []
+        offsets = {group: 0 for group in group_order}
+        while len(selected) < limit:
+            progressed = False
+            for group in group_order:
+                offset = offsets[group]
+                items = grouped[group]
+                if offset >= len(items):
+                    continue
+                selected.append(items[offset])
+                offsets[group] = offset + 1
+                progressed = True
+                if len(selected) >= limit:
+                    break
+            if not progressed:
                 break
         return selected

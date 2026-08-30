@@ -142,6 +142,11 @@ def test_fp16_safe_norms_alias_is_accepted() -> None:
     assert any(row["destination"] == "fp16_safe_norms" for row in request.dispositions)
 
 
+def test_bucket_no_upscale_is_rejected_by_canonical_preset() -> None:
+    with pytest.raises(ProfileCompatibilityError, match="bucket_no_upscale"):
+        resolve_training_cli(minimal_cli("--bucket_no_upscale"))
+
+
 def test_source_dirs_follow_toml_order_and_reject_duplicates(tmp_path: Path) -> None:
     first = tmp_path / "画像 A"
     second = tmp_path / "画像 B"

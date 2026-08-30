@@ -53,6 +53,7 @@ class ResolvedDatasetSettings:
     dataset_index: int
     batch_size: int
     enable_bucket: bool
+    bucket_no_upscale: bool
     min_bucket_reso: int
     max_bucket_reso: int
 
@@ -302,6 +303,7 @@ def resolve_dataset_layout(
     *,
     train_batch_size: int = 1,
     enable_bucket: bool = False,
+    bucket_no_upscale: bool = False,
     min_bucket_reso: int = 256,
     max_bucket_reso: int = 1024,
     dataset_repeats: int = 1,
@@ -336,6 +338,14 @@ def resolve_dataset_layout(
             _fallback_value("enable_bucket", (dataset, general), enable_bucket),
             label=f"datasets[{dataset_index}].enable_bucket",
         )
+        effective_bucket_no_upscale = _bool_setting(
+            _fallback_value(
+                "bucket_no_upscale",
+                (dataset, general),
+                bucket_no_upscale,
+            ),
+            label=f"datasets[{dataset_index}].bucket_no_upscale",
+        )
         effective_min_bucket = _int_setting(
             _fallback_value("min_bucket_reso", (dataset, general), min_bucket_reso),
             label=f"datasets[{dataset_index}].min_bucket_reso",
@@ -349,6 +359,11 @@ def resolve_dataset_layout(
             mismatches.append(f"batch_size={batch_size} (required {int(train_batch_size)})")
         if bucket_enabled is not bool(enable_bucket):
             mismatches.append(f"enable_bucket={bucket_enabled} (required {bool(enable_bucket)})")
+        if effective_bucket_no_upscale is not bool(bucket_no_upscale):
+            mismatches.append(
+                "bucket_no_upscale="
+                f"{effective_bucket_no_upscale} (required {bool(bucket_no_upscale)})"
+            )
         if bucket_enabled:
             if effective_min_bucket != int(min_bucket_reso):
                 mismatches.append(
@@ -368,6 +383,7 @@ def resolve_dataset_layout(
                 dataset_index=dataset_index,
                 batch_size=batch_size,
                 enable_bucket=bucket_enabled,
+                bucket_no_upscale=effective_bucket_no_upscale,
                 min_bucket_reso=effective_min_bucket,
                 max_bucket_reso=effective_max_bucket,
             )
@@ -387,13 +403,13 @@ def resolve_dataset_layout(
                 raise ValueError(
                     f"datasets[{dataset_index}].subsets[{subset_index}] has no image_dir"
                 )
-            image_dir = Path(str(raw_dir)).expanduser()
-            if not image_dir.is_absolute():
+            raw_image_dir = Path(str(raw_dir))
+            if not raw_image_dir.is_absolute():
                 raise ValueError(
                     "canonical diagnostic requires absolute image_dir paths because the training "
                     f"loader resolves relative paths from its process cwd: {raw_dir!r}"
                 )
-            image_dir = image_dir.resolve()
+            image_dir = raw_image_dir.resolve()
             if not image_dir.is_dir():
                 raise FileNotFoundError(f"dataset image_dir was not found: {image_dir}")
 
@@ -479,6 +495,7 @@ def inspect_dataset_config(
     stochastic_repeats: int,
     train_batch_size: int = 1,
     enable_bucket: bool = False,
+    bucket_no_upscale: bool = False,
     min_bucket_reso: int = 256,
     max_bucket_reso: int = 1024,
     dataset_repeats: int = 1,
@@ -489,6 +506,7 @@ def inspect_dataset_config(
         dataset_config,
         train_batch_size=train_batch_size,
         enable_bucket=enable_bucket,
+        bucket_no_upscale=bucket_no_upscale,
         min_bucket_reso=min_bucket_reso,
         max_bucket_reso=max_bucket_reso,
         dataset_repeats=dataset_repeats,

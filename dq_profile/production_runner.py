@@ -170,6 +170,7 @@ def source_dirs_from_dataset_config(
     *,
     train_batch_size: int = 1,
     enable_bucket: bool = True,
+    bucket_no_upscale: bool = False,
     min_bucket_reso: int = 384,
     max_bucket_reso: int = 1024,
     minimum_source_groups: int = 1,
@@ -178,6 +179,7 @@ def source_dirs_from_dataset_config(
         dataset_config,
         train_batch_size=train_batch_size,
         enable_bucket=enable_bucket,
+        bucket_no_upscale=bucket_no_upscale,
         min_bucket_reso=min_bucket_reso,
         max_bucket_reso=max_bucket_reso,
         dataset_repeats=1,
@@ -885,6 +887,9 @@ def run_profile_request(
         request.dataset_config,
         train_batch_size=int(request.preset.expected_explicit["train_batch_size"]),
         enable_bucket=bool(request.preset.expected_explicit["enable_bucket"]),
+        bucket_no_upscale=bool(
+            request.preset.expected_explicit["bucket_no_upscale"]
+        ),
         min_bucket_reso=int(request.preset.expected_explicit["min_bucket_reso"]),
         max_bucket_reso=int(request.preset.expected_explicit["max_bucket_reso"]),
         minimum_source_groups=request.preset.minimum_source_groups,
