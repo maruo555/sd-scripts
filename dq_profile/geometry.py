@@ -16,6 +16,8 @@ class SourceRule:
     pattern: str
     source_group: str
     match: str = "exact"
+    probe_selected: bool = True
+    probe_selection_rank: Optional[int] = None
 
 
 class SourceGroupMap:
@@ -56,7 +58,28 @@ class SourceGroupMap:
             raise ValueError(f"source group record requires image_key/pattern and source_group: {record!r}")
         if match not in {"exact", "prefix"}:
             raise ValueError(f"source group match must be exact or prefix, got {match!r}")
-        return SourceRule(str(pattern), str(group), match)
+        selected_value = record.get("probe_selected", True)
+        if isinstance(selected_value, str):
+            probe_selected = selected_value.strip().casefold() not in {
+                "",
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+        else:
+            probe_selected = bool(selected_value)
+        rank_value = record.get("probe_selection_rank")
+        probe_selection_rank = (
+            None if rank_value in (None, "") else int(rank_value)
+        )
+        return SourceRule(
+            str(pattern),
+            str(group),
+            match,
+            probe_selected,
+            probe_selection_rank,
+        )
 
     def resolve(self, image_key: str) -> str:
         normalized_key = _normalized(image_key)
@@ -73,10 +96,32 @@ class SourceGroupMap:
         return str(image_key)
 
     def manifest(self) -> dict[str, Any]:
+        all_groups = list(dict.fromkeys(str(rule.source_group) for rule in self.rules))
+        selected_groups = list(
+            dict.fromkeys(
+                str(rule.source_group)
+                for rule in self.rules
+                if rule.probe_selected
+            )
+        )
+        total = len(all_groups)
+        selected = len(selected_groups)
         return {
             "provided": bool(self.rules),
             "rule_count": len(self.rules),
             "fallback": "image_key_is_source_group",
+            "source_group_count_total": total,
+            "source_group_count_probed": selected,
+            "source_group_coverage_complete": selected == total,
+            "source_group_coverage_fraction": (
+                float(selected / total) if total else 1.0
+            ),
+            "source_group_selection_policy": (
+                "all_source_groups"
+                if selected == total
+                else "deterministic_evenly_spaced_source_groups_v1"
+            ),
+            "probed_source_groups": selected_groups,
             "rules": [rule.__dict__ for rule in self.rules],
         }
 

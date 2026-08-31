@@ -51,7 +51,7 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 - model、dataset TOML、各`image_dir`が存在する。
 - 学習loaderと同じ拡張子・大文字小文字規則および非再帰探索で、各`image_dir`直下に画像があり、dataset全体で8画像以上、独立した`image_dir`が4 group以上ある。
 - source-group prefixとworkerが返す画像keyを一致させるため、`image_dir`へ`.`／`..`のpath componentを含めず、どの階層にもsymlink、junctionなどのreparse pointを含めない。
-- すべての有効な`image_dir` groupをprobeへ最低1件ずつ含められることを確認する。group数が検証済みprobe上限を超える設定は、部分的なconfidenceを出さず開始前に拒否する。
+- 有効な`image_dir` groupの全inventoryをsource contractへ保存する。group数がprobe上限を超える場合は、TOMLの全source順序を均等に覆う決定的な部分集合をprobe対象とし、probe数／全group数とcoverageをレポートへ明示する。
 - `cache_latents`と両立しない`color_aug=true`または`random_crop=true`が、subset／dataset／`[general]`のfallback後に有効でないことを確認する。
 - DreamBooth loaderに必須の`resolution`が、datasetまたは`[general]`のfallback後に定義されていることを確認する。
 - TOMLの`[general]`／dataset／subset fallbackを解決し、batch・bucket設定（`bucket_no_upscale=false`を含む）が`canonical-v1`と一致することを確認する。
@@ -60,7 +60,7 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 - Git HEAD、ソースhash、preset、model内容のSHA-256、dataset、source inventoryからprotocol fingerprintを作る。
 - 各GPU workerの起動直前にmodel内容とsource inventoryを再度hash照合し、長い多段runの途中でmodel、画像、caption、cache sidecarが変化した場合は混在させず停止する。
 - repositoryに追跡済みの未コミット変更がある場合は、HEADとの差分全体もbinary diffとしてhash化する。未追跡ファイルは対象外と明記する。
-- 実画像数と`min(実画像数, 32)`であるprobe budgetを記録する。
+- 実画像数とmode別probe budgetに加え、全source group数、probe対象group数、決定的な選択規則を記録する。
 
 `--dq-profile-preflight`ではここまで実行し、GPU stageを起動しません。
 通常のpreflight／dry-runを含む全runで`execution_plan.json`も作り、GPU process数、
@@ -111,12 +111,13 @@ no-quantと各固定mulの勾配を比較します。
 - dropoutを無効にした`structural_dropout_off` regimeで測る。
 - module単位の勾配を集約し、Body、Tail、hard-safety、source別の不確実性を作る。
 
-比較用branchの先頭replay windowは固定したままです。この固定windowにrepeat数の少ない
+比較用branchの先頭replay windowは固定したままです。この固定windowにprobe対象の
 `image_dir` groupが含まれなかった場合だけ、DataLoaderを最大2 epoch分追加走査します。
-不足groupを初めて含んだbatchだけをprobe用に保持し、全source groupを揃えてから画像を
-round-robin選択します。追加batchはbranchの128-step prefixへ混ぜないため、候補間比較の
-再現契約は変わりません。極端にrepeatが偏るdatasetでは、このcoverage走査ぶんだけ
-Local計測開始前の時間が増える場合があります。
+不足groupを初めて含んだbatchだけをprobe用に保持し、対象groupを揃えてから画像を
+round-robin選択します。group数が画像上限を超える場合、source inventory自体は省略せず、
+TOMLの先頭だけへ偏らない決定的な等間隔選択で対象groupを絞ります。追加batchはbranchの
+prefixへ混ぜないため、候補間比較の再現契約は変わりません。極端にrepeatが偏るdatasetでは、
+このcoverage走査ぶんだけLocal計測開始前の時間が増える場合があります。
 
 このLocal結果だけを通常レポートのSafety/Fidelityと候補削減に使用します。dropout有効の
 128-step Trajectoryは研究専用の別channelであり、現在の製品入口では実行しません。
@@ -141,8 +142,9 @@ total = I × 4 × (3 + 4M)
 両者の違いはLocal画像上限です。Standardは最大32画像、Quickは最大16画像です。Quickでも
 4 timestep帯、no-quant 3 replicas、candidate 2 noise × 2 quant repeatsを維持するため、Body／Tailの
 定義は変えません。ただしsamplingが薄いため、レポートのconfidence上限をMediumとし、
-`reduced_descriptive`と明示します。独立source groupが16を超えるdatasetは、全groupを最低1件ずつ
-含められないためQuickを開始前に拒否します。その場合はStandardを使用してください。
+`reduced_descriptive`と明示します。独立source groupが画像上限を超えるdatasetも実行できますが、
+Quickは最大16群、Standard／Strictは最大32群だけを決定的にprobeします。全groupはsource contractに
+残り、レポートには`probe / total`を表示します。未probe群がある結果は完全coverageと同一視しません。
 
 `strict`はcore grid `2.70, 3.15, 3.45`から開始します。候補集合が測定端に残る場合だけ、
 最大2段まで外側を追加します。下端側は`2.25`、なお未解決なら`1.80`、上端側は`3.75`、
@@ -291,6 +293,9 @@ d = sqrt(1 + norm_ratio^2 - 2 * norm_ratio * gradient_cosine)
 
 NaN、Inf、極端なgradient explosion、optimizer stateの非finiteがなかった候補です。
 これは最低限の安全条件であり、画質保証ではありません。
+1件でも非finiteなgradient probeが出たmulは、その候補全体を数値比較から外して
+`Hard unsafe`として残します。他の有限なmulはbootstrapとHTML生成を継続するため、
+1候補の異常だけで診断全体を失敗させません。原因と非finite件数はsummary／候補カードへ保存します。
 
 ### Fidelity retained
 
@@ -505,8 +510,10 @@ QuickでもBody／Tailの数式、4 timestep帯、replica数、bootstrap、hard-
 | QA表示 | `Quick smoke` | `Standard smoke` | `Strict reference` |
 | confidence上限 | Medium | 通常 | 通常 |
 
-Quickでは全source groupをprobeへ最低1件ずつ含める契約を維持します。独立groupが16を超える場合は、
-部分的な結果を黙って出さずpreflightで拒否します。Standardへ切り替えてください。
+source groupがmodeの画像上限を超える場合もpreflightでは拒否しません。全inventoryをsource contractへ
+保持したまま、Quickは最大16群、Standard／Strictは最大32群をTOML全域から決定的に選びます。
+`report.html`とsummaryには`source_group_count_probed`／`source_group_count_total`／coverage規則を
+残し、未probe群がある場合はLocal confidenceを過大評価しません。
 
 `--dq_profile_level=standard`は低レベルprotocol内部の別概念です。公開CLIの
 `--dq-profile-mode=standard`と混同しないよう、成果物には`execution_mode`、`qa_depth`、

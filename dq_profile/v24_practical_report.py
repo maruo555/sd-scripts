@@ -425,6 +425,8 @@ def _local_comparison_confidence(
     loo: Mapping[str, Any] | None,
     detailed_bootstrap: bool,
     absolute_norm_available: bool,
+    source_group_count_total: int | None = None,
+    source_group_coverage_complete: bool = True,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     loo_consistencies = [
@@ -460,6 +462,14 @@ def _local_comparison_confidence(
         reasons.append("測定範囲の端が未解決です")
     if not absolute_norm_available:
         reasons.append("旧runでは絶対gradient normが未記録です")
+    if not source_group_coverage_complete:
+        total = int(source_group_count_total or source_count)
+        if level == "High":
+            level = "Medium"
+        reasons.append(
+            f"全source group {total}群のうち{source_count}群を"
+            "決定的に部分抽出しており、未probe群があります"
+        )
     return {
         "level": level,
         "reasons": reasons,
@@ -557,7 +567,11 @@ def _candidate_explanation(card: Mapping[str, Any]) -> str:
     mul = float(card["range_mul"])
     parts: list[str] = []
     if absolute == "hard_unsafe":
-        return f"mul {mul:.2f}はhard safetyを通過していないため、数値比較の対象外です。"
+        reason = str(card.get("invalid_reason") or "hard_safety_failed")
+        return (
+            f"mul {mul:.2f}はhard safetyを通過していないため、"
+            f"数値比較の対象外です（{reason}）。"
+        )
     if absolute == "unmeasurable":
         parts.append("BodyまたはTailが未測定のため、絶対的な摂動量を分類できません。")
     elif absolute == "high_perturbation":
@@ -700,6 +714,10 @@ def build_dataset_card(
             "range_mul": _candidate_mul(row),
             "grid_role": str(row.get("grid_role", "measured")),
             "hard_safety_pass": hard_safety_pass,
+            "invalid_reason": str(row.get("invalid_reason") or "") or None,
+            "nonfinite_sample_count": int(
+                _optional_float(row.get("nonfinite_sample_count")) or 0
+            ),
             "body": body,
             "body_ci_low": _optional_float(row.get("local_body_ci_low")),
             "body_ci_high": _optional_float(row.get("local_body_ci_high")),
@@ -810,6 +828,28 @@ def build_dataset_card(
             evaluation.get("source_group_count", 0),
         )
     )
+    source_group_count_total = int(
+        detail_summary.get("source_group_count_total", source_count)
+    )
+    source_group_coverage_complete = _as_bool(
+        detail_summary.get(
+            "source_group_coverage_complete",
+            source_count == source_group_count_total,
+        )
+    )
+    source_group_coverage_fraction = _optional_float(
+        detail_summary.get("source_group_coverage_fraction")
+    )
+    if source_group_coverage_fraction is None:
+        source_group_coverage_fraction = source_count / max(
+            source_group_count_total, 1
+        )
+    source_group_selection_policy = str(
+        detail_summary.get(
+            "source_group_selection_policy",
+            "all_source_groups",
+        )
+    )
     image_count = int(
         detail_summary.get(
             "image_count",
@@ -830,6 +870,8 @@ def build_dataset_card(
         loo=loo,
         detailed_bootstrap=bool(bootstrap_rows),
         absolute_norm_available=absolute_norm_available,
+        source_group_count_total=source_group_count_total,
+        source_group_coverage_complete=source_group_coverage_complete,
     )
     if confidence_ceiling == "reduced_descriptive":
         if local_comparison_confidence["level"] == "High":
@@ -1070,6 +1112,11 @@ def build_dataset_card(
         "internal_profile_level": internal_profile_level,
         "metric_definition_version": METRIC_DEFINITION_VERSION,
         "source_group_count": source_count,
+        "source_group_count_probed": source_count,
+        "source_group_count_total": source_group_count_total,
+        "source_group_coverage_complete": source_group_coverage_complete,
+        "source_group_coverage_fraction": source_group_coverage_fraction,
+        "source_group_selection_policy": source_group_selection_policy,
         "image_count": image_count,
         "candidate_grid": [card["range_mul"] for card in cards],
         "candidate_count": len(cards),
@@ -1347,11 +1394,25 @@ def _curve_svg(
     def sy(value: float) -> float:
         return top + plot_h - min(value, y_max) / y_max * plot_h
 
-    def line_points(key: str) -> str:
-        return " ".join(
-            f"{sx(float(card['range_mul'])):.1f},{sy(float(card[key])):.1f}"
-            for card in cards
-            if _optional_float(card.get(key)) is not None
+    def line_segments(key: str, color: str) -> str:
+        segments: list[list[str]] = []
+        current: list[str] = []
+        for card in cards:
+            value = _optional_float(card.get(key))
+            if value is None:
+                if current:
+                    segments.append(current)
+                    current = []
+                continue
+            current.append(
+                f"{sx(float(card['range_mul'])):.1f},{sy(value):.1f}"
+            )
+        if current:
+            segments.append(current)
+        return "".join(
+            f'<polyline points="{" ".join(segment)}" fill="none" '
+            f'stroke="{color}" stroke-width="3"/>'
+            for segment in segments
         )
 
     body_errors = []
@@ -1387,6 +1448,20 @@ def _curve_svg(
         f'y1="{top}" y2="{top+plot_h}" stroke="#7c3aed" stroke-width="2" stroke-dasharray="5 5"/>'
         for card in cards
         if card.get("edge_endpoint")
+    ]
+    unsafe_markers = [
+        (
+            f'<g><line x1="{sx(float(card["range_mul"]))-5:.1f}" '
+            f'x2="{sx(float(card["range_mul"]))+5:.1f}" y1="{top+plot_h/2-5:.1f}" '
+            f'y2="{top+plot_h/2+5:.1f}" stroke="#991b1b" stroke-width="2"/>'
+            f'<line x1="{sx(float(card["range_mul"]))-5:.1f}" '
+            f'x2="{sx(float(card["range_mul"]))+5:.1f}" y1="{top+plot_h/2+5:.1f}" '
+            f'y2="{top+plot_h/2-5:.1f}" stroke="#991b1b" stroke-width="2">'
+            f'<title>mul {float(card["range_mul"]):.2f}: Hard unsafe / 数値比較対象外</title>'
+            "</line></g>"
+        )
+        for card in cards
+        if not card.get("hard_safety_pass")
     ]
     overflow_markers = []
     for card in cards:
@@ -1463,11 +1538,12 @@ def _curve_svg(
   {reference_line}
   {''.join(preset_lines)}
   {''.join(edge_lines)}
+  {''.join(unsafe_markers)}
   {''.join(overflow_markers)}
   {''.join(body_errors)}
   {''.join(tail_errors)}
-  <polyline points="{line_points('body')}" fill="none" stroke="#2563eb" stroke-width="3"/>
-  <polyline points="{line_points('tail')}" fill="none" stroke="#d97706" stroke-width="3"/>
+  {line_segments('body', '#2563eb')}
+  {line_segments('tail', '#d97706')}
   {''.join(f'<circle cx="{sx(float(card["range_mul"])):.1f}" cy="{sy(float(card["body"])):.1f}" r="4" fill="#2563eb"/>' for card in cards if card.get("body") is not None)}
   {''.join(f'<rect x="{sx(float(card["range_mul"]))-4:.1f}" y="{sy(float(card["tail"]))-4:.1f}" width="8" height="8" fill="#d97706"/>' for card in cards if card.get("tail") is not None)}
   {''.join(x_ticks)}
@@ -2069,7 +2145,7 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
         <div><span>Measurement contract</span><strong>{html.escape(dataset["measurement_contract"])}</strong></div>
         <div><span>Sampling depth</span><strong>{html.escape(sampling_depth_label)}</strong></div>
         <div><span>Internal profile level</span><strong>{html.escape(dataset["internal_profile_level"])}</strong></div>
-        <div><span>Source groups</span><strong>{dataset["source_group_count"]}</strong></div>
+        <div><span>Source groups (probe / total)</span><strong>{dataset["source_group_count_probed"]} / {dataset["source_group_count_total"]}</strong></div>
         <div><span>Images</span><strong>{dataset["image_count"]}</strong></div>
         <div><span>Hard safety</span><strong>{"PASS" if dataset["hard_safety_all_pass"] else "FAIL"}</strong></div>
         <div><span>Measurement QA</span><strong>{html.escape(dataset["measurement_quality"]["level"])}</strong></div>

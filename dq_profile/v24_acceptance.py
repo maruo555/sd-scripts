@@ -255,7 +255,12 @@ def _winner_probabilities(
 
 def _candidate_contract(
     summary: Mapping[str, Any],
-) -> tuple[list[str], dict[str, float], dict[str, bool]]:
+) -> tuple[
+    list[str],
+    dict[str, float],
+    dict[str, bool],
+    dict[str, str | None],
+]:
     if str(summary.get("schema_version")) != "2.1.0":
         raise ValueError("v2.4 analysis requires a schema 2.1.0 runtime profile")
     protocol = str(summary.get("profile", {}).get("protocol"))
@@ -267,6 +272,7 @@ def _candidate_contract(
         raise ValueError("v2.4 analysis requires a v24 acceptance runtime profile")
     candidates: list[tuple[float, str]] = []
     hard_pass: dict[str, bool] = {}
+    invalid_reasons: dict[str, str | None] = {}
     for row in summary.get("candidates", ()):  # type: ignore[union-attr]
         candidate = str(row.get("candidate"))
         if candidate == "no_quant":
@@ -278,6 +284,13 @@ def _candidate_contract(
         hard_pass[candidate] = not bool(row.get("forced_safety_abort")) and not bool(
             row.get("invalid_reason")
         )
+        invalid_reasons[candidate] = (
+            str(row.get("invalid_reason"))
+            if row.get("invalid_reason")
+            else "forced_safety_abort"
+            if row.get("forced_safety_abort")
+            else None
+        )
     candidates.sort()
     if not candidates:
         raise ValueError("v2.4 profile has no fixed-mul candidate")
@@ -285,6 +298,7 @@ def _candidate_contract(
         [candidate for _, candidate in candidates],
         {candidate: value for value, candidate in candidates},
         hard_pass,
+        invalid_reasons,
     )
 
 
@@ -327,6 +341,7 @@ def analyze_natural_gradient_rows(
     if timestep_bins <= 0 or bootstrap_iterations <= 0:
         raise ValueError("natural-gradient analysis requires positive bins/iterations")
     normalized: list[dict[str, Any]] = []
+    nonfinite_events: list[dict[str, Any]] = []
     for raw in rows:
         row = dict(raw)
         if not bool(row.get("gradient_topology_matches", True)):
@@ -335,23 +350,53 @@ def analyze_natural_gradient_rows(
         source_group = str(row.get("source_group", "") or image_key)
         if not image_key or not source_group:
             raise ValueError("no-quant natural-gradient row lacks image/source key")
-        converted = {
-            **row,
-            "source_group": source_group,
-            "relative_gradient_distance": _finite(
-                row.get("relative_gradient_distance_a_to_b")
-            ),
-            "grad_norm_noquant": _finite(row.get("grad_norm_a")),
-            "grad_norm_candidate": _finite(row.get("grad_norm_b")),
+        numeric_fields = {
+            "relative_gradient_distance": "relative_gradient_distance_a_to_b",
+            "grad_norm_noquant": "grad_norm_a",
+            "grad_norm_candidate": "grad_norm_b",
+            "grad_diff_norm": "grad_diff_norm",
+            "symmetric_gradient_distance": "symmetric_gradient_distance",
+            "angular_gradient_distance": "angular_gradient_distance",
+            "gradient_gain_distance": "gradient_gain_distance",
         }
-        for field in (
-            "grad_diff_norm",
-            "symmetric_gradient_distance",
-            "angular_gradient_distance",
-            "gradient_gain_distance",
-        ):
-            converted[field] = _finite(row.get(field))
+        converted = {**row, "source_group": source_group}
+        nonfinite_fields: list[str] = []
+        for target, source in numeric_fields.items():
+            if source not in row:
+                raise ValueError(
+                    f"no-quant natural-gradient row is missing {source}: {row!r}"
+                )
+            try:
+                number = float(row.get(source))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"no-quant natural-gradient row has malformed {source}: {row!r}"
+                ) from error
+            if not math.isfinite(number):
+                nonfinite_fields.append(source)
+            converted[target] = number
+        if nonfinite_fields:
+            nonfinite_events.append(
+                {
+                    "image_key": image_key,
+                    "source_group": source_group,
+                    "timestep_bin": row.get("timestep_bin"),
+                    "noise_replica_a": row.get("noise_replica_a"),
+                    "noise_replica_b": row.get("noise_replica_b"),
+                    "nonfinite_fields": nonfinite_fields,
+                }
+            )
+            continue
         normalized.append(converted)
+    if nonfinite_events:
+        return {
+            "valid": False,
+            "invalid_reason": "nonfinite_natural_gradient_measurement",
+            "nonfinite_event_count": len(nonfinite_events),
+            "nonfinite_events": nonfinite_events,
+            "finite_pair_count": len(normalized),
+            "selector_input": False,
+        }
     if not normalized:
         return {
             "valid": False,
@@ -439,11 +484,24 @@ def analyze_local_profile(
 ) -> dict[str, Any]:
     if bootstrap_iterations <= 0:
         raise ValueError("bootstrap_iterations must be positive")
-    candidates, range_by_candidate, hard_pass = _candidate_contract(summary)
+    candidates, range_by_candidate, hard_pass, invalid_reasons = _candidate_contract(
+        summary
+    )
     timestep_bins = int(summary.get("profile", {}).get("timestep_bins", 0))
     if timestep_bins <= 0:
         raise ValueError("profile timestep bin count must be positive")
-    samples: list[dict[str, Any]] = []
+    required_numeric_fields = (
+        "relative_gradient_distance",
+        "gradient_cosine",
+        "grad_norm_noquant",
+        "grad_norm_candidate",
+        "grad_diff_norm",
+        "symmetric_gradient_distance",
+        "angular_gradient_distance",
+        "gradient_gain_distance",
+    )
+    candidate_samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    nonfinite_events: list[dict[str, Any]] = []
     for raw in gradient_tail_rows:
         if str(raw.get("record_type")) != "sample":
             continue
@@ -456,45 +514,72 @@ def analyze_local_profile(
             raise ValueError("gradient-tail sample has no image_key")
         source_group = str(row.get("source_group", "") or image_key)
         row["source_group"] = source_group
-        for field in (
-            "relative_gradient_distance",
-            "gradient_cosine",
-            "grad_norm_noquant",
-            "grad_norm_candidate",
-            "grad_diff_norm",
-            "symmetric_gradient_distance",
-            "angular_gradient_distance",
-            "gradient_gain_distance",
-        ):
-            if _optional_finite(row.get(field)) is None:
-                if field == "gradient_gain_distance":
-                    continue
-                raise ValueError(f"v2.4 sample is missing finite {field}: {row!r}")
-        samples.append(row)
-    if not samples:
+        nonfinite_fields: list[str] = []
+        for field in required_numeric_fields:
+            if field not in row:
+                raise ValueError(f"v2.4 sample is missing required {field}: {row!r}")
+            try:
+                number = float(row.get(field))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"v2.4 sample has a malformed {field}: {row!r}"
+                ) from error
+            if not math.isfinite(number):
+                nonfinite_fields.append(field)
+        if nonfinite_fields:
+            nonfinite_events.append(
+                {
+                    "candidate": candidate,
+                    "range_mul": range_by_candidate[candidate],
+                    "image_key": image_key,
+                    "source_group": source_group,
+                    "timestep_bin": row.get("timestep_bin"),
+                    "noise_replica": row.get("noise_replica"),
+                    "quant_repeat": row.get("quant_repeat"),
+                    "nonfinite_fields": nonfinite_fields,
+                }
+            )
+            continue
+        candidate_samples[candidate].append(row)
+    if not candidate_samples and not nonfinite_events:
         raise ValueError("gradient_tail.csv has no v2.4 candidate samples")
+
+    nonfinite_candidates = {
+        str(event["candidate"]) for event in nonfinite_events
+    }
+    for candidate in nonfinite_candidates:
+        hard_pass[candidate] = False
+        invalid_reasons[candidate] = "candidate_nonfinite_probe_measurement"
+    analysis_candidates = [
+        candidate for candidate in candidates if hard_pass[candidate]
+    ]
+    if not analysis_candidates:
+        raise ValueError(
+            "v2.4 local analysis has no finite hard-safety candidate; "
+            "all measured candidates are hard unsafe"
+        )
 
     by_candidate: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     key_sets: dict[str, set[tuple[Any, ...]]] = defaultdict(set)
     image_to_source: dict[str, str] = {}
-    for row in samples:
-        candidate = str(row["candidate"])
-        by_candidate[candidate].append(row)
-        image_key = str(row["image_key"])
-        source_group = str(row["source_group"])
-        previous = image_to_source.setdefault(image_key, source_group)
-        if previous != source_group:
-            raise ValueError(f"image maps to multiple source groups: {image_key}")
-        key_sets[candidate].add(
-            (
-                image_key,
-                int(row["timestep_bin"]),
-                int(row["noise_replica"]),
-                int(row["quant_repeat"]),
+    for candidate in analysis_candidates:
+        for row in candidate_samples[candidate]:
+            by_candidate[candidate].append(row)
+            image_key = str(row["image_key"])
+            source_group = str(row["source_group"])
+            previous = image_to_source.setdefault(image_key, source_group)
+            if previous != source_group:
+                raise ValueError(f"image maps to multiple source groups: {image_key}")
+            key_sets[candidate].add(
+                (
+                    image_key,
+                    int(row["timestep_bin"]),
+                    int(row["noise_replica"]),
+                    int(row["quant_repeat"]),
+                )
             )
-        )
-    reference_keys = key_sets[candidates[0]]
-    for candidate in candidates:
+    reference_keys = key_sets[analysis_candidates[0]]
+    for candidate in analysis_candidates:
         if key_sets[candidate] != reference_keys:
             raise ValueError(f"candidate probe key mismatch for {candidate}")
 
@@ -517,7 +602,7 @@ def analyze_local_profile(
         ],
     ] = {
         candidate: _index_rows(by_candidate[candidate], timestep_bins=timestep_bins)
-        for candidate in candidates
+        for candidate in analysis_candidates
     }
     rng = np.random.default_rng(int(bootstrap_seed))
     source_draw_indices = rng.integers(
@@ -535,7 +620,7 @@ def analyze_local_profile(
         str,
         dict[int, dict[str, list[Mapping[str, Any]]]],
     ] = {}
-    for candidate in candidates:
+    for candidate in analysis_candidates:
         all_images: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
         bin_images: dict[int, dict[str, list[Mapping[str, Any]]]] = {
             index: defaultdict(list) for index in range(timestep_bins)
@@ -554,7 +639,7 @@ def analyze_local_profile(
     source_draws: dict[str, dict[str, np.ndarray]] = {}
     image_draws: dict[str, dict[str, np.ndarray]] = {}
     bootstrap_rows: list[dict[str, Any]] = []
-    for candidate in candidates:
+    for candidate in analysis_candidates:
         all_groups, by_bin = indexes[candidate]
         primary = _body_tail(
             all_groups,
@@ -684,33 +769,39 @@ def analyze_local_profile(
                 }
             )
 
-    body_draw_matrix = np.stack([source_draws[name]["body"] for name in candidates])
-    tail_draw_matrix = np.stack([source_draws[name]["tail"] for name in candidates])
+    body_draw_matrix = np.stack(
+        [source_draws[name]["body"] for name in analysis_candidates]
+    )
+    tail_draw_matrix = np.stack(
+        [source_draws[name]["tail"] for name in analysis_candidates]
+    )
     body_regret = body_draw_matrix - np.min(body_draw_matrix, axis=0, keepdims=True)
     tail_regret = tail_draw_matrix - np.min(tail_draw_matrix, axis=0, keepdims=True)
     body_probabilities = _winner_probabilities(
-        candidates, {name: source_draws[name]["body"] for name in candidates}
+        analysis_candidates,
+        {name: source_draws[name]["body"] for name in analysis_candidates},
     )
     tail_probabilities = _winner_probabilities(
-        candidates, {name: source_draws[name]["tail"] for name in candidates}
+        analysis_candidates,
+        {name: source_draws[name]["tail"] for name in analysis_candidates},
     )
     body_modal = max(
-        candidates,
+        analysis_candidates,
         key=lambda name: (body_probabilities[name], -range_by_candidate[name]),
     )
     tail_modal = max(
-        candidates,
+        analysis_candidates,
         key=lambda name: (tail_probabilities[name], -range_by_candidate[name]),
     )
     body_point = min(
-        candidates,
+        analysis_candidates,
         key=lambda name: (
             point_by_candidate[name]["primary"]["body"],
             range_by_candidate[name],
         ),
     )
     tail_point = min(
-        candidates,
+        analysis_candidates,
         key=lambda name: (
             point_by_candidate[name]["primary"]["tail"],
             range_by_candidate[name],
@@ -719,14 +810,14 @@ def analyze_local_profile(
 
     dominance_rows: list[dict[str, Any]] = []
     dominated_by: dict[str, tuple[str, float] | None] = {
-        candidate: None for candidate in candidates
+        candidate: None for candidate in analysis_candidates
     }
-    for left in candidates:
-        left_index = candidates.index(left)
-        for right in candidates:
+    for left in analysis_candidates:
+        left_index = analysis_candidates.index(left)
+        for right in analysis_candidates:
             if left == right:
                 continue
-            right_index = candidates.index(right)
+            right_index = analysis_candidates.index(right)
             dominates = (
                 (body_draw_matrix[left_index] <= body_draw_matrix[right_index])
                 & (tail_draw_matrix[left_index] <= tail_draw_matrix[right_index])
@@ -756,9 +847,8 @@ def analyze_local_profile(
     mandatory = {body_point, tail_point, body_modal, tail_modal}
     retained = [
         candidate
-        for candidate in candidates
-        if hard_pass[candidate]
-        and (dominated_by[candidate] is None or candidate in mandatory)
+        for candidate in analysis_candidates
+        if dominated_by[candidate] is None or candidate in mandatory
     ]
     retained.sort(key=lambda name: range_by_candidate[name])
     formal_selection_valid = bool(
@@ -801,7 +891,81 @@ def analyze_local_profile(
     timestep_rows: list[dict[str, Any]] = []
     regret_rows: list[dict[str, Any]] = []
     source_loo_rows: list[dict[str, Any]] = []
-    for candidate_index, candidate in enumerate(candidates):
+    nonfinite_events_by_candidate: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in nonfinite_events:
+        nonfinite_events_by_candidate[str(event["candidate"])].append(event)
+    for candidate in candidates:
+        role = (
+            "core_grid"
+            if candidate in core_candidates
+            else "edge_extension"
+        )
+        if candidate not in analysis_candidates:
+            events = nonfinite_events_by_candidate.get(candidate, [])
+            score_rows.append(
+                {
+                    "dataset_id": dataset_id,
+                    "candidate": candidate,
+                    "range_mul": range_by_candidate[candidate],
+                    "grid_role": role,
+                    "hard_safety_pass": False,
+                    "invalid_reason": invalid_reasons.get(candidate)
+                    or "hard_safety_failed",
+                    "nonfinite_sample_count": len(events),
+                    "nonfinite_fields": sorted(
+                        {
+                            field
+                            for event in events
+                            for field in event["nonfinite_fields"]
+                        }
+                    ),
+                    "local_body": None,
+                    "local_body_ci_low": None,
+                    "local_body_ci_high": None,
+                    "local_tail": None,
+                    "local_tail_ci_low": None,
+                    "local_tail_ci_high": None,
+                    "tail_amplification": None,
+                    "tail_amplification_ci_low": None,
+                    "tail_amplification_ci_high": None,
+                    "worst_timestep_bin": None,
+                    "d_gt_1_rate": None,
+                    "gradient_cosine_lt_0_rate": None,
+                    "grad_norm_noquant_q05": None,
+                    "grad_norm_noquant_median": None,
+                    "grad_norm_candidate_median": None,
+                    "grad_diff_norm_q95": None,
+                    "symmetric_body": None,
+                    "symmetric_tail": None,
+                    "angle_body": None,
+                    "angle_tail": None,
+                    "gain_body": None,
+                    "gain_tail": None,
+                    "source_bootstrap_body_min_probability": None,
+                    "source_bootstrap_tail_min_probability": None,
+                    "image_bootstrap_body_ci_low": None,
+                    "image_bootstrap_body_ci_high": None,
+                    "image_bootstrap_tail_ci_low": None,
+                    "image_bootstrap_tail_ci_high": None,
+                    "body_regret_median": None,
+                    "body_regret_ci_high": None,
+                    "tail_regret_median": None,
+                    "tail_regret_ci_high": None,
+                    "body_regret_within_own_sampling_sd_probability": None,
+                    "tail_regret_within_own_sampling_sd_probability": None,
+                    "robustly_dominated": False,
+                    "dominated_by": None,
+                    "dominance_probability": None,
+                    "mandatory_retention_role": [],
+                    "retained_for_formal": False,
+                    "trajectory_risk_T": None,
+                    "conservative_alarm_R": None,
+                    "perturbation_gauge": None,
+                    "not_quality_or_utility": True,
+                }
+            )
+            continue
+        candidate_index = analysis_candidates.index(candidate)
         point = point_by_candidate[candidate]
         primary = point["primary"]
         body_ci = _bootstrap_ci(source_draws[candidate]["body"])
@@ -812,17 +976,15 @@ def analyze_local_profile(
         body_floor = float(np.std(source_draws[candidate]["body"]))
         tail_floor = float(np.std(source_draws[candidate]["tail"]))
         dominated = dominated_by[candidate]
-        role = (
-            "core_grid"
-            if candidate in core_candidates
-            else "edge_extension"
-        )
         row = {
             "dataset_id": dataset_id,
             "candidate": candidate,
             "range_mul": range_by_candidate[candidate],
             "grid_role": role,
             "hard_safety_pass": hard_pass[candidate],
+            "invalid_reason": None,
+            "nonfinite_sample_count": 0,
+            "nonfinite_fields": [],
             "local_body": float(primary["body"]),
             "local_body_ci_low": body_ci["ci_low"],
             "local_body_ci_high": body_ci["ci_high"],
@@ -931,26 +1093,45 @@ def analyze_local_profile(
                 }
             )
 
-    core_rows = [row for row in score_rows if row["grid_role"] == "core_grid"]
-    core_body_matrix = np.stack(
-        [source_draws[row["candidate"]]["body"] for row in core_rows]
-    )
-    core_tail_matrix = np.stack(
-        [source_draws[row["candidate"]]["tail"] for row in core_rows]
-    )
-    core_envelope = {
-        "grid": list(core_values),
-        "candidate_count": len(core_rows),
-        "max_local_body": max(float(row["local_body"]) for row in core_rows),
-        "max_local_tail": max(float(row["local_tail"]) for row in core_rows),
-        "probability_all_core_body_below_anchor": float(
-            np.mean(np.max(core_body_matrix, axis=0) < 1.0)
-        ),
-        "probability_all_core_tail_below_anchor": float(
-            np.mean(np.max(core_tail_matrix, axis=0) < 1.0)
-        ),
-        "scope": "common_core_grid_only",
-    }
+    core_rows = [
+        row
+        for row in score_rows
+        if row["grid_role"] == "core_grid" and row["hard_safety_pass"]
+    ]
+    if core_rows:
+        core_body_matrix = np.stack(
+            [source_draws[row["candidate"]]["body"] for row in core_rows]
+        )
+        core_tail_matrix = np.stack(
+            [source_draws[row["candidate"]]["tail"] for row in core_rows]
+        )
+        core_envelope = {
+            "grid": list(core_values),
+            "candidate_count": len(core_rows),
+            "measured_candidate_count": len(core_candidates),
+            "hard_unsafe_candidate_count": len(core_candidates) - len(core_rows),
+            "max_local_body": max(float(row["local_body"]) for row in core_rows),
+            "max_local_tail": max(float(row["local_tail"]) for row in core_rows),
+            "probability_all_core_body_below_anchor": float(
+                np.mean(np.max(core_body_matrix, axis=0) < 1.0)
+            ),
+            "probability_all_core_tail_below_anchor": float(
+                np.mean(np.max(core_tail_matrix, axis=0) < 1.0)
+            ),
+            "scope": "hard_safe_common_core_grid_only",
+        }
+    else:
+        core_envelope = {
+            "grid": list(core_values),
+            "candidate_count": 0,
+            "measured_candidate_count": len(core_candidates),
+            "hard_unsafe_candidate_count": len(core_candidates),
+            "max_local_body": None,
+            "max_local_tail": None,
+            "probability_all_core_body_below_anchor": None,
+            "probability_all_core_tail_below_anchor": None,
+            "scope": "no_hard_safe_common_core_candidate",
+        }
     selection_reason = (
         "disabled_for_formal_reanalysis"
         if not selection_enabled
@@ -980,9 +1161,17 @@ def analyze_local_profile(
         "credible_candidate_count": len(retained),
         "robustly_dominated_candidates": [
             name
-            for name in candidates
+            for name in analysis_candidates
             if dominated_by[name] is not None and name not in mandatory
         ],
+        "hard_unsafe_candidates": [
+            name for name in candidates if not hard_pass[name]
+        ],
+        "hard_unsafe_reasons": {
+            name: invalid_reasons.get(name)
+            for name in candidates
+            if not hard_pass[name]
+        },
         "point_body_min_candidate": body_point,
         "point_tail_min_candidate": tail_point,
         "bootstrap_modal_body_candidate": body_modal,
@@ -1011,6 +1200,11 @@ def analyze_local_profile(
         "image_count": len(image_keys),
         "source_group_count": len(source_groups),
         "source_groups": source_groups,
+        "hard_unsafe_candidates": [
+            name for name in candidates if not hard_pass[name]
+        ],
+        "nonfinite_event_count": len(nonfinite_events),
+        "nonfinite_events": nonfinite_events,
         "timestep_bins": timestep_bins,
         "bootstrap_iterations": int(bootstrap_iterations),
         "bootstrap_seed": int(bootstrap_seed),

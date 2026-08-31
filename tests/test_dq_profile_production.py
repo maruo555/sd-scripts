@@ -358,16 +358,62 @@ def test_source_inventory_revalidation_detects_same_size_caption_change(
         validate_source_map_inventory(source_map)
 
 
-def test_source_probe_capacity_rejects_partial_group_coverage() -> None:
-    with pytest.raises(ValueError, match="source_groups=33 exceeds probe_budget=32"):
-        production_runner._validate_source_probe_capacity(
-            source_group_count=33,
-            probe_budget=32,
-        )
-    production_runner._validate_source_probe_capacity(
-        source_group_count=32,
+def test_source_probe_selection_spans_full_order_without_dropping_inventory() -> None:
+    payload = [
+        {
+            "pattern": f"C:/dataset/source-{index:02d}/",
+            "source_group": f"source-{index:02d}",
+            "match": "prefix",
+            "directory": f"C:/dataset/source-{index:02d}",
+            "files": [{"name": "image.png", "size": 5, "sha256": "a" * 64}],
+            "image_count": 1,
+        }
+        for index in range(57)
+    ]
+    selected = production_runner._apply_source_probe_selection(
+        payload,
         probe_budget=32,
     )
+    selected_rows = [row for row in selected if row["probe_selected"]]
+    assert len(selected) == 57
+    assert len(selected_rows) == 32
+    assert selected_rows[0]["source_group"] == "source-00"
+    assert selected_rows[-1]["source_group"] == "source-56"
+    assert [row["probe_selection_rank"] for row in selected_rows] == list(range(32))
+    assert all(
+        row["probe_selection_policy"]
+        == "deterministic_evenly_spaced_source_groups_v1"
+        for row in selected
+    )
+    assert production_runner._apply_source_probe_selection(
+        payload,
+        probe_budget=32,
+    ) == selected
+    summary = production_runner._source_probe_selection_summary(selected)
+    assert summary == {
+        "source_group_count_total": 57,
+        "source_group_count_probed": 32,
+        "source_group_count_omitted": 25,
+        "source_group_coverage_complete": False,
+        "source_group_coverage_fraction": pytest.approx(32 / 57),
+        "source_group_selection_policy": "deterministic_evenly_spaced_source_groups_v1",
+    }
+
+
+def test_source_probe_selection_marks_complete_coverage_when_budget_is_sufficient() -> None:
+    payload = [
+        {"pattern": f"source-{index}", "source_group": f"group-{index}"}
+        for index in range(4)
+    ]
+    selected = production_runner._apply_source_probe_selection(
+        payload,
+        probe_budget=16,
+    )
+    assert all(row["probe_selected"] for row in selected)
+    assert [row["probe_selection_rank"] for row in selected] == list(range(4))
+    assert production_runner._source_probe_selection_summary(selected)[
+        "source_group_coverage_complete"
+    ] is True
 
 
 def test_output_base_policy_and_unique_run_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

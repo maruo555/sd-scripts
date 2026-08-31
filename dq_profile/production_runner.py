@@ -266,6 +266,77 @@ def build_source_map(source_dirs: Sequence[Path], *, dataset_key: str) -> tuple[
     return payload, image_count
 
 
+def _apply_source_probe_selection(
+    source_map_payload: Sequence[Mapping[str, Any]],
+    *,
+    probe_budget: int,
+) -> list[dict[str, Any]]:
+    """Annotate which source groups must be represented in the local probe.
+
+    The complete source inventory remains in the source map and therefore in
+    the source contract. When there are more independent image_dir groups than
+    probe images, only the probe requirement is reduced. Evenly spaced indices
+    cover the full deterministic TOML/source order instead of taking a biased
+    prefix.
+    """
+
+    total = len(source_map_payload)
+    budget = int(probe_budget)
+    if total <= 0:
+        raise ValueError("source probe selection requires at least one source group")
+    if budget <= 0:
+        raise ValueError("source probe selection requires a positive probe budget")
+    selected_count = min(total, budget)
+    if selected_count == total:
+        selected_indices = list(range(total))
+        policy = "all_source_groups"
+    elif selected_count == 1:
+        selected_indices = [0]
+        policy = "deterministic_evenly_spaced_source_groups_v1"
+    else:
+        denominator = selected_count - 1
+        selected_indices = [
+            (rank * (total - 1) + denominator // 2) // denominator
+            for rank in range(selected_count)
+        ]
+        policy = "deterministic_evenly_spaced_source_groups_v1"
+    if len(set(selected_indices)) != selected_count:
+        raise RuntimeError("deterministic source probe selection produced duplicate indices")
+    rank_by_index = {index: rank for rank, index in enumerate(selected_indices)}
+    return [
+        {
+            **dict(row),
+            "probe_selected": index in rank_by_index,
+            "probe_selection_rank": rank_by_index.get(index),
+            "probe_selection_policy": policy,
+        }
+        for index, row in enumerate(source_map_payload)
+    ]
+
+
+def _source_probe_selection_summary(
+    source_map_payload: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    total = len(source_map_payload)
+    selected = sum(bool(row.get("probe_selected", True)) for row in source_map_payload)
+    policy = next(
+        (
+            str(row.get("probe_selection_policy"))
+            for row in source_map_payload
+            if row.get("probe_selection_policy")
+        ),
+        "all_source_groups" if selected == total else "custom_partial_source_groups",
+    )
+    return {
+        "source_group_count_total": total,
+        "source_group_count_probed": selected,
+        "source_group_count_omitted": total - selected,
+        "source_group_coverage_complete": selected == total,
+        "source_group_coverage_fraction": float(selected / total) if total else 1.0,
+        "source_group_selection_policy": policy,
+    }
+
+
 def validate_source_map_inventory(source_map: Path) -> None:
     """Refuse to mix worker stages that observed different dataset bytes."""
 
@@ -498,6 +569,9 @@ def build_execution_plan(
     *,
     image_count: int,
     probe_budget: int,
+    source_group_count: int | None = None,
+    probed_source_group_count: int | None = None,
+    source_group_selection_policy: str = "all_source_groups",
 ) -> dict[str, Any]:
     """Describe deterministic work volume before any GPU worker starts.
 
@@ -633,6 +707,20 @@ def build_execution_plan(
                 "steps_per_epoch": int(preflight_summary.steps_per_epoch),
                 "normal_training_steps": int(preflight_summary.normal_training_steps),
                 "probe_images": int(probe_budget),
+                "source_group_count_total": (
+                    None if source_group_count is None else int(source_group_count)
+                ),
+                "source_group_count_probed": (
+                    None
+                    if probed_source_group_count is None
+                    else int(probed_source_group_count)
+                ),
+                "source_group_coverage_complete": (
+                    None
+                    if source_group_count is None or probed_source_group_count is None
+                    else int(source_group_count) == int(probed_source_group_count)
+                ),
+                "source_group_selection_policy": source_group_selection_policy,
             },
         },
         "reference_time_estimate": {
@@ -1169,16 +1257,6 @@ def preflight(request: ResolvedProfileRequest, source_dirs: Sequence[Path]) -> N
         )
 
 
-def _validate_source_probe_capacity(*, source_group_count: int, probe_budget: int) -> None:
-    if int(source_group_count) > int(probe_budget):
-        raise ValueError(
-            "canonical diagnostic must represent every active image_dir group in its "
-            f"structural probe, but source_groups={source_group_count} exceeds "
-            f"probe_budget={probe_budget}. Consolidate source groups or use a preset "
-            "with a larger validated probe budget."
-        )
-
-
 def _write_initial_artifacts(
     run_dir: Path,
     request: ResolvedProfileRequest,
@@ -1189,6 +1267,7 @@ def _write_initial_artifacts(
     probe_budget: int,
     execution_plan: Mapping[str, Any],
 ) -> None:
+    source_probe = _source_probe_selection_summary(source_map_payload)
     write_json(run_dir / "resolved_args.json", request.provenance())
     write_json(run_dir / "protocol_fingerprint.json", fingerprint)
     write_json(run_dir / "execution_plan.json", execution_plan)
@@ -1211,7 +1290,8 @@ def _write_initial_artifacts(
             "profile_scope": "local_body_tail_only",
             "image_count": image_count,
             "probe_budget": probe_budget,
-            "source_group_count": len(source_map_payload),
+            "source_group_count": source_probe["source_group_count_total"],
+            **source_probe,
             "fingerprint_sha256": fingerprint["fingerprint_sha256"],
             "execution_plan_sha256": execution_plan["execution_plan_sha256"],
             "not_quality_or_utility": True,
@@ -1247,15 +1327,21 @@ def run_profile_request(
         dataset_key=sanitize_profile_name(options.profile_name or request.output_name).casefold(),
     )
     probe_budget = min(image_count, request.local_measurement.max_images)
-    _validate_source_probe_capacity(
-        source_group_count=len(source_map_payload),
+    source_map_payload = _apply_source_probe_selection(
+        source_map_payload,
         probe_budget=probe_budget,
     )
+    source_probe = _source_probe_selection_summary(source_map_payload)
     fingerprint = build_protocol_fingerprint(request, source_map_payload=source_map_payload)
     execution_plan = build_execution_plan(
         request,
         image_count=image_count,
         probe_budget=probe_budget,
+        source_group_count=source_probe["source_group_count_total"],
+        probed_source_group_count=source_probe["source_group_count_probed"],
+        source_group_selection_policy=source_probe[
+            "source_group_selection_policy"
+        ],
     )
     run_dir = allocate_run_directory(
         output_base,
@@ -1295,6 +1381,13 @@ def run_profile_request(
         f"warmup boundary={work['warmup_boundary_updates']} updates, "
         f"prefix branch updates={work['prefix']['total_branch_updates']}, "
         f"Local probes={work['local']['total_local_probes']}"
+    )
+    launcher.log(
+        "Source coverage: "
+        f"{source_probe['source_group_count_probed']}/"
+        f"{source_probe['source_group_count_total']} groups in the probe "
+        f"({source_probe['source_group_selection_policy']}); "
+        "the full inventory remains in the source contract"
     )
     launcher.log(
         "Reference time estimate (not guaranteed): "

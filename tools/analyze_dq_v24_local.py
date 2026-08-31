@@ -43,6 +43,14 @@ def _interval(low: Any, high: Any) -> str:
     return f"[{_number(low)}, {_number(high)}]"
 
 
+def _percent(value: Any, digits: int = 1) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{100.0 * number:.{digits}f}%" if math.isfinite(number) else "—"
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
@@ -73,8 +81,8 @@ def render_report(
             f"<td>{_number(row['symmetric_body'])} / {_number(row['symmetric_tail'])}</td>"
             f"<td>{_number(row['angle_body'])} / {_number(row['angle_tail'])}</td>"
             f"<td>{_number(row['gain_body'])} / {_number(row['gain_tail'])}</td>"
-            f"<td>{100*float(row['source_bootstrap_body_min_probability']):.1f}%</td>"
-            f"<td>{100*float(row['source_bootstrap_tail_min_probability']):.1f}%</td>"
+            f"<td>{_percent(row['source_bootstrap_body_min_probability'])}</td>"
+            f"<td>{_percent(row['source_bootstrap_tail_min_probability'])}</td>"
             f"<td>{'yes' if row['robustly_dominated'] else 'no'}</td>"
             f"<td>{'retain' if row['retained_for_formal'] else 'drop'}</td>"
             f"<td>{html.escape(roles)}</td>"
@@ -93,6 +101,12 @@ def render_report(
         else f"invalid: {html.escape(str(natural.get('invalid_reason')))}"
     )
     envelope = summary["core_grid_envelope"]
+    probed_sources = int(
+        summary.get("source_group_count_probed", summary["source_group_count"])
+    )
+    total_sources = int(
+        summary.get("source_group_count_total", probed_sources)
+    )
     return f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><title>DQ v2.4 Acceptance — {html.escape(summary['dataset_id'])}</title>
 <style>
@@ -106,7 +120,7 @@ code{{background:#f3f5f6;padding:2px 4px}}
 </style></head><body>
 <h1>DQ Profiler v2.4 — Local numerical acceptance</h1>
 <div class="grid">
-<div class="card"><b>Dataset</b><br>{html.escape(summary['dataset_id'])}<br>{summary['image_count']} images / {summary['source_group_count']} source groups</div>
+<div class="card"><b>Dataset</b><br>{html.escape(summary['dataset_id'])}<br>{summary['image_count']} images / {probed_sources} of {total_sources} source groups probed</div>
 <div class="card"><b>Execution mode</b><br>{html.escape(str(summary.get('execution_mode', 'strict')))}<br><b>QA depth</b>: {html.escape(str(summary.get('qa_depth', 'strict_reference')))}</div>
 <div class="card"><b>Phenotype (local only)</b><br>{html.escape(summary['local_phenotype'])}</div>
 <div class="card"><b>Credible set</b><br>{credible}<br><b>Formal selection</b>: {selected}</div>
@@ -116,8 +130,8 @@ code{{background:#f3f5f6;padding:2px 4px}}
 Bodyは通常範囲、Tailは最悪timestep帯、AはTail増幅です。候補はsource-cluster bootstrapでBody/Tailの両方が80%以上の確率でPareto劣位な場合だけ除外します。
 Trajectoryは128-step formalで別軸として測り、ここでは未測定です。</div>
 <div class="card info"><b>No-quant natural local baseline</b><br>{natural_text}<br>候補選択票には使いません。</div>
-<div class="card"><b>Common core envelope</b><br>grid {html.escape(str(envelope['grid']))}; max Body {_number(envelope['max_local_body'])}; max Tail {_number(envelope['max_local_tail'])}<br>
-P(all core Body&lt;1) {100*float(envelope['probability_all_core_body_below_anchor']):.1f}% / P(all core Tail&lt;1) {100*float(envelope['probability_all_core_tail_below_anchor']):.1f}%</div>
+  <div class="card"><b>Common core envelope</b><br>grid {html.escape(str(envelope['grid']))}; max Body {_number(envelope['max_local_body'])}; max Tail {_number(envelope['max_local_tail'])}<br>
+  P(all hard-safe core Body&lt;1) {_percent(envelope['probability_all_core_body_below_anchor'])} / P(all hard-safe core Tail&lt;1) {_percent(envelope['probability_all_core_tail_below_anchor'])}</div>
 <h2>候補別カルテ</h2>
 <table><thead><tr><th>mul</th><th>role</th><th>Body</th><th>Body CI</th><th>Tail</th><th>Tail CI</th><th>A</th><th>sym B/T</th><th>angle B/T</th><th>gain B/T</th><th>P body min</th><th>P tail min</th><th>dominated</th><th>formal</th><th>mandatory role</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table>
 <h2>読み方</h2><p><code>d=||g_mul-g_noquant||/||g_noquant||</code>を主距離として残し、対称距離・方向回転・gainを原因分解として併記します。1.0は元勾配と同程度の差という数学的anchorですが「失敗」を意味しません。edge未解決中は最良mulを確定しません。</p>
@@ -155,11 +169,17 @@ def main() -> int:
         tail_path = profile_dir / "gradient_tail.csv"
         natural_path = profile_dir / "local_natural_gradient.csv"
         manifest_path = profile_dir / "source_manifest.json"
+        probe_manifest_path = profile_dir / "probe_manifest.json"
         for path in (summary_path, tail_path, natural_path, manifest_path):
             if not path.is_file():
                 raise FileNotFoundError(f"required v2.4 local input is missing: {path}")
         raw_summary = _read_json(summary_path)
         source_manifest = _read_json(manifest_path)
+        probe_manifest = (
+            _read_json(probe_manifest_path)
+            if probe_manifest_path.is_file()
+            else {}
+        )
         source_contract = str(source_manifest.get("source_contract", {}).get("sha256", ""))
         if not source_contract:
             raise ValueError("local profile source_manifest has no source contract")
@@ -178,6 +198,21 @@ def main() -> int:
         )
         profile_metadata = dict(raw_summary.get("profile") or {})
         analysis_summary = result["summary"]
+        source_group_metadata = dict(
+            probe_manifest.get("source_group_map") or {}
+        )
+        probed_source_groups = int(
+            source_group_metadata.get(
+                "source_group_count_probed",
+                analysis_summary["source_group_count"],
+            )
+        )
+        total_source_groups = int(
+            source_group_metadata.get(
+                "source_group_count_total",
+                probed_source_groups,
+            )
+        )
         analysis_summary.update(
             {
                 "source_profile": str(profile_dir),
@@ -186,6 +221,27 @@ def main() -> int:
                 "local_gradient_tail_sha256": sha256_file(tail_path),
                 "local_natural_gradient_sha256": sha256_file(natural_path),
                 "no_quant_natural_local_baseline": natural,
+                "source_group_count": probed_source_groups,
+                "source_group_count_probed": probed_source_groups,
+                "source_group_count_total": total_source_groups,
+                "source_group_coverage_complete": bool(
+                    source_group_metadata.get(
+                        "source_group_coverage_complete",
+                        probed_source_groups == total_source_groups,
+                    )
+                ),
+                "source_group_coverage_fraction": float(
+                    source_group_metadata.get(
+                        "source_group_coverage_fraction",
+                        probed_source_groups / max(total_source_groups, 1),
+                    )
+                ),
+                "source_group_selection_policy": str(
+                    source_group_metadata.get(
+                        "source_group_selection_policy",
+                        "all_source_groups",
+                    )
+                ),
                 "execution_mode": str(
                     profile_metadata.get("execution_mode", "strict")
                 ),
@@ -315,7 +371,17 @@ def main() -> int:
                 "metric_definition_version": METRIC_DEFINITION_VERSION,
                 "inputs": {
                     path.name: {"path": str(path), "sha256": sha256_file(path)}
-                    for path in (summary_path, tail_path, natural_path, manifest_path)
+                    for path in (
+                        summary_path,
+                        tail_path,
+                        natural_path,
+                        manifest_path,
+                        *(
+                            (probe_manifest_path,)
+                            if probe_manifest_path.is_file()
+                            else ()
+                        ),
+                    )
                 },
                 "source_contract_sha256": source_contract,
                 "selection_rule_sha256": rule_sha,
