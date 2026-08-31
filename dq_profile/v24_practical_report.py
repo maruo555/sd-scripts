@@ -15,13 +15,13 @@ import math
 from typing import Any, Mapping, Sequence
 
 
-PRACTICAL_REPORT_SCHEMA_VERSION = "2.4.3-practical-report-beta"
+PRACTICAL_REPORT_SCHEMA_VERSION = "2.4.4-practical-report-beta"
 LOCAL_ACCEPTANCE_METRIC_VERSION = "2.4.0"
 
 # Compatibility aliases retained for existing report readers.
 SCHEMA_VERSION = PRACTICAL_REPORT_SCHEMA_VERSION
 METRIC_DEFINITION_VERSION = LOCAL_ACCEPTANCE_METRIC_VERSION
-REPORT_CONTRACT_VERSION = "1.3.0-beta"
+REPORT_CONTRACT_VERSION = "1.4.0-beta"
 ABSOLUTE_REFERENCE_DISTANCE = 1.0
 AFFINITY_FIXED_Y_MAX = 4.0
 AFFINITY_SCALE_CALIBRATION = {
@@ -194,6 +194,12 @@ def report_contract() -> dict[str, Any]:
             ),
             "natural_baseline": (
                 "scale context only; never used as selector evidence"
+            ),
+            "source_localization": (
+                "descriptive Tail localization only; never used as selector evidence"
+            ),
+            "dataset_character_vector": (
+                "independent descriptive channels with no composite score"
             ),
         },
         "execution_mode": {
@@ -860,6 +866,38 @@ def build_dataset_card(
             evaluation.get("image_count", 0),
         )
     )
+    image_count_probed = int(
+        detail_summary.get("image_count_probed", image_count)
+    )
+    image_count_total = int(
+        detail_summary.get("image_count_total", image_count_probed)
+    )
+    image_coverage_fraction = _optional_float(
+        detail_summary.get("image_coverage_fraction")
+    )
+    if image_coverage_fraction is None:
+        image_coverage_fraction = image_count_probed / max(image_count_total, 1)
+    image_coverage_complete = _as_bool(
+        detail_summary.get(
+            "image_coverage_complete",
+            image_count_probed == image_count_total,
+        )
+    )
+    source_localization = dict(
+        detail.get("source_localization")
+        or detail_summary.get("source_localization")
+        or {}
+    )
+    no_quant_baseline_profile = dict(
+        detail.get("no_quant_baseline_profile")
+        or detail_summary.get("no_quant_baseline_profile")
+        or {}
+    )
+    dataset_character_vector = dict(
+        detail.get("dataset_character_vector")
+        or detail_summary.get("dataset_character_vector")
+        or {}
+    )
     absolute_norm_available = _as_bool(
         evaluation.get("absolute_gradient_norm_available", True)
     )
@@ -1122,6 +1160,10 @@ def build_dataset_card(
         "source_group_coverage_fraction": source_group_coverage_fraction,
         "source_group_selection_policy": source_group_selection_policy,
         "image_count": image_count,
+        "image_count_probed": image_count_probed,
+        "image_count_total": image_count_total,
+        "image_coverage_fraction": image_coverage_fraction,
+        "image_coverage_complete": image_coverage_complete,
         "candidate_grid": [card["range_mul"] for card in cards],
         "candidate_count": len(cards),
         "hard_safety_pass_count": len(hard_safety_pass_candidates),
@@ -1186,6 +1228,9 @@ def build_dataset_card(
         ),
         "actions": actions,
         "natural_baseline": natural,
+        "source_localization": source_localization,
+        "no_quant_baseline_profile": no_quant_baseline_profile,
+        "dataset_character_vector": dataset_character_vector,
         "pairwise": pairwise,
         "source_loo": loo,
         "timestep_rows": list(detail.get("timestep_rows") or []),
@@ -1909,6 +1954,98 @@ def _overview_behavior_table(datasets: Sequence[Mapping[str, Any]]) -> str:
     )
 
 
+def _dataset_character_profile_html(dataset: Mapping[str, Any]) -> str:
+    vector = dict(dataset.get("dataset_character_vector") or {})
+    channels = dict(vector.get("channels") or {})
+    localization = dict(dataset.get("source_localization") or {})
+    no_quant = dict(dataset.get("no_quant_baseline_profile") or {})
+    if not channels and not localization.get("valid") and not no_quant.get("valid"):
+        return (
+            '<p class="muted">この保存済みrunには追加のdataset character '
+            'channelがありません。</p>'
+        )
+
+    mul_labels = {
+        "flat_within_descriptive_tolerance": "測定範囲ではほぼ平坦",
+        "upper_range_reduces_deformation": "mulを上げるほど摂動が減る傾向",
+        "lower_range_reduces_deformation": "mulを下げるほど摂動が減る傾向",
+        "interior_valley": "中間mulに谷がある",
+        "irregular_or_mixed": "単調でない／混合型",
+        "insufficient_grid": "grid不足",
+    }
+    response = dict(channels.get("mul_response") or {})
+    response_label = mul_labels.get(
+        str(response.get("label")),
+        str(response.get("label") or "未測定"),
+    )
+    source_ref = dict(localization.get("reference_profile") or {})
+    no_quant_signal = dict(no_quant.get("signal_strength") or {})
+    no_quant_load = dict(no_quant.get("source_load") or {})
+    natural = dict(no_quant.get("natural_variation") or {})
+    dominant_bin = no_quant.get("dominant_timestep_bin_by_gradient_rms")
+    dominant_label = "未測定"
+    if dominant_bin is not None:
+        bin_index = int(dominant_bin)
+        bin_text, noise_text = TIMESTEP_BIN_LABELS.get(
+            bin_index, (str(bin_index), "")
+        )
+        dominant_label = f"bin {bin_index} ({bin_text}, {noise_text})"
+
+    localization_rows = "".join(
+        "<tr>"
+        f'<th scope="row">{_fmt(row.get("range_mul"), 2)}</th>'
+        f'<td>{_fmt(row.get("local_tail"))}</td>'
+        f'<td>{html.escape(str(row.get("top_source_alias") or "—"))}</td>'
+        f'<td>{_pct(row.get("top_source_share"))}</td>'
+        f'<td>{_fmt(row.get("effective_source_count"), 2)}</td>'
+        f'<td>{"安定" if _as_bool(row.get("top_source_stable_across_thresholds")) else "変動"}</td>'
+        f'<td>{html.escape(str(row.get("loo_most_actionable_source_alias") or "—"))}</td>'
+        f'<td>{_pct(row.get("loo_max_tail_reduction_fraction"))}</td>'
+        "</tr>"
+        for row in localization.get("candidate_profiles", [])
+    )
+    localization_table = (
+        '<div class="table-wrap"><table><thead><tr><th>mul</th>'
+        '<th>絶対Tail</th><th>最大負担source</th><th>集中率</th><th>実効source数</th>'
+        '<th>q85/90/95</th><th>LOOで最も効くsource</th><th>Tail低下率</th>'
+        f'</tr></thead><tbody>{localization_rows}</tbody></table></div>'
+        if localization_rows
+        else '<p class="muted">source localizationは利用できません。</p>'
+    )
+    coverage_warning = (
+        "全画像をprobeしています。"
+        if dataset.get("image_coverage_complete")
+        else "未probe画像があるため、この体質記述は測定subsetの範囲です。"
+    )
+    return f"""
+<div class="callout-grid">
+  <div><strong>mul応答</strong><br>{html.escape(response_label)}<div class="micro">単一の合成点にはしません。</div></div>
+  <div><strong>Source集中度</strong><br>top {html.escape(str(source_ref.get('top_source_alias') or '—'))}: {_pct(source_ref.get('top_source_share'))}<br>実効source数 {_fmt(source_ref.get('effective_source_count'), 2)}</div>
+  <div><strong>no_quant信号</strong><br>norm中央値 {_fmt(no_quant_signal.get('grad_norm_median'))}<br>q05–q95 {_fmt(no_quant_signal.get('grad_norm_q05'))}–{_fmt(no_quant_signal.get('grad_norm_q95'))}</div>
+  <div><strong>画像カバレッジ</strong><br>{dataset.get('image_count_probed', dataset.get('image_count', 0))} / {dataset.get('image_count_total', dataset.get('image_count', 0))} ({_pct(dataset.get('image_coverage_fraction'))})<div class="micro">{html.escape(coverage_warning)}</div></div>
+</div>
+<details open>
+  <summary>量子化Tailのsource集中（説明専用）</summary>
+  <p class="section-help">各mulのTail負担が一部sourceへ寄るかを、source等重みのq85/q90/q95で確認します。Sxxは匿名aliasです。絶対Tailが小さい場合、高い集中率だけで危険とは判断しません。また「最大負担source」と「外すとTailが最も下がるsource」は別概念です。</p>
+  {localization_table}
+</details>
+<details>
+  <summary>no_quant自身の短期勾配プロファイル（説明専用）</summary>
+  <div class="qa-grid">
+    <div><span>Gradient norm q05</span><strong>{_fmt(no_quant_signal.get('grad_norm_q05'))}</strong></div>
+    <div><span>Gradient norm median</span><strong>{_fmt(no_quant_signal.get('grad_norm_median'))}</strong></div>
+    <div><span>Gradient norm q95</span><strong>{_fmt(no_quant_signal.get('grad_norm_q95'))}</strong></div>
+    <div><span>Gradient norm RMS</span><strong>{_fmt(no_quant_signal.get('grad_norm_rms'))}</strong></div>
+    <div><span>Top source energy</span><strong>{html.escape(str(no_quant_load.get('top_source_alias') or '—'))} / {_pct(no_quant_load.get('top_source_energy_share'))}</strong></div>
+    <div><span>Effective sources</span><strong>{_fmt(no_quant_load.get('effective_source_count'), 2)}</strong></div>
+    <div><span>Dominant timestep</span><strong>{html.escape(dominant_label)}</strong></div>
+    <div><span>Natural Body / Tail</span><strong>{_fmt(natural.get('local_body'))} / {_fmt(natural.get('local_tail'))}</strong></div>
+  </div>
+  <p class="micro">短いno_quant probeの信号規模と偏りです。収束速度、最終画質、rank、LR、epoch数は予測しません。同じmodel・network・precision契約のrun同士でのみ比較してください。</p>
+</details>
+"""
+
+
 def _dataset_section(
     dataset: Mapping[str, Any],
     *,
@@ -2103,7 +2240,13 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
   </section>
 
   <section>
-    <h2>3. 詳細診断</h2>
+    <h2>3. Dataset character profile</h2>
+    <p class="section-help">すでに測定した勾配から、dataset固有の偏りを複数の独立channelで記述します。候補選択への追加票や画質スコアには使いません。</p>
+    {_dataset_character_profile_html(dataset)}
+  </section>
+
+  <section>
+    <h2>4. 詳細診断</h2>
     <div class="chart-card">
       <h3>Tailの原因分解</h3>
       <p class="section-help">symmetric、方向回転（angle）、勾配gain変化を説明用に表示します。候補選定の追加票にはしません。</p>
@@ -2128,7 +2271,7 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
   </section>
 
   <section>
-    <h2>4. 推奨アクション</h2>
+    <h2>5. 推奨アクション</h2>
     <div class="action-box">
       <p><strong>安定性重視:</strong> no_quantを必ず残し、Fidelity retained setを比較対象にします。</p>
       <p><strong>正則化の違いを探索:</strong> hard-safeだが候補内でより強い摂動の点を、「画質的に良い」と断言せず比較へ追加できます。</p>
@@ -2139,7 +2282,7 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
   </section>
 
   <section>
-    <h2>5. 測定品質</h2>
+    <h2>6. 測定品質</h2>
     <details>
       <summary>QA / provenance</summary>
       <div class="qa-grid">
@@ -2150,7 +2293,8 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
         <div><span>Sampling depth</span><strong>{html.escape(sampling_depth_label)}</strong></div>
         <div><span>Internal profile level</span><strong>{html.escape(dataset["internal_profile_level"])}</strong></div>
         <div><span>Source groups (probe / total)</span><strong>{dataset["source_group_count_probed"]} / {dataset["source_group_count_total"]}</strong></div>
-        <div><span>Images</span><strong>{dataset["image_count"]}</strong></div>
+        <div><span>Images (probe / total)</span><strong>{dataset["image_count_probed"]} / {dataset["image_count_total"]}</strong></div>
+        <div><span>Image coverage</span><strong>{_pct(dataset["image_coverage_fraction"])}</strong></div>
         <div><span>Hard safety</span><strong>{"PASS" if dataset["hard_safety_all_pass"] else "FAIL"}</strong></div>
         <div><span>Measurement QA</span><strong>{html.escape(dataset["measurement_quality"]["level"])}</strong></div>
         <div><span>Local confidence</span><strong>{html.escape(dataset["local_comparison_confidence"]["level"])}</strong></div>

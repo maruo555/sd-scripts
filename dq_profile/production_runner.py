@@ -1194,6 +1194,13 @@ PROMOTED_ANALYSIS_FILES = (
     "robust_dominance.csv",
     "source_loo.csv",
     "natural_gradient_baseline.json",
+    "source_localization.json",
+    "source_localization.csv",
+    "source_localization_detail.csv",
+    "no_quant_baseline_profile.json",
+    "no_quant_source_load.csv",
+    "no_quant_timestep_profile.csv",
+    "dataset_character_vector.json",
     "acceptance_contract.json",
 )
 

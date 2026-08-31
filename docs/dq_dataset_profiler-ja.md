@@ -155,6 +155,24 @@ exact parityで検査します。Strictの再測定は校正能力を高めま�
 Fidelity retained set、robust dominance、source LOOなどを作ります。`report.html`、
 `technical_report.html`、JSON、CSVへ保存します。
 
+同じGPU測定済みCSVから、候補選択へ加点しない説明専用channelも作ります。
+
+- **Source localization**: candidateごとにsource等重みのq85／q90／q95を基準とし、
+  Tailの超過負担がどのsourceへ集中するか、上位source比率、実効source数、thresholdを
+  変えたときの安定性を記録します。最大負担sourceと、source LOOでTailが最も下がるsourceは
+  別々に表示します。高い集中率でも絶対Tailが小さい場合は、それだけで警告にしません。
+- **No-quant baseline profile**: candidate／quant repeat間で重複保存された同一no-quant参照を
+  probe単位にまとめ、勾配normのq05／median／q95／RMS、source別energy比、実効source数、
+  timestep別信号規模を記録します。収束、最終画質、rank、LR、epoch数は予測しません。
+- **Dataset character vector**: 絶対的な受容帯、mul応答、Tail増幅、source集中、no-quant信号を
+  独立した5 channelとして並べます。多数決や平均による単一スコアには変換しません。
+- **Image coverage**: probe画像数／dataset実画像数を表示します。32画像を超えるdatasetでは
+  未probe画像が残るため、説明値をdataset全体の完全観測とは扱いません。
+
+これらは`selector_input=false`、`not_quality_or_utility=true`として保存します。
+Fidelity retained set、Hard Safety、代表候補の決定規則は変えません。同じmodel、network、
+optimizer、precision契約のrun同士で比較するときのdataset体質記述に使用します。
+
 この実測例では各CPU解析は5～7秒程度で、HTML生成を含めても全時間への影響は
 小さいものでした。
 
@@ -595,6 +613,10 @@ experimentalと明記する範囲:
 - `source_manifest.json`と`candidate_definitions.json`
 - `status.json`
 - 候補・timestep・bootstrapのCSV
+- `source_localization.json/.csv`と`source_localization_detail.csv`: Tail負担のsource集中
+- `no_quant_baseline_profile.json`、`no_quant_source_load.csv`、
+  `no_quant_timestep_profile.csv`: no-quant短期勾配の規模と偏り
+- `dataset_character_vector.json`: 合成点を作らないdataset体質の5 channel
 - 実行ログ
 
 ### 第三者へ共有する前のプライバシーチェック
