@@ -144,7 +144,8 @@ def test_fidelity_gauge_is_descriptive_worst_channel() -> None:
         contract["affinity_curve_scale"]["mode"]
         == "fixed_primary_with_dataset_auto_zoom"
     )
-    assert "quick" in contract["execution_mode"]
+    assert contract["execution_mode"]["supported_new_runs"] == ["standard", "strict"]
+    assert "legacy_quick" in contract["execution_mode"]
     assert contract["execution_mode"]["sampling_depth_field"] == "sampling_depth"
 
 
@@ -252,7 +253,7 @@ def test_single_dataset_report_is_local_only_and_hides_trajectory_from_selection
     assert "v2.4.3 practical report beta" in html
 
 
-def test_quick_report_exposes_reduced_sampling_and_confidence_ceiling() -> None:
+def test_legacy_quick_report_exposes_reduced_sampling_and_confidence_ceiling() -> None:
     rows = [
         _candidate(2.70, 1.2, 1.3, dominated_by=3.15),
         _candidate(3.15, 0.7, 0.8),

@@ -203,11 +203,15 @@ def report_contract() -> dict[str, Any]:
             "measurement_contract_field": "measurement_contract",
             "sampling_depth_field": "sampling_depth",
             "confidence_ceiling_field": "confidence_ceiling",
-            "quick": (
-                "explicit reduced-sampling run with short prefix smoke, one "
-                "standalone snapshot, and the fixed five-point grid"
+            "supported_new_runs": ["standard", "strict"],
+            "legacy_quick": (
+                "read-only report compatibility for historical reduced-sampling "
+                "Quick artifacts; Quick is not selectable for new runs"
             ),
-            "standard": "daily fixed-grid run with short prefix smoke",
+            "standard": (
+                "daily fixed-grid run with short prefix smoke and one standalone "
+                "snapshot"
+            ),
             "strict": "reference-depth run with long prefix and bounded edge extension",
             "mode_is_not_internal_profile_level": True,
         },
@@ -877,7 +881,7 @@ def build_dataset_card(
         if local_comparison_confidence["level"] == "High":
             local_comparison_confidence["level"] = "Medium"
         local_comparison_confidence["reasons"].append(
-            "Quickは最大16画像の縮小samplingであり、Standardと同じ証拠量ではありません"
+            "旧Quick成果物は最大16画像の縮小samplingであり、現Standardと同じ証拠量ではありません"
         )
     recommendation_maturity = _recommendation_maturity(
         trajectory_available=trajectory_available,

@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 PRESET_SCHEMA_VERSION = "2.0"
 LOCAL_MEASUREMENT_SCHEMA_VERSION = "1.1"
-EXECUTION_MODE_SCHEMA_VERSION = "1.1"
+EXECUTION_MODE_SCHEMA_VERSION = "1.2"
 
 
 @dataclass(frozen=True)
@@ -313,27 +313,6 @@ LOCAL_BODY_TAIL_V1 = LocalMeasurementContract(
 )
 
 
-LOCAL_BODY_TAIL_QUICK_V1 = LocalMeasurementContract(
-    name="local-body-tail-quick-v1",
-    metric_definition_version="2.4.0",
-    max_images=16,
-    timestep_bins=4,
-    stochastic_repeats=2,
-    no_quant_noise_replicas=3,
-    candidate_noise_replicas=2,
-    stochastic_quant_repeats=2,
-    sweep_steps=128,
-    branch_repeats=5,
-    sketch_width=512,
-    sketch_seeds=2,
-    minimum_source_groups=4,
-    bootstrap_iterations=2000,
-    bootstrap_seed=2401,
-    sampling_depth="reduced_16_image",
-    confidence_ceiling="reduced_descriptive",
-)
-
-
 STRICT_MODE = ExecutionMode(
     name="strict",
     description="Reference-depth QA with long prefix parity and bounded edge extension.",
@@ -348,29 +327,16 @@ STRICT_MODE = ExecutionMode(
 
 STANDARD_MODE = ExecutionMode(
     name="standard",
-    description="Daily-use QA with short prefix parity and one fixed five-point Local scan.",
+    description=(
+        "Daily-use QA with short prefix parity, one standalone snapshot, and one "
+        "fixed five-point Local scan."
+    ),
     qa_depth="standard_smoke",
     core_grid=(2.70, 3.15, 3.45, 3.75, 4.05),
     max_edge_extension_rounds=0,
     edge_policy="fixed_tested_envelope_no_extension",
     prefix_short_steps=8,
     prefix_long_steps=16,
-)
-
-
-QUICK_MODE = ExecutionMode(
-    name="quick",
-    description=(
-        "Explicit faster workflow with short prefix parity, one standalone "
-        "snapshot check, and a reduced 16-image Local scan."
-    ),
-    qa_depth="quick_smoke",
-    core_grid=(2.70, 3.15, 3.45, 3.75, 4.05),
-    max_edge_extension_rounds=0,
-    edge_policy="fixed_tested_envelope_no_extension",
-    prefix_short_steps=8,
-    prefix_long_steps=16,
-    local_measurement_name=LOCAL_BODY_TAIL_QUICK_V1.name,
     standalone_snapshot_count=1,
 )
 
@@ -378,10 +344,8 @@ QUICK_MODE = ExecutionMode(
 PRESETS = {CANONICAL_V1.name: CANONICAL_V1}
 LOCAL_MEASUREMENT_CONTRACTS = {
     LOCAL_BODY_TAIL_V1.name: LOCAL_BODY_TAIL_V1,
-    LOCAL_BODY_TAIL_QUICK_V1.name: LOCAL_BODY_TAIL_QUICK_V1,
 }
 EXECUTION_MODES = {
-    QUICK_MODE.name: QUICK_MODE,
     STANDARD_MODE.name: STANDARD_MODE,
     STRICT_MODE.name: STRICT_MODE,
 }
