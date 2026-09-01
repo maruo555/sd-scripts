@@ -113,6 +113,51 @@ def test_source_group_map_supports_exact_and_longest_prefix(tmp_path):
     assert mapping.resolve(r"D:\images\c\crop3.png") == "all"
 
 
+def test_source_group_map_keeps_full_resolution_but_limits_probe_order(tmp_path):
+    source = tmp_path / "sources.json"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "pattern": "D:/images/a/",
+                    "source_group": "source-a",
+                    "match": "prefix",
+                    "probe_selected": True,
+                    "probe_selection_rank": 0,
+                },
+                {
+                    "pattern": "D:/images/b/",
+                    "source_group": "source-b",
+                    "match": "prefix",
+                    "probe_selected": False,
+                    "probe_selection_rank": None,
+                },
+                {
+                    "pattern": "D:/images/c/",
+                    "source_group": "source-c",
+                    "match": "prefix",
+                    "probe_selected": True,
+                    "probe_selection_rank": 1,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    mapping = SourceGroupMap.load(source)
+    assert mapping.resolve("D:/images/b/image.png") == "source-b"
+    assert DiagnosticProfileRuntime._source_group_order(mapping) == (
+        "source-a",
+        "source-c",
+    )
+    manifest = mapping.manifest()
+    assert manifest["source_group_count_total"] == 3
+    assert manifest["source_group_count_probed"] == 2
+    assert manifest["source_group_coverage_complete"] is False
+    assert manifest["source_group_selection_policy"] == (
+        "deterministic_evenly_spaced_source_groups_v1"
+    )
+
+
 class _ReplayLoader:
     def __init__(self, batches):
         self.batches = tuple(batches)

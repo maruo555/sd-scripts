@@ -14,14 +14,19 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from dq_profile.production_cli import ResolvedProfileRequest
-from dq_profile.protocol import loader_visible_image_files, resolve_dataset_layout
+from dq_profile.protocol import (
+    inspect_dataset_config,
+    loader_visible_image_files,
+    resolve_dataset_layout,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = REPO_ROOT.parent
 PROFILE_SCRIPT = REPO_ROOT / "sdxl_dq_dataset_profile.py"
 DEFAULT_OUTPUT_BASE = PROJECT_ROOT / "lora_output" / "dq_dataset_profiler"
-RUN_SCHEMA_VERSION = "1.0-beta"
+RUN_SCHEMA_VERSION = "1.1-beta"
+EXECUTION_PLAN_SCHEMA_VERSION = "1.0-beta"
 INVALID_FILENAME = re.compile(r"[<>:\"/\\|?*\x00-\x1f]")
 WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
@@ -261,6 +266,77 @@ def build_source_map(source_dirs: Sequence[Path], *, dataset_key: str) -> tuple[
     return payload, image_count
 
 
+def _apply_source_probe_selection(
+    source_map_payload: Sequence[Mapping[str, Any]],
+    *,
+    probe_budget: int,
+) -> list[dict[str, Any]]:
+    """Annotate which source groups must be represented in the local probe.
+
+    The complete source inventory remains in the source map and therefore in
+    the source contract. When there are more independent image_dir groups than
+    probe images, only the probe requirement is reduced. Evenly spaced indices
+    cover the full deterministic TOML/source order instead of taking a biased
+    prefix.
+    """
+
+    total = len(source_map_payload)
+    budget = int(probe_budget)
+    if total <= 0:
+        raise ValueError("source probe selection requires at least one source group")
+    if budget <= 0:
+        raise ValueError("source probe selection requires a positive probe budget")
+    selected_count = min(total, budget)
+    if selected_count == total:
+        selected_indices = list(range(total))
+        policy = "all_source_groups"
+    elif selected_count == 1:
+        selected_indices = [0]
+        policy = "deterministic_evenly_spaced_source_groups_v1"
+    else:
+        denominator = selected_count - 1
+        selected_indices = [
+            (rank * (total - 1) + denominator // 2) // denominator
+            for rank in range(selected_count)
+        ]
+        policy = "deterministic_evenly_spaced_source_groups_v1"
+    if len(set(selected_indices)) != selected_count:
+        raise RuntimeError("deterministic source probe selection produced duplicate indices")
+    rank_by_index = {index: rank for rank, index in enumerate(selected_indices)}
+    return [
+        {
+            **dict(row),
+            "probe_selected": index in rank_by_index,
+            "probe_selection_rank": rank_by_index.get(index),
+            "probe_selection_policy": policy,
+        }
+        for index, row in enumerate(source_map_payload)
+    ]
+
+
+def _source_probe_selection_summary(
+    source_map_payload: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    total = len(source_map_payload)
+    selected = sum(bool(row.get("probe_selected", True)) for row in source_map_payload)
+    policy = next(
+        (
+            str(row.get("probe_selection_policy"))
+            for row in source_map_payload
+            if row.get("probe_selection_policy")
+        ),
+        "all_source_groups" if selected == total else "custom_partial_source_groups",
+    )
+    return {
+        "source_group_count_total": total,
+        "source_group_count_probed": selected,
+        "source_group_count_omitted": total - selected,
+        "source_group_coverage_complete": selected == total,
+        "source_group_coverage_fraction": float(selected / total) if total else 1.0,
+        "source_group_selection_policy": policy,
+    }
+
+
 def validate_source_map_inventory(source_map: Path) -> None:
     """Refuse to mix worker stages that observed different dataset bytes."""
 
@@ -406,18 +482,44 @@ def build_protocol_fingerprint(
         REPO_ROOT / "tools" / "check_dq_calibration_gate.py",
     )
     tracked_state = git_tracked_state()
+    training_contract = request.preset.contract()
+    local_contract = request.local_measurement.contract()
+    execution_contract = request.execution_mode.contract()
+    model_identity = _model_identity(request.model_path)
+    dataset_contract = {
+        "path": str(request.dataset_config),
+        "sha256": sha256_file(request.dataset_config),
+        "source_map_sha256": canonical_sha256(source_map_payload),
+    }
+    shared_local_contract = {
+        "training": training_contract,
+        "local_measurement": local_contract,
+        "model": model_identity,
+        "dataset": dataset_contract,
+        "profile_seed": int(request.preset.expected_explicit["seed"]),
+        "scope": "local_body_tail_only",
+    }
     payload = {
         "schema_version": RUN_SCHEMA_VERSION,
         "git_head": git_head(),
         "git_tracked_dirty": tracked_state["dirty"],
         "git_tracked_state": tracked_state,
-        "preset": request.preset.contract(),
-        "model": _model_identity(request.model_path),
-        "dataset_config": {
-            "path": str(request.dataset_config),
-            "sha256": sha256_file(request.dataset_config),
+        "preset": training_contract,
+        "local_measurement_contract": local_contract,
+        "execution_mode": execution_contract,
+        "qa_depth": request.execution_mode.qa_depth,
+        "internal_profile_level": request.execution_mode.internal_profile_level,
+        "model": model_identity,
+        "dataset_config": dataset_contract,
+        "source_map_sha256": dataset_contract["source_map_sha256"],
+        "contract_hashes": {
+            "training_contract_sha256": canonical_sha256(training_contract),
+            "dataset_contract_sha256": canonical_sha256(dataset_contract),
+            "local_measurement_contract_sha256": canonical_sha256(local_contract),
+            "execution_qa_contract_sha256": canonical_sha256(execution_contract),
+            "local_probe_contract_sha256": canonical_sha256(shared_local_contract),
+            "shared_local_contract_sha256": canonical_sha256(shared_local_contract),
         },
-        "source_map_sha256": canonical_sha256(source_map_payload),
         "code": {
             str(path.relative_to(REPO_ROOT)).replace("\\", "/"): sha256_file(path)
             for path in code_files
@@ -426,7 +528,221 @@ def build_protocol_fingerprint(
         "trajectory": "research_only_not_run",
         "not_quality_or_utility": True,
     }
-    return {**payload, "fingerprint_sha256": canonical_sha256(payload)}
+    fingerprint_sha256 = canonical_sha256(payload)
+    return {
+        **payload,
+        "fingerprint_sha256": fingerprint_sha256,
+        "full_protocol_fingerprint_sha256": fingerprint_sha256,
+    }
+
+
+def _local_probe_counts(
+    *,
+    probe_images: int,
+    timestep_bins: int,
+    mul_count: int,
+    no_quant_noise_replicas: int,
+    candidate_noise_replicas: int,
+    stochastic_quant_repeats: int,
+) -> dict[str, int]:
+    points = int(probe_images) * int(timestep_bins)
+    no_quant = points * int(no_quant_noise_replicas)
+    per_candidate = (
+        points
+        * int(candidate_noise_replicas)
+        * int(stochastic_quant_repeats)
+    )
+    candidates = int(mul_count) * per_candidate
+    return {
+        "probe_images": int(probe_images),
+        "timestep_bins": int(timestep_bins),
+        "mul_count": int(mul_count),
+        "no_quant_probes": no_quant,
+        "candidate_probes_per_mul": per_candidate,
+        "candidate_probes": candidates,
+        "total_local_probes": no_quant + candidates,
+    }
+
+
+def build_execution_plan(
+    request: ResolvedProfileRequest,
+    *,
+    image_count: int,
+    probe_budget: int,
+    source_group_count: int | None = None,
+    probed_source_group_count: int | None = None,
+    source_group_selection_policy: str = "all_source_groups",
+) -> dict[str, Any]:
+    """Describe deterministic work volume before any GPU worker starts.
+
+    The timing section is deliberately secondary.  It extrapolates one known
+    RTX 5080 run and is not a promise: bucket shape, cache state, storage,
+    driver/library versions, and the warmup boundary can all change runtime.
+    """
+
+    preset = request.preset
+    local = request.local_measurement
+    execution = request.execution_mode
+    expected = preset.expected_explicit
+    preflight_summary = inspect_dataset_config(
+        request.dataset_config,
+        max_train_epochs=int(expected["max_train_epochs"]),
+        max_train_steps=None,
+        lr_warmup_steps=float(expected["lr_warmup_steps"]),
+        branch_steps_override=int(local.sweep_steps),
+        max_images=int(local.max_images),
+        timestep_bins=int(local.timestep_bins),
+        stochastic_repeats=int(local.stochastic_repeats),
+        train_batch_size=int(expected["train_batch_size"]),
+        enable_bucket=bool(expected["enable_bucket"]),
+        bucket_no_upscale=bool(expected["bucket_no_upscale"]),
+        min_bucket_reso=int(expected["min_bucket_reso"]),
+        max_bucket_reso=int(expected["max_bucket_reso"]),
+        bucket_reso_steps=int(expected["bucket_reso_steps"]),
+        dataset_repeats=1,
+        cache_info=False,
+        minimum_source_groups=int(local.minimum_source_groups),
+        require_resolution=True,
+    )
+    if int(preflight_summary.unique_images) != int(image_count):
+        raise RuntimeError(
+            "dataset image inventory disagrees between source-map and execution-plan "
+            f"preflight: source_map={image_count}, protocol={preflight_summary.unique_images}"
+        )
+
+    core_counts = _local_probe_counts(
+        probe_images=probe_budget,
+        timestep_bins=local.timestep_bins,
+        mul_count=len(execution.core_grid),
+        no_quant_noise_replicas=local.no_quant_noise_replicas,
+        candidate_noise_replicas=local.candidate_noise_replicas,
+        stochastic_quant_repeats=local.stochastic_quant_repeats,
+    )
+    minimum_processes, maximum_processes = execution.gpu_process_count_range
+    warmup = int(preflight_summary.dq_begin_step)
+
+    # Historical calibration from one 13-image/420-warmup RTX 5080 run.
+    # Keep these constants in the artifact so the estimate is auditable.
+    reference_warmup_seconds = 247.0 * warmup / 420.0
+    reference_prefix_update_seconds = 1033.0 / 512.0
+    reference_local_probe_seconds = 1115.0 / 1196.0
+
+    def estimated_local_seconds(mul_count: int) -> float:
+        counts = _local_probe_counts(
+            probe_images=probe_budget,
+            timestep_bins=local.timestep_bins,
+            mul_count=mul_count,
+            no_quant_noise_replicas=local.no_quant_noise_replicas,
+            candidate_noise_replicas=local.candidate_noise_replicas,
+            stochastic_quant_repeats=local.stochastic_quant_repeats,
+        )
+        return (
+            reference_warmup_seconds
+            + counts["total_local_probes"] * reference_local_probe_seconds
+        )
+
+    base_seconds = (
+        execution.standalone_snapshot_count * reference_warmup_seconds
+        + reference_warmup_seconds
+        + execution.prefix_branch_updates * reference_prefix_update_seconds
+        + estimated_local_seconds(len(execution.core_grid))
+    )
+    maximum_seconds = base_seconds
+    projected_edge_mul_counts: list[int] = []
+    for round_index in range(1, execution.max_edge_extension_rounds + 1):
+        # Strict historically adds one adjacent edge point per round.  The
+        # actual conditional plan is reported separately and can stop early.
+        mul_count = len(execution.core_grid) + round_index
+        projected_edge_mul_counts.append(mul_count)
+        maximum_seconds += estimated_local_seconds(mul_count)
+
+    estimate_minutes = {
+        "minimum": round(base_seconds / 60.0, 1),
+        "maximum_if_all_edge_rounds_run": round(maximum_seconds / 60.0, 1),
+    }
+    exact_process_count = (
+        minimum_processes if minimum_processes == maximum_processes else None
+    )
+    payload: dict[str, Any] = {
+        "schema_version": EXECUTION_PLAN_SCHEMA_VERSION,
+        "execution_mode": execution.name,
+        "qa_depth": execution.qa_depth,
+        "internal_profile_level": execution.internal_profile_level,
+        "measurement_contract": local.name,
+        "work_volume": {
+            "gpu_process_count": exact_process_count,
+            "gpu_process_count_min": minimum_processes,
+            "gpu_process_count_max": maximum_processes,
+            "warmup_boundary_updates": warmup,
+            "warmup_executions": exact_process_count,
+            "warmup_executions_min": minimum_processes,
+            "warmup_executions_max": maximum_processes,
+            "total_warmup_updates": (
+                warmup * exact_process_count
+                if exact_process_count is not None
+                else None
+            ),
+            "total_warmup_updates_min": warmup * minimum_processes,
+            "total_warmup_updates_max": warmup * maximum_processes,
+            "standalone_snapshot_count": execution.standalone_snapshot_count,
+            "snapshot_replica_count": execution.standalone_snapshot_count,
+            "prefix": {
+                "candidates": ["no_quant", f"mul_{execution.prefix_anchor_mul:.2f}"],
+                "short_run_a_updates": execution.prefix_short_steps,
+                "short_run_b_updates": execution.prefix_short_steps,
+                "long_run_updates": execution.prefix_long_steps,
+                "checkpoints": list(execution.prefix_checkpoints),
+                "total_branch_updates": execution.prefix_branch_updates,
+            },
+            "local": {
+                **core_counts,
+                "fixed_grid": list(execution.core_grid),
+                "edge_extension": execution.edge_policy,
+                "maximum_edge_extension_rounds": execution.max_edge_extension_rounds,
+                "projected_mul_counts_if_each_edge_round_adds_one": projected_edge_mul_counts,
+            },
+            "dataset": {
+                "unique_images": int(preflight_summary.unique_images),
+                "repeat_weighted_samples": int(preflight_summary.repeat_weighted_samples),
+                "steps_per_epoch": int(preflight_summary.steps_per_epoch),
+                "normal_training_steps": int(preflight_summary.normal_training_steps),
+                "probe_images": int(probe_budget),
+                "source_group_count_total": (
+                    None if source_group_count is None else int(source_group_count)
+                ),
+                "source_group_count_probed": (
+                    None
+                    if probed_source_group_count is None
+                    else int(probed_source_group_count)
+                ),
+                "source_group_coverage_complete": (
+                    None
+                    if source_group_count is None or probed_source_group_count is None
+                    else int(source_group_count) == int(probed_source_group_count)
+                ),
+                "source_group_selection_policy": source_group_selection_policy,
+            },
+        },
+        "reference_time_estimate": {
+            "minutes": estimate_minutes,
+            "is_guarantee": False,
+            "basis": "single historical RTX 5080 run with 13 probe images and warmup boundary 420",
+            "calibration": {
+                "warmup_seconds_at_420_updates": 247.0,
+                "prefix_seconds_per_branch_update": reference_prefix_update_seconds,
+                "local_seconds_per_probe": reference_local_probe_seconds,
+            },
+            "important_variability": [
+                "bucket resolutions and aspect ratios",
+                "latent cache state and storage speed",
+                "GPU, driver, CUDA, PyTorch, bitsandbytes, and Triton versions",
+                "dataset repeat weighting, which changes the warmup boundary",
+                "conditional edge stages in strict mode",
+            ],
+        },
+        "scope": "numerical Local Body/Tail Safety/Fidelity; not final image quality or Utility",
+    }
+    return {**payload, "execution_plan_sha256": canonical_sha256(payload)}
 
 
 def allocate_run_directory(output_base: Path, profile_name: str, fingerprint: str) -> Path:
@@ -553,6 +869,8 @@ def profile_command(
     snapshot_only: bool = False,
 ) -> list[str]:
     preset = request.preset
+    local = request.local_measurement
+    execution = request.execution_mode
     command = [
         *accelerate_prefix(preset),
         f"--pretrained_model_name_or_path={request.model_path}",
@@ -560,21 +878,31 @@ def profile_command(
         f"--output_dir={run_dir / '_internal_training_output'}",
         f"--output_name={request.output_name}",
         *preset.training_tokens,
-        f"--training_comment=DQ Profiler Beta {preset.name} Local-only",
+        (
+            f"--training_comment=DQ Profiler Beta {preset.name} "
+            f"{execution.name} Local-only"
+        ),
         f"--dq_profile_output_dir={run_dir}",
         f"--dq_profile_name={name}",
-        "--dq_profile_level=standard",
+        f"--dq_profile_level={execution.internal_profile_level}",
         f"--dq_profile_protocol={protocol}",
+        f"--dq_profile_execution_mode={execution.name}",
+        f"--dq_profile_qa_depth={execution.qa_depth}",
+        f"--dq_profile_measurement_contract={local.name}",
+        f"--dq_profile_sampling_depth={local.sampling_depth}",
+        f"--dq_profile_confidence_ceiling={local.confidence_ceiling}",
         "--dq_profile_prefix_kernel_mode=deterministic",
+        f"--dq_profile_prefix_short_steps={execution.prefix_short_steps}",
+        f"--dq_profile_prefix_long_steps={execution.prefix_long_steps}",
         f"--dq_profile_max_images={max_images}",
-        f"--dq_profile_timestep_bins={preset.timestep_bins}",
-        f"--dq_profile_stochastic_repeats={preset.stochastic_repeats}",
+        f"--dq_profile_timestep_bins={local.timestep_bins}",
+        f"--dq_profile_stochastic_repeats={local.stochastic_repeats}",
         "--dq_profile_range_muls=" + ",".join(f"{value:.2f}" for value in range_muls),
-        f"--dq_profile_sweep_steps={preset.sweep_steps}",
-        f"--dq_profile_branch_repeats={preset.branch_repeats}",
+        f"--dq_profile_sweep_steps={local.sweep_steps}",
+        f"--dq_profile_branch_repeats={local.branch_repeats}",
         "--dq_profile_guardian_ablation=common_only",
-        f"--dq_profile_sketch_width={preset.sketch_width}",
-        f"--dq_profile_sketch_seeds={preset.sketch_seeds}",
+        f"--dq_profile_sketch_width={local.sketch_width}",
+        f"--dq_profile_sketch_seeds={local.sketch_seeds}",
         f"--dq_profile_source_group_map={source_map}",
     ]
     if gate is not None:
@@ -650,6 +978,7 @@ def run_snapshot_parity(launcher: Launcher, left: Path, right: Path, output_name
 def run_local_analysis(
     launcher: Launcher,
     *,
+    request: ResolvedProfileRequest,
     profile: Path,
     output_name: str,
     dataset_id: str,
@@ -669,9 +998,9 @@ def run_local_analysis(
             "--dataset-id",
             dataset_id,
             "--iterations",
-            "2000",
+            str(request.local_measurement.bootstrap_iterations),
             "--seed",
-            "2401",
+            str(request.local_measurement.bootstrap_seed),
         ],
         label=f"Local Body/Tail analysis / {output_name}",
     )
@@ -705,6 +1034,7 @@ def run_local_pipeline(
     dataset_id: str,
 ) -> tuple[Path, Path, tuple[float, ...], int]:
     names = stage_names()
+    execution = request.execution_mode
     update_status(launcher.run_dir, status="running", current_stage="snapshot_a")
     snapshot_a = run_profile(
         launcher,
@@ -712,22 +1042,27 @@ def run_local_pipeline(
         source_map=source_map,
         name=names["snapshot_a"],
         protocol="v2-prefix-smoke",
-        range_muls=(3.15,),
-        max_images=8,
+        range_muls=(execution.prefix_anchor_mul,),
+        max_images=execution.snapshot_a_max_images,
         snapshot_only=True,
     )
-    update_status(launcher.run_dir, status="running", current_stage="snapshot_b")
-    snapshot_b = run_profile(
-        launcher,
-        request,
-        source_map=source_map,
-        name=names["snapshot_b"],
-        protocol="v2-prefix-smoke",
-        range_muls=(3.15,),
-        max_images=probe_budget,
-        snapshot_only=True,
-    )
-    run_snapshot_parity(launcher, snapshot_a, snapshot_b, names["snapshot_parity"])
+    snapshot_reference = snapshot_a
+    if execution.standalone_snapshot_count >= 2:
+        update_status(launcher.run_dir, status="running", current_stage="snapshot_b")
+        snapshot_b = run_profile(
+            launcher,
+            request,
+            source_map=source_map,
+            name=names["snapshot_b"],
+            protocol="v2-prefix-smoke",
+            range_muls=(execution.prefix_anchor_mul,),
+            max_images=probe_budget,
+            snapshot_only=True,
+        )
+        run_snapshot_parity(
+            launcher, snapshot_a, snapshot_b, names["snapshot_parity"]
+        )
+        snapshot_reference = snapshot_b
 
     update_status(launcher.run_dir, status="running", current_stage="prefix_gate")
     prefix = run_profile(
@@ -736,10 +1071,15 @@ def run_local_pipeline(
         source_map=source_map,
         name=names["prefix"],
         protocol="v2-prefix-smoke",
-        range_muls=(3.15,),
+        range_muls=(execution.prefix_anchor_mul,),
         max_images=probe_budget,
     )
-    run_snapshot_parity(launcher, snapshot_b, prefix, names["prefix_snapshot_parity"])
+    run_snapshot_parity(
+        launcher,
+        snapshot_reference,
+        prefix,
+        names["prefix_snapshot_parity"],
+    )
     gate = prefix / "calibration_gate.json"
     launcher.run(
         [
@@ -761,7 +1101,7 @@ def run_local_pipeline(
     )
 
     update_status(launcher.run_dir, status="running", current_stage="core_local")
-    active_grid = tuple(float(value) for value in request.preset.core_grid)
+    active_grid = tuple(float(value) for value in execution.core_grid)
     active_profile = run_profile(
         launcher,
         request,
@@ -774,6 +1114,7 @@ def run_local_pipeline(
     )
     active_analysis = run_local_analysis(
         launcher,
+        request=request,
         profile=active_profile,
         output_name=names["core_analysis"],
         dataset_id=dataset_id,
@@ -783,7 +1124,7 @@ def run_local_pipeline(
 
     selection = read_json(active_analysis / "local_selection.json")
     completed_edge_rounds = 0
-    for round_index in range(1, request.preset.max_edge_extension_rounds + 1):
+    for round_index in range(1, execution.max_edge_extension_rounds + 1):
         if selection.get("selection_valid") is not True:
             break
         additions = tuple(float(value) for value in selection.get("edge_extension_recommended", ()))
@@ -809,6 +1150,7 @@ def run_local_pipeline(
         )
         edge_analysis = run_local_analysis(
             launcher,
+            request=request,
             profile=edge_profile,
             output_name=round_names["analysis"],
             dataset_id=dataset_id,
@@ -839,6 +1181,7 @@ def run_local_pipeline(
 
 PROMOTED_ANALYSIS_FILES = (
     "report.html",
+    "beginner_report.html",
     "technical_report.html",
     "summary.json",
     "practical_report.json",
@@ -852,6 +1195,13 @@ PROMOTED_ANALYSIS_FILES = (
     "robust_dominance.csv",
     "source_loo.csv",
     "natural_gradient_baseline.json",
+    "source_localization.json",
+    "source_localization.csv",
+    "source_localization_detail.csv",
+    "no_quant_baseline_profile.json",
+    "no_quant_source_load.csv",
+    "no_quant_timestep_profile.csv",
+    "dataset_character_vector.json",
     "acceptance_contract.json",
 )
 
@@ -863,7 +1213,13 @@ def promote_analysis(run_dir: Path, analysis_dir: Path) -> list[str]:
         if source.is_file():
             shutil.copy2(source, run_dir / name)
             promoted.append(name)
-    for required in ("report.html", "technical_report.html", "summary.json", "practical_report.json"):
+    for required in (
+        "report.html",
+        "beginner_report.html",
+        "technical_report.html",
+        "summary.json",
+        "practical_report.json",
+    ):
         if required not in promoted:
             raise FileNotFoundError(f"required product artifact was not generated: {analysis_dir / required}")
     return promoted
@@ -903,25 +1259,15 @@ def preflight(request: ResolvedProfileRequest, source_dirs: Sequence[Path]) -> N
         raise FileNotFoundError(f"DQ profile preflight is missing required files: {missing}")
     if not request.model_path.exists():
         raise FileNotFoundError(f"pretrained model path was not found: {request.model_path}")
-    if len(source_dirs) < request.preset.minimum_source_groups:
+    if len(source_dirs) < request.local_measurement.minimum_source_groups:
         raise ValueError(
             "canonical diagnostic source bootstrap requires at least "
-            f"{request.preset.minimum_source_groups} active image_dir groups; "
+            f"{request.local_measurement.minimum_source_groups} active image_dir groups; "
             f"found {len(source_dirs)}"
         )
     if importlib.util.find_spec("accelerate.commands.launch") is None:
         raise ModuleNotFoundError(
             f"accelerate is not available in the selected Python runtime: {sys.executable}"
-        )
-
-
-def _validate_source_probe_capacity(*, source_group_count: int, probe_budget: int) -> None:
-    if int(source_group_count) > int(probe_budget):
-        raise ValueError(
-            "canonical diagnostic must represent every active image_dir group in its "
-            f"structural probe, but source_groups={source_group_count} exceeds "
-            f"probe_budget={probe_budget}. Consolidate source groups or use a preset "
-            "with a larger validated probe budget."
         )
 
 
@@ -933,9 +1279,12 @@ def _write_initial_artifacts(
     source_map_payload: Sequence[Mapping[str, Any]],
     image_count: int,
     probe_budget: int,
+    execution_plan: Mapping[str, Any],
 ) -> None:
+    source_probe = _source_probe_selection_summary(source_map_payload)
     write_json(run_dir / "resolved_args.json", request.provenance())
     write_json(run_dir / "protocol_fingerprint.json", fingerprint)
+    write_json(run_dir / "execution_plan.json", execution_plan)
     write_json(run_dir / "source_group_map.json", source_map_payload)
     shutil.copy2(request.dataset_config, run_dir / "dataset_config_snapshot.toml")
     write_json(
@@ -946,11 +1295,19 @@ def _write_initial_artifacts(
             "current_stage": "preflight",
             "started_at": datetime.now(timezone.utc).isoformat(),
             "preset": request.preset.name,
+            "execution_mode": request.execution_mode.name,
+            "qa_depth": request.execution_mode.qa_depth,
+            "internal_profile_level": request.execution_mode.internal_profile_level,
+            "local_measurement_contract": request.local_measurement.name,
+            "sampling_depth": request.local_measurement.sampling_depth,
+            "confidence_ceiling": request.local_measurement.confidence_ceiling,
             "profile_scope": "local_body_tail_only",
             "image_count": image_count,
             "probe_budget": probe_budget,
-            "source_group_count": len(source_map_payload),
+            "source_group_count": source_probe["source_group_count_total"],
+            **source_probe,
             "fingerprint_sha256": fingerprint["fingerprint_sha256"],
+            "execution_plan_sha256": execution_plan["execution_plan_sha256"],
             "not_quality_or_utility": True,
             "normal_training_sources_modified": False,
         },
@@ -971,7 +1328,7 @@ def run_profile_request(
         min_bucket_reso=int(request.preset.expected_explicit["min_bucket_reso"]),
         max_bucket_reso=int(request.preset.expected_explicit["max_bucket_reso"]),
         bucket_reso_steps=int(request.preset.expected_explicit["bucket_reso_steps"]),
-        minimum_source_groups=request.preset.minimum_source_groups,
+        minimum_source_groups=request.local_measurement.minimum_source_groups,
     )
     preflight(request, source_dirs)
     output_base = validate_output_base(
@@ -983,12 +1340,23 @@ def run_profile_request(
         source_dirs,
         dataset_key=sanitize_profile_name(options.profile_name or request.output_name).casefold(),
     )
-    probe_budget = min(image_count, request.preset.max_images)
-    _validate_source_probe_capacity(
-        source_group_count=len(source_map_payload),
+    probe_budget = min(image_count, request.local_measurement.max_images)
+    source_map_payload = _apply_source_probe_selection(
+        source_map_payload,
         probe_budget=probe_budget,
     )
+    source_probe = _source_probe_selection_summary(source_map_payload)
     fingerprint = build_protocol_fingerprint(request, source_map_payload=source_map_payload)
+    execution_plan = build_execution_plan(
+        request,
+        image_count=image_count,
+        probe_budget=probe_budget,
+        source_group_count=source_probe["source_group_count_total"],
+        probed_source_group_count=source_probe["source_group_count_probed"],
+        source_group_selection_policy=source_probe[
+            "source_group_selection_policy"
+        ],
+    )
     run_dir = allocate_run_directory(
         output_base,
         options.profile_name or request.output_name,
@@ -1001,10 +1369,44 @@ def run_profile_request(
         source_map_payload=source_map_payload,
         image_count=image_count,
         probe_budget=probe_budget,
+        execution_plan=execution_plan,
     )
     launcher = Launcher(run_dir, dry_run=options.dry_run)
     launcher.log(f"DQ Profiler Beta run directory: {run_dir}")
     launcher.log("Scope: Local Body/Tail numerical Safety/Fidelity only; not quality or Utility")
+    work = execution_plan["work_volume"]
+    timing = execution_plan["reference_time_estimate"]["minutes"]
+    process_text = (
+        str(work["gpu_process_count"])
+        if work["gpu_process_count"] is not None
+        else f"{work['gpu_process_count_min']}-{work['gpu_process_count_max']}"
+    )
+    time_text = (
+        f"{timing['minimum']:.1f} min"
+        if timing["minimum"] == timing["maximum_if_all_edge_rounds_run"]
+        else (
+            f"{timing['minimum']:.1f}-"
+            f"{timing['maximum_if_all_edge_rounds_run']:.1f} min"
+        )
+    )
+    launcher.log(
+        "Execution plan: "
+        f"mode={request.execution_mode.name}, GPU processes={process_text}, "
+        f"warmup boundary={work['warmup_boundary_updates']} updates, "
+        f"prefix branch updates={work['prefix']['total_branch_updates']}, "
+        f"Local probes={work['local']['total_local_probes']}"
+    )
+    launcher.log(
+        "Source coverage: "
+        f"{source_probe['source_group_count_probed']}/"
+        f"{source_probe['source_group_count_total']} groups in the probe "
+        f"({source_probe['source_group_selection_policy']}); "
+        "the full inventory remains in the source contract"
+    )
+    launcher.log(
+        "Reference time estimate (not guaranteed): "
+        f"{time_text}; see execution_plan.json for assumptions"
+    )
     try:
         if options.preflight_only:
             update_status(
@@ -1025,7 +1427,7 @@ def run_profile_request(
                 source_map=run_dir / "source_group_map.json",
                 name=names["core_raw"],
                 protocol="v24-acceptance-local",
-                range_muls=request.preset.core_grid,
+                range_muls=request.execution_mode.core_grid,
                 max_images=probe_budget,
                 gate=gate,
             )
@@ -1067,10 +1469,14 @@ def run_profile_request(
             current_stage="complete",
             completed_at=datetime.now(timezone.utc).isoformat(),
             report="report.html",
+            beginner_report="beginner_report.html",
             technical_report="technical_report.html",
             active_profile=str(active_profile),
             active_analysis=str(active_analysis),
             measured_grid=list(measured_grid),
+            execution_mode=request.execution_mode.name,
+            qa_depth=request.execution_mode.qa_depth,
+            edge_policy=request.execution_mode.edge_policy,
             edge_extension_rounds=edge_rounds,
             edge_unresolved=bool(selection.get("edge_unresolved")),
             selection_valid=bool(selection.get("selection_valid")),
@@ -1080,6 +1486,7 @@ def run_profile_request(
         )
         report = run_dir / "report.html"
         launcher.log(f"Primary report: {report}")
+        launcher.log(f"Beginner report: {run_dir / 'beginner_report.html'}")
         launcher.log(f"Technical report: {run_dir / 'technical_report.html'}")
         if options.open_report and os.name == "nt":
             os.startfile(report)  # type: ignore[attr-defined]

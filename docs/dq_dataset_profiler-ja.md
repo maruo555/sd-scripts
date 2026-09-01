@@ -51,7 +51,7 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 - model、dataset TOML、各`image_dir`が存在する。
 - 学習loaderと同じ拡張子・大文字小文字規則および非再帰探索で、各`image_dir`直下に画像があり、dataset全体で8画像以上、独立した`image_dir`が4 group以上ある。
 - source-group prefixとworkerが返す画像keyを一致させるため、`image_dir`へ`.`／`..`のpath componentを含めず、どの階層にもsymlink、junctionなどのreparse pointを含めない。
-- すべての有効な`image_dir` groupをprobeへ最低1件ずつ含められることを確認する。group数が検証済みprobe上限を超える設定は、部分的なconfidenceを出さず開始前に拒否する。
+- 有効な`image_dir` groupの全inventoryをsource contractへ保存する。group数がprobe上限を超える場合は、TOMLの全source順序を均等に覆う決定的な部分集合をprobe対象とし、probe数／全group数とcoverageをレポートへ明示する。
 - `cache_latents`と両立しない`color_aug=true`または`random_crop=true`が、subset／dataset／`[general]`のfallback後に有効でないことを確認する。
 - DreamBooth loaderに必須の`resolution`が、datasetまたは`[general]`のfallback後に定義されていることを確認する。
 - TOMLの`[general]`／dataset／subset fallbackを解決し、batch・bucket設定（`bucket_no_upscale=false`を含む）が`canonical-v1`と一致することを確認する。
@@ -60,18 +60,22 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 - Git HEAD、ソースhash、preset、model内容のSHA-256、dataset、source inventoryからprotocol fingerprintを作る。
 - 各GPU workerの起動直前にmodel内容とsource inventoryを再度hash照合し、長い多段runの途中でmodel、画像、caption、cache sidecarが変化した場合は混在させず停止する。
 - repositoryに追跡済みの未コミット変更がある場合は、HEADとの差分全体もbinary diffとしてhash化する。未追跡ファイルは対象外と明記する。
-- 実画像数と`min(実画像数, 32)`であるprobe budgetを記録する。
+- 実画像数とmode別probe budgetに加え、全source group数、probe対象group数、決定的な選択規則を記録する。
 
 `--dq-profile-preflight`ではここまで実行し、GPU stageを起動しません。
+通常のpreflight／dry-runを含む全runで`execution_plan.json`も作り、GPU process数、
+warmup境界、Prefix update数、Local probe数、固定grid、参考時間の算出条件を記録します。
 
-### 3.2 量子化開始境界とSnapshot A/B
+### 3.2 量子化開始境界とsnapshot検算
 
 通常学習コードと同じ規則で`dq_delta_begin_step`を求め、量子化開始直前までno-quantで
 warmupします。`canonical-v1`では40 epoch相当の総stepと5% LR warmupから境界が決まります。
 
-同じ初期状態からSnapshot AとSnapshot Bを別processで作り、LoRA重み、optimizer、scheduler、
-GradScaler、Guardian、RNG、replay位置などのfingerprintを比較します。一致しなければ、mul比較を
-開始しません。
+`strict`は、同じ初期状態からSnapshot AとSnapshot Bを別processで作り、LoRA重み、optimizer、
+scheduler、GradScaler、Guardian、RNG、replay位置などのfingerprintを比較します。`standard`は
+Snapshot Aを1回だけ作り、後続のPrefix processが同じ境界を再現できたかを比較します。
+どちらも境界fingerprintが一致しなければmul比較を開始しません。Standardは専用のSnapshot Bを
+省くぶん速い一方、同じsnapshot-only stageを2回作る検算深度はStrictより低くなります。
 
 以下で時間例に使う小規模datasetは、通常学習が8,400 stepだったため、境界は
 `8,400 × 0.05 = 420 step`でした。
@@ -80,27 +84,25 @@ GradScaler、Guardian、RNG、replay位置などのfingerprintを比較します
 
 同じsnapshotから、no-quantとanchor候補`mul=3.15`について次を実行します。
 
-- 64-step run A
-- 64-step run B
-- 128-step run
+| execution mode | short A | short B | long | 比較checkpoint | 合計branch update |
+|---|---:|---:|---:|---|---:|
+| `standard` | 8 | 8 | 16 | `0, 1, 4, 8` | 64 |
+| `strict` | 64 | 64 | 128 | `0, 1, 32, 64` | 512 |
 
-計算量は概ね次の512 branch stepです。
-
-```text
-(no_quant + mul 3.15) × (64 + 64 + 128) = 512 branch steps
-```
-
-64Aと64B、および64Aと128-step runの先頭64 stepについて、sample、noise、timestep、
-dropout、量子化乱数、LR、skip、勾配、重み、optimizer stateを検査します。このstageは
-通常学習に近い経路を検査するためdropout有効です。prefix gateまたはsource contractが
-失敗した場合、Local計測へ進みません。
+各modeでA対B、およびA対long runの同じ先頭prefixを比較します。sample、noise、timestep、
+rank／network dropout、量子化乱数、Loss、LR、skip、勾配、LoRA重み、optimizer、scheduler、
+GradScaler、Guardian、replay cursorを検査します。このstageは通常学習に近い経路を検査するため
+dropout有効です。`standard`は短いsmoke QA、`strict`は環境変更・リリース前・
+再現性調査用のreference QAです。Standardは独立snapshot検算を1回減らします。同じ`PASS`でも深度が異なるため、`execution_mode`と
+`qa_depth`をJSONとレポートへ別々に記録します。prefix gateまたはsource contractが失敗した場合、
+Local計測へ進みません。
 
 ### 3.4 Local Body／Tail scan
 
 ここが製品レポートの診断本体です。optimizer更新を行わず、同じ画像、noise、timestepで
 no-quantと各固定mulの勾配を比較します。
 
-- 画像数: 8～32。32画像を超えてもprobe budgetは32。
+- 画像数: Standard／Strictとも8～32。上限を超えてもprobe budgetは増えない。
 - timestep: 4帯。
 - no-quant: 3 noise replicas。
 - 各mul: 2 noise replicas × 2 stochastic quant repeats。
@@ -108,12 +110,13 @@ no-quantと各固定mulの勾配を比較します。
 - dropoutを無効にした`structural_dropout_off` regimeで測る。
 - module単位の勾配を集約し、Body、Tail、hard-safety、source別の不確実性を作る。
 
-比較用branchの先頭replay windowは固定したままです。この固定windowにrepeat数の少ない
+比較用branchの先頭replay windowは固定したままです。この固定windowにprobe対象の
 `image_dir` groupが含まれなかった場合だけ、DataLoaderを最大2 epoch分追加走査します。
-不足groupを初めて含んだbatchだけをprobe用に保持し、全source groupを揃えてから画像を
-round-robin選択します。追加batchはbranchの128-step prefixへ混ぜないため、候補間比較の
-再現契約は変わりません。極端にrepeatが偏るdatasetでは、このcoverage走査ぶんだけ
-Local計測開始前の時間が増える場合があります。
+不足groupを初めて含んだbatchだけをprobe用に保持し、対象groupを揃えてから画像を
+round-robin選択します。group数が画像上限を超える場合、source inventory自体は省略せず、
+TOMLの先頭だけへ偏らない決定的な等間隔選択で対象groupを絞ります。追加batchはbranchの
+prefixへ混ぜないため、候補間比較の再現契約は変わりません。極端にrepeatが偏るdatasetでは、
+このcoverage走査ぶんだけLocal計測開始前の時間が増える場合があります。
 
 このLocal結果だけを通常レポートのSafety/Fidelityと候補削減に使用します。dropout有効の
 128-step Trajectoryは研究専用の別channelであり、現在の製品入口では実行しません。
@@ -129,29 +132,59 @@ total = I × 4 × (3 + 4M)
 各probeにはforward、backward、activation/gradient hook、module集計が含まれます。そのため、
 通常学習の単純な1 stepと完全に同じ費用ではありません。
 
-### 3.5 Bounded edge extension
+### 3.5 StandardとStrictの候補探索
 
-core gridは`2.70, 3.15, 3.45`です。候補集合が測定端に残る場合だけ、最大2段まで
-外側を追加します。下端側は`2.25`、なお未解決なら`1.80`、上端側は`3.75`、
+`standard`は`2.70, 3.15, 3.45, 3.75, 4.05`を1 processで一度だけ測ります。
+端点でも改善傾向が続く場合は`edge_unresolved`と表示しますが、範囲外を追跡しません。
+この場合、単一代表を出さず、Fidelity retained候補を1点へ自動縮約しません。
+
+Standard／Strictとも最大32画像、4 timestep帯、no-quant 3 replicas、candidate 2 noise ×
+2 quant repeatsを使うため、Local Body／Tailの物差しは共通です。独立source groupが画像上限を
+超えるdatasetも実行できますが、最大32群だけを決定的にprobeします。全groupはsource contractに
+残り、レポートには`probe / total`を表示します。未probe群がある結果は完全coverageと同一視しません。
+
+`strict`はcore grid `2.70, 3.15, 3.45`から開始します。候補集合が測定端に残る場合だけ、
+最大2段まで外側を追加します。下端側は`2.25`、なお未解決なら`1.80`、上端側は`3.75`、
 なお未解決なら`4.05`です。両端が残る場合は両方向を同じroundで追加します。
-
-現在のBeta実装は再現性を優先し、edge追加時に以前のmulも含む拡張grid全体を別processで
-再測定します。その後、共通mulの全probe行が以前のstageと一致することをexact parityで
-検査します。この再測定が現在の主要な時間増加要因です。
+edge追加時は以前のmulも含む拡張grid全体を別processで再測定し、共通mulの全probe行を
+exact parityで検査します。Strictの再測定は校正能力を高めますが、主要な時間増加要因です。
 
 ### 3.6 CPU解析とレポート
 
 最後にsource groupを等重みとするbootstrapを2,000回行い、Body、Tail、95%区間、
 Fidelity retained set、robust dominance、source LOOなどを作ります。`report.html`、
-`technical_report.html`、JSON、CSVへ保存します。
+`beginner_report.html`、`technical_report.html`、JSON、CSVへ保存します。
+
+`beginner_report.html`は最上部のMul affinity curveから読み始められる概要版です。
+Body／Tail／ヒゲ、候補の役割、Body × Tailマップ、5軸の性格カルテ、
+source／timestep偏りを短い説明付きで表示します。性格カルテの参照位置は、
+匿名化した固定Standard参照設定内での相対位置であり、良否の閾値や画質推薦には使いません。
+
+同じGPU測定済みCSVから、候補選択へ加点しない説明専用channelも作ります。
+
+- **Source localization**: candidateごとにsource等重みのq85／q90／q95を基準とし、
+  Tailの超過負担がどのsourceへ集中するか、上位source比率、実効source数、thresholdを
+  変えたときの安定性を記録します。最大負担sourceと、source LOOでTailが最も下がるsourceは
+  別々に表示します。高い集中率でも絶対Tailが小さい場合は、それだけで警告にしません。
+- **No-quant baseline profile**: candidate／quant repeat間で重複保存された同一no-quant参照を
+  probe単位にまとめ、勾配normのq05／median／q95／RMS、source別energy比、実効source数、
+  timestep別信号規模を記録します。収束、最終画質、rank、LR、epoch数は予測しません。
+- **Dataset character vector**: 絶対的な受容帯、mul応答、Tail増幅、source集中、no-quant信号を
+  独立した5 channelとして並べます。多数決や平均による単一スコアには変換しません。
+- **Image coverage**: probe画像数／dataset実画像数を表示します。32画像を超えるdatasetでは
+  未probe画像が残るため、説明値をdataset全体の完全観測とは扱いません。
+
+これらは`selector_input=false`、`not_quality_or_utility=true`として保存します。
+Fidelity retained set、Hard Safety、代表候補の決定規則は変えません。同じmodel、network、
+optimizer、precision契約のrun同士で比較するときのdataset体質記述に使用します。
 
 この実測例では各CPU解析は5～7秒程度で、HTML生成を含めても全時間への影響は
 小さいものでした。
 
 ### 3.7 13画像・8,400 step datasetの参考実測例
 
-同じPC・GPUにおけるproduction smoke runを基準にしています。対応する通常40 epoch学習は
-約1時間23分、この診断は約1時間28分02秒でした。
+同じPC・GPUにおけるStrict実測runを基準にしています。対応する通常40 epoch学習は
+約1時間23分、Strict診断は約1時間28分02秒でした。
 
 | stage | 目的 | 実測時間 | 全体比 |
 |---|---|---:|---:|
@@ -175,7 +208,7 @@ Fidelity retained set、robust dominance、source LOOなどを作ります。`re
 | 要因 | 時間への影響 |
 |---|---|
 | 通常学習相当の総step数 | 5% warmup境界が変わる。画像repeatやdataset設定が多いほど、各GPU stageの境界作成が長くなる |
-| 実画像数 | Local部分は8～32画像の範囲でほぼ比例する。32画像を超える分は直接増えない |
+| 実画像数 | Local部分はprobe上限までほぼ比例する。Standard／Strictとも最大32画像 |
 | bucket解像度 | 高解像度bucketが多いほど各forward/backwardが重くなる |
 | edge延長回数 | 0～2回。現在は拡張grid全体を再測定するため、もっとも大きな可変要因 |
 | GPU、precision、backend | 同じprotocolでも1 probe当たりの時間が変わる |
@@ -183,25 +216,33 @@ Fidelity retained set、robust dominance、source LOOなどを作ります。`re
 
 この実測例と同じGPU・似たbucket構成・似たwarmup step数なら、次が目安です。
 
-| edge延長 | 実測例を基準にした概算 |
-|---|---:|
-| なし | 約46分 |
-| 1回 | 約65分 |
-| 2回 | 約88分 |
+| mode | 実行内容 | 実測例を基準にした概算 |
+|---|---|---:|
+| Standard | snapshot 1回、8A／8B／16、固定5点を1回、edgeなし | 約33分（旧4-process実測からの概算） |
+| Strict（edgeなし） | 64A／64B／128、core 3点 | 約46分 |
+| Strict（edge 1回） | 上記＋拡張grid再測定1回 | 約65分 |
+| Strict（edge 2回） | 上記＋拡張grid再測定2回 | 約88分 |
+
+別の37画像、29,600 training-step相当、warmup境界1,480 stepのdatasetでは、旧4-process
+Standardが同じGPUで約1時間40分59秒でした。現Standardは最大32画像を維持したまま
+snapshot-only processを1回省くため、同条件では約1時間27～31分を見込みます。これはまだ
+現仕様での実測値ではなく、旧実測からsnapshot境界作成1回分を引いた概算です。このdatasetは
+上の13画像例よりwarmupとLocalの両方が重いため、絶対時間を直接比較しないでください。
 
 これは保証値ではありません。実行中は`status.json`の`current_stage`と`run.log`の
 `RUN`／`DONE`時刻で進行を確認してください。
 
-### 3.9 高速化と簡易モードの候補
+### 3.9 軽量化の境界
 
-現時点で`--quick`のような簡易診断モードは実装していません。精度を落とさずに最初に
-検討すべきなのは、edge延長時に新しいmulだけを測り、共通no-quant probeとsnapshot fingerprintで
-安全に統合する方法です。この実測例ではLocal 3 stageが合計約58分でしたが、5 mulを一度だけ
-測る時間は約23分だったため、最大約35分の削減余地があります。
+`standard`は、最大32画像、4 timestep帯、no-quant 3 replicas、candidate 2 noise × 2 quant repeatsを
+Strictと同じまま保ちます。短縮するのは専用Snapshot B、長いPrefix検算、edge再測定です。
+Snapshot Aと後続Prefix processの境界parityは維持するため、同じLocal物差しを短いQAで使う
+日常modeです。
 
-次の候補は完全snapshotの安全な再利用と、既に同一contractで検証済みの場合だけ使える
-`strict`／`verified-fast`の分離です。画像数、timestep帯、noise/quant repeatsを減らす方法は
-Tailの信頼性も同時に下げるため、最初の高速化手段にはしません。
+`strict`は独立Snapshot A/B、長いPrefix、bounded edge再測定を使うreference modeです。コード、
+CUDA、PyTorch、bitsandbytesの変更後、リリース前、またはStandardの結果が疑わしい場合に使います。
+旧16画像Quickはsamplingによる結果の揺れを避けるため新規CLIから廃止しました。既存Quick成果物の
+レポート表示互換性だけは維持します。
 
 ## 4. Mul affinity curveの読み方
 
@@ -260,10 +301,28 @@ d = sqrt(1 + norm_ratio^2 - 2 * norm_ratio * gradient_cosine)
 
 ## 5. レポートの候補集合
 
+### 表の記号
+
+「試したmulと役割」の記号は、すべて同じ意味の合格票ではありません。
+
+- 緑の`✓`: Hard-safetyを通過した候補
+- 青の`✓`: Fidelity retained setに残った候補
+- 橙の`注意`: Hard-safetyは通過したが、同じdataset内の他候補よりBody・Tailの摂動が強い候補
+- 紫の`★`: Body代表、Tail代表、または単一代表
+- `●`: その挙動分類に該当
+- 灰色の`—`: 非該当
+
+特に橙の`注意`は「学習結果や画質が悪い」という判定ではありません。no-quantからの勾配変形が
+候補内で相対的に強いため、穏やかな候補とは別枠で比較するとよい、という注意表示です。
+`✓`、`注意`、`★`はそれぞれ安全性・相対的な摂動・数値上の代表という別の役割を示します。
+
 ### Hard-safety pass
 
 NaN、Inf、極端なgradient explosion、optimizer stateの非finiteがなかった候補です。
 これは最低限の安全条件であり、画質保証ではありません。
+1件でも非finiteなgradient probeが出たmulは、その候補全体を数値比較から外して
+`Hard unsafe`として残します。他の有限なmulはbootstrapとHTML生成を継続するため、
+1候補の異常だけで診断全体を失敗させません。原因と非finite件数はsummary／候補カードへ保存します。
 
 ### Fidelity retained
 
@@ -296,9 +355,13 @@ BodyとTailが同じ候補を支持し、候補削減規則と矛盾しない場
 cd /d D:\work\sd-scripts
 
 python -m dq_profile ^
+  --dq-profile-mode=standard ^
   --pretrained_model_name_or_path="D:\models\sdxl_base.safetensors" ^
   --dataset_config="D:\datasets\example\dataset.toml"
 ```
+
+通常は既定の`standard`を使用します。コード、CUDA、PyTorch、bitsandbytesの変更後や、
+Standardの結果が疑わしい場合だけ`--dq-profile-mode=strict`へ切り替えます。
 
 診断名、出力先、完了後のレポート表示まで指定する推奨例です。
 
@@ -309,6 +372,7 @@ python -m dq_profile ^
   --dq-profile-name="example_dataset" ^
   --dq-profile-output-dir="D:\outputs\dq_diagnostics" ^
   --dq-profile-preset="canonical-v1" ^
+  --dq-profile-mode=standard ^
   --dq-profile-open-report ^
   --pretrained_model_name_or_path="D:\models\sdxl_base.safetensors" ^
   --dataset_config="D:\datasets\example\dataset.toml" ^
@@ -331,8 +395,9 @@ python -m dq_profile ^
 | `--dq-profile-name` | 任意 | `output_name` | datasetごとの親フォルダ名 |
 | `--dq-profile-output-dir` | 任意 | repositoryの`..\lora_output\dq_dataset_profiler` | 診断runを格納する基底ディレクトリ |
 | `--dq-profile-preset` | 任意 | `canonical-v1` | versioned互換性・計測契約。現在の対応presetは1つ |
+| `--dq-profile-mode` | 任意 | `standard` | `standard`: 最大32画像・snapshot 1回の日常診断、`strict`: 独立snapshot A/B・長いreference QA＋bounded edge再測定 |
 | `--dq-profile-preflight` | 任意 | false | パス、source、CLI契約、fingerprintまで作りGPUを起動しない |
-| `--dq-profile-dry-run` | 任意 | false | 解決済みCore commandを`dry_run_command.json`へ書き、GPUを起動しない |
+| `--dq-profile-dry-run` | 任意 | false | `execution_plan.json`と解決済みCore commandを書き、GPUを起動しない |
 | `--dq-profile-open-report` | 任意 | false | Windowsで正常完了した場合に`report.html`を開く |
 
 `resolution`はdataset sectionまたは`[general]`で指定してください（例: `resolution = 1024`）。`image_dir`はドライブ名またはUNCから始まる絶対パスで指定し、4つ以上の独立したsource groupを用意してください。`~`は学習loaderが展開しないため使用できません。子孫フォルダだけにある画像は通常のDreamBooth学習loaderから見えないため診断でも数えません。子フォルダを個別subsetとしてTOMLへ列挙するか、画像を`image_dir`直下へ配置してください。`num_repeats`は1以上が必要です。画像inventoryがworkerごとに変わり得る`cache_info=true`は現在のdiagnostic contractでは拒否します。
@@ -426,14 +491,12 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 現在の実測と同じ物差しではなくなります。既存presetの値を暗黙に変えず、別のversioned presetを
 追加し、snapshot／prefix／Local parityを検証してから使用します。
 
-### 6.4 `canonical-v1`が固定する診断設定
+### 6.4 Local測定契約
 
 | 項目 | 固定値・動作 |
 |---|---|
 | 製品scope | Local Body／Tail Safety/Fidelity。最終画質Utilityではない |
-| core mul grid | `2.70, 3.15, 3.45` |
-| edge extension | 端点が残った場合だけ下側`2.25 → 1.80`、上側`3.75 → 4.05`。最大2回 |
-| probe画像数 | `min(dataset実画像数, 32)`、最低8画像 |
+| probe画像数 | Standard／Strictとも`min(dataset実画像数, 32)`。最低8画像 |
 | timestep bins | `4` |
 | no-quant replicas | noise 3回 |
 | candidate replicas | noise 2回 × stochastic quant 2回 |
@@ -446,7 +509,32 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | CPU threads/process | `8` |
 | bootstrap | source単位、2,000回、固定seed |
 
-### 6.5 明示しても診断値へ置き換えるオプション
+### 6.5 execution modeごとのQA・候補探索契約
+
+| 項目 | `standard` | `strict` |
+|---|---|---|
+| 用途 | 日常の正式dataset診断 | コード／CUDA／PyTorch／bitsandbytes変更後、リリース前、再現性調査 |
+| 独立snapshot | 1回。Prefix processとの境界一致を検査 | A/Bの2回 |
+| Prefix | 8A／8B／16@8 | 64A／64B／128@64 |
+| state checkpoints | `0, 1, 4, 8` | `0, 1, 32, 64` |
+| Prefix branch updates | 64 | 512 |
+| Local画像上限 | 32 | 32 |
+| 最初のgrid | `2.70, 3.15, 3.45, 3.75, 4.05` | `2.70, 3.15, 3.45` |
+| edge extension | なし。端点傾向は未解決として表示 | 最大2 round、拡張gridを再測定してparity検査 |
+| GPU process数 | 3 | 4～6 |
+| QA表示 | `Standard smoke` | `Strict reference` |
+| confidence上限 | 通常 | 通常 |
+
+source groupがmodeの画像上限を超える場合もpreflightでは拒否しません。全inventoryをsource contractへ
+保持したまま、Standard／Strictは最大32群をTOML全域から決定的に選びます。
+`report.html`とsummaryには`source_group_count_probed`／`source_group_count_total`／coverage規則を
+残し、未probe群がある場合はLocal confidenceを過大評価しません。
+
+`--dq_profile_level=standard`は低レベルprotocol内部の別概念です。公開CLIの
+`--dq-profile-mode=standard`と混同しないよう、成果物には`execution_mode`、`qa_depth`、
+`internal_profile_level`を別フィールドで保存します。
+
+### 6.6 明示しても診断値へ置き換えるオプション
 
 次は過去の長い学習commandを受け取りやすくするためエラーにしませんが、診断にはそのまま
 使用しません。`resolved_args.json`へ`overridden_with_reason`として値と理由を保存します。
@@ -463,7 +551,7 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | `dq_delta_log_every`, `dq_delta_log_scope`, `dq_delta_log_mode` | protocolが記録頻度・範囲を管理 |
 | `dq_delta_log_error_parts` | Local protocol独自の誤差分解を使用 |
 
-### 6.6 拒否するオプション
+### 6.7 拒否するオプション
 
 | オプション | 拒否理由 |
 |---|---|
@@ -524,6 +612,7 @@ experimentalと明記する範囲:
   <profile_name>\
     <YYYYMMDD_HHMMSS>_<protocol fingerprint>\
       report.html
+      beginner_report.html
       technical_report.html
       summary.json
       status.json
@@ -535,15 +624,21 @@ experimentalと明記する範囲:
 最低限、次を保管します。
 
 - `report.html`: 通常利用向けの自己完結Local-onlyレポート
+- `beginner_report.html`: 結論から段階的に読める自己完結の概要レポート
 - `technical_report.html`: 解析詳細を残す技術レポート
 - `practical_report.json`と`report_contract.json`: 表示モデルと意味契約
 - `summary.json`
 - `resolved_args.json`
 - `protocol_fingerprint.json`
+- `execution_plan.json`: GPU process数、warmup、Prefix、Local probe数、非保証の参考時間
 - `dataset_config_snapshot.toml`
 - `source_manifest.json`と`candidate_definitions.json`
 - `status.json`
 - 候補・timestep・bootstrapのCSV
+- `source_localization.json/.csv`と`source_localization_detail.csv`: Tail負担のsource集中
+- `no_quant_baseline_profile.json`、`no_quant_source_load.csv`、
+  `no_quant_timestep_profile.csv`: no-quant短期勾配の規模と偏り
+- `dataset_character_vector.json`: 合成点を作らないdataset体質の5 channel
 - 実行ログ
 
 ### 第三者へ共有する前のプライバシーチェック

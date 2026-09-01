@@ -16,11 +16,14 @@ from dq_profile.production_runner import (
     ProductionRunOptions,
     _model_identity,
     allocate_run_directory,
+    build_execution_plan,
+    build_protocol_fingerprint,
     build_source_map,
     git_tracked_state,
     profile_command,
     promote_analysis,
     promote_profile_provenance,
+    run_local_pipeline,
     sanitize_profile_name,
     source_dirs_from_dataset_config,
     subprocess_text_environment,
@@ -45,9 +48,62 @@ def minimal_cli(*extra: str) -> list[str]:
 def test_minimal_cli_uses_versioned_preset_and_japanese_paths() -> None:
     request = resolve_training_cli(minimal_cli())
     assert request.preset.name == "canonical-v1"
+    assert request.local_measurement.name == "local-body-tail-v1"
+    assert request.execution_mode.name == "standard"
     assert request.dataset_config.name == "dataset.toml"
     assert request.output_name == "dataset"
     assert {row["action"] for row in request.dispositions} == {"consumed"}
+
+
+def test_standard_mode_keeps_the_shared_local_ruler_and_shortens_only_qa() -> None:
+    strict = resolve_training_cli(minimal_cli(), execution_mode_name="strict")
+    standard = resolve_training_cli(minimal_cli(), execution_mode_name="standard")
+    assert standard.preset.contract() == strict.preset.contract()
+    assert standard.local_measurement.contract() == strict.local_measurement.contract()
+    assert standard.execution_mode.core_grid == (2.70, 3.15, 3.45, 3.75, 4.05)
+    assert standard.execution_mode.prefix_checkpoints == (0, 1, 4, 8)
+    assert standard.execution_mode.prefix_branch_updates == 64
+    assert standard.execution_mode.max_edge_extension_rounds == 0
+    assert standard.execution_mode.standalone_snapshot_count == 1
+    assert standard.execution_mode.gpu_process_count_range == (3, 3)
+    assert strict.execution_mode.prefix_checkpoints == (0, 1, 32, 64)
+    assert strict.execution_mode.prefix_branch_updates == 512
+    assert strict.execution_mode.max_edge_extension_rounds == 2
+    assert strict.execution_mode.standalone_snapshot_count == 2
+    assert strict.execution_mode.gpu_process_count_range == (4, 6)
+
+
+def test_quick_mode_is_not_available_for_new_runs() -> None:
+    with pytest.raises(ValueError, match="supported: standard, strict"):
+        resolve_training_cli(minimal_cli(), execution_mode_name="quick")
+
+
+def test_cross_mode_fingerprints_split_shared_local_from_execution_qa(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset.toml"
+    dataset.write_text("[general]\nresolution=1024\n", encoding="utf-8")
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"model")
+    argv = [
+        f"--pretrained_model_name_or_path={model}",
+        f"--dataset_config={dataset}",
+    ]
+    strict = build_protocol_fingerprint(
+        resolve_training_cli(argv, execution_mode_name="strict"),
+        source_map_payload=({"source_group": "source-01"},),
+    )
+    standard = build_protocol_fingerprint(
+        resolve_training_cli(argv, execution_mode_name="standard"),
+        source_map_payload=({"source_group": "source-01"},),
+    )
+    strict_hashes = strict["contract_hashes"]
+    standard_hashes = standard["contract_hashes"]
+    assert strict_hashes["training_contract_sha256"] == standard_hashes["training_contract_sha256"]
+    assert strict_hashes["dataset_contract_sha256"] == standard_hashes["dataset_contract_sha256"]
+    assert strict_hashes["local_probe_contract_sha256"] == standard_hashes["local_probe_contract_sha256"]
+    assert strict_hashes["execution_qa_contract_sha256"] != standard_hashes["execution_qa_contract_sha256"]
+    assert strict["full_protocol_fingerprint_sha256"] != standard["full_protocol_fingerprint_sha256"]
 
 
 def test_full_legacy_style_cli_is_explicit_about_overrides() -> None:
@@ -282,16 +338,62 @@ def test_source_inventory_revalidation_detects_same_size_caption_change(
         validate_source_map_inventory(source_map)
 
 
-def test_source_probe_capacity_rejects_partial_group_coverage() -> None:
-    with pytest.raises(ValueError, match="source_groups=33 exceeds probe_budget=32"):
-        production_runner._validate_source_probe_capacity(
-            source_group_count=33,
-            probe_budget=32,
-        )
-    production_runner._validate_source_probe_capacity(
-        source_group_count=32,
+def test_source_probe_selection_spans_full_order_without_dropping_inventory() -> None:
+    payload = [
+        {
+            "pattern": f"C:/dataset/source-{index:02d}/",
+            "source_group": f"source-{index:02d}",
+            "match": "prefix",
+            "directory": f"C:/dataset/source-{index:02d}",
+            "files": [{"name": "image.png", "size": 5, "sha256": "a" * 64}],
+            "image_count": 1,
+        }
+        for index in range(57)
+    ]
+    selected = production_runner._apply_source_probe_selection(
+        payload,
         probe_budget=32,
     )
+    selected_rows = [row for row in selected if row["probe_selected"]]
+    assert len(selected) == 57
+    assert len(selected_rows) == 32
+    assert selected_rows[0]["source_group"] == "source-00"
+    assert selected_rows[-1]["source_group"] == "source-56"
+    assert [row["probe_selection_rank"] for row in selected_rows] == list(range(32))
+    assert all(
+        row["probe_selection_policy"]
+        == "deterministic_evenly_spaced_source_groups_v1"
+        for row in selected
+    )
+    assert production_runner._apply_source_probe_selection(
+        payload,
+        probe_budget=32,
+    ) == selected
+    summary = production_runner._source_probe_selection_summary(selected)
+    assert summary == {
+        "source_group_count_total": 57,
+        "source_group_count_probed": 32,
+        "source_group_count_omitted": 25,
+        "source_group_coverage_complete": False,
+        "source_group_coverage_fraction": pytest.approx(32 / 57),
+        "source_group_selection_policy": "deterministic_evenly_spaced_source_groups_v1",
+    }
+
+
+def test_source_probe_selection_marks_complete_coverage_when_budget_is_sufficient() -> None:
+    payload = [
+        {"pattern": f"source-{index}", "source_group": f"group-{index}"}
+        for index in range(4)
+    ]
+    selected = production_runner._apply_source_probe_selection(
+        payload,
+        probe_budget=16,
+    )
+    assert all(row["probe_selected"] for row in selected)
+    assert [row["probe_selection_rank"] for row in selected] == list(range(4))
+    assert production_runner._source_probe_selection_summary(selected)[
+        "source_group_coverage_complete"
+    ] is True
 
 
 def test_output_base_policy_and_unique_run_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -469,6 +571,33 @@ def test_profile_command_uses_request_paths_and_python_module(tmp_path: Path) ->
     assert "--dq_profile_protocol=v24-acceptance-local" in command
 
 
+def test_standard_profile_command_carries_distinct_execution_and_internal_levels(
+    tmp_path: Path,
+) -> None:
+    request = resolve_training_cli(
+        minimal_cli("--output_name=standard"),
+        execution_mode_name="standard",
+    )
+    command = profile_command(
+        request,
+        run_dir=tmp_path,
+        source_map=tmp_path / "source.json",
+        name="01_core",
+        protocol="v24-acceptance-local",
+        range_muls=request.execution_mode.core_grid,
+        max_images=request.local_measurement.max_images,
+    )
+    assert "--dq_profile_execution_mode=standard" in command
+    assert "--dq_profile_qa_depth=standard_smoke" in command
+    assert "--dq_profile_level=standard" in command
+    assert "--dq_profile_prefix_short_steps=8" in command
+    assert "--dq_profile_prefix_long_steps=16" in command
+    assert "--dq_profile_measurement_contract=local-body-tail-v1" in command
+    assert "--dq_profile_sampling_depth=reference_32_image" in command
+    assert "--dq_profile_max_images=32" in command
+    assert "--dq_profile_range_muls=2.70,3.15,3.45,3.75,4.05" in command
+
+
 def test_dry_run_serializes_the_required_prefix_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -498,7 +627,8 @@ def test_dry_run_serializes_the_required_prefix_gate(
             f"--pretrained_model_name_or_path={model}",
             f"--dataset_config={dataset}",
             "--output_name=dry-run",
-        ]
+        ],
+        execution_mode_name="standard",
     )
     monkeypatch.setattr(production_runner, "preflight", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -528,6 +658,122 @@ def test_dry_run_serializes_the_required_prefix_gate(
     )
     assert payload["requires_prefix_gate"] == str(expected_gate)
     assert f"--dq_profile_prefix_gate_file={expected_gate}" in payload["argv"]
+    plan = json.loads((result.run_dir / "execution_plan.json").read_text(encoding="utf-8"))
+    assert plan["execution_mode"] == "standard"
+    assert plan["qa_depth"] == "standard_smoke"
+    assert plan["work_volume"]["gpu_process_count"] == 3
+    assert plan["work_volume"]["standalone_snapshot_count"] == 1
+    assert plan["work_volume"]["prefix"]["total_branch_updates"] == 64
+    assert plan["work_volume"]["local"]["fixed_grid"] == [2.7, 3.15, 3.45, 3.75, 4.05]
+    assert plan["work_volume"]["local"]["total_local_probes"] == 736
+    assert plan["reference_time_estimate"]["is_guarantee"] is False
+
+
+def test_execution_plan_matches_the_known_13_image_standard_work_volume(
+    tmp_path: Path,
+) -> None:
+    source_dirs = []
+    for source_index, image_total in enumerate((4, 3, 3, 3)):
+        source = tmp_path / f"source-{source_index}"
+        source.mkdir()
+        for image_index in range(image_total):
+            (source / f"image-{image_index}.png").write_bytes(b"image")
+        source_dirs.append(source)
+    dataset = tmp_path / "dataset.toml"
+    dataset.write_text(
+        "[general]\n"
+        "resolution=1024\n"
+        "[[datasets]]\n"
+        + "".join(
+            "[[datasets.subsets]]\n"
+            + f"image_dir = {json.dumps(str(source))}\n"
+            + "num_repeats = 40\n"
+            for source in source_dirs
+        ),
+        encoding="utf-8",
+    )
+    request = resolve_training_cli(
+        [
+            f"--pretrained_model_name_or_path={tmp_path / 'model.safetensors'}",
+            f"--dataset_config={dataset}",
+        ],
+        execution_mode_name="standard",
+    )
+    plan = build_execution_plan(request, image_count=13, probe_budget=13)
+    work = plan["work_volume"]
+    assert work["warmup_boundary_updates"] == 1040
+    assert work["gpu_process_count"] == 3
+    assert work["standalone_snapshot_count"] == 1
+    assert work["total_warmup_updates"] == 3120
+    assert work["prefix"]["checkpoints"] == [0, 1, 4, 8]
+    assert work["prefix"]["total_branch_updates"] == 64
+    assert work["local"]["no_quant_probes"] == 156
+    assert work["local"]["candidate_probes"] == 1040
+    assert work["local"]["total_local_probes"] == 1196
+    assert plan["reference_time_estimate"]["minutes"]["minimum"] > 0
+
+def test_standard_pipeline_skips_the_redundant_second_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = resolve_training_cli(minimal_cli(), execution_mode_name="standard")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    profile_calls: list[tuple[str, bool]] = []
+    parity_calls: list[tuple[str, str, str]] = []
+
+    def fake_run_profile(_launcher, _request, **kwargs):
+        name = str(kwargs["name"])
+        profile_calls.append((name, bool(kwargs.get("snapshot_only"))))
+        output = run_dir / name
+        output.mkdir()
+        if name == production_runner.stage_names()["prefix"]:
+            (output / "calibration_gate.json").write_text("{}", encoding="utf-8")
+        return output
+
+    def fake_snapshot_parity(_launcher, left, right, output_name):
+        parity_calls.append((left.name, right.name, output_name))
+        return run_dir / output_name
+
+    def fake_analysis(_launcher, **kwargs):
+        output = run_dir / str(kwargs["output_name"])
+        output.mkdir()
+        (output / "local_selection.json").write_text(
+            json.dumps({"selection_valid": True}),
+            encoding="utf-8",
+        )
+        return output
+
+    class FakeLauncher:
+        dry_run = False
+
+        def __init__(self) -> None:
+            self.run_dir = run_dir
+
+        def run(self, _command, *, label: str) -> None:
+            assert label == "prefix/source contract gate"
+
+    monkeypatch.setattr(production_runner, "run_profile", fake_run_profile)
+    monkeypatch.setattr(production_runner, "run_snapshot_parity", fake_snapshot_parity)
+    monkeypatch.setattr(production_runner, "run_local_analysis", fake_analysis)
+    run_local_pipeline(
+        FakeLauncher(),
+        request,
+        source_map=tmp_path / "source-map.json",
+        probe_budget=32,
+        dataset_id="standard",
+    )
+    names = production_runner.stage_names()
+    assert profile_calls == [
+        (names["snapshot_a"], True),
+        (names["prefix"], False),
+        (names["core_raw"], False),
+    ]
+    assert parity_calls == [
+        (names["snapshot_a"], names["prefix"], names["prefix_snapshot_parity"])
+    ]
+    assert not (run_dir / names["snapshot_b"]).exists()
+    assert not (run_dir / names["snapshot_parity"]).exists()
 
 
 def test_product_artifacts_are_promoted_to_run_root(tmp_path: Path) -> None:
@@ -537,13 +783,20 @@ def test_product_artifacts_are_promoted_to_run_root(tmp_path: Path) -> None:
     run_dir.mkdir()
     analysis.mkdir()
     profile.mkdir()
-    for name in ("report.html", "technical_report.html", "summary.json", "practical_report.json"):
+    for name in (
+        "report.html",
+        "beginner_report.html",
+        "technical_report.html",
+        "summary.json",
+        "practical_report.json",
+    ):
         (analysis / name).write_text(name, encoding="utf-8")
     (profile / "source_manifest.json").write_text("{}", encoding="utf-8")
     (profile / "candidate_definitions.json").write_text("{}", encoding="utf-8")
     promoted = promote_analysis(run_dir, analysis)
     promoted.extend(promote_profile_provenance(run_dir, profile))
     assert (run_dir / "report.html").is_file()
+    assert (run_dir / "beginner_report.html").is_file()
     assert (run_dir / "source_manifest.json").is_file()
     assert "candidate_definitions.json" in promoted
 
@@ -568,12 +821,49 @@ def test_direct_module_entry_preserves_training_vector(monkeypatch: pytest.Monke
     assert captured["training_argv"] == training
     assert captured["kwargs"] == {
         "preset_name": "canonical-v1",
+        "execution_mode_name": "standard",
         "output_base": DEFAULT_OUTPUT_BASE,
         "profile_name": "test",
         "preflight_only": False,
         "dry_run": False,
         "open_report": False,
     }
+
+
+def test_direct_module_entry_selects_standard_execution_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_profile_mode(training_argv: list[str], **kwargs: object) -> int:
+        captured["training_argv"] = training_argv
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(production_main, "run_profile_mode", fake_run_profile_mode)
+    training = [
+        f"--dataset_config={DATASET}",
+        f"--pretrained_model_name_or_path={MODEL}",
+    ]
+    assert production_main.main(["--dq-profile-mode=standard", *training]) == 0
+    assert captured["training_argv"] == training
+    assert captured["kwargs"]["execution_mode_name"] == "standard"
+
+
+def test_direct_module_entry_rejects_removed_quick_mode(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    training = [
+        f"--dataset_config={DATASET}",
+        f"--pretrained_model_name_or_path={MODEL}",
+    ]
+    with pytest.raises(SystemExit) as error:
+        production_main.main(["--dq-profile-mode=quick", *training])
+    assert error.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "invalid choice" in stderr
+    assert "standard" in stderr
+    assert "strict" in stderr
 
 
 def test_profile_name_sanitization_is_windows_safe() -> None:

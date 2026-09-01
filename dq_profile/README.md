@@ -14,6 +14,7 @@ measurement settings, and output defaults to
 ```powershell
 python -m dq_profile `
   --dq-profile-name="example_dataset" `
+  --dq-profile-mode=standard `
   --pretrained_model_name_or_path="D:\models\sdxl_base.safetensors" `
   --dataset_config="D:\datasets\example\dataset.toml"
 ```
@@ -57,7 +58,21 @@ as if they were one package version:
 - runtime and prefix-gate artifacts use schema/metric `2.1.0`;
 - Local Body/Tail acceptance metrics use definition `2.4.0`;
 - the current practical-report model uses schema
-  `2.4.2-practical-report-prototype`.
+  `2.4.3-practical-report-beta`.
+
+The public execution modes share the same `canonical-v1` training preset and
+`local-body-tail-v1` measurement contract:
+
+- `standard`: daily-use 8A/8B/16@8 prefix smoke and one fixed five-point
+  Local scan (`2.70, 3.15, 3.45, 3.75, 4.05`), without edge remeasurement;
+- `strict`: 64A/64B/128@64 reference parity, a three-point core, and up to
+  two bounded edge-extension remeasurements.
+
+Both modes retain up to 32 images, four timestep bins, three no-quant noise
+replicas, and two candidate-noise by two stochastic-quant repeats. The mode,
+QA depth, shared Local contract hash, and execution-specific hash are recorded
+separately. Use Strict after code/runtime/backend changes or while investigating
+reproducibility; use Standard for ordinary dataset characterization.
 
 Role-specific constants name these layers. The older generic v2.1 constant
 names remain compatibility aliases so existing artifacts and readers keep the

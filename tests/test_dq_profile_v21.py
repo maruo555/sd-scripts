@@ -217,6 +217,32 @@ def test_prefix_pair_exact_numeric_and_control_failure():
     assert gate["passed"] is False
 
 
+def test_prefix_pair_accepts_standard_smoke_checkpoint_contract():
+    traces = [_trace_row(step) for step in range(8)]
+    checkpoints = (0, 1, 4, 8)
+    states = {
+        checkpoint: _state(float(checkpoint + 1), f"standard-{checkpoint}")
+        for checkpoint in checkpoints
+    }
+    rows, summary = evaluate_prefix_pair(
+        reference_rows=traces,
+        candidate_rows=[dict(row) for row in traces],
+        reference_states=states,
+        candidate_states=states,
+        comparison="8A_vs_16_at8",
+        candidate_name="mul_3.150",
+        required_checkpoints=checkpoints,
+    )
+    assert summary["status"] == "pass_exact"
+    assert summary["required_state_checkpoints"] == [0, 1, 4, 8]
+    assert {row["step"] for row in rows if row["record_type"] == "state"} == {
+        0,
+        1,
+        4,
+        8,
+    }
+
+
 def test_dropout_and_quant_digests_cover_sites_and_invocations_without_global_rng():
     context = ProfileQuantContext(39)
     context.begin_pass(

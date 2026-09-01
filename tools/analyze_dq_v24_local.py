@@ -21,6 +21,14 @@ from dq_profile.v24_acceptance import (
     analyze_local_profile,
     analyze_natural_gradient_rows,
 )
+from dq_profile.v24_descriptive import (
+    DESCRIPTIVE_METRIC_DEFINITION_VERSION,
+    DESCRIPTIVE_PROFILE_SCHEMA_VERSION,
+    analyze_no_quant_baseline,
+    analyze_source_localization,
+    build_dataset_character_vector,
+)
+from dq_profile.v24_beginner_report import render_beginner_report
 from dq_profile.v24_practical_report import (
     build_single_dataset_report_model,
     render_report as render_practical_report,
@@ -43,6 +51,14 @@ def _interval(low: Any, high: Any) -> str:
     return f"[{_number(low)}, {_number(high)}]"
 
 
+def _percent(value: Any, digits: int = 1) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{100.0 * number:.{digits}f}%" if math.isfinite(number) else "—"
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
@@ -56,6 +72,8 @@ def render_report(
     summary: dict[str, Any],
     rows: list[dict[str, Any]],
     natural: dict[str, Any],
+    source_localization: dict[str, Any],
+    no_quant_profile: dict[str, Any],
 ) -> str:
     selection = summary["selection"]
     table_rows: list[str] = []
@@ -73,8 +91,8 @@ def render_report(
             f"<td>{_number(row['symmetric_body'])} / {_number(row['symmetric_tail'])}</td>"
             f"<td>{_number(row['angle_body'])} / {_number(row['angle_tail'])}</td>"
             f"<td>{_number(row['gain_body'])} / {_number(row['gain_tail'])}</td>"
-            f"<td>{100*float(row['source_bootstrap_body_min_probability']):.1f}%</td>"
-            f"<td>{100*float(row['source_bootstrap_tail_min_probability']):.1f}%</td>"
+            f"<td>{_percent(row['source_bootstrap_body_min_probability'])}</td>"
+            f"<td>{_percent(row['source_bootstrap_tail_min_probability'])}</td>"
             f"<td>{'yes' if row['robustly_dominated'] else 'no'}</td>"
             f"<td>{'retain' if row['retained_for_formal'] else 'drop'}</td>"
             f"<td>{html.escape(roles)}</td>"
@@ -93,6 +111,19 @@ def render_report(
         else f"invalid: {html.escape(str(natural.get('invalid_reason')))}"
     )
     envelope = summary["core_grid_envelope"]
+    probed_sources = int(
+        summary.get("source_group_count_probed", summary["source_group_count"])
+    )
+    total_sources = int(
+        summary.get("source_group_count_total", probed_sources)
+    )
+    localization_reference = dict(
+        source_localization.get("reference_profile") or {}
+    )
+    no_quant_signal = dict(no_quant_profile.get("signal_strength") or {})
+    no_quant_load = dict(no_quant_profile.get("source_load") or {})
+    probed_images = int(summary.get("image_count_probed", summary["image_count"]))
+    total_images = int(summary.get("image_count_total", probed_images))
     return f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><title>DQ v2.4 Acceptance — {html.escape(summary['dataset_id'])}</title>
 <style>
@@ -106,7 +137,8 @@ code{{background:#f3f5f6;padding:2px 4px}}
 </style></head><body>
 <h1>DQ Profiler v2.4 — Local numerical acceptance</h1>
 <div class="grid">
-<div class="card"><b>Dataset</b><br>{html.escape(summary['dataset_id'])}<br>{summary['image_count']} images / {summary['source_group_count']} source groups</div>
+<div class="card"><b>Dataset</b><br>{html.escape(summary['dataset_id'])}<br>{summary['image_count']} images / {probed_sources} of {total_sources} source groups probed</div>
+<div class="card"><b>Execution mode</b><br>{html.escape(str(summary.get('execution_mode', 'strict')))}<br><b>QA depth</b>: {html.escape(str(summary.get('qa_depth', 'strict_reference')))}</div>
 <div class="card"><b>Phenotype (local only)</b><br>{html.escape(summary['local_phenotype'])}</div>
 <div class="card"><b>Credible set</b><br>{credible}<br><b>Formal selection</b>: {selected}</div>
 <div class="card"><b>Edge</b><br>{html.escape(selection['selection_status'])}<br>next local-only: {edge}</div>
@@ -115,8 +147,18 @@ code{{background:#f3f5f6;padding:2px 4px}}
 Bodyは通常範囲、Tailは最悪timestep帯、AはTail増幅です。候補はsource-cluster bootstrapでBody/Tailの両方が80%以上の確率でPareto劣位な場合だけ除外します。
 Trajectoryは128-step formalで別軸として測り、ここでは未測定です。</div>
 <div class="card info"><b>No-quant natural local baseline</b><br>{natural_text}<br>候補選択票には使いません。</div>
-<div class="card"><b>Common core envelope</b><br>grid {html.escape(str(envelope['grid']))}; max Body {_number(envelope['max_local_body'])}; max Tail {_number(envelope['max_local_tail'])}<br>
-P(all core Body&lt;1) {100*float(envelope['probability_all_core_body_below_anchor']):.1f}% / P(all core Tail&lt;1) {100*float(envelope['probability_all_core_tail_below_anchor']):.1f}%</div>
+<div class="grid">
+<div class="card info"><b>Source localization (descriptive only)</b><br>
+reference mul {_number(source_localization.get('reference_mul'), 2)}; top source {html.escape(str(localization_reference.get('top_source_alias', '—')))} / {_percent(localization_reference.get('top_source_share'))}; effective sources {_number(localization_reference.get('effective_source_count'), 2)}<br>
+絶対Tailが小さい場合の高集中率は、それだけで警告ではありません。</div>
+<div class="card info"><b>No-quant reference signal (descriptive only)</b><br>
+gradient norm q05 / median / q95 = {_number(no_quant_signal.get('grad_norm_q05'))} / {_number(no_quant_signal.get('grad_norm_median'))} / {_number(no_quant_signal.get('grad_norm_q95'))}<br>
+top source energy {_percent(no_quant_load.get('top_source_energy_share'))}; effective sources {_number(no_quant_load.get('effective_source_count'), 2)}</div>
+<div class="card"><b>Image coverage</b><br>{probed_images} / {total_images} images ({_percent(summary.get('image_coverage_fraction'))})<br>
+未probe画像がある場合、結果は測定subsetの記述です。</div>
+</div>
+  <div class="card"><b>Common core envelope</b><br>grid {html.escape(str(envelope['grid']))}; max Body {_number(envelope['max_local_body'])}; max Tail {_number(envelope['max_local_tail'])}<br>
+  P(all hard-safe core Body&lt;1) {_percent(envelope['probability_all_core_body_below_anchor'])} / P(all hard-safe core Tail&lt;1) {_percent(envelope['probability_all_core_tail_below_anchor'])}</div>
 <h2>候補別カルテ</h2>
 <table><thead><tr><th>mul</th><th>role</th><th>Body</th><th>Body CI</th><th>Tail</th><th>Tail CI</th><th>A</th><th>sym B/T</th><th>angle B/T</th><th>gain B/T</th><th>P body min</th><th>P tail min</th><th>dominated</th><th>formal</th><th>mandatory role</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table>
 <h2>読み方</h2><p><code>d=||g_mul-g_noquant||/||g_noquant||</code>を主距離として残し、対称距離・方向回転・gainを原因分解として併記します。1.0は元勾配と同程度の差という数学的anchorですが「失敗」を意味しません。edge未解決中は最良mulを確定しません。</p>
@@ -154,17 +196,24 @@ def main() -> int:
         tail_path = profile_dir / "gradient_tail.csv"
         natural_path = profile_dir / "local_natural_gradient.csv"
         manifest_path = profile_dir / "source_manifest.json"
+        probe_manifest_path = profile_dir / "probe_manifest.json"
         for path in (summary_path, tail_path, natural_path, manifest_path):
             if not path.is_file():
                 raise FileNotFoundError(f"required v2.4 local input is missing: {path}")
         raw_summary = _read_json(summary_path)
         source_manifest = _read_json(manifest_path)
+        probe_manifest = (
+            _read_json(probe_manifest_path)
+            if probe_manifest_path.is_file()
+            else {}
+        )
         source_contract = str(source_manifest.get("source_contract", {}).get("sha256", ""))
         if not source_contract:
             raise ValueError("local profile source_manifest has no source contract")
+        gradient_tail_rows = _read_csv(tail_path)
         result = analyze_local_profile(
             summary=raw_summary,
-            gradient_tail_rows=_read_csv(tail_path),
+            gradient_tail_rows=gradient_tail_rows,
             dataset_id=str(args.dataset_id),
             bootstrap_iterations=int(args.iterations),
             bootstrap_seed=int(args.seed),
@@ -175,7 +224,49 @@ def main() -> int:
             bootstrap_iterations=int(args.iterations),
             bootstrap_seed=int(args.seed) + 1,
         )
+        profile_metadata = dict(raw_summary.get("profile") or {})
         analysis_summary = result["summary"]
+        source_localization = analyze_source_localization(
+            gradient_tail_rows=gradient_tail_rows,
+            score_rows=result["score_rows"],
+            source_loo_rows=result["source_loo_rows"],
+        )
+        no_quant_profile = analyze_no_quant_baseline(
+            gradient_tail_rows=gradient_tail_rows,
+            natural_baseline=natural,
+            timestep_bins=int(raw_summary["profile"]["timestep_bins"]),
+        )
+        dataset_character_vector = build_dataset_character_vector(
+            score_rows=result["score_rows"],
+            local_phenotype=str(analysis_summary["local_phenotype"]),
+            source_localization=source_localization,
+            no_quant_baseline=no_quant_profile,
+        )
+        source_group_metadata = dict(
+            probe_manifest.get("source_group_map") or {}
+        )
+        probed_source_groups = int(
+            source_group_metadata.get(
+                "source_group_count_probed",
+                analysis_summary["source_group_count"],
+            )
+        )
+        total_source_groups = int(
+            source_group_metadata.get(
+                "source_group_count_total",
+                probed_source_groups,
+            )
+        )
+        raw_dataset = dict(raw_summary.get("dataset") or {})
+        probed_images = int(analysis_summary["image_count"])
+        total_images = int(
+            raw_dataset.get(
+                "unique_images",
+                raw_dataset.get("image_count", probed_images),
+            )
+        )
+        total_images = max(total_images, probed_images)
+        image_coverage_fraction = probed_images / max(total_images, 1)
         analysis_summary.update(
             {
                 "source_profile": str(profile_dir),
@@ -184,19 +275,115 @@ def main() -> int:
                 "local_gradient_tail_sha256": sha256_file(tail_path),
                 "local_natural_gradient_sha256": sha256_file(natural_path),
                 "no_quant_natural_local_baseline": natural,
+                "descriptive_profile_schema_version": DESCRIPTIVE_PROFILE_SCHEMA_VERSION,
+                "descriptive_metric_definition_version": DESCRIPTIVE_METRIC_DEFINITION_VERSION,
+                "source_localization": source_localization,
+                "no_quant_baseline_profile": no_quant_profile,
+                "dataset_character_vector": dataset_character_vector,
+                "image_count_probed": probed_images,
+                "image_count_total": total_images,
+                "image_coverage_fraction": image_coverage_fraction,
+                "image_coverage_complete": probed_images == total_images,
+                "unmeasured_image_risk": (
+                    "none_within_resolved_dataset"
+                    if probed_images == total_images
+                    else "descriptive_results_cover_only_the_measured_subset"
+                ),
+                "source_group_count": probed_source_groups,
+                "source_group_count_probed": probed_source_groups,
+                "source_group_count_total": total_source_groups,
+                "source_group_coverage_complete": bool(
+                    source_group_metadata.get(
+                        "source_group_coverage_complete",
+                        probed_source_groups == total_source_groups,
+                    )
+                ),
+                "source_group_coverage_fraction": float(
+                    source_group_metadata.get(
+                        "source_group_coverage_fraction",
+                        probed_source_groups / max(total_source_groups, 1),
+                    )
+                ),
+                "source_group_selection_policy": str(
+                    source_group_metadata.get(
+                        "source_group_selection_policy",
+                        "all_source_groups",
+                    )
+                ),
+                "execution_mode": str(
+                    profile_metadata.get("execution_mode", "strict")
+                ),
+                "qa_depth": str(
+                    profile_metadata.get("qa_depth", "strict_reference")
+                ),
+                "measurement_contract": str(
+                    profile_metadata.get(
+                        "measurement_contract", "local-body-tail-v1"
+                    )
+                ),
+                "sampling_depth": str(
+                    profile_metadata.get(
+                        "sampling_depth", "reference_32_image"
+                    )
+                ),
+                "confidence_ceiling": str(
+                    profile_metadata.get(
+                        "confidence_ceiling", "data_driven_up_to_high"
+                    )
+                ),
+                "internal_profile_level": str(
+                    profile_metadata.get(
+                        "internal_profile_level",
+                        profile_metadata.get("level", "standard"),
+                    )
+                ),
+                "prefix_short_steps": int(
+                    profile_metadata.get("prefix_short_steps", 64)
+                ),
+                "prefix_long_steps": int(
+                    profile_metadata.get("prefix_long_steps", 128)
+                ),
             }
         )
         write_json(output_dir / "acceptance_contract.json", result["contract"])
         write_json(output_dir / "summary.json", analysis_summary)
         write_json(output_dir / "natural_gradient_baseline.json", natural)
+        write_json(output_dir / "source_localization.json", source_localization)
+        write_json(output_dir / "no_quant_baseline_profile.json", no_quant_profile)
+        write_json(
+            output_dir / "dataset_character_vector.json",
+            dataset_character_vector,
+        )
         write_csv(output_dir / "local_acceptance.csv", result["score_rows"])
         write_csv(output_dir / "local_timestep.csv", result["timestep_rows"])
         write_csv(output_dir / "source_bootstrap.csv", result["bootstrap_rows"])
         write_csv(output_dir / "bootstrap_regret.csv", result["regret_rows"])
         write_csv(output_dir / "robust_dominance.csv", result["dominance_rows"])
         write_csv(output_dir / "source_loo.csv", result["source_loo_rows"])
+        write_csv(
+            output_dir / "source_localization.csv",
+            source_localization.get("summary_rows") or [],
+        )
+        write_csv(
+            output_dir / "source_localization_detail.csv",
+            source_localization.get("detail_rows") or [],
+        )
+        write_csv(
+            output_dir / "no_quant_source_load.csv",
+            no_quant_profile.get("source_rows") or [],
+        )
+        write_csv(
+            output_dir / "no_quant_timestep_profile.csv",
+            no_quant_profile.get("timestep_rows") or [],
+        )
         (output_dir / "technical_report.html").write_text(
-            render_report(analysis_summary, result["score_rows"], natural),
+            render_report(
+                analysis_summary,
+                result["score_rows"],
+                natural,
+                source_localization,
+                no_quant_profile,
+            ),
             encoding="utf-8",
         )
 
@@ -209,6 +396,11 @@ def main() -> int:
             "not_quality_or_utility": True,
             "source_contract_sha256": source_contract,
             "local_profile_protocol": "v24-acceptance-local",
+            "execution_mode": analysis_summary["execution_mode"],
+            "qa_depth": analysis_summary["qa_depth"],
+            "measurement_contract": analysis_summary["measurement_contract"],
+            "sampling_depth": analysis_summary["sampling_depth"],
+            "confidence_ceiling": analysis_summary["confidence_ceiling"],
             "local_profile_dir": str(profile_dir),
             "local_summary_path": str(summary_path),
             "local_summary_sha256": sha256_file(summary_path),
@@ -252,6 +444,9 @@ def main() -> int:
                 "source_loo_rows": result["source_loo_rows"],
                 "timestep_rows": result["timestep_rows"],
                 "natural_baseline": natural,
+                "source_localization": source_localization,
+                "no_quant_baseline_profile": no_quant_profile,
+                "dataset_character_vector": dataset_character_vector,
             },
             gate_rows=gate_rows,
             provenance={
@@ -268,6 +463,10 @@ def main() -> int:
             render_practical_report(practical_model),
             encoding="utf-8",
         )
+        (output_dir / "beginner_report.html").write_text(
+            render_beginner_report(practical_model),
+            encoding="utf-8",
+        )
         write_json(
             output_dir / "analysis_manifest.json",
             {
@@ -275,11 +474,27 @@ def main() -> int:
                 "metric_definition_version": METRIC_DEFINITION_VERSION,
                 "inputs": {
                     path.name: {"path": str(path), "sha256": sha256_file(path)}
-                    for path in (summary_path, tail_path, natural_path, manifest_path)
+                    for path in (
+                        summary_path,
+                        tail_path,
+                        natural_path,
+                        manifest_path,
+                        *(
+                            (probe_manifest_path,)
+                            if probe_manifest_path.is_file()
+                            else ()
+                        ),
+                    )
                 },
                 "source_contract_sha256": source_contract,
                 "selection_rule_sha256": rule_sha,
                 "acceptance_contract_sha256": analysis_summary["acceptance_contract_sha256"],
+                "descriptive_channels": {
+                    "schema_version": DESCRIPTIVE_PROFILE_SCHEMA_VERSION,
+                    "metric_definition_version": DESCRIPTIVE_METRIC_DEFINITION_VERSION,
+                    "selector_input": False,
+                    "not_quality_or_utility": True,
+                },
                 "reports": {
                     "primary": {
                         "path": str(output_dir / "report.html"),
@@ -289,6 +504,11 @@ def main() -> int:
                     "technical": {
                         "path": str(output_dir / "technical_report.html"),
                         "sha256": sha256_file(output_dir / "technical_report.html"),
+                    },
+                    "beginner": {
+                        "path": str(output_dir / "beginner_report.html"),
+                        "sha256": sha256_file(output_dir / "beginner_report.html"),
+                        "scope": "single_dataset_beginner_overview",
                     },
                     "contract": {
                         "path": str(output_dir / "report_contract.json"),
@@ -307,6 +527,7 @@ def main() -> int:
                 "selection_valid": selection["selection_valid"],
                 "edge_unresolved": selection["edge_unresolved"],
                 "primary_report": "report.html",
+                "beginner_report": "beginner_report.html",
                 "technical_report": "technical_report.html",
                 "report_scope": "single_dataset_local_only",
                 "trajectory_product_role": "research_only_keep_product_local_only",

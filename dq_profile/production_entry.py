@@ -16,13 +16,18 @@ def run_profile_mode(
     training_argv: Sequence[str],
     *,
     preset_name: str = "canonical-v1",
+    execution_mode_name: str = "standard",
     output_base: Path = DEFAULT_OUTPUT_BASE,
     profile_name: str | None = None,
     preflight_only: bool = False,
     dry_run: bool = False,
     open_report: bool = False,
 ) -> int:
-    request = resolve_training_cli(training_argv, preset_name=preset_name)
+    request = resolve_training_cli(
+        training_argv,
+        preset_name=preset_name,
+        execution_mode_name=execution_mode_name,
+    )
     result = run_profile_request(
         request,
         ProductionRunOptions(

@@ -237,6 +237,32 @@ def test_hard_safety_candidate_is_never_selected() -> None:
     assert result["selection"]["utility"] == "unknown"
 
 
+def test_nonfinite_candidate_is_hard_unsafe_while_other_candidates_complete() -> None:
+    summary, rows = _fixture(
+        {2.70: 0.55, 3.15: 0.35, 3.45: 0.75}
+    )
+    bad = next(row for row in rows if row["candidate"] == "mul_3.150")
+    bad["grad_norm_candidate"] = float("nan")
+    result = _analyze((summary, rows), iterations=60, seed=57)
+
+    score_by_mul = {row["range_mul"]: row for row in result["score_rows"]}
+    unsafe = score_by_mul[3.15]
+    assert unsafe["hard_safety_pass"] is False
+    assert unsafe["invalid_reason"] == "candidate_nonfinite_probe_measurement"
+    assert unsafe["nonfinite_sample_count"] == 1
+    assert unsafe["nonfinite_fields"] == ["grad_norm_candidate"]
+    assert unsafe["local_body"] is None
+    assert unsafe["retained_for_formal"] is False
+    assert score_by_mul[2.70]["local_body"] is not None
+    assert score_by_mul[3.45]["local_tail"] is not None
+    assert 3.15 not in result["selection"]["credible_muls"]
+    assert result["selection"]["hard_unsafe_candidates"] == ["mul_3.150"]
+    assert result["summary"]["nonfinite_event_count"] == 1
+    assert {
+        row["candidate"] for row in result["bootstrap_rows"]
+    } == {"mul_2.700", "mul_3.450"}
+
+
 def test_no_quant_natural_gradient_baseline_uses_source_clusters() -> None:
     rows = []
     for image in range(13):
@@ -272,4 +298,33 @@ def test_no_quant_natural_gradient_baseline_uses_source_clusters() -> None:
     assert result["source_group_count"] == 6
     assert result["pair_count"] == 13 * 4 * 3
     assert result["local_tail"] >= result["local_body"]
+    assert result["selector_input"] is False
+
+
+def test_nonfinite_natural_gradient_invalidates_only_descriptive_baseline() -> None:
+    row = {
+        "image_key": "image-00",
+        "source_group": "source-00",
+        "timestep_bin": 0,
+        "noise_replica_a": 0,
+        "noise_replica_b": 1,
+        "grad_norm_a": 1.0,
+        "grad_norm_b": float("nan"),
+        "grad_diff_norm": float("nan"),
+        "gradient_cosine": float("nan"),
+        "relative_gradient_distance_a_to_b": float("nan"),
+        "symmetric_gradient_distance": float("nan"),
+        "angular_gradient_distance": 2.0,
+        "gradient_gain_distance": float("nan"),
+        "gradient_topology_matches": True,
+    }
+    result = analyze_natural_gradient_rows(
+        [row],
+        timestep_bins=4,
+        bootstrap_iterations=20,
+        bootstrap_seed=61,
+    )
+    assert result["valid"] is False
+    assert result["invalid_reason"] == "nonfinite_natural_gradient_measurement"
+    assert result["nonfinite_event_count"] == 1
     assert result["selector_input"] is False

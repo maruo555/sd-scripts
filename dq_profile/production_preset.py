@@ -4,50 +4,30 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-PRESET_SCHEMA_VERSION = "1.0"
+PRESET_SCHEMA_VERSION = "2.0"
+LOCAL_MEASUREMENT_SCHEMA_VERSION = "1.1"
+EXECUTION_MODE_SCHEMA_VERSION = "1.2"
 
 
 @dataclass(frozen=True)
-class DiagnosticPreset:
+class TrainingPreset:
     name: str
-    metric_definition_version: str
     description: str
     expected_explicit: Mapping[str, Any]
     ignored_explicit: Mapping[str, str]
     unsupported_explicit: Mapping[str, str]
     training_tokens: tuple[str, ...]
-    core_grid: tuple[float, ...]
-    max_images: int
-    timestep_bins: int
-    stochastic_repeats: int
-    sweep_steps: int
-    branch_repeats: int
-    sketch_width: int
-    sketch_seeds: int
-    max_edge_extension_rounds: int
-    minimum_source_groups: int
     num_cpu_threads_per_process: int
 
     def contract(self) -> dict[str, Any]:
         return {
             "schema_version": PRESET_SCHEMA_VERSION,
             "name": self.name,
-            "metric_definition_version": self.metric_definition_version,
             "description": self.description,
             "expected_explicit": dict(self.expected_explicit),
             "ignored_explicit": dict(self.ignored_explicit),
             "unsupported_explicit": dict(self.unsupported_explicit),
             "training_tokens": list(self.training_tokens),
-            "core_grid": list(self.core_grid),
-            "max_images": self.max_images,
-            "timestep_bins": self.timestep_bins,
-            "stochastic_repeats": self.stochastic_repeats,
-            "sweep_steps": self.sweep_steps,
-            "branch_repeats": self.branch_repeats,
-            "sketch_width": self.sketch_width,
-            "sketch_seeds": self.sketch_seeds,
-            "max_edge_extension_rounds": self.max_edge_extension_rounds,
-            "minimum_source_groups": self.minimum_source_groups,
             "num_processes": 1,
             "num_machines": 1,
             "num_cpu_threads_per_process": self.num_cpu_threads_per_process,
@@ -57,9 +37,116 @@ class DiagnosticPreset:
         }
 
 
-CANONICAL_V1 = DiagnosticPreset(
+@dataclass(frozen=True)
+class LocalMeasurementContract:
+    """The Body/Tail ruler shared by every production execution mode."""
+
+    name: str
+    metric_definition_version: str
+    max_images: int
+    timestep_bins: int
+    stochastic_repeats: int
+    no_quant_noise_replicas: int
+    candidate_noise_replicas: int
+    stochastic_quant_repeats: int
+    sweep_steps: int
+    branch_repeats: int
+    sketch_width: int
+    sketch_seeds: int
+    minimum_source_groups: int
+    bootstrap_iterations: int
+    bootstrap_seed: int
+    sampling_depth: str
+    confidence_ceiling: str
+
+    def contract(self) -> dict[str, Any]:
+        return {
+            "schema_version": LOCAL_MEASUREMENT_SCHEMA_VERSION,
+            "name": self.name,
+            "metric_definition_version": self.metric_definition_version,
+            "max_images": self.max_images,
+            "timestep_bins": self.timestep_bins,
+            "stochastic_repeats": self.stochastic_repeats,
+            "no_quant_noise_replicas": self.no_quant_noise_replicas,
+            "candidate_noise_replicas": self.candidate_noise_replicas,
+            "stochastic_quant_repeats": self.stochastic_quant_repeats,
+            "sweep_steps": self.sweep_steps,
+            "branch_repeats": self.branch_repeats,
+            "sketch_width": self.sketch_width,
+            "sketch_seeds": self.sketch_seeds,
+            "minimum_source_groups": self.minimum_source_groups,
+            "bootstrap_iterations": self.bootstrap_iterations,
+            "bootstrap_seed": self.bootstrap_seed,
+            "sampling_depth": self.sampling_depth,
+            "confidence_ceiling": self.confidence_ceiling,
+            "probe_regime": "structural_dropout_off",
+            "diagnostic_target": "numerical_gradient_acceptance_by_fixed_range_mul",
+            "not_quality_or_utility": True,
+        }
+
+
+@dataclass(frozen=True)
+class ExecutionMode:
+    """Production orchestration and QA depth, not the low-level profile level."""
+
+    name: str
+    description: str
+    qa_depth: str
+    core_grid: tuple[float, ...]
+    max_edge_extension_rounds: int
+    edge_policy: str
+    prefix_short_steps: int
+    prefix_long_steps: int
+    local_measurement_name: str = "local-body-tail-v1"
+    standalone_snapshot_count: int = 2
+    prefix_anchor_mul: float = 3.15
+    snapshot_a_max_images: int = 8
+    internal_profile_level: str = "standard"
+
+    def __post_init__(self) -> None:
+        if self.standalone_snapshot_count not in {1, 2}:
+            raise ValueError("standalone_snapshot_count must be 1 or 2")
+
+    @property
+    def prefix_checkpoints(self) -> tuple[int, ...]:
+        return tuple(sorted({0, 1, self.prefix_short_steps // 2, self.prefix_short_steps}))
+
+    @property
+    def prefix_branch_updates(self) -> int:
+        return 2 * (self.prefix_short_steps * 2 + self.prefix_long_steps)
+
+    @property
+    def gpu_process_count_range(self) -> tuple[int, int]:
+        base = self.standalone_snapshot_count + 2
+        return base, base + self.max_edge_extension_rounds
+
+    def contract(self) -> dict[str, Any]:
+        minimum_processes, maximum_processes = self.gpu_process_count_range
+        return {
+            "schema_version": EXECUTION_MODE_SCHEMA_VERSION,
+            "name": self.name,
+            "description": self.description,
+            "qa_depth": self.qa_depth,
+            "core_grid": list(self.core_grid),
+            "max_edge_extension_rounds": self.max_edge_extension_rounds,
+            "edge_policy": self.edge_policy,
+            "prefix_anchor_mul": self.prefix_anchor_mul,
+            "prefix_short_steps": self.prefix_short_steps,
+            "prefix_long_steps": self.prefix_long_steps,
+            "prefix_checkpoints": list(self.prefix_checkpoints),
+            "prefix_branch_updates": self.prefix_branch_updates,
+            "local_measurement_name": self.local_measurement_name,
+            "standalone_snapshot_count": self.standalone_snapshot_count,
+            "snapshot_replica_count": self.standalone_snapshot_count,
+            "snapshot_a_max_images": self.snapshot_a_max_images,
+            "internal_profile_level": self.internal_profile_level,
+            "gpu_process_count_min": minimum_processes,
+            "gpu_process_count_max": maximum_processes,
+        }
+
+
+CANONICAL_V1 = TrainingPreset(
     name="canonical-v1",
-    metric_definition_version="2.4.0",
     description=(
         "Validated SDXL rank-4 Local Body/Tail preset. This is a numerical "
         "Safety/Fidelity diagnostic, not a quality or Utility predictor."
@@ -201,26 +288,94 @@ CANONICAL_V1 = DiagnosticPreset(
         "--rank_log",
         "--rank_log_mode=per_module",
     ),
-    core_grid=(2.70, 3.15, 3.45),
-    max_images=32,
-    timestep_bins=4,
-    stochastic_repeats=2,
-    sweep_steps=128,
-    branch_repeats=5,
-    sketch_width=512,
-    sketch_seeds=2,
-    max_edge_extension_rounds=2,
-    minimum_source_groups=4,
     num_cpu_threads_per_process=8,
 )
 
 
+LOCAL_BODY_TAIL_V1 = LocalMeasurementContract(
+    name="local-body-tail-v1",
+    metric_definition_version="2.4.0",
+    max_images=32,
+    timestep_bins=4,
+    stochastic_repeats=2,
+    no_quant_noise_replicas=3,
+    candidate_noise_replicas=2,
+    stochastic_quant_repeats=2,
+    sweep_steps=128,
+    branch_repeats=5,
+    sketch_width=512,
+    sketch_seeds=2,
+    minimum_source_groups=4,
+    bootstrap_iterations=2000,
+    bootstrap_seed=2401,
+    sampling_depth="reference_32_image",
+    confidence_ceiling="data_driven_up_to_high",
+)
+
+
+STRICT_MODE = ExecutionMode(
+    name="strict",
+    description="Reference-depth QA with long prefix parity and bounded edge extension.",
+    qa_depth="strict_reference",
+    core_grid=(2.70, 3.15, 3.45),
+    max_edge_extension_rounds=2,
+    edge_policy="bounded_dynamic_full_grid_remeasurement",
+    prefix_short_steps=64,
+    prefix_long_steps=128,
+)
+
+
+STANDARD_MODE = ExecutionMode(
+    name="standard",
+    description=(
+        "Daily-use QA with short prefix parity, one standalone snapshot, and one "
+        "fixed five-point Local scan."
+    ),
+    qa_depth="standard_smoke",
+    core_grid=(2.70, 3.15, 3.45, 3.75, 4.05),
+    max_edge_extension_rounds=0,
+    edge_policy="fixed_tested_envelope_no_extension",
+    prefix_short_steps=8,
+    prefix_long_steps=16,
+    standalone_snapshot_count=1,
+)
+
+
 PRESETS = {CANONICAL_V1.name: CANONICAL_V1}
+LOCAL_MEASUREMENT_CONTRACTS = {
+    LOCAL_BODY_TAIL_V1.name: LOCAL_BODY_TAIL_V1,
+}
+EXECUTION_MODES = {
+    STANDARD_MODE.name: STANDARD_MODE,
+    STRICT_MODE.name: STRICT_MODE,
+}
 
 
-def get_preset(name: str) -> DiagnosticPreset:
+def get_preset(name: str) -> TrainingPreset:
     try:
         return PRESETS[name]
     except KeyError as error:
         supported = ", ".join(sorted(PRESETS))
         raise ValueError(f"unknown DQ profile preset {name!r}; supported: {supported}") from error
+
+
+def get_local_measurement_contract(name: str = "local-body-tail-v1") -> LocalMeasurementContract:
+    try:
+        return LOCAL_MEASUREMENT_CONTRACTS[name]
+    except KeyError as error:
+        supported = ", ".join(sorted(LOCAL_MEASUREMENT_CONTRACTS))
+        raise ValueError(
+            f"unknown Local measurement contract {name!r}; supported: {supported}"
+        ) from error
+
+
+def get_execution_mode(name: str) -> ExecutionMode:
+    try:
+        return EXECUTION_MODES[name]
+    except KeyError as error:
+        supported = ", ".join(sorted(EXECUTION_MODES))
+        raise ValueError(f"unknown DQ profile execution mode {name!r}; supported: {supported}") from error
+
+
+# Compatibility for callers that imported the old type name.
+DiagnosticPreset = TrainingPreset

@@ -144,6 +144,9 @@ def test_fidelity_gauge_is_descriptive_worst_channel() -> None:
         contract["affinity_curve_scale"]["mode"]
         == "fixed_primary_with_dataset_auto_zoom"
     )
+    assert contract["execution_mode"]["supported_new_runs"] == ["standard", "strict"]
+    assert "legacy_quick" in contract["execution_mode"]
+    assert contract["execution_mode"]["sampling_depth_field"] == "sampling_depth"
 
 
 def test_absolute_perturbation_is_independent_of_relative_rank() -> None:
@@ -211,13 +214,16 @@ def test_dataset_card_keeps_local_only_and_edge_uncertainty() -> None:
     assert by_mul[3.15]["overall_fidelity_gauge"] is None
     assert "TRAJECTORY_NOT_MEASURED" in by_mul[3.15]["reason_codes"]
     assert card["measurement_quality"]["level"] == "PASS"
+    assert card["execution_mode"] == "strict"
+    assert card["qa_depth"] == "strict_reference"
     assert card["local_comparison_confidence"]["level"] == "Medium"
     assert card["recommendation_maturity"]["level"] == "Local-only"
     assert card["single_representative_mul"] is None
     assert card["representative_selection_state"] == "no_single_edge_unresolved"
     assert card["actions"]["minimum_comparison_set"] == [
         "no_quant",
-        "mul 3.15（観測上のBody／Tail代表）",
+        "mul 3.15（Fidelity retained）",
+        "mul 3.45（Fidelity retained）",
     ]
     assert card["not_quality_or_utility"] is True
 
@@ -243,6 +249,129 @@ def test_single_dataset_report_is_local_only_and_hides_trajectory_from_selection
     html = render_report(model)
     assert "dataset-selector is-single" in html
     assert "Safety/Fidelity ≠ Utility" in html
+    assert "Strict reference" in html
+    assert "v2.4.3 practical report beta" in html
+    assert 'href="beginner_report.html"' in html
+
+
+def test_legacy_quick_report_exposes_reduced_sampling_and_confidence_ceiling() -> None:
+    rows = [
+        _candidate(2.70, 1.2, 1.3, dominated_by=3.15),
+        _candidate(3.15, 0.7, 0.8),
+        _candidate(3.45, 0.8, 0.9),
+    ]
+    detail = _detail()
+    detail["summary"].update(
+        {
+            "execution_mode": "quick",
+            "qa_depth": "quick_smoke",
+            "measurement_contract": "local-body-tail-quick-v1",
+            "sampling_depth": "reduced_16_image",
+            "confidence_ceiling": "reduced_descriptive",
+        }
+    )
+    model = build_single_dataset_report_model(
+        dataset_id="SYN",
+        candidate_rows=rows,
+        detail=detail,
+    )
+    dataset = model["datasets"][0]
+    assert dataset["execution_mode"] == "quick"
+    assert dataset["qa_depth"] == "quick_smoke"
+    assert dataset["measurement_contract"] == "local-body-tail-quick-v1"
+    assert dataset["sampling_depth"] == "reduced_16_image"
+    assert dataset["confidence_ceiling"] == "reduced_descriptive"
+    assert any(
+        "最大16画像" in reason
+        for reason in dataset["local_comparison_confidence"]["reasons"]
+    )
+    html = render_report(model)
+    assert "Quick smoke" in html
+    assert "Reduced (max 16 images)" in html
+    assert "local-body-tail-quick-v1" in html
+
+
+def test_partial_source_coverage_is_visible_and_caps_high_confidence() -> None:
+    rows = [
+        _candidate(2.70, 1.2, 1.3, dominated_by=3.15),
+        _candidate(3.15, 0.7, 0.8),
+        _candidate(3.45, 0.8, 0.9),
+    ]
+    detail = _detail()
+    detail["summary"].update(
+        {
+            "source_group_count": 32,
+            "source_group_count_probed": 32,
+            "source_group_count_total": 57,
+            "source_group_coverage_complete": False,
+            "source_group_coverage_fraction": 32 / 57,
+            "source_group_selection_policy": (
+                "deterministic_evenly_spaced_source_groups_v1"
+            ),
+        }
+    )
+    model = build_single_dataset_report_model(
+        dataset_id="SYN",
+        candidate_rows=rows,
+        detail=detail,
+    )
+    dataset = model["datasets"][0]
+    assert dataset["source_group_count_probed"] == 32
+    assert dataset["source_group_count_total"] == 57
+    assert dataset["source_group_coverage_complete"] is False
+    assert dataset["local_comparison_confidence"]["level"] == "Medium"
+    assert any(
+        "57群のうち32群" in reason
+        for reason in dataset["local_comparison_confidence"]["reasons"]
+    )
+    html = render_report(model)
+    assert "32 / 57" in html
+
+
+def test_hard_unsafe_candidate_with_null_metrics_still_renders() -> None:
+    rows = [
+        _candidate(2.70, 0.8, 0.9),
+        _candidate(3.15, 0.7, 0.8),
+        _candidate(3.45, 0.9, 1.0),
+    ]
+    unsafe = rows[1]
+    unsafe.update(
+        {
+            "hard_safety_pass": False,
+            "invalid_reason": "candidate_nonfinite_probe_measurement",
+            "nonfinite_sample_count": 1,
+            "local_body": None,
+            "local_body_ci_low": None,
+            "local_body_ci_high": None,
+            "local_tail": None,
+            "local_tail_ci_low": None,
+            "local_tail_ci_high": None,
+            "tail_amplification": None,
+        }
+    )
+    detail = _detail()
+    detail["selection"].update(
+        {
+            "credible_muls": [2.70, 3.45],
+            "point_body_min_candidate": "mul_2.700",
+            "point_tail_min_candidate": "mul_2.700",
+        }
+    )
+    model = build_single_dataset_report_model(
+        dataset_id="SYN",
+        candidate_rows=rows,
+        detail=detail,
+    )
+    card = next(
+        item
+        for item in model["datasets"][0]["candidate_cards"]
+        if item["range_mul"] == 3.15
+    )
+    assert card["absolute_perturbation"] == "hard_unsafe"
+    assert card["invalid_reason"] == "candidate_nonfinite_probe_measurement"
+    assert "candidate_nonfinite_probe_measurement" in card["explanation_ja"]
+    assert "Hard unsafe" in render_report(model)
+
 
 def test_all_retained_candidates_do_not_force_a_single_representative() -> None:
     rows = [
@@ -305,7 +434,7 @@ def test_edge_unresolved_with_one_retained_candidate_still_abstains() -> None:
     assert card["representative_selection_state"] == "no_single_edge_unresolved"
     assert card["actions"]["minimum_comparison_set"] == [
         "no_quant",
-        "mul 3.45（観測上のBody／Tail代表）",
+        "mul 3.45（Fidelity retained）",
     ]
 
 
@@ -396,7 +525,11 @@ def test_rendered_report_states_scope_and_does_not_force_overall() -> None:
     assert "試したmulと役割" in rendered
     assert "Hard-safety pass" in rendered
     assert "Fidelity retained" in rendered
-    assert '<span class="matrix-mark on" aria-label="該当">○</span>' in rendered
+    assert 'class="matrix-mark pass"' in rendered
+    assert 'class="matrix-mark retained"' in rendered
+    assert 'class="matrix-mark attention"' in rendered
+    assert 'class="matrix-mark representative"' in rendered
+    assert "すべてが同じ意味の「合格」ではなく" in rendered
     assert '<article id="dataset-SYN" class="view dataset-view">' in rendered
     assert '<section id="overview" class="view" hidden>' in rendered
     assert "dataset-selector is-single" in rendered

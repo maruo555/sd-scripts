@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from dq_profile.production_preset import DiagnosticPreset, get_preset
+from dq_profile.production_preset import (
+    ExecutionMode,
+    LocalMeasurementContract,
+    TrainingPreset,
+    get_execution_mode,
+    get_local_measurement_contract,
+    get_preset,
+)
 
 
 SENSITIVE_NAME = re.compile(r"(?:token|secret|password|api[_-]?key)", re.IGNORECASE)
@@ -41,7 +48,9 @@ class ProfileCompatibilityError(ValueError):
 
 @dataclass(frozen=True)
 class ResolvedProfileRequest:
-    preset: DiagnosticPreset
+    preset: TrainingPreset
+    local_measurement: LocalMeasurementContract
+    execution_mode: ExecutionMode
     model_path: Path
     dataset_config: Path
     output_name: str
@@ -53,6 +62,10 @@ class ResolvedProfileRequest:
         return {
             "schema_version": "1.0",
             "preset": self.preset.name,
+            "local_measurement_contract": self.local_measurement.contract(),
+            "execution_mode": self.execution_mode.contract(),
+            "qa_depth": self.execution_mode.qa_depth,
+            "internal_profile_level": self.execution_mode.internal_profile_level,
             "pretrained_model_name_or_path": str(self.model_path),
             "dataset_config": str(self.dataset_config),
             "output_name": self.output_name,
@@ -153,8 +166,13 @@ def resolve_training_cli(
     argv: Sequence[str],
     *,
     preset_name: str = "canonical-v1",
+    execution_mode_name: str = "standard",
 ) -> ResolvedProfileRequest:
     preset = get_preset(preset_name)
+    execution_mode = get_execution_mode(execution_mode_name)
+    local_measurement = get_local_measurement_contract(
+        execution_mode.local_measurement_name
+    )
     parser = _training_parser()
     namespace, unknown = parser.parse_known_args(list(argv))
     issues: list[CompatibilityIssue] = []
@@ -263,6 +281,8 @@ def resolve_training_cli(
     normal_output_dir = Path(str(raw_output_dir)).expanduser().resolve() if raw_output_dir else None
     return ResolvedProfileRequest(
         preset=preset,
+        local_measurement=local_measurement,
+        execution_mode=execution_mode,
         model_path=model_path,
         dataset_config=dataset_config,
         output_name=output_name,

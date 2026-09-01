@@ -15,13 +15,13 @@ import math
 from typing import Any, Mapping, Sequence
 
 
-PRACTICAL_REPORT_SCHEMA_VERSION = "2.4.2-practical-report-prototype"
+PRACTICAL_REPORT_SCHEMA_VERSION = "2.4.4-practical-report-beta"
 LOCAL_ACCEPTANCE_METRIC_VERSION = "2.4.0"
 
 # Compatibility aliases retained for existing report readers.
 SCHEMA_VERSION = PRACTICAL_REPORT_SCHEMA_VERSION
 METRIC_DEFINITION_VERSION = LOCAL_ACCEPTANCE_METRIC_VERSION
-REPORT_CONTRACT_VERSION = "1.2.0-prototype"
+REPORT_CONTRACT_VERSION = "1.4.0-beta"
 ABSOLUTE_REFERENCE_DISTANCE = 1.0
 AFFINITY_FIXED_Y_MAX = 4.0
 AFFINITY_SCALE_CALIBRATION = {
@@ -195,6 +195,31 @@ def report_contract() -> dict[str, Any]:
             "natural_baseline": (
                 "scale context only; never used as selector evidence"
             ),
+            "source_localization": (
+                "descriptive Tail localization only; never used as selector evidence"
+            ),
+            "dataset_character_vector": (
+                "independent descriptive channels with no composite score"
+            ),
+        },
+        "execution_mode": {
+            "field": "execution_mode",
+            "qa_depth_field": "qa_depth",
+            "internal_profile_level_field": "internal_profile_level",
+            "measurement_contract_field": "measurement_contract",
+            "sampling_depth_field": "sampling_depth",
+            "confidence_ceiling_field": "confidence_ceiling",
+            "supported_new_runs": ["standard", "strict"],
+            "legacy_quick": (
+                "read-only report compatibility for historical reduced-sampling "
+                "Quick artifacts; Quick is not selectable for new runs"
+            ),
+            "standard": (
+                "daily fixed-grid run with short prefix smoke and one standalone "
+                "snapshot"
+            ),
+            "strict": "reference-depth run with long prefix and bounded edge extension",
+            "mode_is_not_internal_profile_level": True,
         },
         "relative_statuses": [
             "near_best_plateau",
@@ -410,6 +435,8 @@ def _local_comparison_confidence(
     loo: Mapping[str, Any] | None,
     detailed_bootstrap: bool,
     absolute_norm_available: bool,
+    source_group_count_total: int | None = None,
+    source_group_coverage_complete: bool = True,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     loo_consistencies = [
@@ -445,6 +472,14 @@ def _local_comparison_confidence(
         reasons.append("測定範囲の端が未解決です")
     if not absolute_norm_available:
         reasons.append("旧runでは絶対gradient normが未記録です")
+    if not source_group_coverage_complete:
+        total = int(source_group_count_total or source_count)
+        if level == "High":
+            level = "Medium"
+        reasons.append(
+            f"全source group {total}群のうち{source_count}群を"
+            "決定的に部分抽出しており、未probe群があります"
+        )
     return {
         "level": level,
         "reasons": reasons,
@@ -542,7 +577,11 @@ def _candidate_explanation(card: Mapping[str, Any]) -> str:
     mul = float(card["range_mul"])
     parts: list[str] = []
     if absolute == "hard_unsafe":
-        return f"mul {mul:.2f}はhard safetyを通過していないため、数値比較の対象外です。"
+        reason = str(card.get("invalid_reason") or "hard_safety_failed")
+        return (
+            f"mul {mul:.2f}はhard safetyを通過していないため、"
+            f"数値比較の対象外です（{reason}）。"
+        )
     if absolute == "unmeasurable":
         parts.append("BodyまたはTailが未測定のため、絶対的な摂動量を分類できません。")
     elif absolute == "high_perturbation":
@@ -685,6 +724,10 @@ def build_dataset_card(
             "range_mul": _candidate_mul(row),
             "grid_role": str(row.get("grid_role", "measured")),
             "hard_safety_pass": hard_safety_pass,
+            "invalid_reason": str(row.get("invalid_reason") or "") or None,
+            "nonfinite_sample_count": int(
+                _optional_float(row.get("nonfinite_sample_count")) or 0
+            ),
             "body": body,
             "body_ci_low": _optional_float(row.get("local_body_ci_low")),
             "body_ci_high": _optional_float(row.get("local_body_ci_high")),
@@ -772,17 +815,88 @@ def build_dataset_card(
         if gates_required
         else None
     )
+    detail_summary = dict(detail.get("summary") or {})
+    execution_mode = str(detail_summary.get("execution_mode", "strict"))
+    qa_depth = str(detail_summary.get("qa_depth", "strict_reference"))
+    measurement_contract = str(
+        detail_summary.get("measurement_contract", "local-body-tail-v1")
+    )
+    sampling_depth = str(
+        detail_summary.get("sampling_depth", "reference_32_image")
+    )
+    confidence_ceiling = str(
+        detail_summary.get(
+            "confidence_ceiling", "data_driven_up_to_high"
+        )
+    )
+    internal_profile_level = str(
+        detail_summary.get("internal_profile_level", "standard")
+    )
     source_count = int(
-        detail.get("summary", {}).get(
+        detail_summary.get(
             "source_group_count",
             evaluation.get("source_group_count", 0),
         )
     )
+    source_group_count_total = int(
+        detail_summary.get("source_group_count_total", source_count)
+    )
+    source_group_coverage_complete = _as_bool(
+        detail_summary.get(
+            "source_group_coverage_complete",
+            source_count == source_group_count_total,
+        )
+    )
+    source_group_coverage_fraction = _optional_float(
+        detail_summary.get("source_group_coverage_fraction")
+    )
+    if source_group_coverage_fraction is None:
+        source_group_coverage_fraction = source_count / max(
+            source_group_count_total, 1
+        )
+    source_group_selection_policy = str(
+        detail_summary.get(
+            "source_group_selection_policy",
+            "all_source_groups",
+        )
+    )
     image_count = int(
-        detail.get("summary", {}).get(
+        detail_summary.get(
             "image_count",
             evaluation.get("image_count", 0),
         )
+    )
+    image_count_probed = int(
+        detail_summary.get("image_count_probed", image_count)
+    )
+    image_count_total = int(
+        detail_summary.get("image_count_total", image_count_probed)
+    )
+    image_coverage_fraction = _optional_float(
+        detail_summary.get("image_coverage_fraction")
+    )
+    if image_coverage_fraction is None:
+        image_coverage_fraction = image_count_probed / max(image_count_total, 1)
+    image_coverage_complete = _as_bool(
+        detail_summary.get(
+            "image_coverage_complete",
+            image_count_probed == image_count_total,
+        )
+    )
+    source_localization = dict(
+        detail.get("source_localization")
+        or detail_summary.get("source_localization")
+        or {}
+    )
+    no_quant_baseline_profile = dict(
+        detail.get("no_quant_baseline_profile")
+        or detail_summary.get("no_quant_baseline_profile")
+        or {}
+    )
+    dataset_character_vector = dict(
+        detail.get("dataset_character_vector")
+        or detail_summary.get("dataset_character_vector")
+        or {}
     )
     absolute_norm_available = _as_bool(
         evaluation.get("absolute_gradient_norm_available", True)
@@ -798,13 +912,21 @@ def build_dataset_card(
         loo=loo,
         detailed_bootstrap=bool(bootstrap_rows),
         absolute_norm_available=absolute_norm_available,
+        source_group_count_total=source_group_count_total,
+        source_group_coverage_complete=source_group_coverage_complete,
     )
+    if confidence_ceiling == "reduced_descriptive":
+        if local_comparison_confidence["level"] == "High":
+            local_comparison_confidence["level"] = "Medium"
+        local_comparison_confidence["reasons"].append(
+            "旧Quick成果物は最大16画像の縮小samplingであり、現Standardと同じ証拠量ではありません"
+        )
     recommendation_maturity = _recommendation_maturity(
         trajectory_available=trajectory_available,
         edge_unresolved=edge_unresolved,
     )
     phenotype = str(
-        detail.get("summary", {}).get(
+        detail_summary.get(
             "local_phenotype",
             evaluation.get("phenotype", "unknown"),
         )
@@ -899,6 +1021,14 @@ def build_dataset_card(
         if stronger_perturbation
         else None
     )
+    preset_nearest_reference = (
+        min(
+            hard_safety_pass_candidates,
+            key=lambda card: (abs(card["range_mul"] - 3.205), card["range_mul"]),
+        )
+        if hard_safety_pass_candidates
+        else None
+    )
     absolute_levels = {
         card["absolute_perturbation"] for card in hard_safety_pass_candidates
     }
@@ -945,9 +1075,13 @@ def build_dataset_card(
             "no_quant",
             f"mul {single_representative['range_mul']:.2f}（暫定代表）",
         ]
+    elif representative_selection_state == "no_single_edge_unresolved":
+        minimum_comparison_set = ["no_quant"] + [
+            f"mul {card['range_mul']:.2f}（Fidelity retained）"
+            for card in fidelity_retained
+        ]
     elif (
-        representative_selection_state
-        in {"no_single_body_tail_tradeoff", "no_single_edge_unresolved"}
+        representative_selection_state == "no_single_body_tail_tradeoff"
         and body_representative
         and tail_representative
     ):
@@ -1012,9 +1146,24 @@ def build_dataset_card(
             if detail
             else "common_core_summary_only"
         ),
+        "execution_mode": execution_mode,
+        "qa_depth": qa_depth,
+        "measurement_contract": measurement_contract,
+        "sampling_depth": sampling_depth,
+        "confidence_ceiling": confidence_ceiling,
+        "internal_profile_level": internal_profile_level,
         "metric_definition_version": METRIC_DEFINITION_VERSION,
         "source_group_count": source_count,
+        "source_group_count_probed": source_count,
+        "source_group_count_total": source_group_count_total,
+        "source_group_coverage_complete": source_group_coverage_complete,
+        "source_group_coverage_fraction": source_group_coverage_fraction,
+        "source_group_selection_policy": source_group_selection_policy,
         "image_count": image_count,
+        "image_count_probed": image_count_probed,
+        "image_count_total": image_count_total,
+        "image_coverage_fraction": image_coverage_fraction,
+        "image_coverage_complete": image_coverage_complete,
         "candidate_grid": [card["range_mul"] for card in cards],
         "candidate_count": len(cards),
         "hard_safety_pass_count": len(hard_safety_pass_candidates),
@@ -1072,8 +1221,16 @@ def build_dataset_card(
             if stronger_representative
             else None
         ),
+        "preset_nearest_reference_mul": (
+            preset_nearest_reference["range_mul"]
+            if preset_nearest_reference
+            else None
+        ),
         "actions": actions,
         "natural_baseline": natural,
+        "source_localization": source_localization,
+        "no_quant_baseline_profile": no_quant_baseline_profile,
+        "dataset_character_vector": dataset_character_vector,
         "pairwise": pairwise,
         "source_loo": loo,
         "timestep_rows": list(detail.get("timestep_rows") or []),
@@ -1286,11 +1443,25 @@ def _curve_svg(
     def sy(value: float) -> float:
         return top + plot_h - min(value, y_max) / y_max * plot_h
 
-    def line_points(key: str) -> str:
-        return " ".join(
-            f"{sx(float(card['range_mul'])):.1f},{sy(float(card[key])):.1f}"
-            for card in cards
-            if _optional_float(card.get(key)) is not None
+    def line_segments(key: str, color: str) -> str:
+        segments: list[list[str]] = []
+        current: list[str] = []
+        for card in cards:
+            value = _optional_float(card.get(key))
+            if value is None:
+                if current:
+                    segments.append(current)
+                    current = []
+                continue
+            current.append(
+                f"{sx(float(card['range_mul'])):.1f},{sy(value):.1f}"
+            )
+        if current:
+            segments.append(current)
+        return "".join(
+            f'<polyline points="{" ".join(segment)}" fill="none" '
+            f'stroke="{color}" stroke-width="3"/>'
+            for segment in segments
         )
 
     body_errors = []
@@ -1326,6 +1497,20 @@ def _curve_svg(
         f'y1="{top}" y2="{top+plot_h}" stroke="#7c3aed" stroke-width="2" stroke-dasharray="5 5"/>'
         for card in cards
         if card.get("edge_endpoint")
+    ]
+    unsafe_markers = [
+        (
+            f'<g><line x1="{sx(float(card["range_mul"]))-5:.1f}" '
+            f'x2="{sx(float(card["range_mul"]))+5:.1f}" y1="{top+plot_h/2-5:.1f}" '
+            f'y2="{top+plot_h/2+5:.1f}" stroke="#991b1b" stroke-width="2"/>'
+            f'<line x1="{sx(float(card["range_mul"]))-5:.1f}" '
+            f'x2="{sx(float(card["range_mul"]))+5:.1f}" y1="{top+plot_h/2+5:.1f}" '
+            f'y2="{top+plot_h/2-5:.1f}" stroke="#991b1b" stroke-width="2">'
+            f'<title>mul {float(card["range_mul"]):.2f}: Hard unsafe / 数値比較対象外</title>'
+            "</line></g>"
+        )
+        for card in cards
+        if not card.get("hard_safety_pass")
     ]
     overflow_markers = []
     for card in cards:
@@ -1402,11 +1587,12 @@ def _curve_svg(
   {reference_line}
   {''.join(preset_lines)}
   {''.join(edge_lines)}
+  {''.join(unsafe_markers)}
   {''.join(overflow_markers)}
   {''.join(body_errors)}
   {''.join(tail_errors)}
-  <polyline points="{line_points('body')}" fill="none" stroke="#2563eb" stroke-width="3"/>
-  <polyline points="{line_points('tail')}" fill="none" stroke="#d97706" stroke-width="3"/>
+  {line_segments('body', '#2563eb')}
+  {line_segments('tail', '#d97706')}
   {''.join(f'<circle cx="{sx(float(card["range_mul"])):.1f}" cy="{sy(float(card["body"])):.1f}" r="4" fill="#2563eb"/>' for card in cards if card.get("body") is not None)}
   {''.join(f'<rect x="{sx(float(card["range_mul"]))-4:.1f}" y="{sy(float(card["tail"]))-4:.1f}" width="8" height="8" fill="#d97706"/>' for card in cards if card.get("tail") is not None)}
   {''.join(x_ticks)}
@@ -1577,10 +1763,22 @@ def _candidate_table(dataset: Mapping[str, Any]) -> str:
     return "".join(rows)
 
 
-def _mark(active: bool) -> str:
-    if active:
-        return '<span class="matrix-mark on" aria-label="該当">○</span>'
-    return '<span class="matrix-mark off" aria-label="非該当">—</span>'
+def _mark(active: bool, *, kind: str = "pattern") -> str:
+    if not active:
+        return '<span class="matrix-mark off" aria-label="非該当">—</span>'
+    symbol, label = {
+        "pass": ("✓", "安全確認を通過"),
+        "retained": ("✓", "候補集合に保持"),
+        "attention": ("注意", "注意が必要な特徴に該当"),
+        "danger": ("!", "要確認の状態に該当"),
+        "representative": ("★", "数値上の代表"),
+        "pattern": ("●", "診断パターンに該当"),
+    }.get(kind, ("●", "診断パターンに該当"))
+    return (
+        f'<span class="matrix-mark {html.escape(kind)}" '
+        f'aria-label="{html.escape(label)}" title="{html.escape(label)}">'
+        f"{html.escape(symbol)}</span>"
+    )
 
 
 def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
@@ -1607,6 +1805,7 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
             "全候補が低摂動",
             "全候補でBody・Tailとも基準1.0未満。",
             "全測定mul",
+            "pattern",
         ),
         (
             "all_tail_attention",
@@ -1614,6 +1813,7 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
             "全候補でTail注意",
             "通常域のBodyは1未満だが、厳しいtimestep帯のTailは1以上。",
             "全測定mul",
+            "attention",
         ),
         (
             "all_high_perturbation",
@@ -1621,6 +1821,7 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
             "全候補が高摂動",
             "全候補でBodyが基準1.0以上。",
             "全測定mul",
+            "attention",
         ),
         (
             "mixed_absolute_response",
@@ -1628,6 +1829,7 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
             "mulにより摂動帯が変化",
             "mulを変えると低摂動・Tail注意・高摂動の帯をまたぐ。",
             mixed_detail,
+            "pattern",
         ),
         (
             "includes_hard_unsafe",
@@ -1635,17 +1837,19 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
             "Hard unsafeを含む",
             "nonfinite、強制安全停止など、数値比較より前の問題を含む。",
             _mul_list(unsafe_muls),
+            "danger",
         ),
         (
             "relatively_stronger",
             "相対",
-            "候補内でより強い摂動あり",
-            "hard-safeだが、同じdataset内でBody・Tailの両方が明瞭に大きい候補がある。",
+            "候補内でより強い摂動あり（注意）",
+            "Hard-safetyは通過しているが、同じdataset内の他候補よりBody・Tailの両方が明瞭に大きい。",
             _mul_list(dataset["relatively_stronger_muls"]),
+            "attention",
         ),
     ]
     rows = []
-    for code, channel, label, meaning, relevant in definitions:
+    for code, channel, label, meaning, relevant, mark_kind in definitions:
         active = (
             bool(dataset["relatively_stronger_muls"])
             if code == "relatively_stronger"
@@ -1653,7 +1857,7 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
         )
         rows.append(
             "<tr>"
-            f'<td class="mark-cell">{_mark(active)}</td>'
+            f'<td class="mark-cell">{_mark(active, kind=mark_kind)}</td>'
             f"<td>{html.escape(channel)}</td>"
             f"<th scope=\"row\">{html.escape(label)}</th>"
             f"<td>{html.escape(meaning)}</td>"
@@ -1681,16 +1885,19 @@ def _candidate_role_matrix(dataset: Mapping[str, Any]) -> str:
             "Hard-safety pass",
             "nonfinite等の安全停止なし",
             hard_safe,
+            "pass",
         ),
         (
             "Fidelity retained",
             "候補内比較で明瞭には除外されない",
             set(float(value) for value in dataset["fidelity_retained_muls"]),
+            "retained",
         ),
         (
-            "候補内でより強い摂動",
-            "hard-safeだが相対的にBody/Tailが強い",
+            "候補内でより強い摂動（注意）",
+            "Hard-safetyは通過。ただし他候補よりno_quantから離れる",
             set(float(value) for value in dataset["relatively_stronger_muls"]),
+            "attention",
         ),
         (
             "Body代表",
@@ -1700,6 +1907,7 @@ def _candidate_role_matrix(dataset: Mapping[str, Any]) -> str:
                 if dataset["body_representative_mul"] is not None
                 else set()
             ),
+            "representative",
         ),
         (
             "Tail代表",
@@ -1709,6 +1917,7 @@ def _candidate_role_matrix(dataset: Mapping[str, Any]) -> str:
                 if dataset["tail_representative_mul"] is not None
                 else set()
             ),
+            "representative",
         ),
         (
             "単一代表",
@@ -1718,13 +1927,14 @@ def _candidate_role_matrix(dataset: Mapping[str, Any]) -> str:
                 if dataset["single_representative_mul"] is not None
                 else set()
             ),
+            "representative",
         ),
     ]
     header = "".join(f"<th>mul<br>{mul:.2f}</th>" for mul in muls)
     rows = []
-    for label, meaning, active_muls in role_rows:
+    for label, meaning, active_muls, mark_kind in role_rows:
         cells = "".join(
-            f'<td class="mark-cell">{_mark(any(_same_mul(mul, active) for active in active_muls))}</td>'
+            f'<td class="mark-cell">{_mark(any(_same_mul(mul, active) for active in active_muls), kind=mark_kind)}</td>'
             for mul in muls
         )
         rows.append(
@@ -1735,27 +1945,34 @@ def _candidate_role_matrix(dataset: Mapping[str, Any]) -> str:
         '<div class="table-wrap"><table class="role-matrix">'
         f'<thead><tr><th>役割</th>{header}</tr></thead>'
         f'<tbody>{"".join(rows)}</tbody></table></div>'
-        '<p class="micro">○ = 該当、— = 非該当。○がない行は「選べなかった」という診断結果です。</p>'
+        '<div class="matrix-legend">'
+        f'<span>{_mark(True, kind="pass")} 安全確認を通過</span>'
+        f'<span>{_mark(True, kind="retained")} 候補集合に保持</span>'
+        f'<span>{_mark(True, kind="attention")} 安全だが相対的に強い摂動</span>'
+        f'<span>{_mark(True, kind="representative")} 数値上の代表</span>'
+        '<span>— 非該当</span></div>'
+        '<p class="micro"><strong>記号は役割への該当を表します。</strong>'
+        'すべてが同じ意味の「合格」ではなく、「注意」は画質不良ではありません。</p>'
     )
 
 
 def _overview_behavior_table(datasets: Sequence[Mapping[str, Any]]) -> str:
     columns = [
-        ("all_low_perturbation", "全候補低"),
-        ("all_tail_attention", "全候補Tail注意"),
-        ("all_high_perturbation", "全候補高"),
-        ("mixed_absolute_response", "mulで帯が変化"),
-        ("includes_hard_unsafe", "Hard unsafe"),
+        ("all_low_perturbation", "全候補低", "pattern"),
+        ("all_tail_attention", "全候補Tail注意", "attention"),
+        ("all_high_perturbation", "全候補高", "attention"),
+        ("mixed_absolute_response", "mulで帯が変化", "pattern"),
+        ("includes_hard_unsafe", "Hard unsafe", "danger"),
     ]
-    header = "".join(f"<th>{html.escape(label)}</th>" for _, label in columns)
+    header = "".join(f"<th>{html.escape(label)}</th>" for _, label, _ in columns)
     rows = []
     for dataset in datasets:
         cells = "".join(
-            f'<td class="mark-cell">{_mark(dataset["absolute_response"] == code)}</td>'
-            for code, _ in columns
+            f'<td class="mark-cell">{_mark(dataset["absolute_response"] == code, kind=mark_kind)}</td>'
+            for code, _, mark_kind in columns
         )
         cells += (
-            f'<td class="mark-cell">{_mark(bool(dataset["relatively_stronger_muls"]))}</td>'
+            f'<td class="mark-cell">{_mark(bool(dataset["relatively_stronger_muls"]), kind="attention")}</td>'
         )
         rows.append(
             f'<tr><th scope="row"><button class="link-button" data-open="{html.escape(dataset["dataset_id"])}">'
@@ -1766,6 +1983,98 @@ def _overview_behavior_table(datasets: Sequence[Mapping[str, Any]]) -> str:
         f'<thead><tr><th>Dataset</th>{header}<th>候補内で強め</th></tr></thead>'
         f'<tbody>{"".join(rows)}</tbody></table></div>'
     )
+
+
+def _dataset_character_profile_html(dataset: Mapping[str, Any]) -> str:
+    vector = dict(dataset.get("dataset_character_vector") or {})
+    channels = dict(vector.get("channels") or {})
+    localization = dict(dataset.get("source_localization") or {})
+    no_quant = dict(dataset.get("no_quant_baseline_profile") or {})
+    if not channels and not localization.get("valid") and not no_quant.get("valid"):
+        return (
+            '<p class="muted">この保存済みrunには追加のdataset character '
+            'channelがありません。</p>'
+        )
+
+    mul_labels = {
+        "flat_within_descriptive_tolerance": "測定範囲ではほぼ平坦",
+        "upper_range_reduces_deformation": "mulを上げるほど摂動が減る傾向",
+        "lower_range_reduces_deformation": "mulを下げるほど摂動が減る傾向",
+        "interior_valley": "中間mulに谷がある",
+        "irregular_or_mixed": "単調でない／混合型",
+        "insufficient_grid": "grid不足",
+    }
+    response = dict(channels.get("mul_response") or {})
+    response_label = mul_labels.get(
+        str(response.get("label")),
+        str(response.get("label") or "未測定"),
+    )
+    source_ref = dict(localization.get("reference_profile") or {})
+    no_quant_signal = dict(no_quant.get("signal_strength") or {})
+    no_quant_load = dict(no_quant.get("source_load") or {})
+    natural = dict(no_quant.get("natural_variation") or {})
+    dominant_bin = no_quant.get("dominant_timestep_bin_by_gradient_rms")
+    dominant_label = "未測定"
+    if dominant_bin is not None:
+        bin_index = int(dominant_bin)
+        bin_text, noise_text = TIMESTEP_BIN_LABELS.get(
+            bin_index, (str(bin_index), "")
+        )
+        dominant_label = f"bin {bin_index} ({bin_text}, {noise_text})"
+
+    localization_rows = "".join(
+        "<tr>"
+        f'<th scope="row">{_fmt(row.get("range_mul"), 2)}</th>'
+        f'<td>{_fmt(row.get("local_tail"))}</td>'
+        f'<td>{html.escape(str(row.get("top_source_alias") or "—"))}</td>'
+        f'<td>{_pct(row.get("top_source_share"))}</td>'
+        f'<td>{_fmt(row.get("effective_source_count"), 2)}</td>'
+        f'<td>{"安定" if _as_bool(row.get("top_source_stable_across_thresholds")) else "変動"}</td>'
+        f'<td>{html.escape(str(row.get("loo_most_actionable_source_alias") or "—"))}</td>'
+        f'<td>{_pct(row.get("loo_max_tail_reduction_fraction"))}</td>'
+        "</tr>"
+        for row in localization.get("candidate_profiles", [])
+    )
+    localization_table = (
+        '<div class="table-wrap"><table><thead><tr><th>mul</th>'
+        '<th>絶対Tail</th><th>最大負担source</th><th>集中率</th><th>実効source数</th>'
+        '<th>q85/90/95</th><th>LOOで最も効くsource</th><th>Tail低下率</th>'
+        f'</tr></thead><tbody>{localization_rows}</tbody></table></div>'
+        if localization_rows
+        else '<p class="muted">source localizationは利用できません。</p>'
+    )
+    coverage_warning = (
+        "全画像をprobeしています。"
+        if dataset.get("image_coverage_complete")
+        else "未probe画像があるため、この体質記述は測定subsetの範囲です。"
+    )
+    return f"""
+<div class="callout-grid">
+  <div><strong>mul応答</strong><br>{html.escape(response_label)}<div class="micro">単一の合成点にはしません。</div></div>
+  <div><strong>Source集中度</strong><br>top {html.escape(str(source_ref.get('top_source_alias') or '—'))}: {_pct(source_ref.get('top_source_share'))}<br>実効source数 {_fmt(source_ref.get('effective_source_count'), 2)}</div>
+  <div><strong>no_quant信号</strong><br>norm中央値 {_fmt(no_quant_signal.get('grad_norm_median'))}<br>q05–q95 {_fmt(no_quant_signal.get('grad_norm_q05'))}–{_fmt(no_quant_signal.get('grad_norm_q95'))}</div>
+  <div><strong>画像カバレッジ</strong><br>{dataset.get('image_count_probed', dataset.get('image_count', 0))} / {dataset.get('image_count_total', dataset.get('image_count', 0))} ({_pct(dataset.get('image_coverage_fraction'))})<div class="micro">{html.escape(coverage_warning)}</div></div>
+</div>
+<details open>
+  <summary>量子化Tailのsource集中（説明専用）</summary>
+  <p class="section-help">各mulのTail負担が一部sourceへ寄るかを、source等重みのq85/q90/q95で確認します。Sxxは匿名aliasです。絶対Tailが小さい場合、高い集中率だけで危険とは判断しません。また「最大負担source」と「外すとTailが最も下がるsource」は別概念です。</p>
+  {localization_table}
+</details>
+<details>
+  <summary>no_quant自身の短期勾配プロファイル（説明専用）</summary>
+  <div class="qa-grid">
+    <div><span>Gradient norm q05</span><strong>{_fmt(no_quant_signal.get('grad_norm_q05'))}</strong></div>
+    <div><span>Gradient norm median</span><strong>{_fmt(no_quant_signal.get('grad_norm_median'))}</strong></div>
+    <div><span>Gradient norm q95</span><strong>{_fmt(no_quant_signal.get('grad_norm_q95'))}</strong></div>
+    <div><span>Gradient norm RMS</span><strong>{_fmt(no_quant_signal.get('grad_norm_rms'))}</strong></div>
+    <div><span>Top source energy</span><strong>{html.escape(str(no_quant_load.get('top_source_alias') or '—'))} / {_pct(no_quant_load.get('top_source_energy_share'))}</strong></div>
+    <div><span>Effective sources</span><strong>{_fmt(no_quant_load.get('effective_source_count'), 2)}</strong></div>
+    <div><span>Dominant timestep</span><strong>{html.escape(dominant_label)}</strong></div>
+    <div><span>Natural Body / Tail</span><strong>{_fmt(natural.get('local_body'))} / {_fmt(natural.get('local_tail'))}</strong></div>
+  </div>
+  <p class="micro">短いno_quant probeの信号規模と偏りです。収束速度、最終画質、rank、LR、epoch数は予測しません。同じmodel・network・precision契約のrun同士でのみ比較してください。</p>
+</details>
+"""
 
 
 def _dataset_section(
@@ -1850,19 +2159,45 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
         if max_measured_mul >= 3.7
         else ""
     )
+    execution_mode_label = {
+        "quick": "Quick",
+        "standard": "Standard",
+        "strict": "Strict",
+    }.get(str(dataset.get("execution_mode")), str(dataset.get("execution_mode", "unknown")))
+    qa_depth_label = {
+        "quick_smoke": "Quick smoke",
+        "standard_smoke": "Standard smoke",
+        "strict_reference": "Strict reference",
+    }.get(str(dataset.get("qa_depth")), str(dataset.get("qa_depth", "unknown")))
+    sampling_depth_label = {
+        "reduced_16_image": "Reduced (max 16 images)",
+        "reference_32_image": "Reference (max 32 images)",
+    }.get(
+        str(dataset.get("sampling_depth")),
+        str(dataset.get("sampling_depth", "unknown")),
+    )
     return f"""
 <article id="dataset-{html.escape(dataset["dataset_id"])}" class="view dataset-view"{hidden}>
   <section class="dataset-intro">
     <div class="dataset-intro-main">
-      <div class="eyebrow">Dataset diagnostic card ・ {html.escape(dataset["protocol_scope"])}</div>
+      <div class="eyebrow">Dataset diagnostic card ・ {html.escape(dataset["protocol_scope"])} ・ {html.escape(execution_mode_label)}</div>
       <h1>{html.escape(dataset["label"])}</h1>
       <div class="tag-row">{tag_html}</div>
       <p class="lead">{html.escape(edge_message)}</p>
     </div>
     <div class="evidence-strip" aria-label="証拠の状態">
       <div class="evidence-chip">
+        <span>Execution / QA depth</span>
+        <strong>{html.escape(execution_mode_label)}</strong>
+        <span>{html.escape(qa_depth_label)}</span>
+      </div>
+      <div class="evidence-chip">
         <span>Measurement QA</span>
         <strong>{html.escape(dataset["measurement_quality"]["level"])}</strong>
+      </div>
+      <div class="evidence-chip">
+        <span>Sampling depth</span>
+        <strong>{html.escape(sampling_depth_label)}</strong>
       </div>
       <div class="evidence-chip">
         <span>Local比較</span>
@@ -1936,7 +2271,13 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
   </section>
 
   <section>
-    <h2>3. 詳細診断</h2>
+    <h2>3. Dataset character profile</h2>
+    <p class="section-help">すでに測定した勾配から、dataset固有の偏りを複数の独立channelで記述します。候補選択への追加票や画質スコアには使いません。</p>
+    {_dataset_character_profile_html(dataset)}
+  </section>
+
+  <section>
+    <h2>4. 詳細診断</h2>
     <div class="chart-card">
       <h3>Tailの原因分解</h3>
       <p class="section-help">symmetric、方向回転（angle）、勾配gain変化を説明用に表示します。候補選定の追加票にはしません。</p>
@@ -1961,7 +2302,7 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
   </section>
 
   <section>
-    <h2>4. 推奨アクション</h2>
+    <h2>5. 推奨アクション</h2>
     <div class="action-box">
       <p><strong>安定性重視:</strong> no_quantを必ず残し、Fidelity retained setを比較対象にします。</p>
       <p><strong>正則化の違いを探索:</strong> hard-safeだが候補内でより強い摂動の点を、「画質的に良い」と断言せず比較へ追加できます。</p>
@@ -1972,13 +2313,19 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
   </section>
 
   <section>
-    <h2>5. 測定品質</h2>
+    <h2>6. 測定品質</h2>
     <details>
       <summary>QA / provenance</summary>
       <div class="qa-grid">
         <div><span>Protocol</span><strong>{html.escape(dataset["metric_definition_version"])}</strong></div>
-        <div><span>Source groups</span><strong>{dataset["source_group_count"]}</strong></div>
-        <div><span>Images</span><strong>{dataset["image_count"]}</strong></div>
+        <div><span>Execution mode</span><strong>{html.escape(execution_mode_label)}</strong></div>
+        <div><span>QA depth</span><strong>{html.escape(qa_depth_label)}</strong></div>
+        <div><span>Measurement contract</span><strong>{html.escape(dataset["measurement_contract"])}</strong></div>
+        <div><span>Sampling depth</span><strong>{html.escape(sampling_depth_label)}</strong></div>
+        <div><span>Internal profile level</span><strong>{html.escape(dataset["internal_profile_level"])}</strong></div>
+        <div><span>Source groups (probe / total)</span><strong>{dataset["source_group_count_probed"]} / {dataset["source_group_count_total"]}</strong></div>
+        <div><span>Images (probe / total)</span><strong>{dataset["image_count_probed"]} / {dataset["image_count_total"]}</strong></div>
+        <div><span>Image coverage</span><strong>{_pct(dataset["image_coverage_fraction"])}</strong></div>
         <div><span>Hard safety</span><strong>{"PASS" if dataset["hard_safety_all_pass"] else "FAIL"}</strong></div>
         <div><span>Measurement QA</span><strong>{html.escape(dataset["measurement_quality"]["level"])}</strong></div>
         <div><span>Local confidence</span><strong>{html.escape(dataset["local_comparison_confidence"]["level"])}</strong></div>
@@ -2048,6 +2395,11 @@ def render_report(model: Mapping[str, Any]) -> str:
     overview_hidden = " hidden" if single_dataset else ""
     overview_selected = "" if single_dataset else " selected"
     selector_class = "dataset-selector is-single" if single_dataset else "dataset-selector"
+    beginner_link = (
+        '<a class="summary-link" href="beginner_report.html">概要レポート</a>'
+        if single_dataset
+        else ""
+    )
     behavior_overview = _overview_behavior_table(datasets)
     payload = html.escape(
         json.dumps(
@@ -2068,7 +2420,7 @@ def render_report(model: Mapping[str, Any]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SDXL DQ 診断カルテ v2.4.2 prototype</title>
+<title>SDXL DQ 診断カルテ v2.4.3 beta</title>
 <style>
 :root{{--ink:#172033;--muted:#607086;--line:#d9e1ec;--paper:#f5f7fb;--card:#fff;--blue:#2563eb;--blue-soft:#eaf1ff;--orange:#d97706;--orange-soft:#fff4e2;--purple:#7c3aed;--purple-soft:#f2ebff;--teal:#0f766e;--shadow:0 12px 34px rgba(25,38,70,.09)}}
 *{{box-sizing:border-box}} body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.65 system-ui,-apple-system,"Segoe UI","Yu Gothic UI",sans-serif}}
@@ -2082,7 +2434,7 @@ h1{{font-size:clamp(28px,4vw,48px);line-height:1.08;margin:5px 0 14px}} h2{{font
 .eyebrow{{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:#65758c;font-weight:800}} .lead{{font-size:17px;color:#3e4d62;max-width:72ch}}
 .dataset-intro{{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(380px,1fr);gap:20px;align-items:center;background:linear-gradient(130deg,#fff 0%,#f2f6ff 100%);padding:17px 22px;border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}}
 .dataset-intro h1{{font-size:clamp(25px,3vw,36px);margin:3px 0 9px}} .dataset-intro .lead{{font-size:14px;margin:8px 0 0}}
-.evidence-strip{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}} .evidence-chip{{display:grid;gap:2px;min-width:0;padding:10px 11px;background:white;border:1px solid var(--line);border-radius:10px}} .evidence-chip span{{font-size:10px;color:var(--muted);font-weight:750}} .evidence-chip strong{{font-size:17px;color:var(--purple);overflow-wrap:anywhere}}
+.evidence-strip{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}} .evidence-chip{{display:grid;gap:2px;min-width:0;padding:10px 11px;background:white;border:1px solid var(--line);border-radius:10px}} .evidence-chip span{{font-size:10px;color:var(--muted);font-weight:750}} .evidence-chip strong{{font-size:17px;color:var(--purple);overflow-wrap:anywhere}}
 .section-heading-inline{{display:flex;justify-content:space-between;gap:16px;align-items:end;margin:0 0 8px}} .section-heading-inline h2{{margin:0}} .section-heading-inline p{{margin:3px 0 0}}
 .scale-badge{{white-space:nowrap;border-radius:999px;padding:6px 11px;background:#e8eef8;color:#334155;font-size:12px;font-weight:800}}
 .primary-chart{{padding:10px 18px 14px}} .primary-chart>.chart{{width:100%;height:315px;max-width:1040px;margin:0 auto}} .primary-chart details .chart{{max-height:390px}}
@@ -2101,7 +2453,7 @@ h1{{font-size:clamp(28px,4vw,48px);line-height:1.08;margin:5px 0 14px}} h2{{font
 .representative-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}} .representative-grid>div{{display:grid;gap:3px;padding:13px;background:white;border:1px solid var(--line);border-radius:10px}} .representative-grid span,.representative-grid small{{color:var(--muted)}}
 .callout-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}} .callout-grid>div{{padding:13px;background:#edf2f8;border-radius:10px}}
 .table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:white}} table{{border-collapse:collapse;width:100%;font-size:13px}} th,td{{border-bottom:1px solid var(--line);padding:10px 9px;text-align:left;vertical-align:top}} thead th{{position:sticky;top:0;background:#edf2f8;white-space:nowrap}} .explanation-row td{{background:#fafbfd;color:#4a596d;padding-top:7px;padding-bottom:12px}}
-.subheading{{margin-top:22px}} .mark-cell{{text-align:center!important;vertical-align:middle}} .matrix-mark{{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;font-weight:900}} .matrix-mark.on{{background:#dbeafe;color:#17499f}} .matrix-mark.off{{color:#a2acba;background:#f3f4f6}} .decision-table th[scope="row"]{{min-width:190px}} .decision-table td:last-child{{min-width:180px}} .role-matrix th:first-child{{min-width:245px}} .role-matrix td{{text-align:center;vertical-align:middle}} .row-help{{display:block;color:var(--muted);font-weight:400;font-size:10px;margin-top:2px}} .overview-behavior-table td{{text-align:center}}
+.subheading{{margin-top:22px}} .mark-cell{{text-align:center!important;vertical-align:middle}} .matrix-mark{{display:inline-grid;place-items:center;min-width:24px;height:24px;padding:0 6px;border-radius:999px;font-weight:900;font-size:12px}} .matrix-mark.pass{{background:#dcfce7;color:#166534}} .matrix-mark.retained{{background:#dbeafe;color:#17499f}} .matrix-mark.attention{{background:#ffedd5;color:#9a4700}} .matrix-mark.danger{{background:#fee2e2;color:#991b1b}} .matrix-mark.representative{{background:#f2ebff;color:#5b21b6}} .matrix-mark.pattern{{background:#e0e7ff;color:#3730a3}} .matrix-mark.off{{color:#a2acba;background:#f3f4f6}} .matrix-legend{{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin-top:9px;color:var(--muted);font-size:11px}} .matrix-legend>span{{display:inline-flex;align-items:center;gap:5px}} .decision-table th[scope="row"]{{min-width:190px}} .decision-table td:last-child{{min-width:180px}} .role-matrix th:first-child{{min-width:245px}} .role-matrix td{{text-align:center;vertical-align:middle}} .row-help{{display:block;color:var(--muted);font-weight:400;font-size:10px;margin-top:2px}} .overview-behavior-table td{{text-align:center}}
 .micro{{font-size:11px;color:var(--muted);margin:3px 0}} .muted,.section-help{{color:var(--muted)}} .chart-grid{{display:grid;grid-template-columns:2fr 1fr;gap:15px}} .chart{{display:block;width:100%;height:auto}}
 .trajectory-empty{{display:grid;place-content:center;text-align:center;min-height:270px}} .empty-icon{{font-size:64px;color:#a4aec0}}
 details{{background:white;border:1px solid var(--line);border-radius:12px;padding:12px 15px;margin:10px 0}} summary{{cursor:pointer;font-weight:800}} details>table,details>.matrix-grid,details>p{{margin-top:12px}}
@@ -2110,18 +2462,18 @@ details{{background:white;border:1px solid var(--line);border-radius:12px;paddin
 .qa-reason-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0}} .qa-reason-grid>div{{padding:12px;background:#f8fafc;border:1px solid var(--line);border-radius:8px}} .qa-reason-grid ul{{margin:5px 0 0;padding-left:18px;font-size:12px;color:var(--muted)}}
 .dataset-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}} .dataset-tile{{appearance:none;text-align:left;border:1px solid var(--line);background:white;border-radius:13px;padding:16px;display:grid;gap:5px;color:var(--ink);cursor:pointer;box-shadow:0 5px 16px rgba(25,38,70,.04)}} .dataset-tile:hover,.dataset-tile:focus{{border-color:#7fa5ed;transform:translateY(-1px)}} .dataset-tile strong{{font-size:16px}} .dataset-tile span:not(.eyebrow){{color:var(--muted);font-size:12px}}
 .overview-hero{{background:linear-gradient(135deg,#172554,#1e3a8a);color:white;border-radius:18px;padding:32px}} .overview-hero .eyebrow,.overview-hero .lead{{color:#d8e5ff}} .overview-kpis{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-top:20px}} .overview-kpis>div{{background:rgba(255,255,255,.1);padding:14px;border:1px solid rgba(255,255,255,.18);border-radius:11px}} .overview-kpis strong{{display:block;font-size:27px}}
-.link-button{{border:0;background:none;color:#1d4ed8;text-decoration:underline;cursor:pointer;padding:0;font:inherit}} .dataset-selector.is-single{{display:none}} footer{{color:var(--muted);font-size:12px;padding-top:30px}}
+.link-button{{border:0;background:none;color:#1d4ed8;text-decoration:underline;cursor:pointer;padding:0;font:inherit}} .header-actions{{display:flex;align-items:center;gap:10px}} .summary-link{{color:#1d4ed8;text-decoration:none;border:1px solid #b8c5d8;border-radius:999px;padding:6px 11px;font-size:12px;font-weight:750;background:white}} .dataset-selector.is-single{{display:none}} footer{{color:var(--muted);font-size:12px;padding-top:30px}}
 @media(max-width:900px){{.hero,.dataset-intro,.chart-grid,.matrix-grid{{grid-template-columns:1fr}}.summary-grid,.callout-grid,.overview-kpis{{grid-template-columns:repeat(2,1fr)}}.dataset-grid{{grid-template-columns:1fr 1fr}}.dataset-intro{{gap:12px}}}}
-@media(max-width:580px){{main{{padding:12px 10px 55px}}.header-inner{{padding:9px 12px;align-items:flex-start;flex-direction:column}}.summary-grid,.callout-grid,.overview-kpis,.dataset-grid,.qa-grid,.qa-reason-grid,.representative-grid,.interpretation-strip{{grid-template-columns:1fr}}.evidence-strip{{grid-template-columns:repeat(3,minmax(0,1fr))}}.dataset-intro{{padding:13px}}.dataset-intro h1{{font-size:24px}}.evidence-chip{{padding:7px}}.evidence-chip strong{{font-size:13px}}.section-heading-inline{{align-items:flex-start;flex-direction:column;gap:6px}}.primary-chart{{padding:8px}}.primary-chart>.chart{{height:250px}}}}
+@media(max-width:580px){{main{{padding:12px 10px 55px}}.header-inner{{padding:9px 12px;align-items:flex-start;flex-direction:column}}.summary-grid,.callout-grid,.overview-kpis,.dataset-grid,.qa-grid,.qa-reason-grid,.representative-grid,.interpretation-strip{{grid-template-columns:1fr}}.evidence-strip{{grid-template-columns:repeat(2,minmax(0,1fr))}}.dataset-intro{{padding:13px}}.dataset-intro h1{{font-size:24px}}.evidence-chip{{padding:7px}}.evidence-chip strong{{font-size:13px}}.section-heading-inline{{align-items:flex-start;flex-direction:column;gap:6px}}.primary-chart{{padding:8px}}.primary-chart>.chart{{height:250px}}}}
 @media print{{header{{position:static}}.view[hidden]{{display:block!important;page-break-before:always}}button,select{{display:none}}body{{background:white}}main{{max-width:none}}}}
 </style>
 </head>
 <body>
-<header><div class="header-inner"><div class="brand">SDXL DQ 診断カルテ <small>v2.4.2 practical report prototype ・ Safety/Fidelity ≠ Utility</small></div><label class="{selector_class}">表示 <select id="dataset-select"><option value="overview"{overview_selected}>横断概要</option>{options}</select></label></div></header>
+<header><div class="header-inner"><div class="brand">SDXL DQ 診断カルテ <small>v2.4.3 practical report beta ・ Safety/Fidelity ≠ Utility</small></div><div class="header-actions">{beginner_link}<label class="{selector_class}">表示 <select id="dataset-select"><option value="overview"{overview_selected}>横断概要</option>{options}</select></label></div></div></header>
 <main>
 <section id="overview" class="view"{overview_hidden}>
   <div class="overview-hero">
-    <div class="eyebrow">Practical diagnostic report prototype</div>
+    <div class="eyebrow">Practical diagnostic report beta</div>
     <h1>結論から詳細へ潜れる、mul別の診断カルテ</h1>
     <p class="lead">数学基準1.0に対する絶対的な摂動帯と、同じdataset内の相対順位を分けて表示します。最終画質のbest mulや量子化採用可否は判定しません。</p>
     <div class="overview-kpis">
@@ -2141,7 +2493,7 @@ details{{background:white;border:1px solid var(--line);border-radius:12px;paddin
   <h2>同一mul 3.45の横断比較</h2>
   <p class="section-help">metric definition 2.4の共通coreだけを比較。同じmulでもTailがdatasetごとに大きく異なることを確認できます。</p>
   <div class="table-wrap"><table><thead><tr><th>Dataset</th><th>Body</th><th>Tail</th><th>Local gauge</th><th>絶対摂動</th><th>相対状態</th><th>Measurement QA</th><th>Local confidence</th></tr></thead><tbody>{common_rows}</tbody></table></div>
-  <h2>このprototypeで確認すること</h2>
+  <h2>このレポートで確認すること</h2>
   <div class="action-box"><ol><li>30秒で絶対摂動帯、Fidelity retained set、強い摂動候補、edgeが分かるか。</li><li>各mulの絶対値と相対状態を混同しないか。</li><li>Measurement QA・Local confidence・Recommendation maturityを混同しないか。</li><li>単一代表を選べない場合に、その理由が明示されるか。</li><li>初心者説明からbootstrap・source LOOまで段階的に潜れるか。</li></ol></div>
 </section>
 {dataset_sections}

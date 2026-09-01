@@ -422,6 +422,8 @@ class DiagnosticProfileRuntime:
     def _source_group_order(source_group_map: SourceGroupMap) -> tuple[str, ...]:
         result: list[str] = []
         for rule in source_group_map.rules:
+            if not rule.probe_selected:
+                continue
             group = str(rule.source_group)
             if group not in result:
                 result.append(group)
@@ -2293,6 +2295,37 @@ class DiagnosticProfileRuntime:
         )
         for candidate_name in candidate_names:
             probe_rows = [row for row in per_image_rows if row["candidate"] == candidate_name]
+            nonfinite_probe_rows: list[dict[str, Any]] = []
+            for probe_row in probe_rows:
+                fields: list[str] = []
+                for field in (
+                    "loss",
+                    "gradient_norm",
+                    "parameter_gradient_cosine",
+                    "clip_rate",
+                    "quant_error_rms",
+                    "quant_error_ratio",
+                ):
+                    raw_value = probe_row.get(field)
+                    if raw_value in (None, ""):
+                        continue
+                    try:
+                        finite = math.isfinite(float(raw_value))
+                    except (TypeError, ValueError):
+                        finite = False
+                    if not finite:
+                        fields.append(field)
+                if fields:
+                    nonfinite_probe_rows.append(
+                        {
+                            "image_key": probe_row.get("image_key"),
+                            "source_group": probe_row.get("source_group"),
+                            "timestep_bin": probe_row.get("timestep_bin"),
+                            "noise_replica": probe_row.get("noise_replica"),
+                            "quant_repeat": probe_row.get("quant_repeat"),
+                            "fields": fields,
+                        }
+                    )
             raw_probe_metrics = aggregate_numeric(
                 probe_rows,
                 (
@@ -2314,6 +2347,23 @@ class DiagnosticProfileRuntime:
                     else "structural_dropout_off"
                 ),
             }
+            if candidate_name != "no_quant" and nonfinite_probe_rows:
+                merged.update(
+                    {
+                        "forced_safety_abort": True,
+                        "common_skip_matched": False,
+                        "invalid_reason": "candidate_nonfinite_probe_measurement",
+                        "nonfinite_probe_row_count": len(nonfinite_probe_rows),
+                        "nonfinite_probe_fields": sorted(
+                            {
+                                field
+                                for item in nonfinite_probe_rows
+                                for field in item["fields"]
+                            }
+                        ),
+                        "nonfinite_probe_examples": nonfinite_probe_rows[:8],
+                    }
+                )
             candidate_rows.append(merged)
 
         manifest_additional_files = [self.args.dataset_config]
@@ -2595,6 +2645,40 @@ class DiagnosticProfileRuntime:
             "profile": {
                 "protocol": self.profile_protocol,
                 "level": self.args.dq_profile_level,
+                "execution_mode": str(
+                    getattr(self.args, "dq_profile_execution_mode", "strict")
+                ),
+                "qa_depth": str(
+                    getattr(self.args, "dq_profile_qa_depth", "strict_reference")
+                ),
+                "measurement_contract": str(
+                    getattr(
+                        self.args,
+                        "dq_profile_measurement_contract",
+                        "local-body-tail-v1",
+                    )
+                ),
+                "sampling_depth": str(
+                    getattr(
+                        self.args,
+                        "dq_profile_sampling_depth",
+                        "reference_32_image",
+                    )
+                ),
+                "confidence_ceiling": str(
+                    getattr(
+                        self.args,
+                        "dq_profile_confidence_ceiling",
+                        "data_driven_up_to_high",
+                    )
+                ),
+                "internal_profile_level": self.args.dq_profile_level,
+                "prefix_short_steps": int(
+                    getattr(self.args, "dq_profile_prefix_short_steps", 64)
+                ),
+                "prefix_long_steps": int(
+                    getattr(self.args, "dq_profile_prefix_long_steps", 128)
+                ),
                 "branch_steps": (
                     len(sequence)
                     if self.profile_protocol == "v1"
