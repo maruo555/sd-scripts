@@ -28,6 +28,7 @@ from dq_profile.v24_descriptive import (
     analyze_source_localization,
     build_dataset_character_vector,
 )
+from dq_profile.v24_beginner_report import render_beginner_report
 from dq_profile.v24_practical_report import (
     build_single_dataset_report_model,
     render_report as render_practical_report,
@@ -462,6 +463,10 @@ def main() -> int:
             render_practical_report(practical_model),
             encoding="utf-8",
         )
+        (output_dir / "beginner_report.html").write_text(
+            render_beginner_report(practical_model),
+            encoding="utf-8",
+        )
         write_json(
             output_dir / "analysis_manifest.json",
             {
@@ -500,6 +505,11 @@ def main() -> int:
                         "path": str(output_dir / "technical_report.html"),
                         "sha256": sha256_file(output_dir / "technical_report.html"),
                     },
+                    "beginner": {
+                        "path": str(output_dir / "beginner_report.html"),
+                        "sha256": sha256_file(output_dir / "beginner_report.html"),
+                        "scope": "single_dataset_beginner_overview",
+                    },
                     "contract": {
                         "path": str(output_dir / "report_contract.json"),
                         "sha256": sha256_file(output_dir / "report_contract.json"),
@@ -517,6 +527,7 @@ def main() -> int:
                 "selection_valid": selection["selection_valid"],
                 "edge_unresolved": selection["edge_unresolved"],
                 "primary_report": "report.html",
+                "beginner_report": "beginner_report.html",
                 "technical_report": "technical_report.html",
                 "report_scope": "single_dataset_local_only",
                 "trajectory_product_role": "research_only_keep_product_local_only",

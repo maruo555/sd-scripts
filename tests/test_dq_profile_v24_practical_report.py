@@ -251,6 +251,7 @@ def test_single_dataset_report_is_local_only_and_hides_trajectory_from_selection
     assert "Safety/Fidelity ≠ Utility" in html
     assert "Strict reference" in html
     assert "v2.4.3 practical report beta" in html
+    assert 'href="beginner_report.html"' in html
 
 
 def test_legacy_quick_report_exposes_reduced_sampling_and_confidence_ceiling() -> None:
@@ -524,7 +525,11 @@ def test_rendered_report_states_scope_and_does_not_force_overall() -> None:
     assert "試したmulと役割" in rendered
     assert "Hard-safety pass" in rendered
     assert "Fidelity retained" in rendered
-    assert '<span class="matrix-mark on" aria-label="該当">○</span>' in rendered
+    assert 'class="matrix-mark pass"' in rendered
+    assert 'class="matrix-mark retained"' in rendered
+    assert 'class="matrix-mark attention"' in rendered
+    assert 'class="matrix-mark representative"' in rendered
+    assert "すべてが同じ意味の「合格」ではなく" in rendered
     assert '<article id="dataset-SYN" class="view dataset-view">' in rendered
     assert '<section id="overview" class="view" hidden>' in rendered
     assert "dataset-selector is-single" in rendered

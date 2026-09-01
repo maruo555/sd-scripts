@@ -153,7 +153,12 @@ exact parityで検査します。Strictの再測定は校正能力を高めま�
 
 最後にsource groupを等重みとするbootstrapを2,000回行い、Body、Tail、95%区間、
 Fidelity retained set、robust dominance、source LOOなどを作ります。`report.html`、
-`technical_report.html`、JSON、CSVへ保存します。
+`beginner_report.html`、`technical_report.html`、JSON、CSVへ保存します。
+
+`beginner_report.html`は最上部のMul affinity curveから読み始められる概要版です。
+Body／Tail／ヒゲ、候補の役割、Body × Tailマップ、5軸の性格カルテ、
+source／timestep偏りを短い説明付きで表示します。性格カルテの参照位置は、
+匿名化した固定Standard参照設定内での相対位置であり、良否の閾値や画質推薦には使いません。
 
 同じGPU測定済みCSVから、候補選択へ加点しない説明専用channelも作ります。
 
@@ -295,6 +300,21 @@ d = sqrt(1 + norm_ratio^2 - 2 * norm_ratio * gradient_cosine)
 この場合は`edge_unresolved=true`とし、最良mulを宣言しません。
 
 ## 5. レポートの候補集合
+
+### 表の記号
+
+「試したmulと役割」の記号は、すべて同じ意味の合格票ではありません。
+
+- 緑の`✓`: Hard-safetyを通過した候補
+- 青の`✓`: Fidelity retained setに残った候補
+- 橙の`注意`: Hard-safetyは通過したが、同じdataset内の他候補よりBody・Tailの摂動が強い候補
+- 紫の`★`: Body代表、Tail代表、または単一代表
+- `●`: その挙動分類に該当
+- 灰色の`—`: 非該当
+
+特に橙の`注意`は「学習結果や画質が悪い」という判定ではありません。no-quantからの勾配変形が
+候補内で相対的に強いため、穏やかな候補とは別枠で比較するとよい、という注意表示です。
+`✓`、`注意`、`★`はそれぞれ安全性・相対的な摂動・数値上の代表という別の役割を示します。
 
 ### Hard-safety pass
 
@@ -592,6 +612,7 @@ experimentalと明記する範囲:
   <profile_name>\
     <YYYYMMDD_HHMMSS>_<protocol fingerprint>\
       report.html
+      beginner_report.html
       technical_report.html
       summary.json
       status.json
@@ -603,6 +624,7 @@ experimentalと明記する範囲:
 最低限、次を保管します。
 
 - `report.html`: 通常利用向けの自己完結Local-onlyレポート
+- `beginner_report.html`: 結論から段階的に読める自己完結の概要レポート
 - `technical_report.html`: 解析詳細を残す技術レポート
 - `practical_report.json`と`report_contract.json`: 表示モデルと意味契約
 - `summary.json`

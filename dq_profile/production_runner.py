@@ -1181,6 +1181,7 @@ def run_local_pipeline(
 
 PROMOTED_ANALYSIS_FILES = (
     "report.html",
+    "beginner_report.html",
     "technical_report.html",
     "summary.json",
     "practical_report.json",
@@ -1212,7 +1213,13 @@ def promote_analysis(run_dir: Path, analysis_dir: Path) -> list[str]:
         if source.is_file():
             shutil.copy2(source, run_dir / name)
             promoted.append(name)
-    for required in ("report.html", "technical_report.html", "summary.json", "practical_report.json"):
+    for required in (
+        "report.html",
+        "beginner_report.html",
+        "technical_report.html",
+        "summary.json",
+        "practical_report.json",
+    ):
         if required not in promoted:
             raise FileNotFoundError(f"required product artifact was not generated: {analysis_dir / required}")
     return promoted
@@ -1462,6 +1469,7 @@ def run_profile_request(
             current_stage="complete",
             completed_at=datetime.now(timezone.utc).isoformat(),
             report="report.html",
+            beginner_report="beginner_report.html",
             technical_report="technical_report.html",
             active_profile=str(active_profile),
             active_analysis=str(active_analysis),
@@ -1478,6 +1486,7 @@ def run_profile_request(
         )
         report = run_dir / "report.html"
         launcher.log(f"Primary report: {report}")
+        launcher.log(f"Beginner report: {run_dir / 'beginner_report.html'}")
         launcher.log(f"Technical report: {run_dir / 'technical_report.html'}")
         if options.open_report and os.name == "nt":
             os.startfile(report)  # type: ignore[attr-defined]

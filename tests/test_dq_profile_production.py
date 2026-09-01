@@ -783,13 +783,20 @@ def test_product_artifacts_are_promoted_to_run_root(tmp_path: Path) -> None:
     run_dir.mkdir()
     analysis.mkdir()
     profile.mkdir()
-    for name in ("report.html", "technical_report.html", "summary.json", "practical_report.json"):
+    for name in (
+        "report.html",
+        "beginner_report.html",
+        "technical_report.html",
+        "summary.json",
+        "practical_report.json",
+    ):
         (analysis / name).write_text(name, encoding="utf-8")
     (profile / "source_manifest.json").write_text("{}", encoding="utf-8")
     (profile / "candidate_definitions.json").write_text("{}", encoding="utf-8")
     promoted = promote_analysis(run_dir, analysis)
     promoted.extend(promote_profile_provenance(run_dir, profile))
     assert (run_dir / "report.html").is_file()
+    assert (run_dir / "beginner_report.html").is_file()
     assert (run_dir / "source_manifest.json").is_file()
     assert "candidate_definitions.json" in promoted
 

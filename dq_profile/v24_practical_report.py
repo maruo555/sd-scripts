@@ -1763,10 +1763,22 @@ def _candidate_table(dataset: Mapping[str, Any]) -> str:
     return "".join(rows)
 
 
-def _mark(active: bool) -> str:
-    if active:
-        return '<span class="matrix-mark on" aria-label="該当">○</span>'
-    return '<span class="matrix-mark off" aria-label="非該当">—</span>'
+def _mark(active: bool, *, kind: str = "pattern") -> str:
+    if not active:
+        return '<span class="matrix-mark off" aria-label="非該当">—</span>'
+    symbol, label = {
+        "pass": ("✓", "安全確認を通過"),
+        "retained": ("✓", "候補集合に保持"),
+        "attention": ("注意", "注意が必要な特徴に該当"),
+        "danger": ("!", "要確認の状態に該当"),
+        "representative": ("★", "数値上の代表"),
+        "pattern": ("●", "診断パターンに該当"),
+    }.get(kind, ("●", "診断パターンに該当"))
+    return (
+        f'<span class="matrix-mark {html.escape(kind)}" '
+        f'aria-label="{html.escape(label)}" title="{html.escape(label)}">'
+        f"{html.escape(symbol)}</span>"
+    )
 
 
 def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
@@ -1793,6 +1805,7 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
             "全候補が低摂動",
             "全候補でBody・Tailとも基準1.0未満。",
             "全測定mul",
+            "pattern",
         ),
         (
             "all_tail_attention",
@@ -1800,6 +1813,7 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
             "全候補でTail注意",
             "通常域のBodyは1未満だが、厳しいtimestep帯のTailは1以上。",
             "全測定mul",
+            "attention",
         ),
         (
             "all_high_perturbation",
@@ -1807,6 +1821,7 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
             "全候補が高摂動",
             "全候補でBodyが基準1.0以上。",
             "全測定mul",
+            "attention",
         ),
         (
             "mixed_absolute_response",
@@ -1814,6 +1829,7 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
             "mulにより摂動帯が変化",
             "mulを変えると低摂動・Tail注意・高摂動の帯をまたぐ。",
             mixed_detail,
+            "pattern",
         ),
         (
             "includes_hard_unsafe",
@@ -1821,17 +1837,19 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
             "Hard unsafeを含む",
             "nonfinite、強制安全停止など、数値比較より前の問題を含む。",
             _mul_list(unsafe_muls),
+            "danger",
         ),
         (
             "relatively_stronger",
             "相対",
-            "候補内でより強い摂動あり",
-            "hard-safeだが、同じdataset内でBody・Tailの両方が明瞭に大きい候補がある。",
+            "候補内でより強い摂動あり（注意）",
+            "Hard-safetyは通過しているが、同じdataset内の他候補よりBody・Tailの両方が明瞭に大きい。",
             _mul_list(dataset["relatively_stronger_muls"]),
+            "attention",
         ),
     ]
     rows = []
-    for code, channel, label, meaning, relevant in definitions:
+    for code, channel, label, meaning, relevant, mark_kind in definitions:
         active = (
             bool(dataset["relatively_stronger_muls"])
             if code == "relatively_stronger"
@@ -1839,7 +1857,7 @@ def _dataset_behavior_table(dataset: Mapping[str, Any]) -> str:
         )
         rows.append(
             "<tr>"
-            f'<td class="mark-cell">{_mark(active)}</td>'
+            f'<td class="mark-cell">{_mark(active, kind=mark_kind)}</td>'
             f"<td>{html.escape(channel)}</td>"
             f"<th scope=\"row\">{html.escape(label)}</th>"
             f"<td>{html.escape(meaning)}</td>"
@@ -1867,16 +1885,19 @@ def _candidate_role_matrix(dataset: Mapping[str, Any]) -> str:
             "Hard-safety pass",
             "nonfinite等の安全停止なし",
             hard_safe,
+            "pass",
         ),
         (
             "Fidelity retained",
             "候補内比較で明瞭には除外されない",
             set(float(value) for value in dataset["fidelity_retained_muls"]),
+            "retained",
         ),
         (
-            "候補内でより強い摂動",
-            "hard-safeだが相対的にBody/Tailが強い",
+            "候補内でより強い摂動（注意）",
+            "Hard-safetyは通過。ただし他候補よりno_quantから離れる",
             set(float(value) for value in dataset["relatively_stronger_muls"]),
+            "attention",
         ),
         (
             "Body代表",
@@ -1886,6 +1907,7 @@ def _candidate_role_matrix(dataset: Mapping[str, Any]) -> str:
                 if dataset["body_representative_mul"] is not None
                 else set()
             ),
+            "representative",
         ),
         (
             "Tail代表",
@@ -1895,6 +1917,7 @@ def _candidate_role_matrix(dataset: Mapping[str, Any]) -> str:
                 if dataset["tail_representative_mul"] is not None
                 else set()
             ),
+            "representative",
         ),
         (
             "単一代表",
@@ -1904,13 +1927,14 @@ def _candidate_role_matrix(dataset: Mapping[str, Any]) -> str:
                 if dataset["single_representative_mul"] is not None
                 else set()
             ),
+            "representative",
         ),
     ]
     header = "".join(f"<th>mul<br>{mul:.2f}</th>" for mul in muls)
     rows = []
-    for label, meaning, active_muls in role_rows:
+    for label, meaning, active_muls, mark_kind in role_rows:
         cells = "".join(
-            f'<td class="mark-cell">{_mark(any(_same_mul(mul, active) for active in active_muls))}</td>'
+            f'<td class="mark-cell">{_mark(any(_same_mul(mul, active) for active in active_muls), kind=mark_kind)}</td>'
             for mul in muls
         )
         rows.append(
@@ -1921,27 +1945,34 @@ def _candidate_role_matrix(dataset: Mapping[str, Any]) -> str:
         '<div class="table-wrap"><table class="role-matrix">'
         f'<thead><tr><th>役割</th>{header}</tr></thead>'
         f'<tbody>{"".join(rows)}</tbody></table></div>'
-        '<p class="micro">○ = 該当、— = 非該当。○がない行は「選べなかった」という診断結果です。</p>'
+        '<div class="matrix-legend">'
+        f'<span>{_mark(True, kind="pass")} 安全確認を通過</span>'
+        f'<span>{_mark(True, kind="retained")} 候補集合に保持</span>'
+        f'<span>{_mark(True, kind="attention")} 安全だが相対的に強い摂動</span>'
+        f'<span>{_mark(True, kind="representative")} 数値上の代表</span>'
+        '<span>— 非該当</span></div>'
+        '<p class="micro"><strong>記号は役割への該当を表します。</strong>'
+        'すべてが同じ意味の「合格」ではなく、「注意」は画質不良ではありません。</p>'
     )
 
 
 def _overview_behavior_table(datasets: Sequence[Mapping[str, Any]]) -> str:
     columns = [
-        ("all_low_perturbation", "全候補低"),
-        ("all_tail_attention", "全候補Tail注意"),
-        ("all_high_perturbation", "全候補高"),
-        ("mixed_absolute_response", "mulで帯が変化"),
-        ("includes_hard_unsafe", "Hard unsafe"),
+        ("all_low_perturbation", "全候補低", "pattern"),
+        ("all_tail_attention", "全候補Tail注意", "attention"),
+        ("all_high_perturbation", "全候補高", "attention"),
+        ("mixed_absolute_response", "mulで帯が変化", "pattern"),
+        ("includes_hard_unsafe", "Hard unsafe", "danger"),
     ]
-    header = "".join(f"<th>{html.escape(label)}</th>" for _, label in columns)
+    header = "".join(f"<th>{html.escape(label)}</th>" for _, label, _ in columns)
     rows = []
     for dataset in datasets:
         cells = "".join(
-            f'<td class="mark-cell">{_mark(dataset["absolute_response"] == code)}</td>'
-            for code, _ in columns
+            f'<td class="mark-cell">{_mark(dataset["absolute_response"] == code, kind=mark_kind)}</td>'
+            for code, _, mark_kind in columns
         )
         cells += (
-            f'<td class="mark-cell">{_mark(bool(dataset["relatively_stronger_muls"]))}</td>'
+            f'<td class="mark-cell">{_mark(bool(dataset["relatively_stronger_muls"]), kind="attention")}</td>'
         )
         rows.append(
             f'<tr><th scope="row"><button class="link-button" data-open="{html.escape(dataset["dataset_id"])}">'
@@ -2364,6 +2395,11 @@ def render_report(model: Mapping[str, Any]) -> str:
     overview_hidden = " hidden" if single_dataset else ""
     overview_selected = "" if single_dataset else " selected"
     selector_class = "dataset-selector is-single" if single_dataset else "dataset-selector"
+    beginner_link = (
+        '<a class="summary-link" href="beginner_report.html">概要レポート</a>'
+        if single_dataset
+        else ""
+    )
     behavior_overview = _overview_behavior_table(datasets)
     payload = html.escape(
         json.dumps(
@@ -2417,7 +2453,7 @@ h1{{font-size:clamp(28px,4vw,48px);line-height:1.08;margin:5px 0 14px}} h2{{font
 .representative-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}} .representative-grid>div{{display:grid;gap:3px;padding:13px;background:white;border:1px solid var(--line);border-radius:10px}} .representative-grid span,.representative-grid small{{color:var(--muted)}}
 .callout-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}} .callout-grid>div{{padding:13px;background:#edf2f8;border-radius:10px}}
 .table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:white}} table{{border-collapse:collapse;width:100%;font-size:13px}} th,td{{border-bottom:1px solid var(--line);padding:10px 9px;text-align:left;vertical-align:top}} thead th{{position:sticky;top:0;background:#edf2f8;white-space:nowrap}} .explanation-row td{{background:#fafbfd;color:#4a596d;padding-top:7px;padding-bottom:12px}}
-.subheading{{margin-top:22px}} .mark-cell{{text-align:center!important;vertical-align:middle}} .matrix-mark{{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;font-weight:900}} .matrix-mark.on{{background:#dbeafe;color:#17499f}} .matrix-mark.off{{color:#a2acba;background:#f3f4f6}} .decision-table th[scope="row"]{{min-width:190px}} .decision-table td:last-child{{min-width:180px}} .role-matrix th:first-child{{min-width:245px}} .role-matrix td{{text-align:center;vertical-align:middle}} .row-help{{display:block;color:var(--muted);font-weight:400;font-size:10px;margin-top:2px}} .overview-behavior-table td{{text-align:center}}
+.subheading{{margin-top:22px}} .mark-cell{{text-align:center!important;vertical-align:middle}} .matrix-mark{{display:inline-grid;place-items:center;min-width:24px;height:24px;padding:0 6px;border-radius:999px;font-weight:900;font-size:12px}} .matrix-mark.pass{{background:#dcfce7;color:#166534}} .matrix-mark.retained{{background:#dbeafe;color:#17499f}} .matrix-mark.attention{{background:#ffedd5;color:#9a4700}} .matrix-mark.danger{{background:#fee2e2;color:#991b1b}} .matrix-mark.representative{{background:#f2ebff;color:#5b21b6}} .matrix-mark.pattern{{background:#e0e7ff;color:#3730a3}} .matrix-mark.off{{color:#a2acba;background:#f3f4f6}} .matrix-legend{{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin-top:9px;color:var(--muted);font-size:11px}} .matrix-legend>span{{display:inline-flex;align-items:center;gap:5px}} .decision-table th[scope="row"]{{min-width:190px}} .decision-table td:last-child{{min-width:180px}} .role-matrix th:first-child{{min-width:245px}} .role-matrix td{{text-align:center;vertical-align:middle}} .row-help{{display:block;color:var(--muted);font-weight:400;font-size:10px;margin-top:2px}} .overview-behavior-table td{{text-align:center}}
 .micro{{font-size:11px;color:var(--muted);margin:3px 0}} .muted,.section-help{{color:var(--muted)}} .chart-grid{{display:grid;grid-template-columns:2fr 1fr;gap:15px}} .chart{{display:block;width:100%;height:auto}}
 .trajectory-empty{{display:grid;place-content:center;text-align:center;min-height:270px}} .empty-icon{{font-size:64px;color:#a4aec0}}
 details{{background:white;border:1px solid var(--line);border-radius:12px;padding:12px 15px;margin:10px 0}} summary{{cursor:pointer;font-weight:800}} details>table,details>.matrix-grid,details>p{{margin-top:12px}}
@@ -2426,14 +2462,14 @@ details{{background:white;border:1px solid var(--line);border-radius:12px;paddin
 .qa-reason-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0}} .qa-reason-grid>div{{padding:12px;background:#f8fafc;border:1px solid var(--line);border-radius:8px}} .qa-reason-grid ul{{margin:5px 0 0;padding-left:18px;font-size:12px;color:var(--muted)}}
 .dataset-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}} .dataset-tile{{appearance:none;text-align:left;border:1px solid var(--line);background:white;border-radius:13px;padding:16px;display:grid;gap:5px;color:var(--ink);cursor:pointer;box-shadow:0 5px 16px rgba(25,38,70,.04)}} .dataset-tile:hover,.dataset-tile:focus{{border-color:#7fa5ed;transform:translateY(-1px)}} .dataset-tile strong{{font-size:16px}} .dataset-tile span:not(.eyebrow){{color:var(--muted);font-size:12px}}
 .overview-hero{{background:linear-gradient(135deg,#172554,#1e3a8a);color:white;border-radius:18px;padding:32px}} .overview-hero .eyebrow,.overview-hero .lead{{color:#d8e5ff}} .overview-kpis{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-top:20px}} .overview-kpis>div{{background:rgba(255,255,255,.1);padding:14px;border:1px solid rgba(255,255,255,.18);border-radius:11px}} .overview-kpis strong{{display:block;font-size:27px}}
-.link-button{{border:0;background:none;color:#1d4ed8;text-decoration:underline;cursor:pointer;padding:0;font:inherit}} .dataset-selector.is-single{{display:none}} footer{{color:var(--muted);font-size:12px;padding-top:30px}}
+.link-button{{border:0;background:none;color:#1d4ed8;text-decoration:underline;cursor:pointer;padding:0;font:inherit}} .header-actions{{display:flex;align-items:center;gap:10px}} .summary-link{{color:#1d4ed8;text-decoration:none;border:1px solid #b8c5d8;border-radius:999px;padding:6px 11px;font-size:12px;font-weight:750;background:white}} .dataset-selector.is-single{{display:none}} footer{{color:var(--muted);font-size:12px;padding-top:30px}}
 @media(max-width:900px){{.hero,.dataset-intro,.chart-grid,.matrix-grid{{grid-template-columns:1fr}}.summary-grid,.callout-grid,.overview-kpis{{grid-template-columns:repeat(2,1fr)}}.dataset-grid{{grid-template-columns:1fr 1fr}}.dataset-intro{{gap:12px}}}}
 @media(max-width:580px){{main{{padding:12px 10px 55px}}.header-inner{{padding:9px 12px;align-items:flex-start;flex-direction:column}}.summary-grid,.callout-grid,.overview-kpis,.dataset-grid,.qa-grid,.qa-reason-grid,.representative-grid,.interpretation-strip{{grid-template-columns:1fr}}.evidence-strip{{grid-template-columns:repeat(2,minmax(0,1fr))}}.dataset-intro{{padding:13px}}.dataset-intro h1{{font-size:24px}}.evidence-chip{{padding:7px}}.evidence-chip strong{{font-size:13px}}.section-heading-inline{{align-items:flex-start;flex-direction:column;gap:6px}}.primary-chart{{padding:8px}}.primary-chart>.chart{{height:250px}}}}
 @media print{{header{{position:static}}.view[hidden]{{display:block!important;page-break-before:always}}button,select{{display:none}}body{{background:white}}main{{max-width:none}}}}
 </style>
 </head>
 <body>
-<header><div class="header-inner"><div class="brand">SDXL DQ 診断カルテ <small>v2.4.3 practical report beta ・ Safety/Fidelity ≠ Utility</small></div><label class="{selector_class}">表示 <select id="dataset-select"><option value="overview"{overview_selected}>横断概要</option>{options}</select></label></div></header>
+<header><div class="header-inner"><div class="brand">SDXL DQ 診断カルテ <small>v2.4.3 practical report beta ・ Safety/Fidelity ≠ Utility</small></div><div class="header-actions">{beginner_link}<label class="{selector_class}">表示 <select id="dataset-select"><option value="overview"{overview_selected}>横断概要</option>{options}</select></label></div></div></header>
 <main>
 <section id="overview" class="view"{overview_hidden}>
   <div class="overview-hero">
