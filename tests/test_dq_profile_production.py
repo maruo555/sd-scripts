@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -521,7 +522,7 @@ def test_launcher_uses_matched_subprocess_encoding(
     captured: dict[str, object] = {}
 
     class FakeProcess:
-        stdout = iter(["worker output\n"])
+        stdout = io.BytesIO("worker 出力\n".encode("cp932"))
 
         @staticmethod
         def wait() -> int:
@@ -541,9 +542,46 @@ def test_launcher_uses_matched_subprocess_encoding(
     Launcher(tmp_path).run(["python", "worker.py"], label="encoding test")
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
-    assert kwargs["encoding"] == "cp932"
-    assert kwargs["errors"] == "replace"
+    assert kwargs["text"] is False
+    assert kwargs["bufsize"] == 0
+    assert "encoding" not in kwargs
+    assert "errors" not in kwargs
     assert kwargs["env"] == {"PYTHONUTF8": "0", "PYTHONIOENCODING": "cp932:replace"}
+    assert "worker 出力" in (tmp_path / "run.log").read_text(encoding="utf-8")
+
+
+def test_launcher_preserves_tqdm_carriage_returns_on_console(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    console: list[str] = []
+
+    class FakeProcess:
+        stdout = io.BytesIO(b"steps 1/3\rsteps 2/3\rsteps 3/3\n")
+
+        @staticmethod
+        def wait() -> int:
+            return 0
+
+    monkeypatch.setattr(
+        production_runner,
+        "subprocess_text_environment",
+        lambda: ({"PYTHONIOENCODING": "utf-8:replace"}, "utf-8"),
+    )
+    monkeypatch.setattr(
+        production_runner.subprocess,
+        "Popen",
+        lambda command, **kwargs: FakeProcess(),
+    )
+    monkeypatch.setattr(production_runner, "console_write", console.append)
+
+    Launcher(tmp_path).run(["python", "worker.py"], label="progress test")
+
+    rendered = "".join(console)
+    assert "steps 1/3\rsteps 2/3\rsteps 3/3\n" in rendered
+    log_text = (tmp_path / "run.log").read_text(encoding="utf-8")
+    assert "\r" not in log_text
+    assert "steps 1/3\nsteps 2/3\nsteps 3/3\n" in log_text
 
 
 def test_profile_command_uses_request_paths_and_python_module(tmp_path: Path) -> None:
