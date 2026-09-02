@@ -73,7 +73,7 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 比較可能性を保つため、初期Betaではrank 4、AdamW8bitFast、fp16 strictなどの
 検証済み条件を固定します。既定の`standard`は最大32画像と独立snapshot 1回を使う日常診断、
 `strict`は独立snapshot A/B、長いPrefix、bounded edge再測定を使う環境変更・リリース前・
-再現性調査用です。旧16画像Quickはsamplingによる結果の揺れを避けるため、新規CLIから廃止しました。
+再現性調査用です。
 
 ```bat
 .\venv\Scripts\python.exe -m dq_profile ^

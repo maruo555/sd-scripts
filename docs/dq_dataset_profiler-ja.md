@@ -214,23 +214,15 @@ optimizer、precision契約のrun同士で比較するときのdataset体質記�
 | GPU、precision、backend | 同じprotocolでも1 probe当たりの時間が変わる |
 | source group数 | bootstrapのCPU時間と区間の安定性に影響するが、通常はGPU時間より小さい |
 
-この実測例と同じGPU・似たbucket構成・似たwarmup step数なら、次が目安です。
+preflight後に作られる`execution_plan.json`の`reference_time_estimate.minutes`には、
+そのrunの画像数、warmup境界、mode、候補数を反映した参考時間を保存します。
+`minimum`が通常経路、`maximum_if_all_edge_rounds_run`がStrictで全edge延長を使った場合の
+上限側の目安です。これは単一環境の実測を基にした保証のない概算であり、bucket構成やGPU環境で
+変わります。実行中は`status.json`の`current_stage`と`run.log`の`RUN`／`DONE`時刻で
+実時間と進行を確認してください。
 
-| mode | 実行内容 | 実測例を基準にした概算 |
-|---|---|---:|
-| Standard | snapshot 1回、8A／8B／16、固定5点を1回、edgeなし | 約33分（旧4-process実測からの概算） |
-| Strict（edgeなし） | 64A／64B／128、core 3点 | 約46分 |
-| Strict（edge 1回） | 上記＋拡張grid再測定1回 | 約65分 |
-| Strict（edge 2回） | 上記＋拡張grid再測定2回 | 約88分 |
-
-別の37画像、29,600 training-step相当、warmup境界1,480 stepのdatasetでは、旧4-process
-Standardが同じGPUで約1時間40分59秒でした。現Standardは最大32画像を維持したまま
-snapshot-only processを1回省くため、同条件では約1時間27～31分を見込みます。これはまだ
-現仕様での実測値ではなく、旧実測からsnapshot境界作成1回分を引いた概算です。このdatasetは
-上の13画像例よりwarmupとLocalの両方が重いため、絶対時間を直接比較しないでください。
-
-これは保証値ではありません。実行中は`status.json`の`current_stage`と`run.log`の
-`RUN`／`DONE`時刻で進行を確認してください。
+対話consoleでは、warmupを含む`tqdm`の進捗を通常学習と同じ1行上で更新します。
+`run.log`は後から検索しやすいよう、各進捗更新を独立した行として保存します。
 
 ### 3.9 軽量化の境界
 
@@ -241,8 +233,6 @@ Snapshot Aと後続Prefix processの境界parityは維持するため、同じLo
 
 `strict`は独立Snapshot A/B、長いPrefix、bounded edge再測定を使うreference modeです。コード、
 CUDA、PyTorch、bitsandbytesの変更後、リリース前、またはStandardの結果が疑わしい場合に使います。
-旧16画像Quickはsamplingによる結果の揺れを避けるため新規CLIから廃止しました。既存Quick成果物の
-レポート表示互換性だけは維持します。
 
 ## 4. Mul affinity curveの読み方
 
@@ -579,31 +569,7 @@ source groupがmodeの画像上限を超える場合もpreflightでは拒否し�
 例えば`--optimizer_type=AdamW8bit`を明示すると、要求される`AdamW8bitFast`との衝突として
 停止します。`--fp16_safe_norms_mode=native_accum`も、現在は同じく停止します。
 
-## 7. 推奨する初回マージ範囲
-
-安定機能として含める範囲:
-
-- isolated profiler entry
-- stateless quant RNGとsealed replay
-- snapshot、manifest、status、hard-safety
-- Local Body／Tail／Tail Amplification
-- Mul affinity curveと単一dataset HTML
-- 匿名化した比較例
-- unit、schema、isolation、golden report test
-
-experimentalと明記する範囲:
-
-- Fidelity retainedによるLocal候補削減
-- 単一代表
-
-研究専用として通常レポートから外す範囲:
-
-- 128-step Trajectory
-- 画質Utilityとの対応
-
-初回マージでは最終画質の自動推薦を行いません。
-
-## 8. 出力の扱い
+## 7. 出力の扱い
 
 既定では次の構造でGit管理外へ保存します。
 
@@ -641,24 +607,7 @@ experimentalと明記する範囲:
 - `dataset_character_vector.json`: 合成点を作らないdataset体質の5 channel
 - 実行ログ
 
-### 第三者へ共有する前のプライバシーチェック
-
-生のrun directoryは、そのまま公開しないでください。少なくとも次を削除または一般化します。
-
-| 情報 | 含まれ得る成果物 | 公開用の扱い |
-|---|---|---|
-| dataset名、作品名、人物名、固有タグ | profile名、report、TOML、CSV | `Dataset A`など意味を持たないIDへ置換 |
-| model／dataset／outputの絶対パス | `resolved_args.json`、manifest、log、TOML | `<model-path>`、`<dataset-path>`などへ置換 |
-| caption、画像ファイル名、画像キー | TOML、probe manifest、raw CSV、log | 削除または連番IDへ置換 |
-| ファイルhash、source inventory | source manifest、source map | 公開例から削除。hashもdatasetを照合できる識別情報として扱う |
-| host名、ユーザー名、環境固有情報 | manifest、log | 比較に不要なら削除 |
-| API key、token、password | 本来CLIへ渡さない | 文字列を伏せ、漏えい時は無効化・再発行する |
-
-リポジトリへ収録する例は、生のrun directoryではなく、公開項目を限定した匿名化成果物を
-新しく作ります。本リポジトリの実測比較例は、名称、パス、caption、画像識別子、hashを
-含まない形にしてあります。
-
-## 9. 実測比較例
+## 8. 実測比較例
 
 [dataset差の実測例](examples/dq_dataset_profiler_anonymized_example.html)には、
 保存済みv2.4実測の点推定と95%区間を丸め、dataset名、作品名、人物名、パス、caption、
@@ -673,20 +622,3 @@ experimentalと明記する範囲:
 - 同じ画像でもタグ設計だけで曲線が変わるpaired dataset
 
 これらはdataset固有の数値的反応が観測できることを示しますが、画質の優劣を示すものではありません。
-
-## 10. Trajectory検証の結果と残作業
-
-128-step Trajectory検証では、Localで棄却されたcontrolがTrajectoryでは最小となり、
-Local Tailとの順位相関が`-0.5`になる反転を確認しました。共有probe parityは`pass_exact`、
-5 repeatのleave-one-outも安定していたため、単なる実行不良ではなく両channelが別の性質を
-測っていると判断します。
-
-このため製品レポートはLocal-onlyを維持し、Trajectoryは研究用の説明channelに限定します。
-詳細は[Trajectory channel 検証判断](dq_dataset_profiler_trajectory_decision-ja.md)を参照してください。
-
-現在残っている主な検証:
-
-- 独立profile seedで、Local候補集合とedge傾向のrun-level再現性を確認する。
-- 将来、固定済みblind評価によるUtility Bridgeで数値指標と最終画質を結ぶ。
-
-Utility Bridgeを終える前でも、Local-onlyのSafety/Fidelity説明診断としては利用・マージ可能です。

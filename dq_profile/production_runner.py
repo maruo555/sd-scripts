@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import hashlib
 import importlib.util
 import json
@@ -11,7 +12,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from dq_profile.production_cli import ResolvedProfileRequest
 from dq_profile.protocol import (
@@ -43,6 +44,59 @@ def console_write(text: str) -> None:
         safe = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
         sys.stdout.write(safe)
     sys.stdout.flush()
+
+
+def _iter_decoded_output(stream: Any, *, encoding: str) -> Iterator[str]:
+    """Decode a binary subprocess pipe without translating carriage returns."""
+
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    while True:
+        chunk = stream.read(4096)
+        if not chunk:
+            break
+        if isinstance(chunk, str):
+            # Keep this fallback for lightweight test doubles. Production pipes
+            # are binary so TextIOWrapper cannot translate tqdm's CR into LF.
+            yield chunk
+            continue
+        text = decoder.decode(chunk, final=False)
+        if text:
+            yield text
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        yield tail
+
+
+def relay_subprocess_output(stream: Any, *, encoding: str, log_stream: Any) -> None:
+    """Relay tqdm CR updates to the console and keep run.log line-oriented."""
+
+    saw_output = False
+    console_ended_line = True
+    log_ended_line = True
+    pending_log_cr = False
+    for text in _iter_decoded_output(stream, encoding=encoding):
+        saw_output = True
+        console_write(text)
+        console_ended_line = text.endswith("\n")
+
+        if pending_log_cr:
+            text = "\r" + text
+            pending_log_cr = False
+        if text.endswith("\r"):
+            text = text[:-1]
+            pending_log_cr = True
+        log_text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if log_text:
+            log_stream.write(log_text)
+            log_ended_line = log_text.endswith("\n")
+
+    if pending_log_cr:
+        log_stream.write("\n")
+        log_ended_line = True
+    elif saw_output and not log_ended_line:
+        log_stream.write("\n")
+    if saw_output and not console_ended_line:
+        console_write("\n")
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -790,16 +844,16 @@ class Launcher:
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            encoding=stream_encoding,
-            errors="replace",
-            bufsize=1,
+            text=False,
+            bufsize=0,
         )
         assert process.stdout is not None
         with self.log_path.open("a", encoding="utf-8") as log_stream:
-            for line in process.stdout:
-                console_write(line)
-                log_stream.write(line)
+            relay_subprocess_output(
+                process.stdout,
+                encoding=stream_encoding,
+                log_stream=log_stream,
+            )
         return_code = process.wait()
         if return_code:
             raise RuntimeError(f"{label} failed with exit code {return_code}")

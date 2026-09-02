@@ -30,9 +30,7 @@ The 128-step Trajectory channel is not part of the production candidate
 reduction rule and cannot be started from the public `python -m dq_profile`
 entry. It remains available only through low-level research protocols, is
 descriptive, and cannot claim a best mul, quality, Utility, or training-success
-verdict. See
-[`docs/dq_dataset_profiler_trajectory_decision-ja.md`](../docs/dq_dataset_profiler_trajectory_decision-ja.md)
-for the validation decision.
+verdict.
 
 ## Copied-source maintenance
 
