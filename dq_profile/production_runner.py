@@ -723,7 +723,9 @@ def build_execution_plan(
         "qa_depth": execution.qa_depth,
         "internal_profile_level": execution.internal_profile_level,
         "measurement_contract": local.name,
+        "data_diagnostics": {"mode": request.data_diagnostics, "selector_input": False},
         "work_volume": {
+            "dataset_initial_forward_only_per_local_worker": (probe_budget * local.timestep_bins * local.no_quant_noise_replicas if request.data_diagnostics == "warmup" else 0),
             "gpu_process_count": exact_process_count,
             "gpu_process_count_min": minimum_processes,
             "gpu_process_count_max": maximum_processes,
@@ -779,6 +781,7 @@ def build_execution_plan(
         },
         "reference_time_estimate": {
             "minutes": estimate_minutes,
+            "excludes_dataset_initial_forwards_and_cpu_reporting": True,
             "is_guarantee": False,
             "basis": "single historical RTX 5080 run with 13 probe images and warmup boundary 420",
             "calibration": {
@@ -959,6 +962,10 @@ def profile_command(
         f"--dq_profile_sketch_seeds={local.sketch_seeds}",
         f"--dq_profile_source_group_map={source_map}",
     ]
+    if protocol == "v24-acceptance-local" and not snapshot_only:
+        command.append(f"--dq_profile_data_diagnostics={request.data_diagnostics}")
+        if request.group_map is not None:
+            command.append(f"--dq_profile_group_map={request.group_map}")
     if gate is not None:
         command.append(f"--dq_profile_prefix_gate_file={gate}")
     if snapshot_only:
@@ -1461,6 +1468,8 @@ def run_profile_request(
         "Reference time estimate (not guaranteed): "
         f"{time_text}; see execution_plan.json for assumptions"
     )
+    if request.data_diagnostics == "warmup":
+        launcher.log(f"Additional initial forward-only probes per Local worker: {work['dataset_initial_forward_only_per_local_worker']}; their time is not included above. Strict edge reruns repeat this evaluation.")
     try:
         if options.preflight_only:
             update_status(
@@ -1517,6 +1526,9 @@ def run_profile_request(
         promoted = promote_analysis(run_dir, active_analysis)
         promoted.extend(promote_profile_provenance(run_dir, active_profile))
         selection = read_json(run_dir / "local_selection.json")
+        if request.data_diagnostics != "off":
+            from dq_profile.diagnostic_report import promote_dataset_report
+            promoted.extend(promote_dataset_report(active_profile, run_dir, selection))
         update_status(
             run_dir,
             status="complete",

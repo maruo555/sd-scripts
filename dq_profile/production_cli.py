@@ -57,6 +57,8 @@ class ResolvedProfileRequest:
     normal_output_dir: Path | None
     parsed_namespace: Any
     dispositions: tuple[dict[str, Any], ...]
+    data_diagnostics: str = "off"
+    group_map: Path | None = None
 
     def provenance(self) -> dict[str, Any]:
         return {
@@ -71,6 +73,9 @@ class ResolvedProfileRequest:
             "output_name": self.output_name,
             "normal_output_dir": str(self.normal_output_dir) if self.normal_output_dir else None,
             "explicit_option_dispositions": list(self.dispositions),
+            "data_diagnostics": self.data_diagnostics,
+            "data_diagnostics_selector_input": False,
+            "diagnostic_group_map": str(self.group_map) if self.group_map else None,
             "policy": {
                 "unknown_options": "reject",
                 "unsupported_options": "reject",

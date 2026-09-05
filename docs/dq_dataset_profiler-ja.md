@@ -1,5 +1,7 @@
 # SDXL DQ Dataset Profiler 利用ガイド
 
+画像・フォルダ・キャラタグ別の追加診断、warmup前後比較、52画像化については、[データセット診断ガイド](dq_dataset_diagnostics-ja.md)を参照してください。
+
 ## 1. この診断機能は何を調べるものか
 
 SDXL DQ Dataset Profilerは、LoRA学習でdelta量子化を使ったときに、
@@ -138,9 +140,9 @@ total = I × 4 × (3 + 4M)
 端点でも改善傾向が続く場合は`edge_unresolved`と表示しますが、範囲外を追跡しません。
 この場合、単一代表を出さず、Fidelity retained候補を1点へ自動縮約しません。
 
-Standard／Strictとも最大32画像、4 timestep帯、no-quant 3 replicas、candidate 2 noise ×
+Standard／Strictとも最大52画像、4 timestep帯、no-quant 3 replicas、candidate 2 noise ×
 2 quant repeatsを使うため、Local Body／Tailの物差しは共通です。独立source groupが画像上限を
-超えるdatasetも実行できますが、最大32群だけを決定的にprobeします。全groupはsource contractに
+超えるdatasetも実行できますが、最大52群だけを決定的にprobeします。全groupはsource contractに
 残り、レポートには`probe / total`を表示します。未probe群がある結果は完全coverageと同一視しません。
 
 `strict`はcore grid `2.70, 3.15, 3.45`から開始します。候補集合が測定端に残る場合だけ、
@@ -171,7 +173,7 @@ source／timestep偏りを短い説明付きで表示します。性格カルテ
   timestep別信号規模を記録します。収束、最終画質、rank、LR、epoch数は予測しません。
 - **Dataset character vector**: 絶対的な受容帯、mul応答、Tail増幅、source集中、no-quant信号を
   独立した5 channelとして並べます。多数決や平均による単一スコアには変換しません。
-- **Image coverage**: probe画像数／dataset実画像数を表示します。32画像を超えるdatasetでは
+- **Image coverage**: probe画像数／dataset実画像数を表示します。52画像を超えるdatasetでは
   未probe画像が残るため、説明値をdataset全体の完全観測とは扱いません。
 
 これらは`selector_input=false`、`not_quality_or_utility=true`として保存します。
@@ -208,7 +210,7 @@ optimizer、precision契約のrun同士で比較するときのdataset体質記�
 | 要因 | 時間への影響 |
 |---|---|
 | 通常学習相当の総step数 | 5% warmup境界が変わる。画像repeatやdataset設定が多いほど、各GPU stageの境界作成が長くなる |
-| 実画像数 | Local部分はprobe上限までほぼ比例する。Standard／Strictとも最大32画像 |
+| 実画像数 | Local部分はprobe上限までほぼ比例する。Standard／Strictとも最大52画像 |
 | bucket解像度 | 高解像度bucketが多いほど各forward/backwardが重くなる |
 | edge延長回数 | 0～2回。現在は拡張grid全体を再測定するため、もっとも大きな可変要因 |
 | GPU、precision、backend | 同じprotocolでも1 probe当たりの時間が変わる |
@@ -226,7 +228,7 @@ preflight後に作られる`execution_plan.json`の`reference_time_estimate.minu
 
 ### 3.9 軽量化の境界
 
-`standard`は、最大32画像、4 timestep帯、no-quant 3 replicas、candidate 2 noise × 2 quant repeatsを
+`standard`は、最大52画像、4 timestep帯、no-quant 3 replicas、candidate 2 noise × 2 quant repeatsを
 Strictと同じまま保ちます。短縮するのは専用Snapshot B、長いPrefix検算、edge再測定です。
 Snapshot Aと後続Prefix processの境界parityは維持するため、同じLocal物差しを短いQAで使う
 日常modeです。
@@ -385,7 +387,7 @@ python -m dq_profile ^
 | `--dq-profile-name` | 任意 | `output_name` | datasetごとの親フォルダ名 |
 | `--dq-profile-output-dir` | 任意 | repositoryの`..\lora_output\dq_dataset_profiler` | 診断runを格納する基底ディレクトリ |
 | `--dq-profile-preset` | 任意 | `canonical-v1` | versioned互換性・計測契約。現在の対応presetは1つ |
-| `--dq-profile-mode` | 任意 | `standard` | `standard`: 最大32画像・snapshot 1回の日常診断、`strict`: 独立snapshot A/B・長いreference QA＋bounded edge再測定 |
+| `--dq-profile-mode` | 任意 | `standard` | `standard`: 最大52画像・snapshot 1回の日常診断、`strict`: 独立snapshot A/B・長いreference QA＋bounded edge再測定 |
 | `--dq-profile-preflight` | 任意 | false | パス、source、CLI契約、fingerprintまで作りGPUを起動しない |
 | `--dq-profile-dry-run` | 任意 | false | `execution_plan.json`と解決済みCore commandを書き、GPUを起動しない |
 | `--dq-profile-open-report` | 任意 | false | Windowsで正常完了した場合に`report.html`を開く |
@@ -516,7 +518,7 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | confidence上限 | 通常 | 通常 |
 
 source groupがmodeの画像上限を超える場合もpreflightでは拒否しません。全inventoryをsource contractへ
-保持したまま、Standard／Strictは最大32群をTOML全域から決定的に選びます。
+保持したまま、Standard／Strictは最大52群をTOML全域から決定的に選びます。
 `report.html`とsummaryには`source_group_count_probed`／`source_group_count_total`／coverage規則を
 残し、未probe群がある場合はLocal confidenceを過大評価しません。
 

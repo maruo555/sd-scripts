@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -22,12 +23,21 @@ def run_profile_mode(
     preflight_only: bool = False,
     dry_run: bool = False,
     open_report: bool = False,
+    data_diagnostics: str = "off",
+    group_map: Path | None = None,
 ) -> int:
     request = resolve_training_cli(
         training_argv,
         preset_name=preset_name,
         execution_mode_name=execution_mode_name,
     )
+    if data_diagnostics not in {"off", "local", "warmup"}:
+        raise ValueError("unknown data diagnostics mode")
+    if group_map is not None:
+        from dq_profile.dataset_diagnostics import load_group_map
+        load_group_map(group_map)
+        group_map = group_map.resolve(strict=True)
+    request = replace(request, data_diagnostics=data_diagnostics, group_map=group_map)
     result = run_profile_request(
         request,
         ProductionRunOptions(

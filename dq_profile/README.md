@@ -32,6 +32,12 @@ entry. It remains available only through low-level research protocols, is
 descriptive, and cannot claim a best mul, quality, Utility, or training-success
 verdict.
 
+## Dataset diagnostics
+
+Add `--dq-profile-data-diagnostics=local` for image/folder/tag reports without extra GPU forwards, or `warmup` for paired initial-state evaluation. The default is `off` until full-SDXL mode parity is validated. Production now uses the 52-image `local-body-tail-v2` contract in every mode.
+
+See [dataset diagnostics guide](../docs/dq_dataset_diagnostics-ja.md) for report controls, group-map reuse, timings, CPU rebuilding, and validation limits.
+
 ## Copied-source maintenance
 
 `copied_train_network.py` and `copied_lora.py` intentionally isolate the
@@ -59,14 +65,14 @@ as if they were one package version:
   `2.4.3-practical-report-beta`.
 
 The public execution modes share the same `canonical-v1` training preset and
-`local-body-tail-v1` measurement contract:
+`local-body-tail-v2` measurement contract:
 
 - `standard`: daily-use 8A/8B/16@8 prefix smoke and one fixed five-point
   Local scan (`2.70, 3.15, 3.45, 3.75, 4.05`), without edge remeasurement;
 - `strict`: 64A/64B/128@64 reference parity, a three-point core, and up to
   two bounded edge-extension remeasurements.
 
-Both modes retain up to 32 images, four timestep bins, three no-quant noise
+Both modes retain up to 52 images, four timestep bins, three no-quant noise
 replicas, and two candidate-noise by two stochastic-quant repeats. The mode,
 QA depth, shared Local contract hash, and execution-specific hash are recorded
 separately. Use Strict after code/runtime/backend changes or while investigating

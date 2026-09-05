@@ -49,7 +49,7 @@ def minimal_cli(*extra: str) -> list[str]:
 def test_minimal_cli_uses_versioned_preset_and_japanese_paths() -> None:
     request = resolve_training_cli(minimal_cli())
     assert request.preset.name == "canonical-v1"
-    assert request.local_measurement.name == "local-body-tail-v1"
+    assert request.local_measurement.name == "local-body-tail-v2"
     assert request.execution_mode.name == "standard"
     assert request.dataset_config.name == "dataset.toml"
     assert request.output_name == "dataset"
@@ -630,9 +630,9 @@ def test_standard_profile_command_carries_distinct_execution_and_internal_levels
     assert "--dq_profile_level=standard" in command
     assert "--dq_profile_prefix_short_steps=8" in command
     assert "--dq_profile_prefix_long_steps=16" in command
-    assert "--dq_profile_measurement_contract=local-body-tail-v1" in command
-    assert "--dq_profile_sampling_depth=reference_32_image" in command
-    assert "--dq_profile_max_images=32" in command
+    assert "--dq_profile_measurement_contract=local-body-tail-v2" in command
+    assert "--dq_profile_sampling_depth=reference_52_image" in command
+    assert "--dq_profile_max_images=52" in command
     assert "--dq_profile_range_muls=2.70,3.15,3.45,3.75,4.05" in command
 
 
@@ -865,6 +865,8 @@ def test_direct_module_entry_preserves_training_vector(monkeypatch: pytest.Monke
         "preflight_only": False,
         "dry_run": False,
         "open_report": False,
+        "data_diagnostics": "off",
+        "group_map": None,
     }
 
 

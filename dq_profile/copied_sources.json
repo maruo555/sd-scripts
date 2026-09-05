@@ -8,10 +8,11 @@
       "source": "train_network.py",
       "source_git_blob_oid": "d1dedba47512bc60bfc1959a13053d8b74178821",
       "source_normalized_sha256": "6a6485e6a3b08d662335910e557d9be205b29914208c45a64e36931a04a7ba2b",
-      "copied_normalized_sha256": "015125254c757aa56c742049b5011d5b1424c291bc508480fdf8e0fcd46ce9ba",
+      "copied_normalized_sha256": "d6e7097f36d21102a6a81b36fbc999329a2168a295251c952ee2de71b38e593f",
       "diagnostic_changes": [
         "uses the isolated profiler NetworkTrainer runtime instead of the ordinary training entry",
-        "captures reproducible snapshots, replay inputs, prefix fingerprints, and Local diagnostic artifacts"
+        "captures reproducible snapshots, replay inputs, prefix fingerprints, and Local diagnostic artifacts",
+        "optional dataset raw-MSE observer, loader inventory, initial LoRA snapshot and actual warmup exposure counts; ordinary trainer unchanged"
       ]
     },
     "dq_profile/copied_lora.py": {
