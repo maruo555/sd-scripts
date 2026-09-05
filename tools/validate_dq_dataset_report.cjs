@@ -118,6 +118,33 @@ const { pathToFileURL } = require('url');
       await contextPage.close();
     }
     check('context regressions without runtime errors',errors.length===0);
+    const sorting=await browser.newPage();sorting.on('pageerror',e=>errors.push(e.message));
+    await sorting.setContent(fs.readFileSync(path.join(__dirname,'../dq_profile/dataset_report.html'),'utf8').replace('__DATASET_PAYLOAD__',JSON.stringify(payload).replace(/</g,'\\u003c')));
+    await sorting.click('#view-tabs [data-kind="image"]');
+    const selected=await sorting.locator('#detail h2').first().textContent();
+    await sorting.selectOption('#sort-by','post');await sorting.selectOption('#sort-direction','desc');
+    check('highest MSE image sorts first',await sorting.locator('#rows button').first().getAttribute('data-id')==='i51');
+    check('sorting preserves selected detail',await sorting.locator('#detail h2').first().textContent()===selected);
+    await sorting.click('#next-page');check('sorting spans pagination',await sorting.locator('#rows button').first().getAttribute('data-id')==='i27');
+    await sorting.evaluate(()=>selectEntity('image','i0'));check('selection locates sorted page',(await sorting.locator('#page-label').textContent()).startsWith('49'));
+    for(const kind of ['image','folder','character']){
+      await sorting.click('#view-tabs [data-kind="'+kind+'"]');
+      for(const [metric,col] of [['pre',2],['post',3],['rel',4],['d',5]])for(const direction of ['asc','desc']){
+        await sorting.selectOption('#sort-by',metric);await sorting.selectOption('#sort-direction',direction);
+        const values=await sorting.locator('#rows tr').evaluateAll((rs,col)=>rs.map(r=>parseFloat(r.children[col].textContent)),col);
+        check(kind+' '+metric+' '+direction+' ordered',values.every((v,i)=>!i||!Number.isFinite(v)||Math.abs(v-values[i-1])<1e-8||(direction==='asc'?v>=values[i-1]:v<=values[i-1])));
+      }
+    }
+    await sorting.evaluate(()=>{for(const b of S[0].bins)b.loss_pre=null;render()});
+    await sorting.click('#view-tabs [data-kind="image"]');await sorting.selectOption('#sort-by','pre');
+    for(const direction of ['asc','desc']){
+      await sorting.selectOption('#sort-direction',direction);await sorting.click('#next-page');await sorting.click('#next-page');
+      check('missing values last in '+direction,await sorting.locator('#rows button').last().getAttribute('data-id')==='i0');
+    }
+    await sorting.evaluate(()=>{for(const b of S[0].bins)b.quant[4].d=1000});
+    await sorting.selectOption('#sort-by','d');await sorting.selectOption('#sort-direction','desc');await sorting.selectOption('#mul','4');
+    check('sort responds to selected mul',await sorting.locator('#rows button').first().getAttribute('data-id')==='i0');
+    await sorting.close();check('sorting without runtime errors',errors.length===0);
     fs.writeFileSync(path.join(path.dirname(report),'browser-validation.json'),JSON.stringify({checks,errors},null,2));
     console.log(JSON.stringify({passed:checks.length,errors,report}));
   }finally{await browser.close()}
