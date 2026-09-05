@@ -688,7 +688,14 @@ class DiagnosticProfileRuntime:
         forced_skip: Optional[bool] = None,
         matched_no_quant_gradient_norm: Optional[float] = None,
         hard_safety: bool = False,
+        diagnostic_forward_only: bool = False,
     ) -> tuple[dict[str, Any], ExactGradient, list[dict[str, Any]]]:
+        observer = getattr(self.trainer, "_dataset_diagnostics", None)
+        if observer is not None:
+            observer.active = phase == "v2_tail_probe" or diagnostic_forward_only
+            observer.raw_mse = None
+        if diagnostic_forward_only and (update or shadow or candidate.quantized):
+            raise ValueError("initial diagnostic pass must be forward-only no-quant")
         if not replay.materialized():
             raise RuntimeError("profile pass requires a fully materialized replay batch")
         rng_digest_before = rng_fingerprint()
@@ -788,8 +795,11 @@ class DiagnosticProfileRuntime:
                 weight_dtype,
                 train_unet=train_unet,
             )
-            accelerator.backward(loss)
-            exact_gradient = ExactGradient.capture(unwrapped.named_parameters(), scale=grad_scale)
+            if diagnostic_forward_only:
+                exact_gradient = ExactGradient({}, 0.0)
+            else:
+                accelerator.backward(loss)
+                exact_gradient = ExactGradient.capture(unwrapped.named_parameters(), scale=grad_scale)
             shadow_rows = self.quant_context.finish_pass()
             profile_trace = self.quant_context.last_trace
             if hasattr(unwrapped, "export_dq_stats"):
@@ -867,6 +877,8 @@ class DiagnosticProfileRuntime:
             }
             return row, exact_gradient, shadow_rows
         finally:
+            if observer is not None:
+                observer.active = False
             if hasattr(unwrapped, "discard_dq_stats_step"):
                 unwrapped.discard_dq_stats_step(stats_step)
             if hasattr(unwrapped, "set_dq_profile_context"):
@@ -1049,6 +1061,9 @@ class DiagnosticProfileRuntime:
                             "gradient_topology_matches": True,
                         }
                     )
+                    observer = getattr(self.trainer, "_dataset_diagnostics", None)
+                    if observer is not None:
+                        observer.record(probe, base_metadata, reference_row, model_seed_id=model_seed_id)
                     sketch_metadata.append(dict(base_metadata))
                     for sketch_name, sketcher in sketchers.items():
                         value = sketcher.sketch(reference_gradient)
@@ -1135,6 +1150,8 @@ class DiagnosticProfileRuntime:
                                 noise_scheduler=noise_scheduler,
                             )
                             cosine = reference_gradient.cosine(candidate_gradient)
+                            if observer is not None:
+                                observer.record(probe, base_metadata, candidate_row, comparison=cosine, quant_repeat=quant_repeat)
                             per_image_rows.append(
                                 {
                                     **candidate_row,
@@ -1297,6 +1314,13 @@ class DiagnosticProfileRuntime:
             trainer=self.trainer,
             guardian=grad_norm_guardian,
         )
+        observer = getattr(self.trainer, "_dataset_diagnostics", None)
+        if observer is not None:
+            observer.evaluate_initial(self, snapshot, accelerator=accelerator, network=network,
+                optimizer=optimizer, lr_scheduler=lr_scheduler, grad_norm_guardian=grad_norm_guardian,
+                unet=unet, text_encoders=text_encoders, tokenizers=tokenizers, train_unet=train_unet,
+                train_text_encoder=train_text_encoder, training_model=training_model, on_step_start=on_step_start,
+                weight_dtype=weight_dtype, noise_scheduler=noise_scheduler)
         return (
             per_image_rows,
             [],
@@ -2838,6 +2862,9 @@ class DiagnosticProfileRuntime:
             + "\n",
             encoding="utf-8",
         )
+        observer = getattr(self.trainer, "_dataset_diagnostics", None)
+        if observer is not None:
+            observer.finish(self.artifacts.root / "data_diagnostics")
         summary_hash = canonical_sha256(summary)
         self.artifacts.mark_complete(summary_hash)
         accelerator.end_training()

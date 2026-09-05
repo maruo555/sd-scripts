@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 
@@ -97,7 +97,7 @@ class ExecutionMode:
     edge_policy: str
     prefix_short_steps: int
     prefix_long_steps: int
-    local_measurement_name: str = "local-body-tail-v1"
+    local_measurement_name: str = "local-body-tail-v2"
     standalone_snapshot_count: int = 2
     prefix_anchor_mul: float = 3.15
     snapshot_a_max_images: int = 8
@@ -313,6 +313,8 @@ LOCAL_BODY_TAIL_V1 = LocalMeasurementContract(
 )
 
 
+LOCAL_BODY_TAIL_V2 = replace(LOCAL_BODY_TAIL_V1, name="local-body-tail-v2", max_images=52, sampling_depth="reference_52_image")
+
 STRICT_MODE = ExecutionMode(
     name="strict",
     description="Reference-depth QA with long prefix parity and bounded edge extension.",
@@ -344,6 +346,7 @@ STANDARD_MODE = ExecutionMode(
 PRESETS = {CANONICAL_V1.name: CANONICAL_V1}
 LOCAL_MEASUREMENT_CONTRACTS = {
     LOCAL_BODY_TAIL_V1.name: LOCAL_BODY_TAIL_V1,
+    LOCAL_BODY_TAIL_V2.name: LOCAL_BODY_TAIL_V2,
 }
 EXECUTION_MODES = {
     STANDARD_MODE.name: STANDARD_MODE,
@@ -359,7 +362,7 @@ def get_preset(name: str) -> TrainingPreset:
         raise ValueError(f"unknown DQ profile preset {name!r}; supported: {supported}") from error
 
 
-def get_local_measurement_contract(name: str = "local-body-tail-v1") -> LocalMeasurementContract:
+def get_local_measurement_contract(name: str = "local-body-tail-v2") -> LocalMeasurementContract:
     try:
         return LOCAL_MEASUREMENT_CONTRACTS[name]
     except KeyError as error:

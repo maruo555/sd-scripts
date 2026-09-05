@@ -1076,6 +1076,10 @@ class NetworkTrainer:
                 weight_dtype,
             )
 
+        diagnostic_observer = getattr(self, "_dataset_diagnostics", None)
+        if diagnostic_observer is not None:
+            diagnostic_observer.tap(noise_pred, target)
+
         loss = train_util.conditional_loss(
             noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
         )
@@ -3431,11 +3435,19 @@ class NetworkTrainer:
                 return global_step >= dq_delta_begin_step
             return progress_frac >= args.dq_delta_begin
 
+        self._dataset_diagnostics = None
         dq_profile_runtime = None
         if bool(getattr(args, "dq_profile_enabled", False)):
             from dq_profile.trainer_runtime import DiagnosticProfileRuntime
 
             dq_profile_runtime = DiagnosticProfileRuntime(args=args, trainer=self)
+            if getattr(args, "dq_profile_data_diagnostics", "off") != "off":
+                from dq_profile.diagnostic_eval import DatasetDiagnostics
+                # The local train_dataset_group was deleted after metadata setup;
+                # the prepared DataLoader still owns the actual training dataset.
+                self._dataset_diagnostics = DatasetDiagnostics(
+                    args, train_dataloader.dataset, accelerator.unwrap_model(network), unet, text_encoders, self
+                )
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -3736,6 +3748,11 @@ class NetworkTrainer:
                                     mode=args.round_lora_mode,
                                     exclude_param_ids=self._te_frozen_param_ids,
                                 )
+                if getattr(self, "_dataset_diagnostics", None) is not None:
+                    self._dataset_diagnostics.observe_training(
+                        batch, global_step, updated=(not skip_step and accelerator.sync_gradients
+                        and not bool(getattr(accelerator, "optimizer_step_was_skipped", False)))
+                    )
                 current_loss = loss_scalar
 
                 if args.scale_weight_norms:

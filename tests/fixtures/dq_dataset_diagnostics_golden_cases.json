@@ -1,0 +1,169 @@
+{
+  "schema_version": "1.0.0",
+  "contract": "dataset-diagnostics-v1",
+  "description": "Synthetic arithmetic fixtures only; not results of a model-training experiment.",
+  "numeric_tolerance": {
+    "rtol": 1e-12,
+    "atol": 1e-12
+  },
+  "cases": [
+    {
+      "id": "positive_improvement",
+      "operation": "pre_post",
+      "input": {
+        "pre": 0.2,
+        "post": 0.15
+      },
+      "expected": {
+        "improvement_abs": 0.05,
+        "improvement_rel": 0.25
+      }
+    },
+    {
+      "id": "negative_improvement",
+      "operation": "pre_post",
+      "input": {
+        "pre": 0.2,
+        "post": 0.22
+      },
+      "expected": {
+        "improvement_abs": -0.02,
+        "improvement_rel": -0.1
+      }
+    },
+    {
+      "id": "matched_noise_only",
+      "operation": "paired_quant_loss",
+      "input": {
+        "noquant_by_noise": [
+          1,
+          3,
+          100
+        ],
+        "candidate_by_noise_and_repeat": [
+          [
+            1.1,
+            1.1
+          ],
+          [
+            3.1,
+            3.1
+          ]
+        ],
+        "matched_noise_indices": [
+          0,
+          1
+        ]
+      },
+      "expected": {
+        "quant_loss_delta": 0.1,
+        "matched_noquant_mean": 2.0,
+        "quant_loss_relative": 0.05,
+        "reference_noise_count": 2
+      }
+    },
+    {
+      "id": "ratio_of_group_means",
+      "operation": "group_improvement",
+      "input": {
+        "pre": [
+          1,
+          100
+        ],
+        "post": [
+          0.5,
+          90
+        ],
+        "weights": [
+          0.5,
+          0.5
+        ]
+      },
+      "expected": {
+        "loss_pre": 50.5,
+        "loss_post": 45.25,
+        "improvement_abs": 5.25,
+        "improvement_rel": 0.10396039603960396
+      },
+      "incorrect_alternative": {
+        "mean_individual_improvement_rel": 0.3
+      }
+    },
+    {
+      "id": "image_equal_multiple_views",
+      "operation": "image_equal",
+      "input": {
+        "image_a": [
+          0.1,
+          0.3
+        ],
+        "image_b": [
+          0.8
+        ]
+      },
+      "expected": {
+        "image_equal_mean": 0.5,
+        "view_weights": [
+          0.25,
+          0.25,
+          0.5
+        ]
+      },
+      "incorrect_alternative": {
+        "all_views_equal_mean": 0.4
+      }
+    },
+    {
+      "id": "step_weighted_quantile",
+      "operation": "weighted_quantile",
+      "input": {
+        "values": [
+          0.1,
+          0.2,
+          5
+        ],
+        "weights": [
+          0.49,
+          0.49,
+          0.02
+        ],
+        "p": 0.95
+      },
+      "expected": {
+        "weighted_quantile": 0.2
+      }
+    },
+    {
+      "id": "gradient_distance",
+      "operation": "gradient_metrics",
+      "input": {
+        "grad_norm_noquant": 1,
+        "grad_norm_candidate": 1,
+        "cosine": 0.98
+      },
+      "expected": {
+        "relative_gradient_distance": 0.2,
+        "grad_diff_norm": 0.2,
+        "symmetric_gradient_distance": 0.2
+      }
+    },
+    {
+      "id": "zero_reference",
+      "operation": "gradient_metrics_zero",
+      "input": {
+        "grad_norm_noquant": 0,
+        "grad_norm_candidate": 1,
+        "grad_diff_norm": 1,
+        "grad_floor": 1e-12
+      },
+      "expected": {
+        "relative_gradient_distance": null,
+        "gradient_cosine": null,
+        "gradient_norm_ratio": null,
+        "grad_diff_norm": 1,
+        "symmetric_gradient_distance": 2,
+        "reference_near_zero": true
+      }
+    }
+  ]
+}

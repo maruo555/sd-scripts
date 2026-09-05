@@ -61,6 +61,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="open report.html after a successful Windows run",
     )
+    parser.add_argument("--dq-profile-data-diagnostics", choices=("off", "local", "warmup"), default="off", help="optional dataset report; warmup adds initial forward evaluation (experimental)")
+    parser.add_argument("--dq-profile-group-map", type=Path, help="optional diagnostic group-map JSON")
     selectors, training_argv = parser.parse_known_args(list(sys.argv[1:] if argv is None else argv))
     return run_profile_mode(
         training_argv,
@@ -71,6 +73,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         preflight_only=bool(selectors.dq_profile_preflight),
         dry_run=bool(selectors.dq_profile_dry_run),
         open_report=bool(selectors.dq_profile_open_report),
+        data_diagnostics=selectors.dq_profile_data_diagnostics,
+        group_map=selectors.dq_profile_group_map,
     )
 
 

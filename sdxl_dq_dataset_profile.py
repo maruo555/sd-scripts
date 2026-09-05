@@ -41,6 +41,8 @@ def _sha256_file(path: Path) -> str:
 def setup_parser() -> argparse.ArgumentParser:
     parser = setup_training_parser()
     group = parser.add_argument_group("DQ Dataset Profiler")
+    group.add_argument("--dq_profile_data_diagnostics", choices=("off", "local", "warmup"), default="off")
+    group.add_argument("--dq_profile_group_map", type=str)
     group.add_argument("--dq_profile_output_dir", type=str, default="dq_profile_output")
     group.add_argument("--dq_profile_name", type=str, default="dq_profile")
     group.add_argument("--dq_profile_level", choices=("standard", "full"), default="standard")
@@ -173,6 +175,11 @@ def _resolved_candidate_definitions(args: argparse.Namespace) -> tuple[Candidate
 
 def _validate_and_isolate(args: argparse.Namespace) -> None:
     protocol = str(getattr(args, "dq_profile_protocol", "v1"))
+    if getattr(args, "dq_profile_data_diagnostics", "off") != "off":
+        if protocol != "v24-acceptance-local" or bool(getattr(args, "dq_profile_snapshot_only", False)):
+            raise ValueError("dataset diagnostics requires a regular v24-acceptance-local worker")
+        from dq_profile.dataset_diagnostics import load_group_map
+        load_group_map(getattr(args, "dq_profile_group_map", None))
     # Preserve programmatic callers that construct an argparse.Namespace
     # instead of going through setup_parser().  These are the historical
     # strict-reference values and therefore do not silently opt into the
