@@ -112,6 +112,53 @@ def test_group_map_matches_approved_format_and_rejects_chains(tmp_path):
         load_group_map(p)
 
 
+@pytest.mark.parametrize('aliases', [
+    {' e\u0301 ': ' character_a '},
+    {'é': 'character_a', ' e\u0301 ': ' character_a '},
+])
+def test_alias_normalization_preserves_membership(tmp_path, aliases):
+    path = tmp_path / 'groups.json'
+    write_json(path, {'aliases': aliases, 'groups': [{'id': 'a', 'tags_any': ['character_a']}]})
+    group_map = load_group_map(path)
+    assert group_map['aliases'] == {'é': 'character_a'}
+    assert belongs({'tags': tags('é')}, group_map['groups'][0], group_map['aliases'])
+
+
+@pytest.mark.parametrize('aliases', [
+    {' ': 'a'}, {'a': ' '},
+    {'é': 'a', 'e\u0301': 'b'},
+    {'x': ' e\u0301 ', 'é': 'y'},
+    {'é': ' e\u0301 '},
+])
+def test_alias_normalization_rejects_empty_conflicts_and_chains(tmp_path, aliases):
+    path = tmp_path / 'groups.json'
+    write_json(path, {'aliases': aliases, 'groups': []})
+    with pytest.raises(ValueError):
+        load_group_map(path)
+
+
+def test_alias_value_unicode_normalizes_before_group_membership(tmp_path):
+    path = tmp_path / 'groups.json'
+    write_json(path, {'aliases': {'character_a': ' e\u0301 '}, 'groups': [{'id': 'a', 'tags_any': ['é']}]})
+    group_map = load_group_map(path)
+    assert group_map['aliases'] == {'character_a': 'é'}
+    assert belongs({'tags': ['character_a']}, group_map['groups'][0], group_map['aliases'])
+
+
+def test_rebuild_normalizes_legacy_manifest_aliases(tmp_path):
+    write_fixture(tmp_path, 4)
+    manifest = json.loads((tmp_path / 'manifest.json').read_text(encoding='utf-8'))
+    manifest['group_map'] = {'aliases': {' character_a ': ' e\u0301 '},
+                             'groups': [{'id': 'unicode', 'tags_any': [' e\u0301 ']}]}
+    write_json(tmp_path / 'manifest.json', manifest)
+    payload = rebuild(tmp_path)
+    assert payload['manifest']['group_map']['aliases'] == {'character_a': 'é'}
+    assert payload['manifest']['group_map']['groups'][0]['tags_any'] == ['é']
+    expected = [s for s in payload['samples'] if 'character_a' in s['tags']]
+    assert len(expected) == 3
+    assert all(s['group_memberships'][0]['id'] == 'unicode' for s in expected)
+
+
 def write_fixture(directory, count=8):
     directory=Path(directory); directory.mkdir(parents=True,exist_ok=True)
     inv,refs,qs,ms=fixture_rows(count)

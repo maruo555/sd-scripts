@@ -149,22 +149,41 @@ const { pathToFileURL } = require('url');
     const aliasData=structuredClone(payload);
     for(const g of aliasData.manifest.group_map.groups)g.tags_all||=[];
     const aliasGroup=aliasData.manifest.group_map.groups[0];
-    for(const s of aliasData.samples)if(!s.tags.includes(aliasGroup.tags_any[0]))s.tags.push('alias_extra');
+    for(const s of aliasData.samples)if(!s.tags.includes(aliasGroup.tags_any[0]))s.tags.push('alias_extra','é');
     const aliasPage=await browser.newPage();aliasPage.on('pageerror',e=>errors.push(e.message));
     await aliasPage.setContent(fs.readFileSync(path.join(__dirname,'../dq_profile/dataset_report.html'),'utf8').replace('__DATASET_PAYLOAD__',JSON.stringify(aliasData).replace(/</g,'\\u003c')));
     await aliasPage.evaluate(id=>selectEntity('character',id),aliasGroup.id);
     const originalInterval=await aliasPage.locator('#intervals').textContent();
     const originalCount=await aliasPage.evaluate(()=>aggregate(entities('character')[0].samples).total);
     check('original tag interval is available',originalInterval.includes('2000回'));
-    const importAliases=async aliases=>{
+    const importAliases=async (aliases,expected=aliases)=>{
       await aliasPage.locator('#import-map').setInputFiles({name:'groups.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify({...aliasData.manifest.group_map,aliases}))});
-      await aliasPage.waitForFunction(expected=>JSON.stringify(state.aliases)===JSON.stringify(expected),aliases);
+      await aliasPage.waitForFunction(expected=>JSON.stringify(state.aliases)===JSON.stringify(expected),expected);
     };
     await importAliases({alias_extra:aliasGroup.tags_any[0]});
     check('alias import changes membership without changing group rules',await aliasPage.evaluate(count=>aggregate(entities('character')[0].samples).total>count&&JSON.stringify(state.groups)===JSON.stringify(M.group_map.groups),originalCount));
     check('changed aliases hide stale interval and request rebuild',(await aliasPage.locator('#intervals').textContent()).includes('CPU再集計'));
     await importAliases(aliasData.manifest.group_map.aliases||{});
     check('restoring aliases restores original interval',await aliasPage.locator('#intervals').textContent()===originalInterval);
+    await importAliases({' e\u0301 ':' '+aliasGroup.tags_any[0]+' '},{'é':aliasGroup.tags_any[0]});
+    check('normalized alias key and value include matching images',await aliasPage.evaluate(count=>aggregate(entities('character')[0].samples).total>count,originalCount));
+    const validAliasState=await aliasPage.evaluate(()=>JSON.stringify({aliases:state.aliases,groups:state.groups}));
+    for(const [label,aliases] of [
+      ['empty key',{' ':'a'}],['empty value',{'a':' '}],
+      ['conflict',{'é':'a','e\u0301':'b'}],
+      ['chain',{'x':' e\u0301 ','é':'y'}],['cycle',{'é':' e\u0301 '}],
+    ]){
+      await aliasPage.locator('#map-status').evaluate(e=>e.textContent='');
+      await aliasPage.locator('#import-map').setInputFiles({name:'invalid.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify({...aliasData.manifest.group_map,aliases}))});
+      await aliasPage.waitForFunction(()=>document.getElementById('map-status').textContent.startsWith('読込失敗'));
+      check('reject normalized alias '+label+' without replacing active settings',await aliasPage.evaluate(()=>JSON.stringify({aliases:state.aliases,groups:state.groups}))===validAliasState);
+    }
+    await importAliases({'é':aliasGroup.tags_any[0],' e\u0301 ':aliasGroup.tags_any[0]},{'é':aliasGroup.tags_any[0]});
+    check('equivalent duplicate aliases merge safely',await aliasPage.evaluate(()=>Object.keys(state.aliases).length===1));
+    const unicodeMap={aliases:{[aliasGroup.tags_any[0]]:' e\u0301 '},groups:[{id:'unicode',tags_any:['é']}]};
+    await aliasPage.locator('#import-map').setInputFiles({name:'unicode.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(unicodeMap))});
+    await aliasPage.waitForFunction(()=>state.groups[0].id==='unicode');
+    check('normalized Unicode alias value matches canonical group tag',await aliasPage.evaluate(()=>state.aliases[M.group_map.groups[0].tags_any[0]]==='é'&&aggregate(entities('character')[0].samples).total===S.length));
     await aliasPage.close();check('alias interval checks without runtime errors',errors.length===0);
     // Exercise native initial focus: selectOption alone does not reproduce focus scrolling.
     for(const width of [1440,390]){

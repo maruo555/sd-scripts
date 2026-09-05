@@ -38,13 +38,14 @@ def build_inventory(dataset_group):
             path = normalized_path(info.absolute_path)
             folder = normalized_path(getattr(subset, "image_dir", None) or Path(path).parent)
             subset_index = int(subset.subset_index)
+            separator = getattr(subset, "caption_separator", ",")
             resolution = list(getattr(dataset, "resolution", None) or (dataset.width, dataset.height))
             row = {"image_id": identity(path), "sample_id": identity(path, di, subset_index, resolution),
                    "path": path, "name": Path(path).name, "folder_path": folder,
                    "folder_id": identity(folder), "folder_name": Path(folder).name,
                    "dataset_index": di, "subset_index": subset_index,
                    "resolution": resolution, "bucket_resolution": scalar_tree(info.bucket_reso),
-                   "caption": info.caption, "tags": tags(info.caption),
+                   "caption": info.caption, "caption_separator": separator, "tags": tags(info.caption, separator),
                    "class_tokens": getattr(subset, "class_tokens", None),
                    "subset_group": getattr(subset, "group", None),
                    "num_repeats": info.num_repeats, "is_reg": info.is_reg,

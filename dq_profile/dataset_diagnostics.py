@@ -40,8 +40,35 @@ def normalized_path(value):
     return os.path.normcase(os.path.realpath(os.fspath(value)))
 
 
-def tags(caption):
-    return sorted(set(unicodedata.normalize("NFC", x.strip()) for x in (caption or "").split(",") if x.strip()))
+def normalize_tag(value):
+    return unicodedata.normalize("NFC", value.strip())
+
+
+def tags(caption, separator=","):
+    return sorted({normalize_tag(x) for x in (caption or "").split(separator) if x.strip()})
+
+
+def normalize_aliases(aliases):
+    if not isinstance(aliases, dict):
+        raise ValueError("aliases must be an object")
+    normalized = {}
+    for key, value in aliases.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("aliases require nonempty strings")
+        key, value = normalize_tag(key), normalize_tag(value)
+        if not key or not value:
+            raise ValueError("aliases require nonempty strings")
+        if key in normalized and normalized[key] != value:
+            raise ValueError("conflicting aliases after normalization")
+        normalized[key] = value
+    if any(value in normalized for value in normalized.values()):
+        raise ValueError("aliases require one-hop mappings without chains/cycles")
+    return normalized
+
+
+def normalize_group_tags(group, aliases):
+    for key in ("tags_any", "tags_all"):
+        group[key] = sorted({aliases.get(normalize_tag(v), normalize_tag(v)) for v in group.get(key, [])})
 
 
 def improvement(pre, post):
@@ -89,9 +116,8 @@ def load_group_map(path=None):
     data = json.loads(Path(path).read_text(encoding="utf-8-sig")) if path else {"schema_version": "dataset-groups-v1", "aliases": {}, "groups": []}
     if not isinstance(data, dict) or not isinstance(data.get("groups"), list):
         raise ValueError("group-map must contain a groups array")
-    aliases = data.setdefault("aliases", {})
-    if not isinstance(aliases, dict) or any(not isinstance(k, str) or not isinstance(v, str) or not k or not v or v in aliases for k, v in aliases.items()):
-        raise ValueError("aliases require nonempty strings and one-hop mappings without chains/cycles")
+    aliases = normalize_aliases(data.get("aliases", {}))
+    data["aliases"] = aliases
     seen = {"__ungrouped__", "__unknown__", "__all__"}
     for group in data["groups"]:
         if not isinstance(group, dict) or not isinstance(group.get("id"), str) or not group["id"] or group["id"] in seen:
@@ -104,8 +130,7 @@ def load_group_map(path=None):
                 raise ValueError(f"invalid group-map {key}")
         if not any(group.get(key) for key in ("tags_any", "tags_all", "image_paths", "subset_groups")):
             raise ValueError("group-map group has no membership rule")
-        for key in ("tags_any", "tags_all"):
-            group[key] = sorted({aliases.get(unicodedata.normalize("NFC", v.strip()), unicodedata.normalize("NFC", v.strip())) for v in group.get(key, [])})
+        normalize_group_tags(group, aliases)
         group.setdefault("label", group["id"])
         if not isinstance(group["label"], str) or group.get("kind", "character") not in {"character", "subset", "semantic"}:
             raise ValueError("invalid group label/kind")
@@ -266,6 +291,10 @@ def rebuild(directory, group_map=None):
         return [json.loads(line) for line in (directory / name).read_text(encoding="utf-8").splitlines() if line.strip()]
     inventory, refs, quant = read("inventory.jsonl"), read("reference_probes.jsonl"), read("quant_probes.jsonl")
     groups = load_group_map(group_map) if group_map else manifest["group_map"]
+    # Saved manifests may predate alias normalization; apply the same rules on CPU rebuild.
+    groups["aliases"] = normalize_aliases(groups.get("aliases", {}))
+    for group in groups["groups"]:
+        normalize_group_tags(group, groups["aliases"])
     # Explicit subset groups remain available without user TOML changes.
     for name in sorted({s.get("subset_group") for s in inventory if s.get("subset_group")}):
         found = next((g for g in groups["groups"] if g["id"] == name), None)

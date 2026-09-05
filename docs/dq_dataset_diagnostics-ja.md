@@ -81,7 +81,7 @@ mul・timestep・「キャラを指定」の操作バーはスクロール中も
 
 - **画像一覧**：表示名は「親フォルダ名 / ファイル名」です。散布図のポップアップ・画像比較・詳細見出しでも同じ形式を使い、`base.png`等の同名ファイルを区別します。物理画像を一行にまとめ、解像度・subsetが違うsampleを詳細で分離します。未測定sampleへ別sampleの値を転用しません。
 - **フォルダ一覧**：loaderが解決した`image_dir`絶対パスで自動集計します。同名の別フォルダを混同しません。TOMLにgroupを追記する必要はありません。
-- **タグ一覧**：「キャラを指定」で元captionに実在するタグを選びます。captionファイルが優先されるloaderの規則を守り、`class_tokens`を勝手に連結しません。元captionと評価時captionは別に保存します。
+- **タグ一覧**：「キャラを指定」で元captionに実在するタグを選びます。captionファイルが優先されるloaderの規則を守り、`class_tokens`を勝手に連結しません。元captionと評価時captionは別に保存します。タグはsubsetごとの`caption_separator`（既定はカンマ）で分割し、区切り文字もinventoryに記録します。
 - **散布図**：全有効画像を薄く表示し、選択対象を強調します。軸の範囲は全体・全mulで固定し、選択変更で縮尺を動かしません。bin・filter変更時は対象に合わせて再計算します。学習反応と量子化の影響の2図を常時表示します。
 - **mul比較**：画像・フォルダ・タグそれぞれ最大6対象。各対象の内部で、全mulに共通する完全なloss/勾配の有効sampleを使います。違うキャラ同士の画像集合の積集合は取りません。クリックで対象とmulを上の表示へ同期します。
 
@@ -109,7 +109,7 @@ HTMLからgroup-map JSONを保存し、次回は任意で次を指定します�
 
 添付仕様の`dataset-groups-v1`形式を受け付けます。`tags_any`はOR、非空の`tags_all`はAND、`subset_groups`と`image_paths`は別の所属根拠としてORです。既存subset groupも自動で含めます。
 
-Unicode NFCと前後空白だけを正規化します。caseやunderscoreを同一視しません。明示aliasは一段だけで、連鎖・循環を拒否します。Pythonで読み込む相対`image_paths`はJSONの親が基準です。明示画像が存在しない場合やgroup ID重複はエラーです。
+Unicode NFCと前後空白だけを正規化します。caseやunderscoreを同一視しません。明示aliasはキー・値の両方をNFC・前後空白の除去で正規化してから適用します。Pythonでの読み込み・CPU再集計とHTMLでの設定読み込みに共通です。一段だけの対応を許可し、正規化後の空文字・対応先が異なる重複キー・連鎖・循環を拒否します。Pythonで読み込む相対`image_paths`はJSONの親が基準です。明示画像が存在しない場合やgroup ID重複はエラーです。
 
 ## GPUなしで再集計する
 

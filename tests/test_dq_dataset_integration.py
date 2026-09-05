@@ -28,6 +28,25 @@ def test_real_loader_shape_and_caption_precedence_and_multiple_contexts():
     json.dumps(scalar_tree(rows),allow_nan=False)
 
 
+@pytest.mark.parametrize('separator', [',', ';', '||'])
+def test_inventory_uses_each_subset_caption_separator(separator):
+    from dq_profile.dataset_diagnostics import belongs
+    caption = separator.join(['character_a', ' pose ', 'e\u0301'])
+    info = NS(absolute_path='D:/fixture/separators.png', bucket_reso=(720, 720),
+              caption=caption, num_repeats=1, is_reg=False)
+    datasets = []
+    for index, sep in enumerate([separator, '~']):
+        subset = NS(image_dir='D:/fixture', subset_index=index, caption_separator=sep)
+        datasets.append(NS(image_data={'image': info}, image_to_subset={'image': subset}, resolution=(720, 720)))
+    first, second = build_inventory(NS(datasets=datasets))
+    assert first['tags'] == ['character_a', 'pose', 'é']
+    assert first['caption_separator'] == separator
+    assert first['caption'] == caption
+    assert second['tags'] == [caption.strip().replace('e\u0301', 'é')]
+    assert belongs(first, {'tags_all': ['character_a', 'pose']})
+    assert not belongs(second, {'tags_any': ['character_a']})
+
+
 def test_bootstrap_uses_same_draw_for_pre_post_and_is_deterministic():
     inv,refs,qs,ms=fixture_rows(4)
     for row in refs:
