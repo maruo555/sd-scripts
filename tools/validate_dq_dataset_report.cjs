@@ -185,6 +185,26 @@ const { pathToFileURL } = require('url');
     await aliasPage.waitForFunction(()=>state.groups[0].id==='unicode');
     check('normalized Unicode alias value matches canonical group tag',await aliasPage.evaluate(()=>state.aliases[M.group_map.groups[0].tags_any[0]]==='é'&&aggregate(entities('character')[0].samples).total===S.length));
     await aliasPage.close();check('alias interval checks without runtime errors',errors.length===0);
+    const pathPage=await browser.newPage();pathPage.on('pageerror',e=>errors.push(e.message));
+    await pathPage.setContent(fs.readFileSync(path.join(__dirname,'../dq_profile/dataset_report.html'),'utf8').replace('__DATASET_PAYLOAD__',JSON.stringify(payload).replace(/</g,String.fromCharCode(92)+'u003c')));
+    const originalPathSettings=await pathPage.evaluate(()=>JSON.stringify({aliases:state.aliases,groups:state.groups}));
+    const backslash=String.fromCharCode(92);
+    for(const imagePath of ['image.png','./image.png','../image.png','D:image.png',backslash+'image.png']){
+      await pathPage.locator('#map-status').evaluate(e=>e.textContent='');
+      await pathPage.locator('#import-map').setInputFiles({name:'relative.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify({aliases:{new_alias:'canonical'},groups:[{id:'relative',image_paths:[imagePath]}]}))});
+      await pathPage.waitForFunction(()=>document.getElementById('map-status').textContent.length>0);
+      const message=await pathPage.locator('#map-status').textContent();
+      check('relative image path rejected with CPU guidance: '+imagePath,message.startsWith('読込失敗')&&message.includes('Python')&&message.includes('再集計'));
+      check('relative image path preserves current settings: '+imagePath,await pathPage.evaluate(()=>JSON.stringify({aliases:state.aliases,groups:state.groups}))===originalPathSettings);
+    }
+    for(const imagePath of ['D:/fixture/image.png',['D:','fixture','image.png'].join(backslash),backslash.repeat(2)+['server','share','image.png'].join(backslash),'/fixture/image.png']){
+      await pathPage.evaluate(p=>S[0].path=p,imagePath);
+      await pathPage.locator('#map-status').evaluate(e=>e.textContent='');
+      await pathPage.locator('#import-map').setInputFiles({name:'absolute.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify({groups:[{id:'absolute',image_paths:[imagePath]}]}))});
+      await pathPage.waitForFunction(()=>document.getElementById('map-status').textContent.length>0);
+      check('absolute image path still matches: '+imagePath,await pathPage.evaluate(()=>document.getElementById('map-status').textContent==='設定を読み込みました。'&&entities('character')[0].samples.length===1));
+    }
+    await pathPage.close();check('path import checks without runtime errors',errors.length===0);
     // Exercise native initial focus: selectOption alone does not reproduce focus scrolling.
     for(const width of [1440,390]){
       const sticky=await browser.newPage({viewport:{width,height:1000}});

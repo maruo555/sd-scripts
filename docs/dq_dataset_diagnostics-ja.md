@@ -109,7 +109,7 @@ HTMLからgroup-map JSONを保存し、次回は任意で次を指定します�
 
 添付仕様の`dataset-groups-v1`形式を受け付けます。`tags_any`はOR、非空の`tags_all`はAND、`subset_groups`と`image_paths`は別の所属根拠としてORです。既存subset groupも自動で含めます。
 
-Unicode NFCと前後空白だけを正規化します。caseやunderscoreを同一視しません。明示aliasはキー・値の両方をNFC・前後空白の除去で正規化してから適用します。Pythonでの読み込み・CPU再集計とHTMLでの設定読み込みに共通です。一段だけの対応を許可し、正規化後の空文字・対応先が異なる重複キー・連鎖・循環を拒否します。Pythonで読み込む相対`image_paths`はJSONの親が基準です。明示画像が存在しない場合やgroup ID重複はエラーです。
+Unicode NFCと前後空白だけを正規化します。caseやunderscoreを同一視しません。明示aliasはキー・値の両方をNFC・前後空白の除去で正規化してから適用します。Pythonでの読み込み・CPU再集計とHTMLでの設定読み込みに共通です。一段だけの対応を許可し、正規化後の空文字・対応先が異なる重複キー・連鎖・循環を拒否します。Pythonで読み込む相対`image_paths`はJSONの親が基準です。HTMLの設定読み込みでは相対`image_paths`を拒否し、現在の設定を維持します。相対パスを使う場合はPythonでgroup-mapを指定して再集計してください。HTMLへ読み込む場合はレポートに記録された絶対パスを使用します。明示画像が存在しない場合やgroup ID重複はエラーです。
 
 ## GPUなしで再集計する
 
