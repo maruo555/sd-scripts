@@ -77,6 +77,8 @@ standardの5候補では、選択実画像数をVとしてLocalは92V回のforwa
 
 診断run直下の`data_diagnostics/dataset_report.html`を開きます。既存の量子化レポート3種類にもリンクを追加します。
 
+mul・timestep・「キャラを指定」の操作バーはスクロール中も画面上部に残ります。下のグラフを見たまま条件を切り替えられます。「キャラを指定」を押すと設定欄へ移動し、「閉じる」で元のスクロール位置へ戻ります。
+
 - **画像一覧**：表示名は「親フォルダ名 / ファイル名」です。散布図のポップアップ・画像比較・詳細見出しでも同じ形式を使い、`base.png`等の同名ファイルを区別します。物理画像を一行にまとめ、解像度・subsetが違うsampleを詳細で分離します。未測定sampleへ別sampleの値を転用しません。
 - **フォルダ一覧**：loaderが解決した`image_dir`絶対パスで自動集計します。同名の別フォルダを混同しません。TOMLにgroupを追記する必要はありません。
 - **タグ一覧**：「キャラを指定」で元captionに実在するタグを選びます。captionファイルが優先されるloaderの規則を守り、`class_tokens`を勝手に連結しません。元captionと評価時captionは別に保存します。
@@ -131,7 +133,7 @@ raw MSEは全latent領域で、mask・sample weight・Min-SNR等を適用する�
 
 sample → 画像 → groupの順で画像等重みにします。改善率は平均pre/postから求め、画像別改善率を平均しません。勾配変形は既存ExactGradientの直接の差分normを使います。参照normやloss分母が1e-12以下なら比率をnullにし、gradient topology不一致も無効にします。欠測を0点として描画しません。
 
-画像詳細の3 noise replicasの変化幅は95%区間ではありません。groupの参考区間はsourceブロックを2,000回再標本化し、同じdrawを前後・候補で共有します。4 source未満では区間を出しません。HTML内でfilter/bin/groupを変えた場合、保存済みの別母集団の区間は表示せず、CPU再集計を案内します。
+画像詳細の3 noise replicasの変化幅は95%区間ではありません。groupの参考区間はsourceブロックを2,000回再標本化し、同じdrawを前後・候補で共有します。4 source未満では区間を出しません。HTML内でfilter/bin/groupやタグの別名（aliases）を変えた場合、保存済みの別母集団の区間は表示せず、CPU再集計を案内します。
 
 これらは単一の学習runに条件づけた観測です。画質、汎化性能、別seed学習の成功確率を示しません。追加チャンネルは常に`selector_input=false`で、既存の推薦処理は読みません。
 

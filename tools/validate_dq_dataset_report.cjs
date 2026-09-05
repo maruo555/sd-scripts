@@ -145,6 +145,62 @@ const { pathToFileURL } = require('url');
     await sorting.selectOption('#sort-by','d');await sorting.selectOption('#sort-direction','desc');await sorting.selectOption('#mul','4');
     check('sort responds to selected mul',await sorting.locator('#rows button').first().getAttribute('data-id')==='i0');
     await sorting.close();check('sorting without runtime errors',errors.length===0);
+    // Changing only aliases can change membership without changing canonical group rules.
+    const aliasData=structuredClone(payload);
+    for(const g of aliasData.manifest.group_map.groups)g.tags_all||=[];
+    const aliasGroup=aliasData.manifest.group_map.groups[0];
+    for(const s of aliasData.samples)if(!s.tags.includes(aliasGroup.tags_any[0]))s.tags.push('alias_extra');
+    const aliasPage=await browser.newPage();aliasPage.on('pageerror',e=>errors.push(e.message));
+    await aliasPage.setContent(fs.readFileSync(path.join(__dirname,'../dq_profile/dataset_report.html'),'utf8').replace('__DATASET_PAYLOAD__',JSON.stringify(aliasData).replace(/</g,'\\u003c')));
+    await aliasPage.evaluate(id=>selectEntity('character',id),aliasGroup.id);
+    const originalInterval=await aliasPage.locator('#intervals').textContent();
+    const originalCount=await aliasPage.evaluate(()=>aggregate(entities('character')[0].samples).total);
+    check('original tag interval is available',originalInterval.includes('2000回'));
+    const importAliases=async aliases=>{
+      await aliasPage.locator('#import-map').setInputFiles({name:'groups.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify({...aliasData.manifest.group_map,aliases}))});
+      await aliasPage.waitForFunction(expected=>JSON.stringify(state.aliases)===JSON.stringify(expected),aliases);
+    };
+    await importAliases({alias_extra:aliasGroup.tags_any[0]});
+    check('alias import changes membership without changing group rules',await aliasPage.evaluate(count=>aggregate(entities('character')[0].samples).total>count&&JSON.stringify(state.groups)===JSON.stringify(M.group_map.groups),originalCount));
+    check('changed aliases hide stale interval and request rebuild',(await aliasPage.locator('#intervals').textContent()).includes('CPU再集計'));
+    await importAliases(aliasData.manifest.group_map.aliases||{});
+    check('restoring aliases restores original interval',await aliasPage.locator('#intervals').textContent()===originalInterval);
+    await aliasPage.close();check('alias interval checks without runtime errors',errors.length===0);
+    // Exercise native initial focus: selectOption alone does not reproduce focus scrolling.
+    for(const width of [1440,390]){
+      const sticky=await browser.newPage({viewport:{width,height:1000}});
+      sticky.on('pageerror',e=>errors.push(e.message));
+      await sticky.goto(pathToFileURL(report).href);
+      await sticky.locator('#comparison').evaluate(e=>e.scrollIntoView({block:'start'}));
+      await sticky.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+      const origin=await sticky.evaluate(()=>scrollY);
+      const clickVisible=async selector=>{
+        const r=await sticky.locator(selector).boundingBox();
+        await sticky.mouse.click(r.x+r.width/2,r.y+r.height/2);
+      };
+      for(const id of ['mul','bin']){
+        await clickVisible('#'+id);await sticky.keyboard.press('Escape');
+        check(width+' '+id+' initial mouse focus preserves scroll',Math.abs(await sticky.evaluate(()=>scrollY)-origin)<2);
+        await sticky.keyboard.press('ArrowDown');
+        check(width+' '+id+' value change preserves scroll',Math.abs(await sticky.evaluate(()=>scrollY)-origin)<2);
+      }
+      // Start Tab navigation immediately before the toolbar, without moving the viewport.
+      await sticky.evaluate(()=>{const b=document.createElement('button');b.id='focus-start';document.getElementById('report-controls').before(b);b.focus({preventScroll:true});b.style.position='absolute'});
+      for(const id of ['mul','bin','open-tags']){
+        await sticky.keyboard.press('Tab');
+        check(width+' '+id+' keyboard focus preserves scroll',await sticky.evaluate(({id,origin})=>document.activeElement.id===id&&Math.abs(scrollY-origin)<2,{id,origin}));
+      }
+      await sticky.locator('#focus-start').evaluate(e=>e.remove());
+      await clickVisible('#open-tags');
+      const bar=await sticky.locator('#report-controls').boundingBox(),tags=await sticky.locator('#tag-panel').boundingBox();
+      check(width+' tag panel clears sticky toolbar',tags.y>=bar.y+bar.height);
+      await clickVisible('#close-tags');
+      check(width+' closing tags restores position',Math.abs(await sticky.evaluate(()=>scrollY)-origin)<2);
+      await sticky.locator('#image-detail').evaluate(e=>e.scrollIntoView({block:'start'}));
+      check(width+' detail anchor clears toolbar',(await sticky.locator('#image-detail').boundingBox()).y>=bar.height);
+      await sticky.close();
+    }
+    check('sticky controls without runtime errors',errors.length===0);
     fs.writeFileSync(path.join(path.dirname(report),'browser-validation.json'),JSON.stringify({checks,errors},null,2));
     console.log(JSON.stringify({passed:checks.length,errors,report}));
   }finally{await browser.close()}
