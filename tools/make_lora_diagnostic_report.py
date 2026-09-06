@@ -2428,96 +2428,27 @@ def render_rank_heatmap_card(
 
 
 def build_html(report: Dict[str, Any]) -> str:
-    report_json = json.dumps(sanitize_json(report), ensure_ascii=False).replace("</", "<\\/")
-    diagnostics = report.get("diagnostics", {})
-    rank_charts = ((report.get("charts") or {}).get("rank") or [])
-    rank_chart_ids = {item.get("id") for item in rank_charts if isinstance(item, dict)}
-    has_rank_grouped_charts = any(
-        chart_id in rank_chart_ids
-        for chart_id in (
-            "rank_group_path_energy_share",
-            "rank_group_path_energy_share_per_param",
-            "rank_group_path_sat",
-            "rank_group_role_energy_share",
-            "rank_group_role_energy_share_per_param",
-            "rank_group_role_sat",
-        )
-    )
-    score_value = diagnostics.get("score")
-    score_text = "-" if score_value is None else f"{score_value}点"
-    lora_data = report.get("lora")
-    lora_cards = {}
-    module_rows = "<tr><td colspan='7' class='muted'>LoRA解析を実行していません</td></tr>"
-    unet_rows = "<tr><td colspan='6' class='muted'>LoRA解析を実行していません</td></tr>"
-    if lora_data:
-        lora_cards = lora_data.get("summary_cards", {})
-        module_rows = render_module_rows(lora_data.get("module_summary", []))
-        unet_rows = render_unet_rows(lora_data.get("unet_block_summary", []))
-    lora_error = report.get("lora_error")
-    lora_error_html = f"<p class='sub' style='color: var(--bad);'>{lora_error}</p>" if lora_error else ""
-    lora_trend_error = report.get("lora_trend_error")
-    lora_trend_error_html = f"<p class='sub' style='color: var(--bad);'>{lora_trend_error}</p>" if lora_trend_error else ""
-    rank_final_heatmaps = ((report.get("rank") or {}).get("final_heatmaps") or {})
-    rank_heatmap_cards_html = ""
-    if has_rank_grouped_charts:
-        rank_heatmap_cards_html = (
-            render_rank_heatmap_card(
-                "Final Energy Share Per Param Heatmap",
-                "最終 step における、位置×役割ごとの正規化重み量シェア（合計1.0）",
-                rank_final_heatmaps.get("energy_share_per_param"),
-            )
-            + render_rank_heatmap_card(
-                "Final RankSatWMean Heatmap",
-                "最終 step における、位置×役割ごとの rank の使われ方の広さ",
-                rank_final_heatmaps.get("rank_sat_wmean"),
-                fixed_max=1.0,
-            )
-        )
-    rank_grouped_help_html = ""
-    if has_rank_grouped_charts:
-        rank_grouped_help_html = """
-      <div class="callout" style="margin: 0 0 16px 0;">
-        <strong>重み量と rank の広がりの違い</strong>
-        <p class="sub" style="margin: 8px 0 0 0;">
-          `Energy Share` や `Energy Share Per Param` は、LoRA 重みがどれだけ大きく育っているかを見る指標です。
-          一方で `RankSatWMean` は、設定した rank の成分をどれだけ広く使っているかを見る指標です。
-        </p>
-        <p class="sub" style="margin: 8px 0 0 0;">
-          この2つは一致するとは限りません。
-          重み量が大きくても、実際には少数の rank 成分に偏っていることがあります。
-          逆に、重み量はそれほど大きくなくても、複数の rank 成分を広く使っていることがあります。
-        </p>
-        <p class="sub" style="margin: 8px 0 0 0;">
-          そのため、`重み量` と `rank の広がり` を並べて見ると、
-          「どこが強く学習しているか」と「どこで rank を広く使えているか」を分けて確認できます。
-        </p>
-      </div>
-      <div class="callout" style="margin: 0 0 16px 0;">
-        <strong>RankSat 要約グラフとの関係</strong>
-        <p class="sub" style="margin: 8px 0 0 0;">
-          `Path Group RankSatWMean` と `Role Group RankSatWMean` は、上の `RankSatWMean / P50 / P95 / Max / Top1P95` と同じく、
-          rank の使われ方の広さを見る指標です。
-          上のグラフが全体要約なのに対し、こちらは block 位置別・役割別の内訳を見ます。
-        </p>
-      </div>
-      <div class="callout" style="margin: 12px 0 16px 0;">
-        <strong>Path 系列の見方</strong>
-        <p class="sub" style="margin: 8px 0 0 0;">
-          `Down / Mid / Up` は、UNet のどの位置のブロックかを表します。
-          `Down` は入力側で細かい情報を取り込む前半、`Mid` は中央、`Up` は出力側で絵を組み立て直す後半です。
-          3つの Path グラフは同じ系列を共有しているので、どの位置が強く学習しているか、サイズ差を補正するとどう見えるか、rank を広く使えているかを並べて読めます。
-        </p>
-      </div>
-      <div class="callout" style="margin: 0 0 16px 0;">
-        <strong>Role 系列の見方</strong>
-        <p class="sub" style="margin: 8px 0 0 0;">
-          `Q / K / V / Out` は Attention の中の役割です。
-          `Q` は「何を見たいか」、`K` は「どんな特徴を持つか」、`V` は「実際に取り出して混ぜる中身」、`Out` は混ぜた結果を次へ渡す出口です。
-          `FF` は Attention の後ろにある特徴変換用の全結合層、`Other` はそのどちらにも素直に入らない周辺の層です。
-          3つの Role グラフは同じ系列を共有しているので、どの役割が主戦場か、サイズ差を除いても強いか、rank の使い方に偏りがあるかを比べてください。
-        </p>
-      </div>
-"""
+    try:
+        from tools.lora_diagnostic_display import prepare_display, render_body
+    except ModuleNotFoundError:
+        from lora_diagnostic_display import prepare_display, render_body
+
+    display_report, display_notes = prepare_display(report)
+    report_json = json.dumps(sanitize_json(display_report), ensure_ascii=False).replace("</", "<\\/")
+    heatmap_cards = []
+    final_heatmaps = (report.get("rank") or {}).get("final_heatmaps") or {}
+    for key, title, subtitle, fixed_max in [
+        ("energy_share_per_param", "Final Energy Share Per Param Heatmap", "位置×役割ごとの正規化重み量シェア（合計1.0）", None),
+        ("rank_sat_wmean", "Final RankSatWMean Heatmap", "位置×役割ごとのrank成分の広がり", 1.0),
+    ]:
+        heatmap = final_heatmaps.get(key)
+        if heatmap and any(
+            safe_float(cell.get("value")) is not None
+            for row in heatmap.get("rows") or [] for cell in row.get("cells") or []
+        ):
+            heatmap_cards.append(render_rank_heatmap_card(title, subtitle, heatmap, fixed_max=fixed_max))
+    heatmaps = "<div class='heatmap-grid'>" + "".join(heatmap_cards) + "</div>" if heatmap_cards else ""
+    body_html = render_body(display_report, display_notes, heatmaps)
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -2627,7 +2558,7 @@ th {{
   font-weight: 600;
   background: #f8fafc;
 }}
-td.num {{
+th.num, td.num {{
   text-align: right;
   font-variant-numeric: tabular-nums;
 }}
@@ -2729,6 +2660,29 @@ td.num {{
   line-height: 1.8;
   font-size: 13px;
 }}
+
+.grid.cards {{ margin-top: 12px; }}
+.help {{ margin: 8px 0 14px; font-size: 13px; }}
+summary {{ cursor: pointer; color: #334155; line-height: 1.7; }}
+summary:focus-visible {{ outline: 2px solid #2563eb; outline-offset: 3px; }}
+.help p {{ line-height: 1.7; }}
+.axis-note {{ color: var(--muted); font-size: 12px; margin: 6px 0 12px; }}
+.constant-values {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 12px; }}
+.constant-value {{ background: #f1f5f9; border-radius: 6px; padding: 6px 10px; font-size: 13px; }}
+.constant-charts {{ grid-column: 1 / -1; min-width: 0; }}
+.constant-charts .chart-grid {{ margin-top: 10px; }}
+.table-scroll {{ overflow-x: auto; }}
+.wide-table table {{ min-width: 640px; }}
+.badge {{ white-space: nowrap; }}
+.series-legend {{ overflow-x: auto; }}
+.series-row {{ min-width: 400px; }}
+h1, .sub {{ overflow-wrap: anywhere; }}
+.input-status {{ line-height: 1.7; overflow-wrap: anywhere; }}
+.analysis-errors {{ border-left: 4px solid var(--warn); background: var(--warn-bg); padding: 12px 16px; margin-top: 16px; }}
+.analysis-errors p {{ margin: 6px 0 0; }}
+.single-values {{ padding: 10px; line-height: 1.8; font-variant-numeric: tabular-nums; }}
+.chart-grid, .heatmap-grid {{ grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); }}
+
 @media (max-width: 700px) {{
   .container {{ padding: 12px; }}
   .chart-canvas {{ height: 210px; }}
@@ -2737,191 +2691,7 @@ td.num {{
 </head>
 <body>
   <div class="container">
-    <h1>LoRA Diagnostic Report</h1>
-    <p class="sub">{report.get("base_name", "-")} / generated at {report.get("generated_at", "-")}</p>
-
-    <section class="panel">
-      <div class="overall">
-        総合診断:
-        <span class="score {diagnostics.get("overall_class", "info")}">{diagnostics.get("overall_status", "-")} ({score_text})</span>
-      </div>
-      <div class="grid cards" style="margin-top: 12px;">
-        <div class="card">
-          <div class="title">Grad しきい値超過率</div>
-          <div class="value">{fmt_percent((((report.get("grad") or {}).get("summary") or {}).get("threshold_exceeded_ratio")), 2)}</div>
-          <div class="caption">低いほど更新スキップの偏りが小さい</div>
-        </div>
-        <div class="card">
-          <div class="title">Loss MA 低下率</div>
-          <div class="value">{fmt_percent((((report.get("grad") or {}).get("summary") or {}).get("loss_ma_drop_ratio")), 2)}</div>
-          <div class="caption">高いほど収束方向</div>
-        </div>
-        <div class="card">
-          <div class="title">DQ Auto in-band比率</div>
-          <div class="value">{fmt_percent((((report.get("dq") or {}).get("summary") or {}).get("in_band_ratio")), 2)}</div>
-          <div class="caption">高いほど auto 制御が安定</div>
-        </div>
-        <div class="card">
-          <div class="title">最終 QuantErrRatioEMA</div>
-          <div class="value">{fmt_float((((report.get("dq") or {}).get("summary") or {}).get("final_quant_err_ratio_ema")), 4)}</div>
-          <div class="caption">低いほど量子化誤差が小さい</div>
-        </div>
-        <div class="card">
-          <div class="title">最終 RankSatP95</div>
-          <div class="value">{fmt_float((((report.get("rank") or {}).get("summary") or {}).get("final_rank_sat_p95")), 4)}</div>
-          <div class="caption">高すぎると rank 飽和の兆候</div>
-        </div>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>カテゴリ</th>
-            <th>項目</th>
-            <th class="num">値</th>
-            <th>判定</th>
-            <th>メモ</th>
-          </tr>
-        </thead>
-        <tbody>{render_check_rows(diagnostics.get("checks", []))}</tbody>
-      </table>
-      <p class="sub">判定はヒューリスティクスです。プロジェクト特性に合わせてしきい値を調整してください。</p>
-    </section>
-
-    <section class="panel">
-      <h2>GradNorm Dashboard</h2>
-      <p class="sub">既存 `make_dashboard.py` 相当の5グラフを統合表示しています。</p>
-      <div id="gradCharts" class="chart-grid"></div>
-    </section>
-
-    <section class="panel">
-      <h2>DQ Delta Dashboard</h2>
-      <p class="sub">X軸は TrainStep。縦線ラベルで Epoch を表示します。</p>
-      <div id="dqCharts" class="chart-grid"></div>
-    </section>
-
-    <section class="panel">
-      <h2>Rank Dashboard</h2>
-      <p class="sub">LoRA重みから推定した rank 飽和指標の推移です。</p>
-      <div class="callout" style="margin: 12px 0 16px 0;">
-        <strong>RankSat グラフの見方</strong>
-        <p class="sub" style="margin: 8px 0 0 0;">
-          このグラフは、LoRA の各モジュールが「設定した rank をどのくらい広く使えているか」をまとめて見せるものです。
-          値が高いほど、複数の rank 成分を使って学習しており、値が低いほど、少数の成分に偏って学習している傾向があります。
-        </p>
-        <p class="sub" style="margin: 8px 0 0 0;">
-          `RankSatWMean` は、値が小さいほど少数の rank 成分への偏りが強く、値が大きいほど複数の rank 成分を広く使っています。
-        </p>
-        <p class="sub" style="margin: 8px 0 0 0;">
-          `RankSatWMean` は全モジュールを重み付きで平均した代表値で、全体としての rank の使われ方を見ます。
-          `P50` は中央値で、典型的なモジュールがどの程度 rank を使っているかを見ます。
-          `P95` は上位 5% 側の値で、一部のモジュールが強く rank を使っていないかを見ます。
-          `Max` は最も高いモジュールの値で、局所的に rank を使い切っている層があるかを見ます。
-          `Top1P95` は「1つ目の成分への偏り」の強いモジュールがどの程度あるかを見る指標で、高いほど、実質的に少数成分へ寄っている可能性があります。
-        </p>
-        <p class="sub" style="margin: 8px 0 0 0;">
-          `WMean` や `P50` が高いと、全体として rank を広く使えている可能性があります。
-          `P95` や `Max` だけ高い場合は、一部のモジュールだけが強く rank を使っている可能性があります。
-          `Top1P95` も高い場合は、rank はあるが、実際には少数成分への偏りが強い可能性があります。
-        </p>
-      </div>
-      {rank_grouped_help_html}
-      <div id="rankCharts" class="chart-grid"></div>
-      {"<div class='heatmap-grid'>" + rank_heatmap_cards_html + "</div>" if rank_heatmap_cards_html else ""}
-    </section>
-
-    <section class="panel">
-      <h2>Group Loss Dashboard</h2>
-      <p class="sub">group lossログが存在する場合に、step単位とepoch単位のEMA推移を表示します。</p>
-      <div id="groupLossCharts" class="chart-grid"></div>
-    </section>
-
-    <section class="panel">
-      <h2>LoRA Checkpoint Analysis</h2>
-      {lora_error_html}
-      <div class="grid cards">
-        <div class="card">
-          <div class="title">総ブロック数</div>
-          <div class="value">{fmt_int(lora_cards.get("total_blocks"))}</div>
-          <div class="caption">解析対象LoRAブロック数</div>
-        </div>
-        <div class="card">
-          <div class="title">総パラメータ</div>
-          <div class="value">{fmt_int(lora_cards.get("total_params"))}</div>
-          <div class="caption">up/down重み合算</div>
-        </div>
-        <div class="card">
-          <div class="title">情報密度中央値</div>
-          <div class="value">{fmt_float(lora_cards.get("density_median"))}</div>
-          <div class="caption">高すぎ/低すぎの偏りを確認</div>
-        </div>
-        <div class="card">
-          <div class="title">RMS中央値</div>
-          <div class="value">{fmt_float(lora_cards.get("rms_median"))}</div>
-          <div class="caption">更新量の強さの目安</div>
-        </div>
-        <div class="card">
-          <div class="title">Entropy中央値</div>
-          <div class="value">{fmt_float(lora_cards.get("entropy_median"))}</div>
-          <div class="caption">分布の広がりの目安</div>
-        </div>
-        <div class="card">
-          <div class="title">Sparsity中央値</div>
-          <div class="value">{fmt_float(lora_cards.get("sparsity_median"))}</div>
-          <div class="caption">高すぎると情報不足の可能性</div>
-        </div>
-      </div>
-
-      <h3 style="margin-top: 16px;">モジュール別統計</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>モジュール</th>
-            <th class="num">ブロック数</th>
-            <th class="num">総パラメータ</th>
-            <th class="num">情報密度平均</th>
-            <th class="num">情報密度中央値</th>
-            <th class="num">RMS中央値</th>
-            <th class="num">Entropy中央値</th>
-          </tr>
-        </thead>
-        <tbody>{module_rows}</tbody>
-      </table>
-
-      <h3 style="margin-top: 16px;">UNetブロック別概要</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>UNetブロック</th>
-            <th class="num">LoRA数</th>
-            <th class="num">総パラメータ</th>
-            <th class="num">情報密度平均</th>
-            <th class="num">情報密度中央値</th>
-            <th class="num">RMS中央値</th>
-          </tr>
-        </thead>
-        <tbody>{unet_rows}</tbody>
-      </table>
-    </section>
-
-    <section class="panel">
-      <h2>LoRA 情報密度エポック推移</h2>
-      <p class="sub">`--lora_epoch_trend` 有効時のみ表示。系列ごとに色を固定し、下の凡例でブロック名との対応を示します。</p>
-      {lora_trend_error_html}
-      <div id="loraTrendCharts" class="chart-grid"></div>
-    </section>
-
-    <section class="panel">
-      <h2>Input Files</h2>
-      <div class="file-list">
-        <div>Grad Log: <code>{(report.get("grad") or {}).get("path", "-")}</code></div>
-        <div>DQ Log: <code>{(report.get("dq") or {}).get("path", "-")}</code></div>
-        <div>DQ Auto Log: <code>{(report.get("dq") or {}).get("auto_path", "-")}</code></div>
-        <div>Rank Log: <code>{(report.get("rank") or {}).get("path", "-")}</code></div>
-        <div>Group Loss Step Log: <code>{(report.get("group_loss") or {}).get("step_path", "-")}</code></div>
-        <div>Group Loss Epoch Log: <code>{(report.get("group_loss") or {}).get("epoch_path", "-")}</code></div>
-        <div>LoRA Final Checkpoint: <code>{(report.get("lora") or {}).get("path", "-")}</code></div>
-      </div>
-    </section>
+    {body_html}
   </div>
 
 <script>
@@ -3203,6 +2973,18 @@ function drawChart(canvas, chart) {{
       }}
     }}
     ctx.stroke();
+    for (let i = 0; i < n; i += 1) {{
+      if (!finite(xVals[i]) || !finite(yVals[i])) continue;
+      const before = i > 0 && finite(xVals[i - 1]) && finite(yVals[i - 1]);
+      const after = i + 1 < n && finite(xVals[i + 1]) && finite(yVals[i + 1]);
+      if (before || after) continue;
+      const px = margin.left + ((xVals[i] - bounds.xMin) / (bounds.xMax - bounds.xMin)) * chartW;
+      const py = margin.top + chartH - ((yVals[i] - yAxis.min) / yRange) * chartH;
+      ctx.fillStyle = series.color || '#2563eb';
+      ctx.beginPath();
+      ctx.arc(px, py, 2.5, 0, 2 * Math.PI);
+      ctx.fill();
+    }}
   }});
 
   ctx.strokeStyle = '#94a3b8';
@@ -3272,48 +3054,66 @@ function appendSeriesLegend(parent, chart) {{
 
 function mountCharts(containerId, charts) {{
   const container = document.getElementById(containerId);
-  if (!container || !Array.isArray(charts)) return;
-  if (charts.length === 0) {{
-    const empty = document.createElement('div');
-    empty.className = 'muted';
-    empty.textContent = '表示できるデータがありません。';
-    container.appendChild(empty);
-    return;
-  }}
+  if (!container || !Array.isArray(charts) || !charts.length) return;
   const states = [];
+  const collapsedCharts = charts.filter(chart => chart.display_mode === 'constant');
+  let collapsedGrid = null;
+  let disclosure = null;
+  if (collapsedCharts.length) {{
+    disclosure = document.createElement('details');
+    disclosure.className = 'constant-charts';
+    const summary = document.createElement('summary');
+    summary.textContent = `一定値のグラフを表示（${{collapsedCharts.length}}件）`;
+    disclosure.appendChild(summary);
+    collapsedGrid = document.createElement('div');
+    collapsedGrid.className = 'chart-grid';
+    disclosure.appendChild(collapsedGrid);
+  }}
   charts.forEach((chart, idx) => {{
     const card = document.createElement('div');
     card.className = 'chart-card';
+    card.dataset.chartId = chart.id || '';
     const title = document.createElement('div');
     title.className = 'chart-title';
     title.textContent = chart.title || `Chart ${{idx + 1}}`;
-    const subtitle = document.createElement('div');
-    subtitle.className = 'chart-subtitle';
-    subtitle.textContent = chart.subtitle || '';
-    const canvas = document.createElement('canvas');
-    canvas.className = 'chart-canvas';
     card.appendChild(title);
     if (chart.subtitle) {{
+      const subtitle = document.createElement('div');
+      subtitle.className = 'chart-subtitle';
+      subtitle.textContent = chart.subtitle;
       card.appendChild(subtitle);
     }}
-    card.appendChild(canvas);
-    appendSeriesLegend(card, chart);
-    container.appendChild(card);
-    states.push({{ canvas, chart }});
+    if (chart.display_mode === 'single') {{
+      const values = document.createElement('div');
+      values.className = 'single-values';
+      (chart.display_values || []).forEach(item => {{
+        const row = document.createElement('div');
+        row.textContent = `${{item.name}}：${{item.value}}（観測1点・${{chart.x_label || 'x'}} ${{item.x}}${{item.missing ? '・一部欠測' : ''}}）`;
+        values.appendChild(row);
+      }});
+      card.appendChild(values);
+    }} else {{
+      const canvas = document.createElement('canvas');
+      canvas.className = 'chart-canvas';
+      card.appendChild(canvas);
+      appendSeriesLegend(card, chart);
+      states.push({{ canvas, chart }});
+    }}
+    (chart.display_mode === 'constant' ? collapsedGrid : container).appendChild(card);
   }});
-
+  if (disclosure) container.appendChild(disclosure);
   const renderAll = () => {{
-    states.forEach((state) => drawChart(state.canvas, state.chart));
+    states.forEach(state => {{
+      if (!state.canvas.closest('details:not([open])') && state.canvas.getClientRects().length) drawChart(state.canvas, state.chart);
+    }});
   }};
+  if (disclosure) disclosure.addEventListener('toggle', renderAll);
   renderAll();
   window.addEventListener('resize', renderAll);
 }}
 
-mountCharts('gradCharts', ((reportData.charts || {{}}).grad || []));
-mountCharts('dqCharts', ((reportData.charts || {{}}).dq || []));
-mountCharts('rankCharts', ((reportData.charts || {{}}).rank || []));
-mountCharts('groupLossCharts', ((reportData.charts || {{}}).group_loss || []));
-mountCharts('loraTrendCharts', ((reportData.charts || {{}}).lora_trend || []));
+Object.entries(reportData.charts || {{}}).forEach(([section, charts]) => mountCharts(`charts-${{section}}`, charts));
+
 </script>
 </body>
 </html>
