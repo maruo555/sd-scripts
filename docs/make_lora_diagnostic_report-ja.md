@@ -10,6 +10,16 @@
 
 出力先は、`--output_dir` 未指定時に `--input_dir/diagnostic_report` です。
 
+## HTMLの表示整理
+
+- 有効な実測値がないグラフ・系列、値のない数値カード、空の表・セクションを省略します。0は有効値です。閾値などの参考線だけではグラフを表示しません。
+- 一部欠測があるグラフは残し、欠測区間の線をつなぎません。観測が1点だけの場合は値と観測位置を表示します（複数点の参考線がある場合はグラフに点を表示）。
+- RankDim・Bits・RangeMulが記録期間中一定の場合、およびThreshOffが全件0の場合は数値表示にまとめます。「一定値のグラフを表示」でグラフを展開できます。欠測がある場合は「有効な記録では一定・一部欠測」と明記します。
+- 指標の説明は各セクションの「見方」にまとめます。実行時閾値と固定参考値、DQ Direct・Guardの系列の違いなど、解釈に必要な注記はグラフの近くに残します。
+- 末尾の「入力データ・解析状況」で入力ファイル、表示を省略した項目、欠測、解析エラーの詳細を確認できます。解析エラーの概要は通常表示にも残します。
+
+この整理はHTMLの表示用データに適用します。出力JSONの解析値・診断スコア・グラフペイロードは変更しません。旧JSONでは未実行と未取得を区別できない場合があるため、理由が不明な項目は「解析結果なし」と表示します。過去HTMLは自動更新されません。
+
 ## `--input_dir` 内で使うログファイル名（固定）
 このツールは、`--input_dir` 配下の以下ファイル名を前提に読み込みます。
 
@@ -48,7 +58,7 @@ python tools\make_lora_diagnostic_report.py --base_name loraname --input_dir ..\
   `FileNotFoundError: 入力ログが見つかりません: ...`
 
 `dq_delta_auto` は任意です。無い場合は自動でスキップして続行します。  
-`rank_logs` は任意です。無い場合は Rank セクションだけ空になります。
+`rank_logs` は任意です。表示できるデータがない場合は Rank セクションを省略します。
 
 - `dq_delta_auto+<base_name>.txt` が無い  
   auto系の解析だけ省略し、HTML/JSONは生成されます。
@@ -348,3 +358,10 @@ DQ autoログに該当列がある場合は、`QErrPerClip`（run指定閾値の
 `--dq_delta_log_detail basic` の `dq_delta_logs` には、軽量化のため `ZeroRate`, `AbsMax`, `Range`, `ScaleMin/Mean/Max` が出力されない。そのためHTMLレポートでも、該当列がない場合は `ZeroRate`, `AbsMax`, `Range` 系のグラフを表示しない。
 
 `QErrPerClip` グラフは主に `dq_delta_auto` 側の `QErrPerClip` 列から作る。autoログに数値が1つ以上ある場合に表示され、古いログで `dq_delta_logs` 側にのみ `QErrPerClip` がある場合はfallbackとして使う。
+
+
+## 学習設定の表示
+
+レポート生成時に `input_dir/run_records` の設定記録を自動検出します。対象の記録がない場合のみ、チェックポイントのメタデータから取得します。引数単位で両者を混ぜることはありません。単独HTMLの「学習設定」、比較HTMLの「学習設定の比較」から確認できます。
+
+移動した記録や対象未確定の場合は `--training_settings path/to/manifest.json` で指定できます。通常のbatに指定を追加する必要はありません。設定の保存範囲、照合条件、過去データの制約は [学習設定の記録と診断レポート](lora-training-settings-spec-ja.md) を参照してください。

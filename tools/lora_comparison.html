@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>LoRA レポート比較</title>
+<style>
+:root{color-scheme:light;--bg:#f4f6fa;--paper:#fff;--text:#17233a;--muted:#59677c;--line:#dce3ed;--accent:#315fd3;--soft:#edf2ff;--grid:#e9edf3;--warn:#87531a;--warn-bg:#fff6e8;--c0:#176cb5;--c1:#b63e75;--c2:#16806d;--c3:#a06b0a}
+@media(prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#151c29;--paper:#1e2839;--text:#e2e9f5;--muted:#abb9ce;--line:#3b4960;--accent:#94b5ff;--soft:#2c3b58;--grid:#334056;--warn:#f2c183;--warn-bg:#3b3024;--c0:#78baff;--c1:#f298c1;--c2:#61d2b7;--c3:#e7bb61}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 system-ui,-apple-system,"Segoe UI","Noto Sans JP",sans-serif}button,input,select{font:inherit;color:inherit}button,select,input[type=text],input[type=number]{background:var(--paper);border:1px solid var(--line);border-radius:6px;padding:7px 11px}button{cursor:pointer}button:hover{background:var(--soft)}button:disabled{opacity:.45;cursor:default}button.primary{background:var(--accent);color:var(--paper);border-color:var(--accent)}button:focus-visible,select:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}input[type=checkbox],input[type=radio]{accent-color:var(--accent)}h1,h2,h3,p{margin:0}h1{font-size:21px;letter-spacing:.01em}h2{font-size:18px}h3{font-size:14px;font-weight:600}header{max-width:1560px;margin:auto;padding:22px 28px 16px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}.subtitle,.muted{color:var(--muted);font-size:12px}.actions,.row{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.container{max-width:1560px;margin:auto;padding:0 28px 32px}.dropzone{border:1px dashed var(--line);border-radius:10px;padding:42px 20px;text-align:center;background:var(--paper)}.dropzone strong{font-size:18px;display:block;margin-bottom:12px}.dropzone p{color:var(--muted);margin-top:10px}.dragging .dropzone,.dragging #run-panel{outline:3px solid var(--accent);outline-offset:3px}.panel{background:var(--paper);border:1px solid var(--line);border-radius:10px}.runs{padding:13px 16px;margin-bottom:16px}.run-list{display:flex;gap:10px;flex-wrap:wrap}.run-card{border-left:3px solid var(--run-color);padding:6px 9px;flex:1 1 260px;max-width:100%;min-width:0}.run-top{display:flex;align-items:flex-start;gap:6px}.run-top label{display:flex;align-items:flex-start;gap:7px;flex:1;min-width:0;cursor:pointer}.run-name{overflow-wrap:anywhere;line-height:1.4;font-weight:600}.run-meta{margin-left:24px;font-size:11px;color:var(--muted);overflow-wrap:anywhere}.remove{background:none;border:0;padding:0 5px;font-size:18px;line-height:1.3}.workspace{display:grid;grid-template-columns:235px minmax(0,1fr);gap:18px;align-items:start}.sidebar{padding:10px}.sidebar summary{padding:5px 7px;font-weight:600}.catalog{max-height:720px;overflow-y:auto}.catalog h3{padding:14px 7px 4px;color:var(--muted);font-size:12px}.chart-choice{display:block;width:100%;text-align:left;background:none;border:0;padding:8px;border-radius:6px;line-height:1.45;margin:2px 0}.chart-choice[aria-current=true]{background:var(--soft);color:var(--accent);font-weight:600}.chart-count{display:block;color:var(--muted);font-size:11px;font-weight:400}.content{min-width:0}.view-heading{display:flex;align-items:start;justify-content:space-between;gap:12px;margin:2px 0 12px}.toolbar{padding:12px 14px;display:flex;gap:10px 18px;flex-wrap:wrap;margin-bottom:10px}.field{display:flex;align-items:center;gap:8px;font-size:12px}.field select{max-width:230px;min-width:0}.range-input{width:95px}#range-fields{display:flex;align-items:center;gap:6px}.series-box{padding:10px 14px;margin-bottom:12px}.series-box summary{cursor:pointer;font-size:12px}.series-list{display:flex;flex-wrap:wrap;gap:5px 14px;margin-top:10px}.series-list label{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;overflow-wrap:anywhere;min-height:26px}.series-actions{display:flex;gap:8px;margin:10px 0 3px}.series-actions button{font-size:12px;padding:3px 9px}.dash-swatch{display:inline-block;width:25px;border-top:2px solid var(--muted)}.notice{font-size:12px;padding:8px 11px;border-radius:5px;background:var(--warn-bg);color:var(--warn);margin-bottom:9px;overflow-wrap:anywhere}.plot-grid{display:grid;grid-template-columns:1fr;gap:14px}.plot-grid.facets{grid-template-columns:repeat(2,minmax(0,1fr))}.plot-card{min-width:0;padding:13px 10px 6px;position:relative}.plot-title{padding:0 8px;overflow-wrap:anywhere;margin-bottom:2px}.plot-svg{display:block;width:100%;touch-action:pan-y}.plot-svg text{fill:var(--muted);font:11px system-ui,sans-serif}.plot-svg .axis-title{fill:var(--text);font-size:12px}.run-legend{display:flex;flex-wrap:wrap;gap:8px 19px;padding:0 5px 10px}.run-legend span{display:flex;align-items:center;gap:7px;font-size:12px;overflow-wrap:anywhere;min-width:0}.swatch{display:inline-block;width:20px;height:3px;flex:none}.plot-note{font-size:12px;color:var(--muted);margin:9px 2px}.table-panel{margin-top:15px;padding:13px 15px}.table-panel summary,.help summary{cursor:pointer;font-weight:600}.table-scroll{overflow-x:auto;margin-top:8px}table{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}th{color:var(--muted);font-weight:500}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}td:first-child{max-width:300px;white-space:normal;overflow-wrap:anywhere}.empty{padding:38px 20px;text-align:center;color:var(--muted)}.help{margin-top:18px;padding:13px 16px;font-size:12px;color:var(--muted)}.help p,.help li{margin-top:7px}.help ul{padding-left:20px}.status{font-size:12px;color:var(--muted);overflow-wrap:anywhere;margin:8px 0}.error-list{color:var(--warn);background:var(--warn-bg);padding:9px 13px;border-radius:6px;margin:8px 0;font-size:12px}.error-list:empty{display:none}.tooltip{position:fixed;z-index:30;background:var(--paper);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:9px 12px;box-shadow:0 4px 20px #0002;pointer-events:none;max-width:min(440px,calc(100vw - 20px));font-size:12px}.tooltip table{font-size:11px}.tooltip th,.tooltip td{padding:3px 5px}.tooltip td:first-child{max-width:220px}.tip-title{font-weight:600;margin-bottom:4px}.heat-table th,.heat-table td{text-align:center;min-width:62px;padding:12px 7px}.heat-table th:first-child,.heat-table td:first-child{text-align:left}.heat-table td{font-variant-numeric:tabular-nums}.heat-caption{padding:7px;color:var(--muted);font-size:12px}.heat-cell{color:#14253b}.heat-scale{height:9px;max-width:240px;background:linear-gradient(to right,#eff6ff,#5596d8);border-radius:3px}.heat-key{display:flex;gap:9px;align-items:center;font-size:12px;color:var(--muted);margin:9px 0}.heat-key .heat-scale{width:180px}.sr-only{position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}[hidden]{display:none!important}
+@media(max-width:1050px){.workspace{grid-template-columns:195px minmax(0,1fr)}.plot-grid.facets{grid-template-columns:1fr}.container{padding:0 18px 25px}header{padding:18px}}
+@media(max-width:720px){.workspace{grid-template-columns:1fr}.sidebar{padding:8px}.catalog{max-height:280px}.view-heading{margin-top:5px}.container{padding:0 10px 20px}header{padding:16px 12px}.toolbar{gap:10px}.field{flex:1 1 100%;justify-content:space-between}.field select{flex:1;max-width:70%}.run-card{flex-basis:100%}.plot-card{padding:10px 4px 4px}.range-input{width:90px}.view-heading h2{font-size:17px}.plot-grid.facets{grid-template-columns:1fr}.catalog button{font-size:13px}}
+@media(pointer:coarse){button,select{min-height:42px}.series-list label{min-height:40px}input[type=number]{font-size:16px}.remove{min-width:40px}}
+</style>
+</head>
+<body>
+<header><div><h1>LoRA レポート比較</h1><p class="subtitle">生成済みの診断JSONを、同じグラフで見比べる <span id="version"></span></p></div><div class="actions"><button id="add-files" class="primary">JSONを追加</button><button id="save" disabled>比較をHTMLに保存</button></div></header>
+<main class="container">
+<input id="file-input" type="file" accept=".json,application/json" multiple hidden>
+<div id="status" class="status" role="status" aria-live="polite"></div><div id="errors" class="error-list" role="alert"></div>
+<section id="dropzone" class="dropzone"><strong>比較したいレポートJSONをドロップ</strong><button id="choose-files">JSONを選択</button><p><code>*_diagnostic.json</code> を複数選べます。データはこのブラウザ内で処理します。</p></section>
+<section id="run-panel" class="panel runs" hidden><div class="row" style="justify-content:space-between;margin-bottom:9px"><h3>比較するラン</h3><span class="muted">同時表示は4ランまで・色はランごとに共通</span></div><div id="run-list" class="run-list"></div></section>
+<details id="training-settings" class="panel table-panel" hidden style="margin:0 0 16px"><summary>学習設定の比較</summary><p class="muted">未記録は不明です。Noneは指定なしを表します。出典が違う場合、記録された引数と実際の動作が一致するとは限りません。</p><label class="row"><input id="settings-differences" type="checkbox" checked>差がある項目・一部未記録の項目だけ表示</label><div id="settings-sources" class="status"></div><div class="table-scroll"><table id="settings-table"></table></div></details>
+<div id="workspace" class="workspace" hidden>
+<aside class="panel sidebar"><details id="catalog-details" open><summary>グラフを選ぶ</summary><nav id="catalog" class="catalog" aria-label="比較するグラフ"></nav></details></aside>
+<section class="content" aria-label="グラフ比較">
+<div class="view-heading"><div><h2 id="chart-title"></h2><div id="chart-subtitle" class="muted"></div></div></div>
+<div class="toolbar panel">
+<label class="field">表示<select id="mode"><option value="overlay">重ねる</option><option value="panels">並べる（共通の目盛り）</option><option value="difference">基準との差</option></select></label>
+<label class="field" id="baseline-field">基準<select id="baseline"></select></label>
+<label class="field">横軸<select id="axis"><option value="native">元の横軸</option><option value="progress">記録範囲の進捗 %</option></select></label>
+<label class="field">範囲<select id="range"><option value="all">全記録</option><option value="common">共通範囲</option><option value="tail">共通範囲の終盤20%</option><option value="custom">範囲を指定</option></select></label>
+<label class="field" id="range-fields" hidden><span class="sr-only">表示範囲</span><input id="range-min" class="range-input" type="number" step="any" aria-label="範囲の開始"><span>〜</span><input id="range-max" class="range-input" type="number" step="any" aria-label="範囲の終了"><button id="apply-range">適用</button></label>
+</div>
+<details id="series-box" class="panel series-box"><summary id="series-summary">表示する系列</summary><div class="series-actions"><button id="series-all">すべて選択</button><button id="series-none">選択を解除</button></div><div id="series-list" class="series-list"></div></details>
+<div id="notices"></div><div id="run-legend" class="run-legend"></div><div id="plots" class="plot-grid"></div><p id="plot-note" class="plot-note"></p>
+<details id="statistics" class="panel table-panel"><summary>表示範囲の記録値</summary><p class="muted">平均は表示系列の有効な記録値の単純平均です。時間平均や画像品質の評価ではありません。</p><div class="table-scroll"><table><thead><tr><th>ラン</th><th>系列</th><th>記録数</th><th>平均</th><th>最小</th><th>最大</th><th>最終記録値</th></tr></thead><tbody id="stats-body"></tbody></table></div></details>
+<details id="source-notes" class="panel table-panel"><summary>元レポートの補足</summary><div id="source-notes-body"></div></details>
+</section></div>
+<details class="panel help"><summary>使い方・比較について</summary><ul><li>JSONを選び、グラフと系列を切り替えます。線の色はラン、線種は系列を表します。</li><li>グラフにカーソルを合わせると、近い実記録の値と位置を確認できます。クリック／タップで固定し、もう一度クリックすると解除します。</li><li>「並べる」は同じ縦軸の目盛りを使います。欠けた値は0に置き換えず、記録がない区間を外挿しません。</li><li>「基準との差」は同名の系列を比較します。基準に一致する記録がない位置では、連続量は基準を線形補間し、Bits等の離散量は直前値を使います。欠損をまたぐ補間はしません。</li><li>元のグラフに保存された値を使います。移動平均の幅や学習条件が違う場合は、その点も含めて比較してください。進捗100%は選んだグラフの記録末尾であり、学習の完走を意味しません。</li><li>密な線は描画時のみ点数を減らします。区間表とツールチップは間引く前の記録値を参照します。</li><li>比較を保存すると、読み込んだランと表示設定を含むHTMLになります。元JSONがない場所でも開けます。未保存の選択状態は、ページを閉じると失われます。</li><li>新しいビューアへの更新はHTMLをコピーし直してください。保存済み比較HTMLには保存当時のビューアが含まれます。</li></ul></details>
+</main>
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+<script id="saved-state" type="application/json">null</script>
+<script>
+(() => {
+'use strict';
+const VERSION='0.2.1', BUNDLE_VERSION=1;
+const originalHTML='<!doctype html>\n'+document.documentElement.outerHTML;
+const $=id=>document.getElementById(id), finite=v=>typeof v==='number'&&Number.isFinite(v);
+const array=v=>Array.isArray(v)?v:[], obj=v=>v&&typeof v==='object'&&!Array.isArray(v)?v:{};
+const text=v=>v==null?'':String(v);
+const state={runs:[],selected:[],chart:'loss_ma',mode:'overlay',axis:'native',range:'all',custom:[0,1],baseline:null,series:{}};
+let renders=[],busy=false,dragDepth=0,resizeTimer,pinned=false,displayIndex=0,rangeDraft=null;
+const aliases={dq_rank_dim:'rank_dim',dq_rank_sat:'rank_sat',dq_rank_energy:'rank_energy',group_loss_ema_step:'group_loss_step_ema',group_loss_ema_epoch:'group_loss_epoch_ema'};
+const titles={grad_norm:'勾配ノルム・閾値',loss_ma:'Loss・移動平均',thresh_off:'ThreshOff',scale:'GradScaler Scale',cosine:'勾配 Cosine',cosine_by_epoch:'勾配の整列度（epoch）',dq_bits:'DQ Bits',dq_range_mul:'DQ RangeMul',dq_clip:'DQ ClipRate',dq_qerr_ratio:'DQ 量子化誤差比',dq_qerr_rms:'DQ 量子化誤差 RMS',dq_zero_rate:'DQ ZeroRate',dq_absmax:'DQ AbsMax',dq_range:'DQ Range',dq_qerr_per_clip:'DQ QErrPerClip',dq_low_auto_bad:'DQ Auto Bad / Streak',dq_error_part_ratio:'DQ Clip / Round 誤差比',dq_error_part_share:'DQ Clip / Round 構成比',rank_dim:'RankDim',rank_sat:'Rank 飽和度・Top1',rank_energy:'Rank 重み量',rank_lr:'学習率の記録',rank_group_path_energy_share:'Down / Mid / Up：重み構成比',rank_group_path_energy_share_per_param:'Down / Mid / Up：パラメータ当たり構成比',rank_group_path_sat:'Down / Mid / Up：RankSat',rank_group_role_energy_share:'役割別：重み構成比',rank_group_role_energy_share_per_param:'役割別：パラメータ当たり構成比',rank_group_role_sat:'役割別：RankSat',group_loss_step_ema:'Group Loss EMA（step）',group_loss_epoch_ema:'Group Loss EMA（epoch）',group_scale_applied_epoch:'Group Scale（epoch）',group_ratio_epoch:'Group Ratio（epoch）',group_ratio_ema_epoch:'Group Ratio EMA（epoch）',lora_trend_unet:'UNet 情報密度推移',lora_trend_te1:'TE1 情報密度推移',lora_trend_te2:'TE2 情報密度推移',dq_direct_ratio:'DQ Direct 誤差比',dq_direct_rms:'DQ Direct 誤差 RMS',dq_guard_direct_ratio:'DQ Guard 誤差比・上限',dq_guard_gain:'DQ Guard Gain',dq_guard_cadence:'DQ Guard サンプリング間隔',heat_energy_share_per_param:'最終重み構成比ヒートマップ',heat_rank_sat_wmean:'最終RankSatヒートマップ'};
+const groups={grad:'Loss・勾配',dq:'DQ',dq_direct:'DQ Direct',dq_guard:'DQ Guard',rank:'Rank',group_loss:'Group Loss',lora_trend:'情報密度推移',heatmap:'最終ヒートマップ'};
+const discrete=new Set(['thresh_off','scale','dq_bits','dq_range_mul','rank_dim','dq_low_auto_bad','dq_guard_gain','dq_guard_cadence','rank_lr','group_scale_applied_epoch']);
+const dash=['','7 3','2 3','10 3 2 3','12 3','4 2 1 2'];
+function el(tag,attrs={},content){const n=document.createElement(tag);for(const [k,v] of Object.entries(attrs)){if(k==='class')n.className=v;else n.setAttribute(k,v)}if(content!==undefined)n.textContent=content;return n}
+function svgEl(tag,attrs={},content){const n=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v]of Object.entries(attrs))n.setAttribute(k,v);if(content!==undefined)n.textContent=content;return n}
+function color(run){return getComputedStyle(document.documentElement).getPropertyValue('--c'+run.color).trim()}
+function fmt(v){if(!finite(v))return '—';if(v===0)return '0';const a=Math.abs(v);if(a<.0001||a>=1e7)return v.toExponential(3);return v.toLocaleString('en-US',{maximumSignificantDigits:6})}
+function selected(){return state.selected.map(id=>state.runs.find(r=>r.id===id)).filter(Boolean)}
+function axisKind(label){return /epoch/i.test(label)?'epoch':/step/i.test(label)?'step':label||'x'}
+function hideTip(){pinned=false;$('tooltip').hidden=true;for(const r of renders){r.guide?.setAttribute('visibility','hidden');r.dots?.replaceChildren()}}
+function flash(message){$('status').textContent=message}
+function issue(message){$('errors').append(el('div',{},message))}
+function normalizeReport(report,name,fingerprint){
+ if(!report||typeof report!=='object'||Array.isArray(report)||!report.charts||typeof report.charts!=='object')throw Error('診断レポートのJSONではありません（chartsが見つかりません）。');
+ const charts=[],used=new Set();let dropped=0;
+ for(const [section,items] of Object.entries(report.charts))for(const raw of array(items)){
+  if(!raw||typeof raw!=='object'||typeof raw.id!=='string')continue;
+  const id=Object.hasOwn(aliases,raw.id)?aliases[raw.id]:raw.id;if(used.has(id))continue;
+  const seenNames=new Map(),ss=[];
+  for(const [i,source]of array(raw.series).entries()){
+   if(!source||typeof source!=='object')continue;
+   const xx=array(source.x).length?source.x:array(raw.x),yy=array(source.y),points=[];
+   for(let j=0;j<Math.min(xx.length,yy.length);j++)if(finite(xx[j]))points.push([xx[j],finite(yy[j])?yy[j]:null]);
+   if(!points.some(p=>finite(p[1])))continue;
+   points.sort((a,b)=>a[0]-b[0]);
+   const label=text(source.name||'系列 '+(i+1));const duplicate=seenNames.get(label)||0;seenNames.set(label,duplicate+1);
+   ss.push({name:duplicate?label+' ['+(duplicate+1)+']':label,points});
+  }
+  if(!ss.length){dropped++;continue}
+  const sectionData=obj(report[section]),rows=array(sectionData.rows).length?sectionData.rows:array(sectionData.samples);
+  const scopes=[...new Set(rows.map(r=>text(r?.Scope||r?.scope)).filter(Boolean))].sort();
+  const metric=text(sectionData.metric_version||rows.find(r=>r?.MetricVersion)?.MetricVersion);
+  charts.push({id,kind:'line',section:id.startsWith('rank_')?'rank':section,title:(Object.hasOwn(titles,id)?titles[id]:text(raw.title||id)),originalTitle:text(raw.title),subtitle:text(raw.subtitle),xLabel:text(raw.x_label||'x'),metric,scope:scopes.join(', '),series:ss,markers:array(raw.markers).filter(m=>finite(m?.x)).map(m=>({x:m.x,label:text(m.label)})),fixedMin:finite(raw.y_min_fixed)?raw.y_min_fixed:null,fixedMax:finite(raw.y_max_fixed)?raw.y_max_fixed:null,minFloor:finite(raw.y_min_floor)?raw.y_min_floor:null,maxCeil:finite(raw.y_max_ceil)?raw.y_max_ceil:null,tickStep:finite(raw.y_tick_step)&&raw.y_tick_step>0?raw.y_tick_step:null,tickPrecision:Number.isInteger(raw.y_tick_precision)&&raw.y_tick_precision>=0?Math.min(15,raw.y_tick_precision):null,tickInteger:raw.y_tick_integer===true,tickNiceInteger:raw.y_tick_nice_integer===true,discrete:discrete.has(id)});used.add(id);
+ }
+ for(const [key,raw]of Object.entries(obj(report.rank?.final_heatmaps))){
+  const rows=array(raw?.rows).map(r=>({label:text(r?.label),cells:array(r?.cells).map(c=>({role:text(c?.role),value:finite(c?.value)?c.value:null}))}));
+  if(!rows.some(r=>r.cells.some(c=>finite(c.value))))continue;
+  const id='heat_'+key;charts.push({id,kind:'heatmap',section:'heatmap',title:(Object.hasOwn(titles,id)?titles[id]:key),rows,epoch:raw.Epoch,step:raw.TrainStep,scope:text(raw.Scope)});
+ }
+ if(!charts.length)throw Error('比較できるグラフデータがありません。');
+ return {id:fingerprint,fingerprint,name:text(report.base_name||name.replace(/_diagnostic\.json$/i,'')),source:name,generated:text(report.generated_at),training_settings:report.training_settings||null,charts,dropped,color:0};
+}
+async function readFiles(files){
+ if(busy)return;busy=true;$('errors').replaceChildren();$('add-files').disabled=true;
+ let count=0;
+ for(const [index,file]of [...files].entries()){
+  flash(`読み込み中 ${index+1}/${files.length}：${file.name}`);
+  try{
+   if(!/\.json$/i.test(file.name))throw Error('単独HTMLではなく、対応する *_diagnostic.json を選んでください。');
+   if(file.size>128*1024*1024)throw Error('1ファイル128 MiBまで読み込めます。');
+   const bytes=await file.arrayBuffer();const hash=await crypto.subtle.digest('SHA-256',bytes);const fingerprint=[...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,'0')).join('');
+   if(state.runs.some(r=>r.fingerprint===fingerprint)){issue(file.name+'：同じ内容を読み込み済みです。');continue}
+   const report=JSON.parse(new TextDecoder().decode(bytes).replace(/^\uFEFF/,''));
+   const run=normalizeReport(report,file.name,fingerprint);run.color=state.runs.length%4;state.runs.push(run);
+   if(state.selected.length<4)state.selected.push(run.id);count++;
+  }catch(e){issue(file.name+'：'+e.message)}
+  await new Promise(resolve=>setTimeout(resolve,0));
+ }
+ busy=false;$('add-files').disabled=false;$('file-input').value='';
+ if(!state.baseline)state.baseline=state.selected[0]||null;
+ flash(`${count}件を追加・読み込み済み ${state.runs.length}ラン`);assignColors();render();
+}
+function catalogue(){const map=new Map();for(const r of selected())for(const c of r.charts){if(!map.has(c.id))map.set(c.id,{...c,count:0});map.get(c.id).count++}return [...map.values()].sort((a,b)=>(Object.keys(groups).indexOf(a.section)<0?99:Object.keys(groups).indexOf(a.section))-(Object.keys(groups).indexOf(b.section)<0?99:Object.keys(groups).indexOf(b.section)))}
+function seriesNames(entries){return [...new Set(entries.flatMap(e=>array(e.chart?.series).map(s=>s.name)))];}
+function chosenSeries(id,names){if(!Object.hasOwn(state.series,id)||!Array.isArray(state.series[id])){let defaults=names.slice(0,4);if(id==='loss_ma'){const ma=names.filter(n=>/\bma\b|moving average/i.test(n));if(ma.length)defaults=ma}Object.defineProperty(state.series,id,{value:defaults,writable:true,enumerable:true,configurable:true})}return new Set(state.series[id].filter(n=>names.includes(n)))}
+function stableSetting(value){
+ if(Array.isArray(value))return '['+value.map(stableSetting).join(',')+']';
+ if(value&&typeof value==='object')return '{'+Object.keys(value).sort().map(k=>JSON.stringify(k)+':'+stableSetting(value[k])).join(',')+'}';
+ return JSON.stringify(value);
+}
+function renderTrainingSettings(){
+ const runs=selected();$('training-settings').hidden=!runs.length;
+ const sources={record:'設定記録ファイル',metadata:'メタデータ',none:'記録なし'};
+ const statuses={recorded:'初期化後',partial:'一部のみ',error:'読取エラー',ambiguous:'対象未確定',mismatch:'対応不一致',unavailable:'未取得'};
+ $('settings-sources').replaceChildren(...runs.map(r=>{const s=obj(r.training_settings);return el('div',{},`${r.name}：${sources[s.source]||'記録なし'} / ${statuses[s.status]||'未取得'}${array(s.notes).length?' · '+s.notes.join(' '):''}`)}));
+ const maps=runs.map(r=>{
+  const s=obj(r.training_settings),m=new Map();
+  if(s.schema_version!==1||!['recorded','partial'].includes(s.status))return m;
+  for(const [k,v]of Object.entries(obj(s.values)))m.set('設定 / '+k,v);
+  for(const [k,v]of Object.entries(obj(s.resolved?.runtime)))m.set('確定値 / '+k,v);
+  for(const phase of ['optimizer_groups_created','optimizer_groups_at_start'])for(const g of array(s.resolved?.[phase]))for(const [k,v]of Object.entries(obj(obj(g).options)))m.set((phase.endsWith('created')?'Optimizer作成時':'開始時（resume復元後）')+' / '+text(g.label||g.index)+' / '+k,v);
+  for(const [k,v]of Object.entries(obj(s.resolved?.metadata)))if(['ss_datasets','ss_dataset_dirs','ss_bucket_info','ss_sd_model_name','ss_new_sd_model_hash','ss_sd_scripts_commit_hash'].includes(k))m.set('付帯記録 / '+k,v);
+  return m;
+ });
+ const table=$('settings-table'),head=el('thead'),hr=el('tr');hr.append(el('th',{},'項目'),...runs.map(r=>el('th',{},r.name)));head.append(hr);const body=el('tbody');
+ const keys=[...new Set(maps.flatMap(m=>[...m.keys()]))].sort();let shown=0;
+ for(const key of keys){const known=maps.map(m=>m.has(key)),values=maps.map(m=>m.get(key));const equal=known.every(Boolean)&&values.every(v=>stableSetting(v)===stableSetting(values[0]));
+  if(runs.length>1&&$('settings-differences').checked&&equal)continue;
+  const tr=el('tr');tr.append(el('td',{},key));
+  values.forEach((v,i)=>{const cell=el('td',{style:'text-align:left;white-space:pre-wrap;overflow-wrap:anywhere;max-width:340px'},!known[i]?'未記録':v===null?'None（指定なし）':typeof v==='object'?JSON.stringify(v,null,2):String(v));if(!known[i])cell.className='muted';tr.append(cell)});body.append(tr);shown++;
+ }
+ if(!shown){const tr=el('tr');tr.append(el('td',{colspan:runs.length+1},keys.length?'記録された設定に差はありません。':'学習設定の記録はありません。新しい生成コマンドで診断JSONを作り直すと取り込めます。'));body.append(tr)}
+ table.replaceChildren(head,body);
+}
+$('settings-differences').addEventListener('change',renderTrainingSettings);
+function render(){
+ hideTip();renders=[];
+ const has=state.runs.length>0;$('dropzone').hidden=has;$('run-panel').hidden=!has;$('workspace').hidden=!has;$('save').disabled=!has;
+ renderRuns();renderTrainingSettings();if(!has)return;
+ if(!state.selected.includes(state.baseline))state.baseline=state.selected[0]||null;
+ const cats=catalogue();if(!cats.some(c=>c.id===state.chart))state.chart=cats.find(c=>c.id==='loss_ma')?.id||cats[0]?.id||'';
+ renderCatalogue(cats);
+ const picked=cats.find(c=>c.id===state.chart);$('chart-title').textContent=picked?.title||'表示するランを選んでください';
+ $('chart-subtitle').textContent=picked?`${picked.count}/${state.selected.length}ランに収録`:'ラン名の左のチェックで選択できます。';
+ $('baseline').replaceChildren(...selected().map((r,i)=>{const option=el('option',{value:r.id},`${i+1} · ${r.name}`);return option}));$('baseline').value=state.baseline||'';
+ for(const key of ['mode','axis','range'])$(key).value=state[key];
+ $('range-fields').hidden=state.range!=='custom';$('range-min').value=(rangeDraft||state.custom)[0];$('range-max').value=(rangeDraft||state.custom)[1];
+ $('plots').replaceChildren();$('notices').replaceChildren();$('run-legend').replaceChildren();$('stats-body').replaceChildren();$('source-notes-body').replaceChildren();
+ if(!picked){$('plots').append(el('div',{class:'panel empty'},'表示するランに有効なグラフがありません。'));$('series-box').hidden=true;$('statistics').hidden=true;$('source-notes').hidden=true;return}
+ const entries=selected().map(run=>({run,chart:run.charts.find(c=>c.id===state.chart)}));
+ const heat=picked.kind==='heatmap';$('series-box').hidden=heat;$('statistics').hidden=heat;for(const id of ['mode','axis','range'])$(id).disabled=heat;$('baseline').disabled=heat;$('baseline-field').hidden=state.mode!=='difference'||heat;
+ if(heat){renderHeatmaps(entries);renderNotes(entries);return}
+ const names=seriesNames(entries),chosen=chosenSeries(state.chart,names);
+ $('series-summary').textContent=`表示系列 ${chosen.size}/${names.length}：${[...chosen].slice(0,4).join(' / ')}${chosen.size>4?' …':''}`;
+ $('series-list').replaceChildren(...names.map((name,i)=>{const label=el('label'),input=el('input',{type:'checkbox',value:name});input.checked=chosen.has(name);const sw=svgEl('svg',{width:27,height:12,'aria-hidden':'true'});sw.append(svgEl('line',{x1:0,x2:27,y1:6,y2:6,stroke:'var(--muted)','stroke-width':2,'stroke-dasharray':dash[i%dash.length]}));label.append(input,sw,document.createTextNode(name));input.onchange=()=>{const set=new Set(state.series[state.chart]);input.checked?set.add(name):set.delete(name);state.series[state.chart]=[...set];render()};return label}));
+ for(const {run,chart}of entries){const span=el('span'),sw=el('i',{class:'swatch'});sw.style.background=color(run);span.append(sw,document.createTextNode(run.name+(run.id===state.baseline&&state.mode==='difference'?'（基準）':'')));$('run-legend').append(span);if(!chart)notice(run.name+'：このグラフは未収録です。')}
+ if(!chosen.size){$('plots').append(el('div',{class:'panel empty'},'「表示する系列」から1つ以上選んでください。'));renderNotes(entries);return}
+ drawLines(entries,names,chosen);renderNotes(entries);
+}
+function renderRuns(){
+ $('run-list').replaceChildren(...state.runs.map(run=>{
+  const card=el('div',{class:'run-card'});card.style.setProperty('--run-color',color(run));const top=el('div',{class:'run-top'}),label=el('label'),check=el('input',{type:'checkbox','aria-label':run.name+'を表示'});check.checked=state.selected.includes(run.id);
+  check.onchange=()=>{if(check.checked){if(state.selected.length>=4){check.checked=false;flash('同時表示は4ランまでです。別のランのチェックを外してください。');return}state.selected.push(run.id)}else state.selected=state.selected.filter(id=>id!==run.id);assignColors();render()};
+  label.append(check,el('span',{class:'run-name'},run.name));const remove=el('button',{class:'remove','aria-label':run.name+'を一覧から削除'},'×');remove.onclick=()=>{state.runs=state.runs.filter(r=>r.id!==run.id);state.selected=state.selected.filter(id=>id!==run.id);assignColors();render()};top.append(label,remove);card.append(top,el('div',{class:'run-meta'},`${run.generated||'生成日時未記録'} · ${run.charts.length}グラフ`));return card;
+ }));
+}
+function assignColors(){selected().forEach((r,i)=>r.color=i)}
+function renderCatalogue(cats){const nav=$('catalog');nav.replaceChildren();let section='';for(const c of cats){if(c.section!==section){section=c.section;nav.append(el('h3',{},groups[section]||section))}const button=el('button',{class:'chart-choice','data-chart-id':c.id,'aria-current':String(c.id===state.chart)});button.append(document.createTextNode(c.title),el('span',{class:'chart-count'},`${c.count}/${state.selected.length}ラン`));button.onclick=()=>{state.chart=c.id;state.range='all';render();if(innerWidth<=720)$('catalog-details').open=false};nav.append(button)}}
+function notice(s){$('notices').append(el('div',{class:'notice'},s))}
+function renderNotes(entries){
+ let count=0;for(const {run,chart}of entries){if(!chart)continue;const lines=[chart.subtitle,chart.scope?'Scope: '+chart.scope:'',chart.metric?'Metric: '+chart.metric:'',chart.originalTitle&&chart.originalTitle!==chart.title?'元のグラフ名: '+chart.originalTitle:''].filter(Boolean);if(!lines.length)continue;const block=el('div',{style:'margin-top:9px'});block.append(el('h3',{},run.name));for(const line of lines)block.append(el('p',{class:'muted'},line));$('source-notes-body').append(block);count++}$('source-notes').hidden=!count;
+}
+function extent(points){let min=Infinity,max=-Infinity;for(const p of points)if(finite(p[0])&&finite(p[1])){min=Math.min(min,p[0]);max=Math.max(max,p[0])}return [min,max]}
+function sampleAt(points,x,hold=false){
+ if(!points.length||x<points[0][0]||x>points.at(-1)[0])return null;
+ let lo=0,hi=points.length;while(lo<hi){const mid=(lo+hi)>>>1;if(points[mid][0]<x)lo=mid+1;else hi=mid}
+ if(points[lo]?.[0]===x)return finite(points[lo][1])?points[lo][1]:null;
+ const a=points[lo-1],b=points[lo];if(!a||!b||!finite(a[1])||!finite(b[1]))return null;
+ return hold?a[1]:a[1]+(b[1]-a[1])*(x-a[0])/(b[0]-a[0]);
+}
+// Keep differences at target observations only. The fourth element is a drawing
+// boundary, so baseline gaps neither invent observations nor alter statistics.
+function differencePoints(points,base,hold){
+ const gaps=base.filter(p=>!finite(p[1])).map(p=>p[0]);let gapIndex=0,previousX=null;
+ return points.map(p=>{let breakBefore=false;while(gapIndex<gaps.length&&gaps[gapIndex]<=p[0]){if(previousX!==null&&gaps[gapIndex]>previousX)breakBefore=true;gapIndex++}
+  const b=sampleAt(base,p[0],hold);previousX=p[0];return [p[0],finite(p[1])&&finite(b)?p[1]-b:null,p[2],breakBefore];
+ });
+}
+function nearest(points,x){let lo=0,hi=points.length;while(lo<hi){let mid=(lo+hi)>>>1;if(points[mid][0]<x)lo=mid+1;else hi=mid}const a=points[lo-1],b=points[lo];return !a?b:!b?a:x-a[0]<=b[0]-x?a:b}
+function drawLines(entries,names,chosen){
+ const present=entries.filter(e=>e.chart),kinds=new Set(present.map(e=>axisKind(e.chart.xLabel))),versions=new Set(present.map(e=>e.chart.metric||'未記録')),scopes=new Set(present.map(e=>e.chart.scope||'未記録'));
+ const incompatible=(state.axis==='native'&&kinds.size>1)||versions.size>1||scopes.size>1;
+ const mode=incompatible?'panels':state.mode;
+ if(incompatible)notice('横軸・Metric・Scopeの記録が異なるため、重ねずに並べて表示します。定義や条件は「元レポートの補足」で確認できます。');
+ let items=[];
+ for(const {run,chart}of present){const bounds=extent(chart.series.flatMap(s=>s.points));for(const series of chart.series){if(!chosen.has(series.name))continue;const points=series.points.map(p=>[state.axis==='progress'?(bounds[1]===bounds[0]?100:(p[0]-bounds[0])/(bounds[1]-bounds[0])*100):p[0],p[1],p[0]]);items.push({run,chart,name:series.name,points,index:names.indexOf(series.name),discrete:chart.discrete})}}
+ const baseItems=items.filter(s=>s.run.id===state.baseline);
+ if(mode==='difference'){
+  const missing=new Set();items=items.filter(s=>s.run.id!==state.baseline).map(s=>{const base=baseItems.find(b=>b.name===s.name);if(!base){missing.add(s.name);return {...s,points:[]}}return {...s,points:differencePoints(s.points,base.points,s.discrete)}});
+  if(missing.size)notice('基準ランに同名の系列がありません：'+[...missing].join(' / '));
+  if(!baseItems.length)notice('基準ランにこのグラフ・系列がありません。基準ランを変更してください。');
+ }
+ const valid=items.filter(s=>s.points.some(p=>finite(p[1])));
+ if(!valid.length){$('plots').append(el('div',{class:'panel empty'},mode==='difference'?'同じ位置で比較できるデータがありません。':'表示できる記録がありません。'));$('plot-note').textContent='';return}
+ const runBounds=selected().map(r=>extent(valid.filter(s=>s.run.id===r.id).flatMap(s=>s.points))).filter(d=>finite(d[0]));
+ let xMin=Math.min(...runBounds.map(d=>d[0])),xMax=Math.max(...runBounds.map(d=>d[1]));
+ if(state.range==='common'||state.range==='tail'){xMin=Math.max(...runBounds.map(d=>d[0]));xMax=Math.min(...runBounds.map(d=>d[1]));if(state.range==='tail')xMin=xMin+.8*(xMax-xMin)}
+ if(state.range==='custom'){[xMin,xMax]=state.custom}
+ if(xMin>xMax||!finite(xMin)||!finite(xMax)){notice('表示する共通範囲がありません。範囲を「全記録」に戻してください。');return}
+ const cut=valid.map(s=>({...s,points:s.points.filter(p=>p[0]>=xMin&&p[0]<=xMax)}));
+ let yMin=Infinity,yMax=-Infinity;for(const s of cut)for(const p of s.points)if(finite(p[1])){yMin=Math.min(yMin,p[1]);yMax=Math.max(yMax,p[1])}
+ if(!finite(yMin)){notice('指定した範囲に記録がありません。');return}
+ if(mode==='difference'){yMin=Math.min(0,yMin);yMax=Math.max(0,yMax)}
+ const pad=yMin===yMax?Math.max(Math.abs(yMin)*.05,1e-6):(yMax-yMin)*.08;yMin-=pad;yMax+=pad;
+ const charts=mode==='difference'?[]:[...new Set(cut.filter(s=>s.points.some(p=>finite(p[1]))).map(s=>s.chart))];
+ const yAxis=comparisonYAxis(charts,yMin,yMax);yMin=yAxis.min;yMax=yAxis.max;
+ if(xMin===xMax){xMin-=.5;xMax+=.5}
+ const xlabel=state.axis==='progress'?'記録範囲の進捗 (%)':present[0].chart.xLabel;
+ $('plot-note').textContent=(mode==='difference'?'差 = 対象 − 基準。同じ位置の基準値を必要に応じて補間。':'記録されたグラフ値を表示。色 = ラン、線種 = 系列。')+(state.axis==='progress'?' 進捗は各グラフの最初〜最後の有効記録を0〜100%に換算。':'')+' カーソル／タップで記録値を確認。';
+ if(state.chart.startsWith('lora_trend'))notice('情報密度はチェックポイント内の正規化を含みます。値の大小だけで画像品質や絶対的な情報量を判断しないでください。');
+ $('plots').className='plot-grid'+(mode==='panels'?' facets':'');
+ if(mode==='panels')for(const {run,chart}of entries){const own=cut.filter(s=>s.run.id===run.id);if(!chart||!own.some(s=>s.points.some(p=>finite(p[1])))){$('plots').append(el('div',{class:'panel empty'},run.name+'：この範囲・系列の記録なし'));continue}const ownLabel=state.axis==='progress'?xlabel:chart.xLabel;const domain=incompatible&&kinds.size>1&&state.axis==='native'?extent(own.flatMap(s=>s.points)):[xMin,xMax];renders.push(drawPlot(run.name,own,{x:domain,y:[yMin,yMax],yAxis},ownLabel,false))}
+ else renders.push(drawPlot(mode==='difference'?'基準：'+(state.runs.find(r=>r.id===state.baseline)?.name||''):null,cut,{x:[xMin,xMax],y:[yMin,yMax],yAxis},xlabel,mode==='difference'));
+ renderStats(cut);
+}
+function renderStats(items){$('stats-body').replaceChildren(...items.map(s=>{const ys=s.points.map(p=>p[1]).filter(finite),row=el('tr');let min=Infinity,max=-Infinity,sum=0;for(const v of ys){sum+=v;min=Math.min(min,v);max=Math.max(max,v)}for(const value of [s.run.name,s.name,ys.length.toLocaleString(),ys.length?fmt(sum/ys.length):'—',fmt(min),fmt(max),fmt(ys.at(-1))])row.append(el('td',{},value));return row}))}
+function ticks(lo,hi,n=5){const span=hi-lo;if(!(span>0))return [lo];const rough=span/n,power=Math.pow(10,Math.floor(Math.log10(rough))),ratio=rough/power,step=(ratio>=5?5:ratio>=2?2:1)*power;const result=[];for(let v=Math.ceil(lo/step)*step;v<=hi+step*1e-8&&result.length<20;v+=step)result.push(Math.abs(v)<step*1e-8?0:v);return result}
+// One axis for every displayed run. Missing constraints retain the automatic extent.
+function comparisonYAxis(charts,min,max){
+ if(charts.length){
+  const lo=Math.min(...charts.map(c=>Math.min(c.fixedMin??min,c.minFloor??Infinity))),hi=Math.max(...charts.map(c=>Math.max(c.fixedMax??max,c.maxCeil??-Infinity)));
+  if(hi>lo){min=lo;max=hi}
+ }
+ const steps=[...new Set(charts.map(c=>c.tickStep).filter(v=>finite(v)&&v>0))];
+ const integer=charts.length>0&&charts.every(c=>c.tickInteger||c.tickNiceInteger);
+ // Conflicting intervals use automatic ticks; matching intervals keep their multiples.
+ let step=steps.length===1?steps[0]:null;
+ if(step===null&&integer){
+  const rough=(max-min)/6,power=Math.pow(10,Math.floor(Math.log10(rough))),ratio=rough/power;
+  step=Math.max(1,(ratio>5?10:ratio>2?5:ratio>1?2:1)*power);
+ }
+ let values=ticks(min,max),precision=null;
+ if(step!==null){
+  if(integer)step=Math.max(1,Math.ceil(step));
+  // Bound work and label density, including imported reports with tiny tick intervals.
+  step*=Math.max(1,Math.ceil(((max-min)/step)/10));
+  const start=Math.floor(min/step),end=Math.ceil(max/step),count=end-start+1;
+  if(finite(step)&&step>0&&finite(start)&&finite(end)&&count>=2&&count<=13&&finite(start*step)&&finite(end*step)){
+   min=start*step;max=end*step;values=Array.from({length:count},(_,i)=>(start+i)*step);
+  }
+ }
+ const precisions=charts.map(c=>c.tickPrecision).filter(finite);
+ if(precisions.length){
+  precision=Math.max(...precisions);
+  // Keep adjacent ticks distinguishable if reports disagree on their formatting.
+  while(precision<15&&values.some((v,i)=>i>0&&v.toFixed(precision)===values[i-1].toFixed(precision)))precision++;
+ }
+ return {min,max,values,integer,precision};
+}
+function axisTickLabel(value,axis){
+ if(axis.integer)return Math.round(value).toString();
+ if(axis.precision!==null)return value.toFixed(axis.precision);
+ return fmt(value);
+}
+function thin(points,max=1400){
+ if(points.length<=max)return points;
+ const out=[],size=Math.ceil(points.length/(max/4));
+ for(let a=0;a<points.length;a+=size){const b=Math.min(points.length,a+size),indices=new Set([a,b-1]);let imin=-1,imax=-1;for(let j=a;j<b;j++){if(points[j][3]){indices.add(j);if(j>a)indices.add(j-1)}if(!finite(points[j][1])){indices.add(j);continue}if(imin<0||points[j][1]<points[imin][1])imin=j;if(imax<0||points[j][1]>points[imax][1])imax=j}if(imin>=0)indices.add(imin);if(imax>=0)indices.add(imax);for(const j of [...indices].sort((x,y)=>x-y))out.push(points[j])}return out;
+}
+function drawPlot(title,items,domain,xlabel,difference){
+ const card=el('div',{class:'panel plot-card'});if(title)card.append(el('h3',{class:'plot-title'},title));const svg=svgEl('svg',{class:'plot-svg',role:'img','aria-label':(title||$('chart-title').textContent)+'：'+items.length+'系列'});card.append(svg);$('plots').append(card);
+ const width=Math.max(250,card.clientWidth-20),height=360,left=76,right=18,top=20,bottom=51,plotW=width-left-right,plotH=height-top-bottom;
+ svg.setAttribute('viewBox',`0 0 ${width} ${height}`);
+ let [x0,x1]=domain.x;if(x0===x1){x0-=.5;x1+=.5}const [y0,y1]=domain.y;
+ const X=v=>left+(v-x0)/(x1-x0)*plotW,Y=v=>top+(y1-v)/(y1-y0)*plotH;
+ const clip='clip-'+(++displayIndex),defs=svgEl('defs'),cp=svgEl('clipPath',{id:clip});cp.append(svgEl('rect',{x:left,y:top,width:plotW,height:plotH}));defs.append(cp);svg.append(defs);
+ svg.append(svgEl('rect',{x:left,y:top,width:plotW,height:plotH,fill:'none',stroke:'var(--line)','data-chart-frame':''}));
+ for(const t of domain.yAxis.values){svg.append(svgEl('line',{x1:left,x2:width-right,y1:Y(t),y2:Y(t),stroke:'var(--grid)'}));svg.append(svgEl('text',{x:left-9,y:Y(t)+4,'text-anchor':'end'},axisTickLabel(t,domain.yAxis)))}
+ for(const t of ticks(x0,x1,width<400?3:6)){svg.append(svgEl('line',{x1:X(t),x2:X(t),y1:top+plotH,y2:top+plotH+4,stroke:'var(--line)'}));svg.append(svgEl('text',{x:X(t),y:top+plotH+19,'text-anchor':'middle'},Math.abs(t)>=10000?fmt(t/1000)+'k':fmt(t)))}
+ svg.append(svgEl('text',{class:'axis-title',x:left+plotW/2,y:height-8,'text-anchor':'middle'},xlabel));svg.append(svgEl('text',{class:'axis-title',x:left,y:12},difference?'差分':'記録値'));
+ if(difference)svg.append(svgEl('line',{x1:left,x2:width-right,y1:Y(0),y2:Y(0),stroke:'var(--muted)','stroke-dasharray':'3 3'}));
+ const lines=svgEl('g',{'clip-path':`url(#${clip})`});svg.append(lines);
+ for(const s of items){const pts=thin(s.points,Math.max(400,plotW*3)),parts=[];let prev=null;for(const p of pts){if(p[3])prev=null;if(!finite(p[1])){prev=null;continue}const x=X(p[0]).toFixed(2),y=Y(p[1]).toFixed(2);parts.push(!prev?`M${x},${y}`:s.discrete?`H${x}V${y}`:`L${x},${y}`);prev=p}lines.append(svgEl('path',{d:parts.join(' '),fill:'none',stroke:color(s.run),'stroke-width':1.65,'stroke-dasharray':dash[s.index%dash.length],'data-series':s.name,'data-run':s.run.id}));for(let i=0;i<pts.length;i++){const p=pts[i];if(finite(p[1])&&(pts.length<70||((!finite(pts[i-1]?.[1])||p[3])&&(!finite(pts[i+1]?.[1])||pts[i+1]?.[3]))))lines.append(svgEl('circle',{cx:X(p[0]),cy:Y(p[1]),r:2.2,fill:color(s.run),'data-point':''}))}}
+ const guide=svgEl('line',{y1:top,y2:top+plotH,stroke:'var(--muted)',visibility:'hidden','data-hover-guide':''}),dots=svgEl('g',{'clip-path':`url(#${clip})`});svg.append(guide,dots);
+ const overlay=svgEl('rect',{x:left,y:top,width:plotW,height:plotH,fill:'transparent','data-hover-overlay':''});svg.append(overlay);
+ const chart={svg,items,X,Y,x0,x1,guide,dots};
+ function hover(event,force=false){if(pinned&&!force)return;const bounds=svg.getBoundingClientRect(),px=(event.clientX-bounds.left)*width/bounds.width,value=x0+(px-left)/plotW*(x1-x0);showHover(chart,Math.max(x0,Math.min(x1,value)),event,xlabel,difference)}
+ overlay.addEventListener('pointermove',e=>hover(e));overlay.addEventListener('pointerleave',()=>{if(!pinned)hideTip()});overlay.addEventListener('click',e=>{if(pinned){hideTip()}else{hover(e,true);pinned=true}});
+ return chart;
+}
+function showHover(source,x,event,xlabel,difference){
+ const tip=$('tooltip');tip.replaceChildren(el('div',{class:'tip-title'},`${xlabel} ${fmt(x)} · 近い実記録`));
+ const table=el('table'),head=el('tr');for(const h of ['ラン / 系列','記録位置',difference?'差分':'値'])head.append(el('th',{},h));table.append(head);
+ let rows=0;
+ for(const chart of renders){if(x<chart.x0||x>chart.x1)continue;chart.guide.setAttribute('x1',chart.X(x));chart.guide.setAttribute('x2',chart.X(x));chart.guide.setAttribute('visibility','visible');chart.dots.replaceChildren();for(const s of chart.items){if(x<s.points[0]?.[0]||x>s.points.at(-1)?.[0])continue;const p=nearest(s.points,x);if(!p||!finite(p[1]))continue;chart.dots.append(svgEl('circle',{cx:chart.X(p[0]),cy:chart.Y(p[1]),r:3.5,fill:color(s.run)}));if(chart!==source)continue;if(rows++>=12)continue;const tr=el('tr');tr.append(el('td',{},s.run.name+' / '+s.name),el('td',{},fmt(p[0])),el('td',{},fmt(p[1])));table.append(tr)}}
+ tip.append(table);if(rows>12)tip.append(el('div',{class:'muted'},'ほか'+(rows-12)+'系列。表示系列を絞ると確認できます。'));tip.hidden=false;tip.style.left=Math.max(8,Math.min(event.clientX+14,innerWidth-tip.offsetWidth-8))+'px';tip.style.top=Math.max(8,Math.min(event.clientY+14,innerHeight-tip.offsetHeight-8))+'px';
+}
+function renderHeatmaps(entries){
+ $('run-legend').replaceChildren();$('plots').className='plot-grid facets';
+ const available=entries.filter(e=>e.chart),rows=[...new Set(available.flatMap(e=>e.chart.rows.map(r=>r.label)))],cols=[...new Set(available.flatMap(e=>e.chart.rows.flatMap(r=>r.cells.map(c=>c.role))))];
+ let max=0;for(const e of available)for(const r of e.chart.rows)for(const c of r.cells)if(finite(c.value))max=Math.max(max,c.value);if(state.chart==='heat_rank_sat_wmean')max=Math.max(1,max);if(!max)max=1;
+ const key=el('div',{class:'heat-key'});key.append(document.createTextNode('共通の色目盛り 0'),el('span',{class:'heat-scale'}),document.createTextNode(fmt(max)));$('run-legend').append(key);
+ for(const {run,chart}of entries){const card=el('div',{class:'panel plot-card'});card.append(el('h3',{class:'plot-title'},run.name));if(!chart){card.append(el('div',{class:'empty'},'未収録'));$('plots').append(card);continue}card.append(el('div',{class:'heat-caption'},`Epoch ${chart.epoch??'—'} / Step ${chart.step??'—'}${chart.scope?' / '+chart.scope:''}`));const wrap=el('div',{class:'table-scroll'}),table=el('table',{class:'heat-table'}),thead=el('thead'),tr=el('tr');tr.append(el('th',{},''));for(const col of cols)tr.append(el('th',{},col));thead.append(tr);table.append(thead);const tbody=el('tbody');for(const label of rows){const row=el('tr');row.append(el('th',{scope:'row'},label));for(const role of cols){const value=chart.rows.find(r=>r.label===label)?.cells.find(c=>c.role===role)?.value,cell=el('td',{},finite(value)?value.toFixed(4):'—');if(finite(value)){const ratio=Math.max(0,Math.min(1,value/max));cell.style.background=`rgb(${Math.round(239-154*ratio)},${Math.round(246-96*ratio)},${Math.round(255-39*ratio)})`;cell.className='heat-cell';cell.setAttribute('title',`${label} / ${role}: ${fmt(value)}`)}row.append(cell)}tbody.append(row)}table.append(tbody);wrap.append(table);card.append(wrap);$('plots').append(card)}
+ $('plot-note').textContent='各ランの最終記録を、同じ色目盛り・同じ行列で表示しています。最終epochが異なる場合は、その違いも確認してください。';
+}
+function save(){
+ try{
+  const bundle={version:BUNDLE_VERSION,viewerVersion:VERSION,runs:state.runs,view:{...state,runs:undefined},savedAt:new Date().toISOString()};
+  const doc=new DOMParser().parseFromString(originalHTML,'text/html');doc.getElementById('saved-state').textContent=JSON.stringify(bundle).replace(/</g,'\\u003c');doc.title='LoRA 比較 · '+selected().map(r=>r.name).join(' / ');
+  const blob=new Blob(['<!doctype html>\n'+doc.documentElement.outerHTML],{type:'text/html;charset=utf-8'}),url=URL.createObjectURL(blob),a=el('a',{href:url,download:'compare_'+new Date().toISOString().replace(/[:.]/g,'-')+'.html'});document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);flash('比較HTMLを保存しました。ブラウザの保存先を確認してください。');
+ }catch(e){issue('保存できませんでした：'+e.message)}
+}
+function restore(){
+ try{const data=JSON.parse($('saved-state').textContent);if(!data)return;if(data.version!==BUNDLE_VERSION)throw Error('未対応の比較データ形式です。');if(!Array.isArray(data.runs)||!data.view)throw Error('比較データが不正です。');for(const r of data.runs)if(typeof r.id!=='string'||!Array.isArray(r.charts))throw Error('ランの情報が不正です。');Object.assign(state,data.view);state.runs=data.runs;state.selected=array(state.selected).filter(id=>state.runs.some(r=>r.id===id)).slice(0,4);state.series=obj(state.series);flash(`保存済み比較：${state.runs.length}ラン`)}catch(e){issue('保存済みデータを読み込めません：'+e.message)}
+}
+$('version').textContent=' · v'+VERSION;
+$('add-files').onclick=$('choose-files').onclick=()=>$('file-input').click();$('file-input').onchange=e=>readFiles(e.target.files);$('save').onclick=save;
+for(const key of ['mode','axis','range'])$(key).onchange=e=>{state[key]=e.target.value;render()};$('baseline').onchange=e=>{state.baseline=e.target.value;render()};$('apply-range').onclick=()=>{const a=Number($('range-min').value),b=Number($('range-max').value);if(!finite(a)||!finite(b)||a>=b){flash('開始より大きい終了値を入力してください。');return}state.custom=[a,b];rangeDraft=null;render()};
+for(const id of ['range-min','range-max'])$(id).oninput=()=>{rangeDraft=[$('range-min').value,$('range-max').value]};
+$('series-all').onclick=()=>{state.series[state.chart]=seriesNames(selected().map(run=>({run,chart:run.charts.find(c=>c.id===state.chart)})));render()};$('series-none').onclick=()=>{state.series[state.chart]=[];render()};
+document.addEventListener('dragenter',e=>{if([...e.dataTransfer.types].includes('Files')){e.preventDefault();dragDepth++;document.body.classList.add('dragging')}});document.addEventListener('dragover',e=>{if([...e.dataTransfer.types].includes('Files'))e.preventDefault()});document.addEventListener('dragleave',()=>{if(--dragDepth<=0){dragDepth=0;document.body.classList.remove('dragging')}});document.addEventListener('drop',e=>{e.preventDefault();dragDepth=0;document.body.classList.remove('dragging');if(e.dataTransfer.files.length)readFiles(e.dataTransfer.files)});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')hideTip()});window.addEventListener('scroll',()=>{if(!pinned)hideTip()},{passive:true});
+let lastWidth=0;new ResizeObserver(entries=>{const width=Math.round(entries[0].contentRect.width);if(width===lastWidth)return;lastWidth=width;clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{if(state.runs.length)render()},100)}).observe($('workspace'));
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>render());restore();assignColors();render();
+})();
+</script>
+</body>
+</html>
