@@ -4,10 +4,25 @@ import math
 from pathlib import Path
 import struct
 
+try:
+    from library.training_settings import snapshot, snapshot_metadata
+except ModuleNotFoundError as exc:
+    if exc.name not in ("library", "library.training_settings"):
+        raise
+    # Direct execution of tools/make_lora_diagnostic_report.py has tools/ on sys.path.
+    # Load the same stdlib-only sanitizer without changing the process import path.
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location(
+        "_lora_settings_snapshot", Path(__file__).resolve().parents[1] / "library" / "training_settings.py"
+    )
+    _snapshot_module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_snapshot_module)
+    snapshot, snapshot_metadata = _snapshot_module.snapshot, _snapshot_module.snapshot_metadata
+
 MAX_JSON = 16 * 1024 * 1024
 # Conservative conversion of known scalar/structured metadata. Unknown keys stay text.
-BOOL_KEYS = set("gradient_checkpointing full_fp16 v2 cache_latents lowram zero_terminal_snr debiased_estimation scale_v_pred_loss_like_noise_pred".split())
-NUMBER_KEYS = set("learning_rate text_encoder_lr unet_lr network_dim network_alpha network_dropout seed num_epochs max_train_steps gradient_accumulation_steps lr_warmup_steps clip_skip max_token_length max_grad_norm min_snr_gamma noise_offset multires_noise_iterations multires_noise_discount adaptive_noise_scale prior_loss_weight num_train_images num_reg_images num_batches_per_epoch batch_size epoch steps".split())
+BOOL_KEYS = set("gradient_checkpointing full_fp16 v2 cache_latents lowram zero_terminal_snr debiased_estimation scale_v_pred_loss_like_noise_pred noise_offset_random_strength ip_noise_gamma_random_strength".split())
+NUMBER_KEYS = set("learning_rate text_encoder_lr unet_lr network_dim network_alpha network_dropout seed num_epochs max_train_steps gradient_accumulation_steps lr_warmup_steps clip_skip max_token_length max_grad_norm min_snr_gamma noise_offset multires_noise_iterations multires_noise_discount adaptive_noise_scale prior_loss_weight num_train_images num_reg_images num_batches_per_epoch batch_size epoch steps caption_dropout_rate caption_dropout_every_n_epochs caption_tag_dropout_rate noise_offset_random_min_ratio noise_offset_random_max_ratio huber_c ip_noise_gamma te1_lr_warmup_steps te2_lr_warmup_steps te1_freeze_at te2_freeze_at".split())
 JSON_KEYS = set("datasets dataset_dirs reg_dataset_dirs bucket_info network_args tag_frequency".split())
 ARTIFACT_KEYS = set("ss_epoch ss_steps ss_training_finished_at sshs_model_hash sshs_legacy_hash".split())
 
@@ -92,7 +107,10 @@ def _payload(directory, relative, run_id):
         raise ValueError("settings version or run ID mismatch")
     if not isinstance(data.get("args"), dict):
         raise ValueError("settings args must be an object")
-    return data
+    clean = snapshot(data)
+    if isinstance(data.get("metadata"), dict):
+        clean["metadata"] = snapshot_metadata(data["metadata"])
+    return clean
 
 
 def _validate_manifest_identity(manifest):
@@ -129,7 +147,7 @@ def load_training_settings(input_dir, base_name, model_path, manifest_path=None)
                   checkpoint={"path": str(model_path), "status": "unavailable", "metadata": {}})
     metadata = {}
     try:
-        metadata = read_metadata(model_path)
+        metadata = snapshot_metadata(read_metadata(model_path))
         result["checkpoint"].update(status="read", metadata={k: v for k, v in metadata.items() if k in ARTIFACT_KEYS})
     except (OSError, ValueError, OverflowError) as exc:
         result["checkpoint"]["error"] = type(exc).__name__

@@ -87,8 +87,38 @@ const payload=(name,data)=>({name,mimeType:'application/json',buffer:Buffer.from
   const marks=await page.locator('#plots path[data-series]').evaluateAll(es=>es.map(e=>e.getTotalLength()));assert(marks.every(n=>n>0));
   results.push({width,colorScheme,marks:marks.length,overflow});
  }
+ // Only the baseline has a gap; target observations and statistics must stay unchanged.
+ for(const id of ['loss_ma','dq_bits']){
+  await page.goto(pathToFileURL(viewer).href);
+  const base={base_name:'gap-base',charts:{grad:[chart(id,[{name:'value',y:[0,null,0]}],[0,1,2])]}},
+        target={base_name:'gap-target',charts:{grad:[chart(id,[{name:'value',y:[1,1]}],[0,2])]}};
+  await page.locator('#file-input').setInputFiles([payload('gap-base.json',base),payload('gap-target.json',target)]);
+  await page.selectOption('#mode','difference');
+  for(const axis of ['native','progress']){
+   await page.selectOption('#axis',axis);
+   const d=await page.locator('#plots path[data-series]').first().getAttribute('d');
+   assert.equal((d.match(/M/g)||[]).length,2,`${id}/${axis}: split baseline-only gap`);
+   assert.equal(await page.locator('#plots [data-point]').count(),2,'both isolated observations visible');
+   assert.deepEqual((await page.locator('#stats-body tr').first().locator('td').allTextContents()).slice(2),['2','1','1','1','1'],'no synthetic observation in statistics');
+  }
+  await page.selectOption('#axis','native');
+  await page.selectOption('#range','custom');await page.fill('#range-min','0');await page.fill('#range-max','1');await page.click('#apply-range');
+  assert.equal((await page.locator('#stats-body tr').first().locator('td').allTextContents())[2],'1');
+  await page.selectOption('#range','all');
+  const event=page.waitForEvent('download');await page.click('#save');const download=await event;
+  const savedGap=path.join(output,`gap-${id}.html`);await download.saveAs(savedGap);await page.goto(pathToFileURL(savedGap).href);
+  assert.equal(((await page.locator('#plots path[data-series]').first().getAttribute('d')).match(/M/g)||[]).length,2,'gap survives save/reopen');
+ }
+ // Dense data must retain the boundary even when the SVG path is thinned.
+ await page.goto(pathToFileURL(viewer).href);
+ const xs=Array.from({length:10000},(_,i)=>i),ys=xs.map(()=>0);ys[5001]=null;
+ const targetXs=xs.filter(x=>x!==5001),dense=(name,x,y)=>({base_name:name,charts:{grad:[chart('loss_ma',[{name:'value',y}],x)]}});
+ await page.locator('#file-input').setInputFiles([payload('dense-base.json',dense('dense-base',xs,ys)),payload('dense-target.json',dense('dense-target',targetXs,targetXs.map(()=>1)))]);
+ await page.selectOption('#mode','difference');
+ assert.equal(((await page.locator('#plots path[data-series]').first().getAttribute('d')).match(/M/g)||[]).length,2,'thinning retains baseline gap boundary');
+ assert.equal((await page.locator('#stats-body tr').first().locator('td').allTextContents())[2],'9,999');
  await browser.close();assert.deepEqual(network,[],'offline viewer must not request network');assert.deepEqual(errors,[]);
  fs.writeFileSync(path.join(output,'integration-results.json'),JSON.stringify({results,errors,network},null,2));
- console.log('PASS: imports, legacy IDs, gaps, zeros, differences, shared scales, ranges, hover, heatmaps, duplicate handling, malformed input, HTML safety, save/reopen, selection limit, responsive themes, offline.');
+ console.log('PASS: imports, legacy IDs, gaps, zeros, differences, baseline-only gaps (native/progress/discrete/thinned/saved), shared scales, ranges, hover, heatmaps, duplicate handling, malformed input, HTML safety, save/reopen, selection limit, responsive themes, offline.');
  console.log('Artifacts:',output);
 })().catch(e=>{console.error(e);process.exit(1)});

@@ -45,7 +45,7 @@
 <script>
 (() => {
 'use strict';
-const VERSION='0.2.0', BUNDLE_VERSION=1;
+const VERSION='0.2.1', BUNDLE_VERSION=1;
 const originalHTML='<!doctype html>\n'+document.documentElement.outerHTML;
 const $=id=>document.getElementById(id), finite=v=>typeof v==='number'&&Number.isFinite(v);
 const array=v=>Array.isArray(v)?v:[], obj=v=>v&&typeof v==='object'&&!Array.isArray(v)?v:{};
@@ -194,6 +194,14 @@ function sampleAt(points,x,hold=false){
  const a=points[lo-1],b=points[lo];if(!a||!b||!finite(a[1])||!finite(b[1]))return null;
  return hold?a[1]:a[1]+(b[1]-a[1])*(x-a[0])/(b[0]-a[0]);
 }
+// Keep differences at target observations only. The fourth element is a drawing
+// boundary, so baseline gaps neither invent observations nor alter statistics.
+function differencePoints(points,base,hold){
+ const gaps=base.filter(p=>!finite(p[1])).map(p=>p[0]);let gapIndex=0,previousX=null;
+ return points.map(p=>{let breakBefore=false;while(gapIndex<gaps.length&&gaps[gapIndex]<=p[0]){if(previousX!==null&&gaps[gapIndex]>previousX)breakBefore=true;gapIndex++}
+  const b=sampleAt(base,p[0],hold);previousX=p[0];return [p[0],finite(p[1])&&finite(b)?p[1]-b:null,p[2],breakBefore];
+ });
+}
 function nearest(points,x){let lo=0,hi=points.length;while(lo<hi){let mid=(lo+hi)>>>1;if(points[mid][0]<x)lo=mid+1;else hi=mid}const a=points[lo-1],b=points[lo];return !a?b:!b?a:x-a[0]<=b[0]-x?a:b}
 function drawLines(entries,names,chosen){
  const present=entries.filter(e=>e.chart),kinds=new Set(present.map(e=>axisKind(e.chart.xLabel))),versions=new Set(present.map(e=>e.chart.metric||'未記録')),scopes=new Set(present.map(e=>e.chart.scope||'未記録'));
@@ -204,7 +212,7 @@ function drawLines(entries,names,chosen){
  for(const {run,chart}of present){const bounds=extent(chart.series.flatMap(s=>s.points));for(const series of chart.series){if(!chosen.has(series.name))continue;const points=series.points.map(p=>[state.axis==='progress'?(bounds[1]===bounds[0]?100:(p[0]-bounds[0])/(bounds[1]-bounds[0])*100):p[0],p[1],p[0]]);items.push({run,chart,name:series.name,points,index:names.indexOf(series.name),discrete:chart.discrete})}}
  const baseItems=items.filter(s=>s.run.id===state.baseline);
  if(mode==='difference'){
-  const missing=new Set();items=items.filter(s=>s.run.id!==state.baseline).map(s=>{const base=baseItems.find(b=>b.name===s.name);if(!base){missing.add(s.name);return {...s,points:[]}}return {...s,points:s.points.map(p=>{const b=sampleAt(base.points,p[0],s.discrete);return [p[0],finite(p[1])&&finite(b)?p[1]-b:null,p[2]]})}});
+  const missing=new Set();items=items.filter(s=>s.run.id!==state.baseline).map(s=>{const base=baseItems.find(b=>b.name===s.name);if(!base){missing.add(s.name);return {...s,points:[]}}return {...s,points:differencePoints(s.points,base.points,s.discrete)}});
   if(missing.size)notice('基準ランに同名の系列がありません：'+[...missing].join(' / '));
   if(!baseItems.length)notice('基準ランにこのグラフ・系列がありません。基準ランを変更してください。');
  }
@@ -234,7 +242,7 @@ function ticks(lo,hi,n=5){const span=hi-lo;if(!(span>0))return [lo];const rough=
 function thin(points,max=1400){
  if(points.length<=max)return points;
  const out=[],size=Math.ceil(points.length/(max/4));
- for(let a=0;a<points.length;a+=size){const b=Math.min(points.length,a+size),indices=new Set([a,b-1]);let imin=-1,imax=-1;for(let j=a;j<b;j++){if(!finite(points[j][1])){indices.add(j);continue}if(imin<0||points[j][1]<points[imin][1])imin=j;if(imax<0||points[j][1]>points[imax][1])imax=j}if(imin>=0)indices.add(imin);if(imax>=0)indices.add(imax);for(const j of [...indices].sort((x,y)=>x-y))out.push(points[j])}return out;
+ for(let a=0;a<points.length;a+=size){const b=Math.min(points.length,a+size),indices=new Set([a,b-1]);let imin=-1,imax=-1;for(let j=a;j<b;j++){if(points[j][3]){indices.add(j);if(j>a)indices.add(j-1)}if(!finite(points[j][1])){indices.add(j);continue}if(imin<0||points[j][1]<points[imin][1])imin=j;if(imax<0||points[j][1]>points[imax][1])imax=j}if(imin>=0)indices.add(imin);if(imax>=0)indices.add(imax);for(const j of [...indices].sort((x,y)=>x-y))out.push(points[j])}return out;
 }
 function drawPlot(title,items,domain,xlabel,difference){
  const card=el('div',{class:'panel plot-card'});if(title)card.append(el('h3',{class:'plot-title'},title));const svg=svgEl('svg',{class:'plot-svg',role:'img','aria-label':(title||$('chart-title').textContent)+'：'+items.length+'系列'});card.append(svg);$('plots').append(card);
@@ -249,7 +257,7 @@ function drawPlot(title,items,domain,xlabel,difference){
  svg.append(svgEl('text',{class:'axis-title',x:left+plotW/2,y:height-8,'text-anchor':'middle'},xlabel));svg.append(svgEl('text',{class:'axis-title',x:left,y:12},difference?'差分':'記録値'));
  if(difference)svg.append(svgEl('line',{x1:left,x2:width-right,y1:Y(0),y2:Y(0),stroke:'var(--muted)','stroke-dasharray':'3 3'}));
  const lines=svgEl('g',{'clip-path':`url(#${clip})`});svg.append(lines);
- for(const s of items){const pts=thin(s.points,Math.max(400,plotW*3)),parts=[];let prev=null;for(const p of pts){if(!finite(p[1])){prev=null;continue}const x=X(p[0]).toFixed(2),y=Y(p[1]).toFixed(2);parts.push(!prev?`M${x},${y}`:s.discrete?`H${x}V${y}`:`L${x},${y}`);prev=p}lines.append(svgEl('path',{d:parts.join(' '),fill:'none',stroke:color(s.run),'stroke-width':1.65,'stroke-dasharray':dash[s.index%dash.length],'data-series':s.name,'data-run':s.run.id}));for(let i=0;i<pts.length;i++){const p=pts[i];if(finite(p[1])&&(pts.length<70||(!finite(pts[i-1]?.[1])&&!finite(pts[i+1]?.[1]))))lines.append(svgEl('circle',{cx:X(p[0]),cy:Y(p[1]),r:2.2,fill:color(s.run),'data-point':''}))}}
+ for(const s of items){const pts=thin(s.points,Math.max(400,plotW*3)),parts=[];let prev=null;for(const p of pts){if(p[3])prev=null;if(!finite(p[1])){prev=null;continue}const x=X(p[0]).toFixed(2),y=Y(p[1]).toFixed(2);parts.push(!prev?`M${x},${y}`:s.discrete?`H${x}V${y}`:`L${x},${y}`);prev=p}lines.append(svgEl('path',{d:parts.join(' '),fill:'none',stroke:color(s.run),'stroke-width':1.65,'stroke-dasharray':dash[s.index%dash.length],'data-series':s.name,'data-run':s.run.id}));for(let i=0;i<pts.length;i++){const p=pts[i];if(finite(p[1])&&(pts.length<70||((!finite(pts[i-1]?.[1])||p[3])&&(!finite(pts[i+1]?.[1])||pts[i+1]?.[3]))))lines.append(svgEl('circle',{cx:X(p[0]),cy:Y(p[1]),r:2.2,fill:color(s.run),'data-point':''}))}}
  const guide=svgEl('line',{y1:top,y2:top+plotH,stroke:'var(--muted)',visibility:'hidden','data-hover-guide':''}),dots=svgEl('g',{'clip-path':`url(#${clip})`});svg.append(guide,dots);
  const overlay=svgEl('rect',{x:left,y:top,width:plotW,height:plotH,fill:'transparent','data-hover-overlay':''});svg.append(overlay);
  const chart={svg,items,X,Y,x0,x1,guide,dots};

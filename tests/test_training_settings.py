@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from library.training_settings import dataset_batch_settings, finish_record, optimizer_groups, snapshot, snapshot_metadata, start_record
-from tools.lora_training_settings import load_training_settings, read_metadata
+from tools.lora_training_settings import load_training_settings, normalize_metadata, read_metadata
 from tools.lora_training_settings_display import render_settings
 from tools.make_lora_diagnostic_report import build_html
 
@@ -200,6 +200,58 @@ class SettingsTests(unittest.TestCase):
         path.write_text(json.dumps(original), encoding="utf-8")
         self.assertEqual(self.load()["status"], "recorded")
         self.assertIn("学習設定", build_html({"charts": {}, "training_settings": self.load()}))
+
+    def test_metadata_fallback_redacts_both_normalized_and_raw_values(self):
+        secret = "FALLBACK_DUMMY_SECRET"
+        self.metadata["ss_network_args"] = json.dumps({"api_key": secret, "conv_dim": 4})
+        self.header(self.metadata)
+        original = self.model.read_bytes()
+        data = self.load()
+        self.assertEqual(data["source"], "metadata")
+        self.assertEqual(data["values"]["network_args"], {"api_key": "[redacted]", "conv_dim": 4})
+        self.assertNotIn(secret, json.dumps(data))
+        self.assertNotIn(secret, build_html({"charts": {}, "training_settings": data}))
+        self.assertEqual(self.model.read_bytes(), original)
+
+    def test_legacy_sidecar_secrets_are_redacted_at_read_time(self):
+        record = self.record()
+        secret = "LEGACY_SIDECAR_DUMMY_SECRET"
+        originals = {}
+        for name in ("requested_args", "resolved_config"):
+            path = record[0] / "inputs" / (name + ".json")
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["args"]["wandb_api_key"] = secret
+            value["args"]["network_args"] = ["api_key=" + secret, "conv_dim=4"]
+            if name == "resolved_config":
+                value["metadata"]["ss_network_args"] = json.dumps({"api_key": secret, "conv_dim": 4})
+                value["runtime"]["access_token"] = secret
+            path.write_text(json.dumps(value), encoding="utf-8")
+            originals[path] = path.read_bytes()
+        data = self.load()
+        self.assertEqual(data["status"], "recorded")
+        self.assertNotIn(secret, json.dumps(data))
+        self.assertNotIn(secret, build_html({"charts": {}, "training_settings": data}))
+        self.assertEqual({p: p.read_bytes() for p in originals}, originals)
+        manifest = {**record[1], "settings_status": "requested"}
+        (record[0] / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(self.load()["status"], "partial")
+        self.assertNotIn(secret, json.dumps(self.load()))
+
+    def test_known_metadata_types_match_settings_without_guessing_unknown_values(self):
+        expected = {"caption_dropout_rate": 0.0, "caption_dropout_every_n_epochs": 0,
+                    "caption_tag_dropout_rate": 0.25, "noise_offset_random_strength": False,
+                    "ip_noise_gamma_random_strength": True, "noise_offset_random_min_ratio": 0.0,
+                    "noise_offset_random_max_ratio": 1.0, "huber_c": 0.1}
+        metadata = {"ss_" + k: str(v) for k, v in expected.items()}
+        actual = normalize_metadata(metadata)
+        self.assertEqual(actual, expected)
+        for key, value in expected.items():
+            self.assertIs(type(actual[key]), type(value))
+        actual = normalize_metadata({"ss_future_name": "0001", "ss_learning_rate": "invalid",
+                                     "ss_unet_lr": "None", "ss_noise_offset_random_strength": "invalid"})
+        self.assertEqual(actual, {"future_name": "0001", "learning_rate": "invalid", "unet_lr": None,
+                                  "noise_offset_random_strength": "invalid"})
+        self.assertNotIn("caption_dropout_rate", actual)
 
     def test_metadata_fallback_only_without_record(self):
         data = self.load()
