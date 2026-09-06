@@ -112,6 +112,36 @@ const payload=(name,data)=>({name,mimeType:'application/json',buffer:Buffer.from
  const boundsDownloadEvent=page.waitForEvent('download');await page.click('#save');const boundsDownload=await boundsDownloadEvent;
  const savedBounds=path.join(output,'fixed-bounds.html');await boundsDownload.saveAs(savedBounds);await page.goto(pathToFileURL(savedBounds).href);
  assert.deepEqual((await readAxes())[0].map(Number),mixedAxes,'bounds survive save/reopen');
+ // Non-fixed bounds and tick metadata are preserved through imports and save/reopen.
+ const axisReport=(name,id,bounds,ys,reference=null)=>({base_name:name,charts:{dq:[{...chart(id,[{name:'value',y:ys},...(reference===null?[]:[{name:'reference',y:ys.map(()=>reference)}])],ys.map((_,i)=>i)),...bounds}]}});
+ const loadAxes=async(id,left,right,ys=[8,8],reference=null)=>{
+  await page.goto(pathToFileURL(viewer).href);
+  await page.locator('#file-input').setInputFiles([payload('axis-a.json',axisReport('axis-a',id,left,ys,reference)),payload('axis-b.json',axisReport('axis-b',id,right,ys,reference))]);
+ };
+ const bitsBounds={y_min_floor:0,y_tick_step:1,y_tick_integer:true};
+ await loadAxes('dq_bits',bitsBounds,bitsBounds);
+ const bitsAxes=(await readAxes())[0];assert.equal(bitsAxes[0],'0');assert(bitsAxes.includes('8'));assert(bitsAxes.every(t=>/^\d+$/.test(t)),'bits have integer labels');
+ await page.selectOption('#mode','panels');assert.deepEqual(await readAxes(),[bitsAxes,bitsAxes],'panels share constrained ticks');
+ await page.selectOption('#mode','difference');const bitsDifferenceAxes=await readAxes();
+ await loadAxes('dq_bits',{},{});await page.selectOption('#mode','difference');assert.deepEqual(await readAxes(),bitsDifferenceAxes,'difference ignores all source axis metadata');
+ await loadAxes('dq_bits',bitsBounds,bitsBounds,[-2,8]);assert(Number((await readAxes())[0][0])<=-2,'floor expands range instead of clipping negative observations');
+ const qerrBounds={y_min_fixed:0,y_max_ceil:100,y_tick_step:25,y_tick_precision:0};
+ await loadAxes('dq_qerr_per_clip',qerrBounds,qerrBounds,[20,30],100);
+ await page.locator('#series-box').evaluate(e=>e.open=true);await page.locator('#series-list input[value="reference"]').uncheck();
+ assert.deepEqual((await readAxes())[0],['0','25','50','75','100'],'reference ceiling remains after hiding its series');
+ assert.equal(await page.locator('#plots path[data-series="reference"]').count(),0);
+ const axisDownloadEvent=page.waitForEvent('download');await page.click('#save');const axisDownload=await axisDownloadEvent;
+ const savedAxis=path.join(output,'axis-constraints.html');await axisDownload.saveAs(savedAxis);await page.goto(pathToFileURL(savedAxis).href);
+ assert.deepEqual((await readAxes())[0],['0','25','50','75','100'],'non-fixed bounds and ticks survive saved HTML');
+ await loadAxes('dq_qerr_per_clip',qerrBounds,qerrBounds,[120,150]);assert(Number((await readAxes())[0].at(-1))>=150,'ceiling never clips observations above reference');
+ const decimalBounds={y_min_fixed:0,y_max_fixed:1,y_tick_step:.1,y_tick_precision:1};
+ await loadAxes('decimal',decimalBounds,decimalBounds,[.8,.81]);
+ assert.equal((await readAxes())[0][0],'0.0');assert.equal((await readAxes())[0].at(-1),'1.0');assert((await readAxes())[0].includes('0.1'),'decimal interval and precision preserved');
+ await loadAxes('integer',{y_tick_nice_integer:true},{y_tick_nice_integer:true},[7.9,8.1]);assert((await readAxes())[0].every(t=>/^\d+$/.test(t)),'nice integer ticks remain distinct');
+ await loadAxes('mixed',decimalBounds,{...decimalBounds,y_tick_step:.25},[.8,.81]);
+ const conflictAxes=(await readAxes())[0];assert.equal(new Set(conflictAxes).size,conflictAxes.length,'conflicting steps yield distinct common automatic ticks');
+ await page.selectOption('#mode','panels');assert.deepEqual(await readAxes(),[conflictAxes,conflictAxes]);
+ await loadAxes('tiny',{...decimalBounds,y_tick_step:1e-300},{...decimalBounds,y_tick_step:1e-300});assert((await readAxes())[0].length<=13,'tiny imported intervals cannot create unbounded ticks');
  // Only the baseline has a gap; target observations and statistics must stay unchanged.
  for(const id of ['loss_ma','dq_bits']){
   await page.goto(pathToFileURL(viewer).href);
@@ -144,6 +174,6 @@ const payload=(name,data)=>({name,mimeType:'application/json',buffer:Buffer.from
  assert.equal((await page.locator('#stats-body tr').first().locator('td').allTextContents())[2],'9,999');
  await browser.close();assert.deepEqual(network,[],'offline viewer must not request network');assert.deepEqual(errors,[]);
  fs.writeFileSync(path.join(output,'integration-results.json'),JSON.stringify({results,errors,network},null,2));
- console.log('PASS: imports, legacy IDs, gaps, zeros, differences, baseline-only gaps (native/progress/discrete/thinned/saved), shared scales, ranges, hover, heatmaps, duplicate handling, malformed input, HTML safety, save/reopen, selection limit, responsive themes, offline.');
+ console.log('PASS: imports, legacy IDs, gaps, zeros, differences, baseline-only gaps (native/progress/discrete/thinned/saved), shared scales, fixed/floor/ceiling bounds and tick metadata, ranges, hover, heatmaps, duplicate handling, malformed input, HTML safety, save/reopen, selection limit, responsive themes, offline.');
  console.log('Artifacts:',output);
 })().catch(e=>{console.error(e);process.exit(1)});

@@ -86,7 +86,7 @@ function normalizeReport(report,name,fingerprint){
   const sectionData=obj(report[section]),rows=array(sectionData.rows).length?sectionData.rows:array(sectionData.samples);
   const scopes=[...new Set(rows.map(r=>text(r?.Scope||r?.scope)).filter(Boolean))].sort();
   const metric=text(sectionData.metric_version||rows.find(r=>r?.MetricVersion)?.MetricVersion);
-  charts.push({id,kind:'line',section:id.startsWith('rank_')?'rank':section,title:(Object.hasOwn(titles,id)?titles[id]:text(raw.title||id)),originalTitle:text(raw.title),subtitle:text(raw.subtitle),xLabel:text(raw.x_label||'x'),metric,scope:scopes.join(', '),series:ss,markers:array(raw.markers).filter(m=>finite(m?.x)).map(m=>({x:m.x,label:text(m.label)})),fixedMin:finite(raw.y_min_fixed)?raw.y_min_fixed:null,fixedMax:finite(raw.y_max_fixed)?raw.y_max_fixed:null,discrete:discrete.has(id)});used.add(id);
+  charts.push({id,kind:'line',section:id.startsWith('rank_')?'rank':section,title:(Object.hasOwn(titles,id)?titles[id]:text(raw.title||id)),originalTitle:text(raw.title),subtitle:text(raw.subtitle),xLabel:text(raw.x_label||'x'),metric,scope:scopes.join(', '),series:ss,markers:array(raw.markers).filter(m=>finite(m?.x)).map(m=>({x:m.x,label:text(m.label)})),fixedMin:finite(raw.y_min_fixed)?raw.y_min_fixed:null,fixedMax:finite(raw.y_max_fixed)?raw.y_max_fixed:null,minFloor:finite(raw.y_min_floor)?raw.y_min_floor:null,maxCeil:finite(raw.y_max_ceil)?raw.y_max_ceil:null,tickStep:finite(raw.y_tick_step)&&raw.y_tick_step>0?raw.y_tick_step:null,tickPrecision:Number.isInteger(raw.y_tick_precision)&&raw.y_tick_precision>=0?Math.min(15,raw.y_tick_precision):null,tickInteger:raw.y_tick_integer===true,tickNiceInteger:raw.y_tick_nice_integer===true,discrete:discrete.has(id)});used.add(id);
  }
  for(const [key,raw]of Object.entries(obj(report.rank?.final_heatmaps))){
   const rows=array(raw?.rows).map(r=>({label:text(r?.label),cells:array(r?.cells).map(c=>({role:text(c?.role),value:finite(c?.value)?c.value:null}))}));
@@ -228,24 +228,56 @@ function drawLines(entries,names,chosen){
  if(!finite(yMin)){notice('指定した範囲に記録がありません。');return}
  if(mode==='difference'){yMin=Math.min(0,yMin);yMax=Math.max(0,yMax)}
  const pad=yMin===yMax?Math.max(Math.abs(yMin)*.05,1e-6):(yMax-yMin)*.08;yMin-=pad;yMax+=pad;
- if(mode!=='difference'){
-  // Combine each displayed chart's bounds so panels and overlays share one scale.
-  // A missing bound keeps the automatic extent, including data from older reports.
-  const charts=[...new Set(cut.filter(s=>s.points.some(p=>finite(p[1]))).map(s=>s.chart))];
-  const lo=Math.min(...charts.map(c=>c.fixedMin??yMin)),hi=Math.max(...charts.map(c=>c.fixedMax??yMax));
-  if(hi>lo){yMin=lo;yMax=hi}
- }
+ const charts=mode==='difference'?[]:[...new Set(cut.filter(s=>s.points.some(p=>finite(p[1]))).map(s=>s.chart))];
+ const yAxis=comparisonYAxis(charts,yMin,yMax);yMin=yAxis.min;yMax=yAxis.max;
  if(xMin===xMax){xMin-=.5;xMax+=.5}
  const xlabel=state.axis==='progress'?'記録範囲の進捗 (%)':present[0].chart.xLabel;
  $('plot-note').textContent=(mode==='difference'?'差 = 対象 − 基準。同じ位置の基準値を必要に応じて補間。':'記録されたグラフ値を表示。色 = ラン、線種 = 系列。')+(state.axis==='progress'?' 進捗は各グラフの最初〜最後の有効記録を0〜100%に換算。':'')+' カーソル／タップで記録値を確認。';
  if(state.chart.startsWith('lora_trend'))notice('情報密度はチェックポイント内の正規化を含みます。値の大小だけで画像品質や絶対的な情報量を判断しないでください。');
  $('plots').className='plot-grid'+(mode==='panels'?' facets':'');
- if(mode==='panels')for(const {run,chart}of entries){const own=cut.filter(s=>s.run.id===run.id);if(!chart||!own.some(s=>s.points.some(p=>finite(p[1])))){$('plots').append(el('div',{class:'panel empty'},run.name+'：この範囲・系列の記録なし'));continue}const ownLabel=state.axis==='progress'?xlabel:chart.xLabel;const domain=incompatible&&kinds.size>1&&state.axis==='native'?extent(own.flatMap(s=>s.points)):[xMin,xMax];renders.push(drawPlot(run.name,own,{x:domain,y:[yMin,yMax]},ownLabel,false))}
- else renders.push(drawPlot(mode==='difference'?'基準：'+(state.runs.find(r=>r.id===state.baseline)?.name||''):null,cut,{x:[xMin,xMax],y:[yMin,yMax]},xlabel,mode==='difference'));
+ if(mode==='panels')for(const {run,chart}of entries){const own=cut.filter(s=>s.run.id===run.id);if(!chart||!own.some(s=>s.points.some(p=>finite(p[1])))){$('plots').append(el('div',{class:'panel empty'},run.name+'：この範囲・系列の記録なし'));continue}const ownLabel=state.axis==='progress'?xlabel:chart.xLabel;const domain=incompatible&&kinds.size>1&&state.axis==='native'?extent(own.flatMap(s=>s.points)):[xMin,xMax];renders.push(drawPlot(run.name,own,{x:domain,y:[yMin,yMax],yAxis},ownLabel,false))}
+ else renders.push(drawPlot(mode==='difference'?'基準：'+(state.runs.find(r=>r.id===state.baseline)?.name||''):null,cut,{x:[xMin,xMax],y:[yMin,yMax],yAxis},xlabel,mode==='difference'));
  renderStats(cut);
 }
 function renderStats(items){$('stats-body').replaceChildren(...items.map(s=>{const ys=s.points.map(p=>p[1]).filter(finite),row=el('tr');let min=Infinity,max=-Infinity,sum=0;for(const v of ys){sum+=v;min=Math.min(min,v);max=Math.max(max,v)}for(const value of [s.run.name,s.name,ys.length.toLocaleString(),ys.length?fmt(sum/ys.length):'—',fmt(min),fmt(max),fmt(ys.at(-1))])row.append(el('td',{},value));return row}))}
 function ticks(lo,hi,n=5){const span=hi-lo;if(!(span>0))return [lo];const rough=span/n,power=Math.pow(10,Math.floor(Math.log10(rough))),ratio=rough/power,step=(ratio>=5?5:ratio>=2?2:1)*power;const result=[];for(let v=Math.ceil(lo/step)*step;v<=hi+step*1e-8&&result.length<20;v+=step)result.push(Math.abs(v)<step*1e-8?0:v);return result}
+// One axis for every displayed run. Missing constraints retain the automatic extent.
+function comparisonYAxis(charts,min,max){
+ if(charts.length){
+  const lo=Math.min(...charts.map(c=>Math.min(c.fixedMin??min,c.minFloor??Infinity))),hi=Math.max(...charts.map(c=>Math.max(c.fixedMax??max,c.maxCeil??-Infinity)));
+  if(hi>lo){min=lo;max=hi}
+ }
+ const steps=[...new Set(charts.map(c=>c.tickStep).filter(v=>finite(v)&&v>0))];
+ const integer=charts.length>0&&charts.every(c=>c.tickInteger||c.tickNiceInteger);
+ // Conflicting intervals use automatic ticks; matching intervals keep their multiples.
+ let step=steps.length===1?steps[0]:null;
+ if(step===null&&integer){
+  const rough=(max-min)/6,power=Math.pow(10,Math.floor(Math.log10(rough))),ratio=rough/power;
+  step=Math.max(1,(ratio>5?10:ratio>2?5:ratio>1?2:1)*power);
+ }
+ let values=ticks(min,max),precision=null;
+ if(step!==null){
+  if(integer)step=Math.max(1,Math.ceil(step));
+  // Bound work and label density, including imported reports with tiny tick intervals.
+  step*=Math.max(1,Math.ceil(((max-min)/step)/10));
+  const start=Math.floor(min/step),end=Math.ceil(max/step),count=end-start+1;
+  if(finite(step)&&step>0&&finite(start)&&finite(end)&&count>=2&&count<=13&&finite(start*step)&&finite(end*step)){
+   min=start*step;max=end*step;values=Array.from({length:count},(_,i)=>(start+i)*step);
+  }
+ }
+ const precisions=charts.map(c=>c.tickPrecision).filter(finite);
+ if(precisions.length){
+  precision=Math.max(...precisions);
+  // Keep adjacent ticks distinguishable if reports disagree on their formatting.
+  while(precision<15&&values.some((v,i)=>i>0&&v.toFixed(precision)===values[i-1].toFixed(precision)))precision++;
+ }
+ return {min,max,values,integer,precision};
+}
+function axisTickLabel(value,axis){
+ if(axis.integer)return Math.round(value).toString();
+ if(axis.precision!==null)return value.toFixed(axis.precision);
+ return fmt(value);
+}
 function thin(points,max=1400){
  if(points.length<=max)return points;
  const out=[],size=Math.ceil(points.length/(max/4));
@@ -259,7 +291,7 @@ function drawPlot(title,items,domain,xlabel,difference){
  const X=v=>left+(v-x0)/(x1-x0)*plotW,Y=v=>top+(y1-v)/(y1-y0)*plotH;
  const clip='clip-'+(++displayIndex),defs=svgEl('defs'),cp=svgEl('clipPath',{id:clip});cp.append(svgEl('rect',{x:left,y:top,width:plotW,height:plotH}));defs.append(cp);svg.append(defs);
  svg.append(svgEl('rect',{x:left,y:top,width:plotW,height:plotH,fill:'none',stroke:'var(--line)','data-chart-frame':''}));
- for(const t of ticks(y0,y1,5)){svg.append(svgEl('line',{x1:left,x2:width-right,y1:Y(t),y2:Y(t),stroke:'var(--grid)'}));svg.append(svgEl('text',{x:left-9,y:Y(t)+4,'text-anchor':'end'},fmt(t)))}
+ for(const t of domain.yAxis.values){svg.append(svgEl('line',{x1:left,x2:width-right,y1:Y(t),y2:Y(t),stroke:'var(--grid)'}));svg.append(svgEl('text',{x:left-9,y:Y(t)+4,'text-anchor':'end'},axisTickLabel(t,domain.yAxis)))}
  for(const t of ticks(x0,x1,width<400?3:6)){svg.append(svgEl('line',{x1:X(t),x2:X(t),y1:top+plotH,y2:top+plotH+4,stroke:'var(--line)'}));svg.append(svgEl('text',{x:X(t),y:top+plotH+19,'text-anchor':'middle'},Math.abs(t)>=10000?fmt(t/1000)+'k':fmt(t)))}
  svg.append(svgEl('text',{class:'axis-title',x:left+plotW/2,y:height-8,'text-anchor':'middle'},xlabel));svg.append(svgEl('text',{class:'axis-title',x:left,y:12},difference?'差分':'記録値'));
  if(difference)svg.append(svgEl('line',{x1:left,x2:width-right,y1:Y(0),y2:Y(0),stroke:'var(--muted)','stroke-dasharray':'3 3'}));
