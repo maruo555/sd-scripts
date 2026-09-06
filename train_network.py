@@ -2806,7 +2806,7 @@ class NetworkTrainer:
         loss_recorder = train_util.LossRecorder()
         if settings_record:
             settings_dataset_batches = training_settings.dataset_batch_settings(
-                train_dataset_group.datasets, accelerator.num_processes, args.gradient_accumulation_steps,
+                getattr(train_dataset_group, "datasets", None), accelerator.num_processes, args.gradient_accumulation_steps,
             )
         del train_dataset_group
 
