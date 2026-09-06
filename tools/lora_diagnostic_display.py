@@ -4,6 +4,11 @@ import math
 import re
 from html import escape
 
+try:
+    from tools.lora_training_settings_display import render_settings
+except ModuleNotFoundError:
+    from lora_training_settings_display import render_settings
+
 
 SECTION_NAMES = {
     "grad": "GradNorm", "dq": "DQ Delta", "dq_guard": "DQ Guard", "dq_direct": "DQ Direct", "rank": "Rank",
@@ -209,6 +214,8 @@ def render_body(report, notes, heatmaps=""):
     overall += table(["カテゴリ", "項目", "値", "判定", "メモ"], check_rows, (2,))
     overall += "<p class='sub'>判定は参考基準に基づく目安です。</p>"
     body += f"<section class='panel'>{overall}</section>"
+
+    body += render_settings(report.get("training_settings"))
 
     errors = [report.get(k) for k in ("lora_error", "lora_trend_error") if report.get(k)]
     if errors:

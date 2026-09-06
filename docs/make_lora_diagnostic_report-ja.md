@@ -358,3 +358,10 @@ DQ autoログに該当列がある場合は、`QErrPerClip`（run指定閾値の
 `--dq_delta_log_detail basic` の `dq_delta_logs` には、軽量化のため `ZeroRate`, `AbsMax`, `Range`, `ScaleMin/Mean/Max` が出力されない。そのためHTMLレポートでも、該当列がない場合は `ZeroRate`, `AbsMax`, `Range` 系のグラフを表示しない。
 
 `QErrPerClip` グラフは主に `dq_delta_auto` 側の `QErrPerClip` 列から作る。autoログに数値が1つ以上ある場合に表示され、古いログで `dq_delta_logs` 側にのみ `QErrPerClip` がある場合はfallbackとして使う。
+
+
+## 学習設定の表示
+
+レポート生成時に `input_dir/run_records` の設定記録を自動検出します。対象の記録がない場合のみ、チェックポイントのメタデータから取得します。引数単位で両者を混ぜることはありません。単独HTMLの「学習設定」、比較HTMLの「学習設定の比較」から確認できます。
+
+移動した記録や対象未確定の場合は `--training_settings path/to/manifest.json` で指定できます。通常のbatに指定を追加する必要はありません。設定の保存範囲、照合条件、過去データの制約は [学習設定の記録と診断レポート](lora-training-settings-spec-ja.md) を参照してください。

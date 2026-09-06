@@ -28,6 +28,7 @@ from diffusers import DDPMScheduler
 from library import deepspeed_utils, model_util
 
 import library.train_util as train_util
+from library import training_settings
 from library.train_util import DreamBoothDataset
 import library.config_util as config_util
 from library.config_util import (
@@ -1098,6 +1099,7 @@ class NetworkTrainer:
         return loss.mean()
 
     def train(self, args):
+        requested_training_args = training_settings.snapshot(vars(args))
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
         train_util.verify_training_args(args)
@@ -1813,6 +1815,12 @@ class NetworkTrainer:
         logger.info("preparing accelerator")
         accelerator = train_util.prepare_accelerator(args)
         is_main_process = accelerator.is_main_process
+        settings_record = None
+        if is_main_process:
+            settings_record = training_settings.start_record(
+                args.output_dir, train_util.default_if_none(args.output_name, train_util.DEFAULT_LAST_OUTPUT_NAME),
+                session_id, training_started_at, requested_training_args,
+            )
 
         # mixed precisionに対応した型を用意しておき適宜castする
         weight_dtype, save_dtype = train_util.prepare_dtype(args)
@@ -2095,6 +2103,7 @@ class NetworkTrainer:
         #         accelerator.print(f"trainable_params: {k} = {v}")
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
+        settings_created_groups = training_settings.optimizer_groups(optimizer, lr_descriptions) if settings_record else None
 
         if self._te_lr_after_cfg:
             if lr_descriptions is None:
@@ -2817,6 +2826,64 @@ class NetworkTrainer:
             f"inf_to_window: {inf_to_window}, skip_nan_immediate: {skip_nan_immediate}, "
             f"skip_inf_immediate: {skip_inf_immediate}"
         )
+        if settings_record:
+            # Read already resolved values; do not rerun resolvers or inspect tensors.
+            settings_runtime = {
+                "num_train_epochs": num_train_epochs,
+                "num_update_steps_per_epoch": num_update_steps_per_epoch,
+                "total_batch_size": total_batch_size,
+                "epoch_to_start": epoch_to_start,
+                "optimizer_name": optimizer_name,
+                "optimizer_args": optimizer_args,
+                "train_unet": train_unet,
+                "train_text_encoder": train_text_encoder,
+                "te_selection_indices": te_selection_indices,
+                "dq_bits_sched": dq_bits_sched,
+                "dq_auto_enabled": dq_auto_enabled,
+                "dq_auto_preset": dq_auto_preset,
+                "dq_auto_active_band": dq_auto_active_band,
+                "dq_auto_active_clip_low": dq_auto_active_clip_low,
+                "dq_auto_active_clip_high": dq_auto_active_clip_high,
+                "dq_auto_mul_up": dq_auto_mul_up,
+                "dq_auto_mul_down": dq_auto_mul_down,
+                "dq_auto_every": dq_auto_every,
+                "dq_auto_min": dq_auto_min,
+                "dq_auto_max": dq_auto_max,
+                "dq_auto_ema": dq_auto_ema,
+                "dq_auto_use_raw": dq_auto_use_raw,
+                "dq_delta_begin_step": dq_delta_begin_step,
+                "dq_auto_warmup_enabled": dq_auto_warmup_enabled,
+                "dq_auto_warmup_updates": dq_auto_warmup_updates,
+                "dq_auto_init_applied": dq_auto_init_applied,
+                "dq_auto_init_value": dq_auto_init_value,
+                "dq_low_auto_enabled": dq_low_auto_enabled,
+                "dq_low_auto_min_progress": dq_low_auto_min_progress,
+                "dq_low_auto_bad_streak_threshold": dq_low_auto_bad_streak_threshold,
+                "dq_low_auto_freeze_progress": dq_low_auto_freeze_progress,
+                "dq_low_auto_qerr_ratio_threshold": dq_low_auto_qerr_ratio_threshold,
+                "dq_low_auto_qerr_per_clip_threshold": dq_low_auto_qerr_per_clip_threshold,
+                "avg_cp_mode": avg_cp_mode,
+                "avg_promote_pick": avg_promote_pick,
+                "shadow_mode": shadow_mode,
+                "promote_mode": promote_mode,
+                "grad_norm_mode": grad_norm_mode,
+                "skip_grad_norm": skip_grad_norm,
+                "log_grad_norm": log_grad_norm,
+                "log_grad_cosine": log_grad_cosine,
+                "skip_grad_norm_max": skip_grad_norm_max,
+                "nan_to_window": nan_to_window,
+                "inf_to_window": inf_to_window,
+                "skip_nan_immediate": skip_nan_immediate,
+                "skip_inf_immediate": skip_inf_immediate,
+            }
+            settings_runtime.update(
+                num_processes=accelerator.num_processes, weight_dtype=str(weight_dtype), save_dtype=str(save_dtype),
+                te_lr_after=self._te_lr_after_cfg, te_freeze=self._te_freeze_cfg,
+            )
+            training_settings.finish_record(
+                settings_record, args, optimizer, lr_descriptions, settings_created_groups, metadata, settings_runtime,
+            )
+
         model_name_for_logs = train_util.default_if_none(args.output_name, train_util.DEFAULT_LAST_OUTPUT_NAME)
         use_grad_norm = skip_grad_norm or log_grad_norm
         grad_norm_guardian: Optional[GradNormGuardian] = None

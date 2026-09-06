@@ -21,6 +21,7 @@
 <div id="status" class="status" role="status" aria-live="polite"></div><div id="errors" class="error-list" role="alert"></div>
 <section id="dropzone" class="dropzone"><strong>比較したいレポートJSONをドロップ</strong><button id="choose-files">JSONを選択</button><p><code>*_diagnostic.json</code> を複数選べます。データはこのブラウザ内で処理します。</p></section>
 <section id="run-panel" class="panel runs" hidden><div class="row" style="justify-content:space-between;margin-bottom:9px"><h3>比較するラン</h3><span class="muted">同時表示は4ランまで・色はランごとに共通</span></div><div id="run-list" class="run-list"></div></section>
+<details id="training-settings" class="panel table-panel" hidden style="margin:0 0 16px"><summary>学習設定の比較</summary><p class="muted">未記録は不明です。Noneは指定なしを表します。出典が違う場合、記録された引数と実際の動作が一致するとは限りません。</p><label class="row"><input id="settings-differences" type="checkbox" checked>差がある項目・一部未記録の項目だけ表示</label><div id="settings-sources" class="status"></div><div class="table-scroll"><table id="settings-table"></table></div></details>
 <div id="workspace" class="workspace" hidden>
 <aside class="panel sidebar"><details id="catalog-details" open><summary>グラフを選ぶ</summary><nav id="catalog" class="catalog" aria-label="比較するグラフ"></nav></details></aside>
 <section class="content" aria-label="グラフ比較">
@@ -44,7 +45,7 @@
 <script>
 (() => {
 'use strict';
-const VERSION='0.1.0', BUNDLE_VERSION=1;
+const VERSION='0.2.0', BUNDLE_VERSION=1;
 const originalHTML='<!doctype html>\n'+document.documentElement.outerHTML;
 const $=id=>document.getElementById(id), finite=v=>typeof v==='number'&&Number.isFinite(v);
 const array=v=>Array.isArray(v)?v:[], obj=v=>v&&typeof v==='object'&&!Array.isArray(v)?v:{};
@@ -93,7 +94,7 @@ function normalizeReport(report,name,fingerprint){
   const id='heat_'+key;charts.push({id,kind:'heatmap',section:'heatmap',title:(Object.hasOwn(titles,id)?titles[id]:key),rows,epoch:raw.Epoch,step:raw.TrainStep,scope:text(raw.Scope)});
  }
  if(!charts.length)throw Error('比較できるグラフデータがありません。');
- return {id:fingerprint,fingerprint,name:text(report.base_name||name.replace(/_diagnostic\.json$/i,'')),source:name,generated:text(report.generated_at),charts,dropped,color:0};
+ return {id:fingerprint,fingerprint,name:text(report.base_name||name.replace(/_diagnostic\.json$/i,'')),source:name,generated:text(report.generated_at),training_settings:report.training_settings||null,charts,dropped,color:0};
 }
 async function readFiles(files){
  if(busy)return;busy=true;$('errors').replaceChildren();$('add-files').disabled=true;
@@ -118,10 +119,40 @@ async function readFiles(files){
 function catalogue(){const map=new Map();for(const r of selected())for(const c of r.charts){if(!map.has(c.id))map.set(c.id,{...c,count:0});map.get(c.id).count++}return [...map.values()].sort((a,b)=>(Object.keys(groups).indexOf(a.section)<0?99:Object.keys(groups).indexOf(a.section))-(Object.keys(groups).indexOf(b.section)<0?99:Object.keys(groups).indexOf(b.section)))}
 function seriesNames(entries){return [...new Set(entries.flatMap(e=>array(e.chart?.series).map(s=>s.name)))];}
 function chosenSeries(id,names){if(!Object.hasOwn(state.series,id)||!Array.isArray(state.series[id])){let defaults=names.slice(0,4);if(id==='loss_ma'){const ma=names.filter(n=>/\bma\b|moving average/i.test(n));if(ma.length)defaults=ma}Object.defineProperty(state.series,id,{value:defaults,writable:true,enumerable:true,configurable:true})}return new Set(state.series[id].filter(n=>names.includes(n)))}
+function stableSetting(value){
+ if(Array.isArray(value))return '['+value.map(stableSetting).join(',')+']';
+ if(value&&typeof value==='object')return '{'+Object.keys(value).sort().map(k=>JSON.stringify(k)+':'+stableSetting(value[k])).join(',')+'}';
+ return JSON.stringify(value);
+}
+function renderTrainingSettings(){
+ const runs=selected();$('training-settings').hidden=!runs.length;
+ const sources={record:'設定記録ファイル',metadata:'メタデータ',none:'記録なし'};
+ const statuses={recorded:'初期化後',partial:'一部のみ',error:'読取エラー',ambiguous:'対象未確定',mismatch:'対応不一致',unavailable:'未取得'};
+ $('settings-sources').replaceChildren(...runs.map(r=>{const s=obj(r.training_settings);return el('div',{},`${r.name}：${sources[s.source]||'記録なし'} / ${statuses[s.status]||'未取得'}${array(s.notes).length?' · '+s.notes.join(' '):''}`)}));
+ const maps=runs.map(r=>{
+  const s=obj(r.training_settings),m=new Map();
+  if(s.schema_version!==1||!['recorded','partial'].includes(s.status))return m;
+  for(const [k,v]of Object.entries(obj(s.values)))m.set('設定 / '+k,v);
+  for(const [k,v]of Object.entries(obj(s.resolved?.runtime)))m.set('確定値 / '+k,v);
+  for(const phase of ['optimizer_groups_created','optimizer_groups_at_start'])for(const g of array(s.resolved?.[phase]))for(const [k,v]of Object.entries(obj(g.options)))m.set((phase.endsWith('created')?'Optimizer作成時':'開始時（resume復元後）')+' / '+text(g.label||g.index)+' / '+k,v);
+  for(const [k,v]of Object.entries(obj(s.resolved?.metadata)))if(['ss_datasets','ss_dataset_dirs','ss_bucket_info','ss_sd_model_name','ss_new_sd_model_hash','ss_sd_scripts_commit_hash'].includes(k))m.set('付帯記録 / '+k,v);
+  return m;
+ });
+ const table=$('settings-table'),head=el('thead'),hr=el('tr');hr.append(el('th',{},'項目'),...runs.map(r=>el('th',{},r.name)));head.append(hr);const body=el('tbody');
+ const keys=[...new Set(maps.flatMap(m=>[...m.keys()]))].sort();let shown=0;
+ for(const key of keys){const known=maps.map(m=>m.has(key)),values=maps.map(m=>m.get(key));const equal=known.every(Boolean)&&values.every(v=>stableSetting(v)===stableSetting(values[0]));
+  if(runs.length>1&&$('settings-differences').checked&&equal)continue;
+  const tr=el('tr');tr.append(el('td',{},key));
+  values.forEach((v,i)=>{const cell=el('td',{style:'text-align:left;white-space:pre-wrap;overflow-wrap:anywhere;max-width:340px'},!known[i]?'未記録':v===null?'None（指定なし）':typeof v==='object'?JSON.stringify(v,null,2):String(v));if(!known[i])cell.className='muted';tr.append(cell)});body.append(tr);shown++;
+ }
+ if(!shown){const tr=el('tr');tr.append(el('td',{colspan:runs.length+1},keys.length?'記録された設定に差はありません。':'学習設定の記録はありません。新しい生成コマンドで診断JSONを作り直すと取り込めます。'));body.append(tr)}
+ table.replaceChildren(head,body);
+}
+$('settings-differences').addEventListener('change',renderTrainingSettings);
 function render(){
  hideTip();renders=[];
  const has=state.runs.length>0;$('dropzone').hidden=has;$('run-panel').hidden=!has;$('workspace').hidden=!has;$('save').disabled=!has;
- renderRuns();if(!has)return;
+ renderRuns();renderTrainingSettings();if(!has)return;
  if(!state.selected.includes(state.baseline))state.baseline=state.selected[0]||null;
  const cats=catalogue();if(!cats.some(c=>c.id===state.chart))state.chart=cats.find(c=>c.id==='loss_ma')?.id||cats[0]?.id||'';
  renderCatalogue(cats);

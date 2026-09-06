@@ -9,6 +9,11 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from tools.lora_training_settings import load_training_settings
+except ModuleNotFoundError:
+    from lora_training_settings import load_training_settings
+
 ColorPalette = [
     "#0f766e",
     "#2563eb",
@@ -3151,6 +3156,7 @@ def setup_parser() -> argparse.ArgumentParser:
         default=".",
         help="ログとモデルがあるディレクトリ（ログ名は gradient_logs+/dq_delta_logs+/dq_delta_auto+/rank_logs+ の固定形式）",
     )
+    parser.add_argument("--training_settings", default=None, help="学習設定のmanifest.json（通常はinput_dir/run_recordsから自動選択）")
     parser.add_argument("--loss_ma_window", type=int, default=100, help="Loss移動平均の窓サイズ")
     parser.add_argument("--lora_bins", type=int, default=128, help="LoRA重み解析のヒストグラムビン数")
     parser.add_argument("--skip_lora_analysis", action="store_true", help="LoRAチェックポイント解析をスキップ")
@@ -3238,6 +3244,7 @@ def main() -> None:
     report = {
         "base_name": args.base_name,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "training_settings": load_training_settings(args.input_dir, args.base_name, model_path, args.training_settings),
         "grad": grad_data,
         "dq": dq_data,
         "rank": rank_data,
