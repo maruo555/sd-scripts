@@ -134,7 +134,7 @@ function renderTrainingSettings(){
   if(s.schema_version!==1||!['recorded','partial'].includes(s.status))return m;
   for(const [k,v]of Object.entries(obj(s.values)))m.set('設定 / '+k,v);
   for(const [k,v]of Object.entries(obj(s.resolved?.runtime)))m.set('確定値 / '+k,v);
-  for(const phase of ['optimizer_groups_created','optimizer_groups_at_start'])for(const g of array(s.resolved?.[phase]))for(const [k,v]of Object.entries(obj(g.options)))m.set((phase.endsWith('created')?'Optimizer作成時':'開始時（resume復元後）')+' / '+text(g.label||g.index)+' / '+k,v);
+  for(const phase of ['optimizer_groups_created','optimizer_groups_at_start'])for(const g of array(s.resolved?.[phase]))for(const [k,v]of Object.entries(obj(obj(g).options)))m.set((phase.endsWith('created')?'Optimizer作成時':'開始時（resume復元後）')+' / '+text(g.label||g.index)+' / '+k,v);
   for(const [k,v]of Object.entries(obj(s.resolved?.metadata)))if(['ss_datasets','ss_dataset_dirs','ss_bucket_info','ss_sd_model_name','ss_new_sd_model_hash','ss_sd_scripts_commit_hash'].includes(k))m.set('付帯記録 / '+k,v);
   return m;
  });

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from library.training_settings import finish_record, optimizer_groups, snapshot, start_record
+from library.training_settings import dataset_batch_settings, finish_record, optimizer_groups, snapshot, snapshot_metadata, start_record
 from tools.lora_training_settings import load_training_settings, read_metadata
 from tools.lora_training_settings_display import render_settings
 from tools.make_lora_diagnostic_report import build_html
@@ -92,7 +92,9 @@ class SettingsTests(unittest.TestCase):
         start_guard = next(n for n in train.body if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
                            and n.test.id == "is_main_process" and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
                            and c.func.attr == "start_record" for c in ast.walk(n)))
-        finish_guard = next(n for n in train.body if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "settings_record")
+        finish_guard = next(n for n in train.body if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "settings_record"
+                            and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                                    and c.func.attr == "finish_record" for c in ast.walk(n)))
         resume = next(n for n in ast.walk(train) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                       and n.func.attr == "resume_from_local_or_hf_if_specified")
         scheduler = next(n for n in ast.walk(train) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
@@ -114,6 +116,90 @@ class SettingsTests(unittest.TestCase):
         exec(code, env)
         self.assertIsNotNone(env["settings_record"])
         self.assertEqual(env["settings_created_groups"][0]["label"], "TE1")
+
+    def test_dataset_batches_use_dataset_values_and_preserve_multiple_sizes(self):
+        datasets = [SimpleNamespace(batch_size=4), SimpleNamespace(batch_size=2)]
+        before = [d.batch_size for d in datasets]
+        batches = dataset_batch_settings(datasets, num_processes=2, accumulation_steps=3)
+        self.assertEqual(batches, [
+            {"dataset_index": 0, "batch_size_per_device": 4, "nominal_effective_batch_size": 24},
+            {"dataset_index": 1, "batch_size_per_device": 2, "nominal_effective_batch_size": 12},
+        ])
+        self.assertEqual([d.batch_size for d in datasets], before)
+        self.assertEqual(dataset_batch_settings([SimpleNamespace(batch_size=1)], 1, 1)[0]["nominal_effective_batch_size"], 1)
+
+    def test_dataset_batch_hook_reads_before_dataset_is_deleted(self):
+        source = (Path(__file__).resolve().parents[1] / "train_network.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "dataset_batch_settings")
+        deletion = next(n for n in ast.walk(tree) if isinstance(n, ast.Delete)
+                        and any(isinstance(t, ast.Name) and t.id == "train_dataset_group" for t in n.targets))
+        self.assertLess(call.lineno, deletion.lineno)
+        self.assertIn('"dataset_batch_sizes": settings_dataset_batches', source)
+        self.assertNotIn('"total_batch_size": total_batch_size', source)
+
+    def test_structured_metadata_secrets_do_not_reappear_in_record_or_report(self):
+        secret = "DEMO_ONLY_REVIEW_SECRET"
+        self.args.network_args = ["api_key=" + secret, "conv_dim=4"]
+        self.metadata["ss_network_args"] = json.dumps({"api_key": secret, "conv_dim": 4,
+                                                       "nested": {"access_token": secret}})
+        original = copy.deepcopy(self.metadata)
+        record = self.record()
+        for path in record[0].rglob("*.json"):
+            self.assertNotIn(secret, path.read_text(encoding="utf-8"))
+        data = self.load()
+        self.assertEqual(data["status"], "recorded")
+        network = json.loads(data["resolved"]["metadata"]["ss_network_args"])
+        self.assertEqual(network, {"api_key": "[redacted]", "conv_dim": 4,
+                                  "nested": {"access_token": "[redacted]"}})
+        self.assertNotIn(secret, json.dumps(data))
+        self.assertNotIn(secret, build_html({"charts": {}, "training_settings": data}))
+        self.assertEqual(self.metadata, original, "checkpoint metadata itself must not be changed")
+
+    def test_normal_metadata_is_preserved_and_malformed_structured_fields_are_omitted(self):
+        self.assertEqual(snapshot_metadata(self.metadata), self.metadata)
+        bad = {"ss_network_args": '{"api_key":"DEMO_ONLY_SECRET"'}
+        self.assertNotIn("DEMO_ONLY_SECRET", json.dumps(snapshot_metadata(bad)))
+
+    def test_bad_manifest_identity_does_not_stop_report_generation(self):
+        record = self.record()
+        path = record[0] / "manifest.json"
+        for key in ("output_name", "session_id", "training_started_at", "run_id"):
+            for invalid in ([], {}, None, 123):
+                with self.subTest(key=key, invalid=invalid):
+                    path.write_text(json.dumps({**record[1], "settings_status": "resolved", key: invalid}), encoding="utf-8")
+                    data = self.load()
+                    self.assertEqual((data["source"], data["status"]), ("record", "error"))
+                    self.assertEqual(data["values"], {})
+                    self.assertIn("学習設定", build_html({"charts": {}, "training_settings": data}))
+
+    def test_bad_unrelated_manifest_does_not_hide_valid_match(self):
+        good = self.record()
+        other = self.record(session=456)
+        (other[0] / "manifest.json").write_text(json.dumps({**other[1], "output_name": []}), encoding="utf-8")
+        self.assertEqual(self.load()["run_id"], good[1]["run_id"])
+        self.assertEqual(self.load()["status"], "recorded")
+
+    def test_invalid_resolved_structures_become_error_without_breaking_html(self):
+        record = self.record()
+        path = record[0] / "inputs/resolved_config.json"
+        original = json.loads(path.read_text(encoding="utf-8"))
+        cases = [(key, value) for key in ("optimizer_groups_created", "optimizer_groups_at_start")
+                 for value in (None, {}, [None], [{"options": None}], [{"options": []}],
+                               [{"options": {}, "label": []}], [{"options": {}, "index": "bad"}])]
+        cases += [(key, value) for key in ("runtime", "metadata") for value in (None, [], "invalid")]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                path.write_text(json.dumps({**original, key: value}), encoding="utf-8")
+                data = self.load()
+                self.assertEqual((data["source"], data["status"]), ("record", "error"))
+                self.assertEqual(data["values"], {})
+                self.assertIn("学習設定", build_html({"charts": {}, "training_settings": data}))
+        original["optimizer_groups_created"] = {"unrecorded": "optimizer_groups"}
+        path.write_text(json.dumps(original), encoding="utf-8")
+        self.assertEqual(self.load()["status"], "recorded")
+        self.assertIn("学習設定", build_html({"charts": {}, "training_settings": self.load()}))
 
     def test_metadata_fallback_only_without_record(self):
         data = self.load()

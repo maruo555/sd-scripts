@@ -17,7 +17,10 @@ def _reject_constant(value):
 
 
 def _loads(data):
-    return json.loads(data, parse_constant=_reject_constant)
+    try:
+        return json.loads(data, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("JSON nesting limit exceeded") from exc
 
 
 def _read_json(path):
@@ -92,6 +95,34 @@ def _payload(directory, relative, run_id):
     return data
 
 
+def _validate_manifest_identity(manifest):
+    # Validate before membership/identity comparisons, including unrelated records.
+    for key in ("output_name", "session_id", "training_started_at", "run_id"):
+        if not isinstance(manifest.get(key), str):
+            raise ValueError("invalid manifest identity")
+
+
+def _validate_resolved(data):
+    for key in ("runtime", "metadata"):
+        if key in data and not isinstance(data[key], dict):
+            raise ValueError("invalid resolved object")
+    for key in ("optimizer_groups_created", "optimizer_groups_at_start"):
+        if key not in data:
+            continue
+        groups = data[key]
+        if isinstance(groups, dict) and isinstance(groups.get("unrecorded"), str):
+            continue
+        if not isinstance(groups, list):
+            raise ValueError("invalid optimizer groups")
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("options"), dict):
+                raise ValueError("invalid optimizer group options")
+            if "label" in group and not isinstance(group["label"], str):
+                raise ValueError("invalid optimizer group label")
+            if "index" in group and (type(group["index"]) is not int or group["index"] < 0):
+                raise ValueError("invalid optimizer group index")
+
+
 def load_training_settings(input_dir, base_name, model_path, manifest_path=None):
     """Select a whole source. Never fill sidecar gaps from checkpoint metadata."""
     result = dict(schema_version=1, status="unavailable", source="none", values={}, notes=[],
@@ -117,6 +148,7 @@ def load_training_settings(input_dir, base_name, model_path, manifest_path=None)
     for path in paths:
         try:
             manifest = _read_json(path)
+            _validate_manifest_identity(manifest)
             if manifest_path or manifest.get("output_name") in names or (
                 has_identity and (manifest.get("session_id"), manifest.get("training_started_at")) == identity
             ):
@@ -164,6 +196,7 @@ def load_training_settings(input_dir, base_name, model_path, manifest_path=None)
             result["notes"].append("引数のみの記録です。初期化後の確定値はありません。")
         elif manifest.get("settings_status") == "resolved":
             resolved = _payload(path.parent, manifest.get("resolved_config"), manifest["run_id"])
+            _validate_resolved(resolved)
             result.update(status="recorded", values=resolved["args"], value_stage="initialized", resolved=resolved)
         else:
             raise ValueError("unsupported settings status")

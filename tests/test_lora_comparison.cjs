@@ -64,7 +64,7 @@ const payload=(name,data)=>({name,mimeType:'application/json',buffer:Buffer.from
  await page.waitForFunction(()=>document.getElementById('errors').textContent.includes('同じ内容'));
  assert.equal(await page.locator('.run-card').count(),2);
  const evil=report('</script><img src=x onerror="window.XSS=1">',2);
- evil.training_settings={schema_version:1,source:'metadata',status:'partial',values:{danger:'</script><img src=x onerror="window.XSS=1">'}};
+ evil.training_settings={schema_version:1,source:'metadata',status:'partial',values:{danger:'</script><img src=x onerror="window.XSS=1">'},resolved:{optimizer_groups_created:[null,{options:null}]}};
  await page.locator('#file-input').setInputFiles([payload('evil.json',evil),{name:'broken.json',mimeType:'application/json',buffer:Buffer.from('{broken')},payload('wrong.json',{other:1})]);
  await page.waitForFunction(()=>document.querySelectorAll('.run-card').length===3&&!document.getElementById('add-files').disabled);
  assert.equal(await page.locator('img').count(),0);assert.equal(await page.evaluate(()=>window.XSS),undefined);

@@ -2804,6 +2804,10 @@ class NetworkTrainer:
             )
 
         loss_recorder = train_util.LossRecorder()
+        if settings_record:
+            settings_dataset_batches = training_settings.dataset_batch_settings(
+                train_dataset_group.datasets, accelerator.num_processes, args.gradient_accumulation_steps,
+            )
         del train_dataset_group
 
         # prepare gradient skipping if enabled (複数 GPUではrankごとに判定がズレる恐れありらしい)
@@ -2831,7 +2835,7 @@ class NetworkTrainer:
             settings_runtime = {
                 "num_train_epochs": num_train_epochs,
                 "num_update_steps_per_epoch": num_update_steps_per_epoch,
-                "total_batch_size": total_batch_size,
+                "dataset_batch_sizes": settings_dataset_batches,
                 "epoch_to_start": epoch_to_start,
                 "optimizer_name": optimizer_name,
                 "optimizer_args": optimizer_args,

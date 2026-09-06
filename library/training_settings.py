@@ -34,6 +34,35 @@ def snapshot(value, depth=0):
     return {"unrecorded": "non_json_value"}
 
 
+def snapshot_metadata(metadata):
+    """Redact known structured metadata while retaining its string-based format."""
+    result = snapshot(metadata)
+    for key in ("ss_network_args", "ss_datasets", "ss_dataset_dirs", "ss_reg_dataset_dirs", "ss_bucket_info", "ss_tag_frequency"):
+        raw = metadata.get(key)
+        if not isinstance(raw, str) or raw == "None":
+            continue
+        try:
+            parsed = json.loads(raw)
+            cleaned = snapshot(parsed)
+            if cleaned != parsed:
+                result[key] = json.dumps(cleaned, ensure_ascii=False, allow_nan=False)
+        except (ValueError, RecursionError):
+            # Do not copy a malformed structured field whose secrets cannot be checked.
+            result[key] = "[unrecorded: invalid structured metadata]"
+    return result
+
+
+def dataset_batch_settings(datasets, num_processes, accumulation_steps):
+    """Record configured dataset batches, not the CLI default or observed tail batches."""
+    try:
+        return [dict(dataset_index=i, batch_size_per_device=dataset.batch_size,
+                     nominal_effective_batch_size=dataset.batch_size * num_processes * accumulation_steps)
+                for i, dataset in enumerate(datasets)]
+    except Exception as exc:
+        logger.warning("Dataset batch settings unavailable (%s).", type(exc).__name__)
+        return {"unrecorded": "dataset_batch_sizes"}
+
+
 def optimizer_groups(optimizer, descriptions=None):
     """Capture group options, excluding parameters and optimizer state."""
     try:
@@ -83,7 +112,7 @@ def finish_record(record, args, optimizer, descriptions, created_groups, metadat
                         args=snapshot(vars(args)), runtime=snapshot(runtime),
                         optimizer_groups_created=created_groups,
                         optimizer_groups_at_start=optimizer_groups(optimizer, descriptions),
-                        metadata=snapshot(metadata))
+                        metadata=snapshot_metadata(metadata))
         _write(directory / manifest["resolved_config"], resolved)
         _write(directory / "manifest.json", {**manifest, "settings_status": "resolved"})
     except Exception as exc:

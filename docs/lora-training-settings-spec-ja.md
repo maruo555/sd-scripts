@@ -36,10 +36,11 @@ resolved_config内の `args` は調整後の引数であり、すべての設定
 - `optimizer_groups_at_start`：scheduler初期化・resume復元後、学習ループ前のgroup。warmupによりLRが0の場合もそのまま記録。
 - `runtime`：実際のoptimizer名、学習対象TE、process数、予定epoch数、DQ auto band/閾値・初期mul・warmup、平均化モード、勾配設定など。
 - `metadata`：学習処理が既に組み立てたモデル・データセット情報。チェックポイントを後から読んで補完するものではない。
+- `runtime.dataset_batch_sizes`：dataset側で確定したbatch sizeをdataset別に保存。`batch_size_per_device` と、process数・gradient accumulationを掛けた `nominal_effective_batch_size` を持つ。後者は設定上の値であり、端数batchやskipを反映した実測値ではない。CLIのbatch sizeだけから計算していた旧 `runtime.total_batch_size` は新しい記録では出力しない。
 
 学習中のLR変更・DQ auto切替の履歴や、画質評価は含まない。画像・captionの内容hash、依存環境の完全な一覧、未コミット差分も今回の対象外。データセット構成が一致していても、入力の内容が同一とは証明できない。
 
-パラメータ・optimizer stateは保存しない。tensorをCPUに移したり値を取り出したりしない。JSONで表現できない値は `unrecorded` として明示する。APIキー等の既知の認証情報は伏せる。
+パラメータ・optimizer stateは保存しない。tensorをCPUに移したり値を取り出したりしない。JSONで表現できない値は `unrecorded` として明示する。APIキー等の既知の認証情報は伏せる。`ss_network_args` 等のJSON文字列も解析してから伏せ、元のチェックポイント用メタデータは変更しない。確認できない不正な構造化メタデータは記録対象から外す。
 
 ファイルは一時ファイルから置換する。保存失敗は警告を出して学習を継続する。`settings_status=requested` は引数のみ、`resolved` は初期化後の設定保存済みを意味し、**学習の成功・完走を意味しない**。accelerator初期化より前に失敗した学習には記録が残らない。
 
@@ -53,7 +54,7 @@ resolved_config内の `args` は調整後の引数であり、すべての設定
 4. 対象の記録がない場合だけ、チェックポイントのメタデータから取得する。
 5. 両方なければ「記録なし」。従来のグラフ・診断処理は継続する。
 
-記録ファイルが一部だけでも、欠けた項目をチェックポイントのメタデータで穴埋めしない。壊れたファイル・未対応version・run ID不一致はエラー表示とし、自動切替しない。読めないmanifestがあり対象を判定できない場合も、無条件のメタデータ切替を避ける。
+記録ファイルが一部だけでも、欠けた項目をチェックポイントのメタデータで穴埋めしない。壊れたファイル・未対応version・run ID不一致はエラー表示とし、自動切替しない。読めないmanifestがあり対象を判定できない場合も、無条件のメタデータ切替を避ける。識別キーやoptimizer情報等の型が不正な場合も設定エラーとして処理し、従来のグラフ生成は継続する。
 
 checkpoint側のepoch/step/hash等は設定とは別枠。session照合は既存メタデータ上の対応確認であり、チェックポイントの内容hashによる同一性検証ではない。チェックポイントのメタデータやtensorは今回変更しない。
 
