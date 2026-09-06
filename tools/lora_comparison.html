@@ -228,6 +228,13 @@ function drawLines(entries,names,chosen){
  if(!finite(yMin)){notice('指定した範囲に記録がありません。');return}
  if(mode==='difference'){yMin=Math.min(0,yMin);yMax=Math.max(0,yMax)}
  const pad=yMin===yMax?Math.max(Math.abs(yMin)*.05,1e-6):(yMax-yMin)*.08;yMin-=pad;yMax+=pad;
+ if(mode!=='difference'){
+  // Combine each displayed chart's bounds so panels and overlays share one scale.
+  // A missing bound keeps the automatic extent, including data from older reports.
+  const charts=[...new Set(cut.filter(s=>s.points.some(p=>finite(p[1]))).map(s=>s.chart))];
+  const lo=Math.min(...charts.map(c=>c.fixedMin??yMin)),hi=Math.max(...charts.map(c=>c.fixedMax??yMax));
+  if(hi>lo){yMin=lo;yMax=hi}
+ }
  if(xMin===xMax){xMin-=.5;xMax+=.5}
  const xlabel=state.axis==='progress'?'記録範囲の進捗 (%)':present[0].chart.xLabel;
  $('plot-note').textContent=(mode==='difference'?'差 = 対象 − 基準。同じ位置の基準値を必要に応じて補間。':'記録されたグラフ値を表示。色 = ラン、線種 = 系列。')+(state.axis==='progress'?' 進捗は各グラフの最初〜最後の有効記録を0〜100%に換算。':'')+' カーソル／タップで記録値を確認。';

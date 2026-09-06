@@ -87,6 +87,31 @@ const payload=(name,data)=>({name,mimeType:'application/json',buffer:Buffer.from
   const marks=await page.locator('#plots path[data-series]').evaluateAll(es=>es.map(e=>e.getTotalLength()));assert(marks.every(n=>n>0));
   results.push({width,colorScheme,marks:marks.length,overflow});
  }
+ // Fixed bounds must affect actual rendered geometry, while differences remain automatic.
+ const fixedReport=(name,bounds,offset=0)=>({base_name:name,charts:{grad:[{...chart('bounded',[{name:'value',y:[.80+offset,.81+offset]}],[0,1]),...bounds}]}});
+ const readAxes=()=>page.locator('#plots svg').evaluateAll(es=>es.map(e=>[...e.querySelectorAll('text[text-anchor="end"]')].map(t=>t.textContent)));
+ const loadBounds=async(left,right)=>{
+  await page.goto(pathToFileURL(viewer).href);
+  await page.locator('#file-input').setInputFiles([payload('bounds-a.json',fixedReport('bounds-a',left)),payload('bounds-b.json',fixedReport('bounds-b',right,.01))]);
+ };
+ await loadBounds({y_min_fixed:0,y_max_fixed:1},{y_min_fixed:0,y_max_fixed:1});
+ const boundedAxes=await readAxes();assert.equal(Number(boundedAxes[0][0]),0);assert.equal(Number(boundedAxes[0].at(-1)),1);
+ const relativeHeight=await page.locator('#plots svg').first().evaluate(e=>e.querySelector('path[data-series]').getBBox().height/e.querySelector('[data-chart-frame]').height.baseVal.value);
+ assert(Math.abs(relativeHeight-.01)<1e-6,'0.01 change occupies 1% of fixed 0..1 plot');
+ await page.selectOption('#mode','panels');assert.deepEqual(await readAxes(),[boundedAxes[0],boundedAxes[0]],'fixed panels share overlay scale');
+ await page.selectOption('#mode','difference');const differenceAxes=await readAxes();
+ await loadBounds({},{});await page.selectOption('#mode','difference');assert.deepEqual(await readAxes(),differenceAxes,'difference scale ignores original fixed bounds');
+ await loadBounds({y_min_fixed:0},{y_min_fixed:0});
+ const lowerAxes=(await readAxes())[0].map(Number);assert.equal(lowerAxes[0],0);assert(lowerAxes.at(-1)<1,'upper end remains automatic');
+ await loadBounds({y_max_fixed:1},{y_max_fixed:1});
+ const upperAxes=(await readAxes())[0].map(Number);assert(upperAxes[0]>.7,'lower end remains automatic');assert.equal(upperAxes.at(-1),1);
+ await loadBounds({y_min_fixed:0,y_max_fixed:1},{y_min_fixed:-1,y_max_fixed:2});
+ const unionAxes=(await readAxes())[0].map(Number);assert.equal(unionAxes[0],-1);assert.equal(unionAxes.at(-1),2,'different fixed bounds use their union');
+ await loadBounds({y_min_fixed:0,y_max_fixed:.5},{});
+ const mixedAxes=(await readAxes())[0].map(Number);assert.equal(mixedAxes[0],0);assert(mixedAxes.at(-1)>=.8,'older report without fixed bounds keeps its data in view');
+ const boundsDownloadEvent=page.waitForEvent('download');await page.click('#save');const boundsDownload=await boundsDownloadEvent;
+ const savedBounds=path.join(output,'fixed-bounds.html');await boundsDownload.saveAs(savedBounds);await page.goto(pathToFileURL(savedBounds).href);
+ assert.deepEqual((await readAxes())[0].map(Number),mixedAxes,'bounds survive save/reopen');
  // Only the baseline has a gap; target observations and statistics must stay unchanged.
  for(const id of ['loss_ma','dq_bits']){
   await page.goto(pathToFileURL(viewer).href);
