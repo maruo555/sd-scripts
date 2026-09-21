@@ -158,7 +158,7 @@ GUIと同じ処理を呼びます。以下のパスは架空の例です。--led
 .\venv\Scripts\python.exe tools/lora_ledger.py export --ledger D:\lora-workspace\lora_ledger --run-id <ID>
 ```
 
---sourceは追加する探索フォルダです。registerは既定で新規と追加資料を反映し、変更・欠落は明示した--run-idまたはGUIで確認します。--fullは内容を全読込するため、全重みを対象にすると時間がかかります。
+--sourceは追加する探索フォルダです。登録から外したフォルダは保持している参照先IDを再利用して登録し、無効化した探索先は除外条件などを保って有効に戻します。registerは既定で新規と追加資料を反映し、変更・欠落は明示した--run-idまたはGUIで確認します。--fullは内容を全読込するため、全重みを対象にすると時間がかかります。
 
 exportの--selectionには `{"run_ids": ["ID"], "include_unverified": false}` というJSONファイルを渡せます。学習後のbatへ追加する場合も同じregister処理を利用できます。既存の学習batや学習コードの変更は行っていません。
 
@@ -169,7 +169,7 @@ exportの--selectionには `{"run_ids": ["ID"], "include_unverified": false}` �
 .\venv\Scripts\python.exe -m unittest discover -s tests -p test_training_settings.py -q
 ```
 
-台帳・PySide6操作の62テスト、既存設定記録の27テストを確認しています。Qtテストはoffscreenで実行します。
+台帳・PySide6操作の65テスト、既存設定記録の27テストを確認しています。Qtテストはoffscreenで実行します。
 
 走査時間はファイル数・保存先・キャッシュの状態によって変わります。通常の再走査ではキャッシュを利用し、内容hashの完全確認は必要な対象を選んで実行してください。
 

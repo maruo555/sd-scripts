@@ -33,9 +33,12 @@ def main(argv=None):
         sources = config["sources"]
         for value in args.source:
             path = str(Path(value).resolve())
-            if path in roots.values():
+            source = next((s for s in sources if Path(roots[s["root"]]) == Path(path)), None)
+            if source is not None:
+                source["enabled"] = True
                 continue
-            root_id = new_id()
+            # Reuse retained roots so previously registered references keep their IDs.
+            root_id = next((key for key, value in roots.items() if Path(value) == Path(path)), None) or new_id()
             roots[root_id] = path
             sources.append({"id": new_id(), "root": root_id, "name": Path(path).name,
                             "enabled": True, "recursive": True, "exclude": []})

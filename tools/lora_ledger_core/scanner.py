@@ -589,16 +589,14 @@ def verify(ledger, full=False, progress=None, cancel=None, run_ids=None):
                     elif status == "exists":
                         ref["observed"].update(sha256=value, fingerprint_status="sha256")
                         changed = True
-                if ref.get("status") != status:
-                    ref["status"] = status
-                    changed = True
             except Cancelled:
                 raise
             except FileNotFoundError:
-                ref["status"] = "missing"
-                changed = True
+                status = "missing"
             except (OSError, LedgerError):
-                ref["status"] = "unreadable"
+                status = "unreadable"
+            if ref.get("status") != status:
+                ref["status"] = status
                 changed = True
             results.append({"run_id": run["run_id"], "path": ref["relative_path"], "status": ref["status"]})
         if changed:

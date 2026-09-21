@@ -1,5 +1,7 @@
 """Acceptance coverage for optional notes, provenance and real comparison windows."""
 import copy
+import io
+from contextlib import redirect_stdout, redirect_stderr
 import csv
 import json
 import os
@@ -8,6 +10,7 @@ from unittest.mock import patch
 from pathlib import Path
 import test_lora_ledger as fixtures
 checkpoint = fixtures.checkpoint
+from tools.lora_ledger import main as ledger_cli
 from tools.lora_ledger_core.storage import new_review, read_json, atomic_json, sha256_file, Cancelled
 from tools.lora_ledger_core.scanner import scan, apply_scan, verify
 from tools.lora_ledger_core.reviews import candidate_for, preference_pairs, import_report, fingerprint_review
@@ -53,6 +56,64 @@ class ExtendedTests(unittest.TestCase):
         again = scan(self.ledger)
         self.assertEqual(again["rows"][0]["status"], "unchanged")
         self.assertEqual(len(again["rows"][0]["run"]["source_refs"]), 1)
+
+    def test_cli_restores_removed_source_without_changing_existing_refs(self):
+        checkpoint(self.source / "a.safetensors", name="a")
+        run = self.register()[0]
+        original = run["artifacts"][0]
+        config, roots = self.ledger.config(), self.ledger.locations()
+        self.ledger.set_sources([], {}, config["revision"])
+        checkpoint(self.source / "a-000020.safetensors", name="a", epoch="20")
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            ledger_cli(["register", "--ledger", str(self.ledger.directory),
+                        "--source", str(self.source), "--source", str(self.source)])
+        self.assertEqual(len(self.ledger.config()["sources"]), 1)
+        self.assertEqual(self.ledger.config()["sources"][0]["root"], original["ref"]["root"])
+        self.assertEqual(self.ledger.locations(), roots)
+        updated = self.ledger.get_run(run["run_id"])
+        self.assertEqual(len(updated["artifacts"]), 2)
+        restored = next(a for a in updated["artifacts"] if a["artifact_id"] == original["artifact_id"])
+        self.assertEqual(restored["ref"], original["ref"])
+
+    def test_cli_reenables_disabled_source_and_preserves_options(self):
+        config, roots = self.ledger.config(), self.ledger.locations()
+        source = config["sources"][0]
+        source.update(enabled=False, recursive=False, exclude=["ignored"])
+        self.ledger.set_sources([source], roots, config["revision"])
+        checkpoint(self.source / "a.safetensors", name="a")
+        self.assertEqual(scan(self.ledger)["rows"], [])
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            ledger_cli(["register", "--ledger", str(self.ledger.directory),
+                        "--source", str(self.source)])
+            ledger_cli(["register", "--ledger", str(self.ledger.directory),
+                        "--source", str(self.source)])
+        source["enabled"] = True
+        self.assertEqual(self.ledger.config()["sources"], [source])
+        self.assertEqual(self.ledger.locations(), roots)
+        self.assertEqual(len(self.ledger.list_runs()), 1)
+        self.assertEqual(len(self.ledger.list_runs()[0]["artifacts"]), 1)
+
+    def test_verify_unavailable_refs_only_saves_status_transitions(self):
+        checkpoint(self.source / "a.safetensors", name="a")
+        run = self.register()[0]
+        history = self.ledger.directory / "history/runs" / run["run_id"]
+        for error, status in [(FileNotFoundError, "missing"), (PermissionError, "unreadable")]:
+            with self.subTest(status=status):
+                before = self.ledger.get_run(run["run_id"])
+                with patch("tools.lora_ledger_core.scanner.file_stat", side_effect=error):
+                    self.assertEqual(verify(self.ledger)[0]["status"], status)
+                    changed = self.ledger.get_run(run["run_id"])
+                    self.assertEqual(changed["revision"], before["revision"] + 1)
+                    snapshots = sorted(history.glob("*.json"))
+                    self.assertEqual(verify(self.ledger)[0]["status"], status)
+                    self.assertEqual(verify(self.ledger, full=True)[0]["status"], status)
+                self.assertEqual(self.ledger.get_run(run["run_id"]), changed)
+                self.assertEqual(sorted(history.glob("*.json")), snapshots)
+        self.assertEqual(verify(self.ledger)[0]["status"], "exists")
+        recovered = self.ledger.get_run(run["run_id"])
+        self.assertEqual(recovered["revision"], changed["revision"] + 1)
+        verify(self.ledger)
+        self.assertEqual(self.ledger.get_run(run["run_id"]), recovered)
 
     def test_scan_packs_settings_and_reuses_header_cache(self):
         checkpoint(self.source / "a.safetensors")
