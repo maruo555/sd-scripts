@@ -121,6 +121,7 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 2. キャラクターの再現度が足りなければ **Preset A** に切り替え、当たり／破綻のリスクをトレードオフ。  
 
 **ツール一覧**
+
 | ツール名 | 概要 | 説明 |
 |---|---|---|
 | `python -m dq_profile` | Experimental DQ Dataset Profilerを直接起動し、Local Body／Tailレポートを生成 | 既定は最大32画像・独立snapshot 1回の`standard`。二重snapshotとreference-depth検算は`strict`。出力は`lora_output/dq_dataset_profiler`。Safety/Fidelity診断であり最終画質推薦ではない。使い方: [docs/dq_dataset_profiler-ja.md](docs/dq_dataset_profiler-ja.md) |
@@ -128,6 +129,7 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 | `make_lora_diagnostic_report.py` | LoRA学習ログ（`grad_norm` / `dq_delta`）とLoRA重みを診断し、グラフ内蔵HTMLを生成 | 使い方とオプション詳細: [docs/make_lora_diagnostic_report-ja.md](docs/make_lora_diagnostic_report-ja.md) |
 | `sdxl_lora_report_gui.py` | SDXL LoRAの一括生成・比較HTMLレポートをGUIで作成 | [docs/sdxl_lora_report_README-ja.md](docs/sdxl_lora_report_README-ja.md) |
 | `sdxl_lora_report_cui.py` | JSON設定からSDXL LoRA比較レポートをCUI生成。GUIの下請けとしても使用 | [docs/sdxl_lora_report_README-ja.md](docs/sdxl_lora_report_README-ja.md) |
+| `lora_ledger_gui.py` | LoRA学習結果と人間評価を管理するPySide6 GUIの軽量台帳 | 複数の保存先を再走査して追加登録し、学習設定・お気に入り・比較評価を記録。元ログ・重みは参照し、台帳はリポジトリ外へ保存。CSV・AI相談用データを書き出せます。起動は `lora_ledger_gui.bat`。使い方: [docs/lora-research-ledger-usage-ja.md](docs/lora-research-ledger-usage-ja.md) |
 | `sdxl_gen_img.py` | SDXL画像生成スクリプト。本フォークでは `--network_lbw` でLoRA Block Weight指定に対応 | [docs/sdxl_gen_img_README-ja.md](docs/sdxl_gen_img_README-ja.md) |
 
 ### Experimental SDXL DQ Dataset Profiler

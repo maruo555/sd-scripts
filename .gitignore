@@ -9,3 +9,6 @@ wandb
 analyze_lora_result
 .tmp/
 dq_profile_output/
+
+# Local startup location for LoRA research ledger
+.local/lora_ledger_gui.json
