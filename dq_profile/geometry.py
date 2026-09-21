@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 
 def _normalized(value: str) -> str:
-    return str(value).strip().replace("\\", "/").casefold()
+    normalized = str(value).strip().replace("\\", "/").casefold()
+    # Literal TOML paths can retain repeated separators that Path.resolve()
+    # removes from generated source rules. Normalize both spellings without
+    # losing a directory prefix's trailing slash or the leading UNC root.
+    if normalized.startswith("//"):
+        return "//" + re.sub(r"/+", "/", normalized.lstrip("/"))
+    return re.sub(r"/+", "/", normalized)
 
 
 @dataclass(frozen=True)

@@ -173,6 +173,46 @@ def _source_batch(source: str, index: int):
     return {"image_keys": [f"{source}/image-{index}.png"]}
 
 
+def test_capture_matches_source_map_with_literal_toml_windows_paths(tmp_path):
+    source = tmp_path / "sources.json"
+    groups = [f"source-{index:02d}" for index in range(1, 11)]
+    source.write_text(
+        json.dumps([
+            {"pattern": f"D:/train_data/{group}/", "source_group": group, "match": "prefix"}
+            for group in groups
+        ]),
+        encoding="utf-8",
+    )
+    mapping = SourceGroupMap.load(source)
+    batches = [
+        {"image_keys": [rf"D:\\train_data\{group}\image.png"]}
+        for group in groups
+    ]
+    runtime = object.__new__(DiagnosticProfileRuntime)
+    sequence, metadata = runtime._capture_batches(
+        first_batch=batches[0],
+        epoch_iterator=iter(batches[1:]),
+        train_dataloader=_ReplayLoader(batches),
+        current_epoch=SimpleNamespace(value=1),
+        current_step=SimpleNamespace(value=0),
+        global_step=1200,
+        epoch=2,
+        data_step=0,
+        count=2,
+        source_group_resolver=mapping.resolve,
+        required_source_groups=groups,
+    )
+
+    assert metadata["coverage_complete"] is True
+    assert metadata["represented_source_groups"] == groups
+    assert metadata["coverage_scan_batches"] == 8
+    runtime.profile_protocol = "v24-acceptance-local"
+    runtime.args = SimpleNamespace(dq_profile_source_group_map=source, dq_profile_max_images=10)
+    selected, _ = runtime._select_probe_items(sequence)
+    assert [mapping.resolve(item.image_keys[0]) for item in selected] == groups
+    assert selected[0].image_keys == tuple(batches[0]["image_keys"])
+
+
 def test_capture_extends_fixed_prefix_only_for_missing_source_groups():
     runtime = object.__new__(DiagnosticProfileRuntime)
     batches = [
