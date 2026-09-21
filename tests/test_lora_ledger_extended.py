@@ -115,6 +115,62 @@ class ExtendedTests(unittest.TestCase):
         verify(self.ledger)
         self.assertEqual(self.ledger.get_run(run["run_id"]), recovered)
 
+    def test_scan_marks_unreadable_replacements_and_preserves_recorded_content(self):
+        import struct
+        nested = self.source / "nested"
+        nested.mkdir()
+        paths = [nested / "a.safetensors", nested / "b.safetensors"]
+        for index, path in enumerate(paths, 1):
+            checkpoint(path, name=path.stem, session=str(index))
+        self.add_source(nested)
+        originals = self.register()
+        for run in originals:
+            save_note(self.ledger, run, None, {"favorite_rating": 4}, confirm_hash=False)
+        reviews = self.ledger.reviews()
+        # The retained references use the parent root; discovery now uses the child.
+        config = self.ledger.config()
+        config["sources"][0]["enabled"] = False
+        self.ledger.set_sources(config["sources"], self.ledger.locations(), config["revision"])
+        paths[0].write_bytes(b"truncated")
+        header = json.dumps({"__metadata__": {}}).encode()
+        paths[1].write_bytes(struct.pack("<Q", len(header)) + header)
+        for full in (False, True):
+            result = scan(self.ledger, full=full)
+            self.assertEqual(len(result["issues"]), 2)
+            self.assertEqual({row["status"] for row in result["rows"]}, {"changed"})
+            for row in result["rows"]:
+                artifact = row["run"]["artifacts"][0]
+                original = next(r for r in originals if r["run_id"] == row["run_id"])
+                self.assertEqual(artifact["ref"]["status"], "unreadable")
+                self.assertEqual(artifact["ref"]["observed"], original["artifacts"][0]["ref"]["observed"])
+                self.assertEqual(artifact["artifact_id"], original["artifacts"][0]["artifact_id"])
+                self.assertEqual(row["run"]["settings_sources"], original["settings_sources"])
+            self.assertEqual(apply_scan(self.ledger, result)["applied"], [])
+        applied = apply_scan(self.ledger, result, [r["run_id"] for r in originals])
+        self.assertEqual(applied["errors"], [])
+        self.assertEqual(self.ledger.reviews(), reviews)
+        self.assertTrue(all(row["status"] == "unchanged" for row in scan(self.ledger)["rows"]))
+
+    def test_scan_marks_rejected_manifest_but_keeps_excluded_references(self):
+        from library.training_settings import start_record
+        record_root = self.source / "records"
+        start_record(record_root, "a", "99", "123", {"learning_rate": 0.0003})
+        nested = self.source / "nested"
+        checkpoint(nested / "b.safetensors", name="b")
+        runs = self.register()
+        settings_run = next(run for run in runs if not run["artifacts"])
+        weight_run = next(run for run in runs if run["artifacts"])
+        manifest = next(ref for ref in settings_run["source_refs"] if ref["kind"] == "manifest")
+        atomic_json(self.ledger.resolve_ref(manifest), {})
+        config = self.ledger.config()
+        config["sources"][0]["exclude"] = ["nested"]
+        self.ledger.set_sources(config["sources"], self.ledger.locations(), config["revision"])
+        rows = {row["run_id"]: row for row in scan(self.ledger)["rows"]}
+        self.assertEqual(rows[settings_run["run_id"]]["status"], "changed")
+        ref = next(ref for ref in rows[settings_run["run_id"]]["run"]["source_refs"] if ref["kind"] == "manifest")
+        self.assertEqual(ref["status"], "unreadable")
+        self.assertEqual(rows[weight_run["run_id"]]["status"], "unchanged")
+
     def test_scan_packs_settings_and_reuses_header_cache(self):
         checkpoint(self.source / "a.safetensors")
         self.register()

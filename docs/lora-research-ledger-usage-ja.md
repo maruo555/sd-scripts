@@ -169,7 +169,7 @@ exportの--selectionには `{"run_ids": ["ID"], "include_unverified": false}` �
 .\venv\Scripts\python.exe -m unittest discover -s tests -p test_training_settings.py -q
 ```
 
-台帳・PySide6操作の65テスト、既存設定記録の27テストを確認しています。Qtテストはoffscreenで実行します。
+台帳・PySide6操作の68テスト、既存設定記録の27テストを確認しています。Qtテストはoffscreenで実行します。
 
 走査時間はファイル数・保存先・キャッシュの状態によって変わります。通常の再走査ではキャッシュを利用し、内容hashの完全確認は必要な対象を選んで実行してください。
 

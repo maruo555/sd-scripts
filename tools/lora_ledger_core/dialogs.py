@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 from .storage import LedgerError, Cancelled, new_id, new_review, file_stat, now
 from .scanner import STATES, apply_scan, link_reference
 from library.generation_lora_strengths import format_strength_spec, serialize_strength_spec
-from .reviews import candidate_for, import_report, fingerprint_review, preference_pairs, pair_cases, select_cases
+from .reviews import candidate_for, import_report, fingerprint_review, preference_pairs, pair_cases, select_cases, prune_cases
 
 
 class Worker(QThread):
@@ -412,6 +412,7 @@ class ComparisonDialog(QDialog):
                                 "adopted": self.table.cellWidget(i, 5).isChecked()}
 
     def populate(self):
+        prune_cases(self.review)
         self.table.setRowCount(len(self.review["candidates"]))
         available_cases = self.review.get("available_cases", self.review.get("cases"))
         available = {c["candidate_id"] for c in available_cases or []}

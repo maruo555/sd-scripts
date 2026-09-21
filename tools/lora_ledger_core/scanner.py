@@ -241,6 +241,9 @@ def scan(ledger, progress=None, cancel=None, full=False):
                 if not kind:
                     continue
                 seen.add(key)
+                # Audit retained references even if parsing under a new root fails.
+                if key in canonical_refs:
+                    online_roots.add(canonical_refs[key][0])
                 if len(seen) % 100 == 0:
                     emit(f"ファイル確認: {len(seen):,} 件")
                 try:
@@ -266,7 +269,6 @@ def scan(ledger, progress=None, cancel=None, full=False):
                                  "path": str(path), "kind": kind, "observed": observed, "data": data}
                     if key in canonical_refs:
                         entry["root"], entry["relative_path"] = canonical_refs[key]
-                        online_roots.add(entry["root"])
                     entries.append(entry)
                     new_cache[key] = entry
                 except Cancelled:
@@ -285,13 +287,20 @@ def scan(ledger, progress=None, cancel=None, full=False):
                 continue
             try:
                 path = ledger.resolve_ref(ref)
-                current = current_by_path.get(os.path.normcase(str(path)))
+                path_key = os.path.normcase(str(path))
+                current = current_by_path.get(path_key)
                 if current:
                     status = "exists" if same_stat(ref["observed"], current["observed"]) else "changed"
                     if ref["observed"].get("sha256") and current["observed"].get("sha256"):
                         status = "exists" if ref["observed"]["sha256"] == current["observed"]["sha256"] else "changed"
+                elif not path.exists():
+                    status = "missing"
+                elif path_key in seen:
+                    # Discovered but not parsed: presence alone cannot verify the old content.
+                    status = "unreadable"
                 else:
-                    status = "exists" if path.exists() else "missing"
+                    # Excluded paths keep their last known state until explicitly checked.
+                    status = ref.get("status", "exists")
                 ref["status"] = status
             except (OSError, LedgerError):
                 ref["status"] = "unreadable"

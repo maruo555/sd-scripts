@@ -178,6 +178,47 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.ledger.reviews(history=True)[0]["cases"], first["cases"])
         dialog.close()
 
+    def test_removing_candidate_prunes_cases_without_changing_prompt_selection(self):
+        folder = self.root / "comparison_report"
+        folder.mkdir()
+        (folder / "image.png").write_bytes(b"image")
+        conditions = [{"id": str(i), "name": str(i), "items": [{"path": str(
+            self.ledger.resolve_ref(r["artifacts"][0]["ref"]))}]} for i, r in enumerate(self.runs)]
+        atomic_json(folder / "metadata.json", {"conditions": conditions, "jobs": [
+            {"condition_id": c["id"], "prompt_id": p, "status": "done", "returncode": 0,
+             "image": "image.png"} for c in conditions for p in ("p1", "p2")]})
+        for mode in ("all_cases", "selected"):
+            with self.subTest(mode=mode):
+                review = import_report(self.ledger, folder)
+                review["candidates"][0]["usability"] = "usable"
+                if mode == "selected":
+                    review["available_cases"] = copy.deepcopy(review["cases"])
+                    review["cases"] = [c for c in review["cases"] if c["prompt_id"] == "p1"]
+                    review["selection_mode"] = mode
+                original = self.ledger.save_review(review)
+                kept_id = original["candidates"][0]["candidate_id"]
+                dialog = ComparisonDialog(self.window, self.ledger, original)
+                self.addCleanup(dialog.close)
+                prompt_text = dialog.case_filter.text()
+                dialog.table.setCurrentCell(1, 1)
+                dialog.remove_candidate()
+                self.assertEqual(dialog.case_filter.text(), prompt_text)
+                self.assertIn("2 件", dialog.case_label.text())
+                dialog.hash_check.setChecked(False)
+                with patch("tools.lora_ledger_core.dialogs.show_error") as error:
+                    dialog.save()
+                error.assert_not_called()
+                updated = next(r for r in self.ledger.reviews() if r["review_id"] == original["review_id"])
+                self.assertEqual(updated["revision"], 2)
+                self.assertEqual(updated["cases"], [c for c in original["cases"] if c["candidate_id"] == kept_id])
+                if mode == "selected":
+                    self.assertEqual(updated["available_cases"], [c for c in original["available_cases"]
+                                                                 if c["candidate_id"] == kept_id])
+                previous = next(r for r in self.ledger.reviews(history=True)
+                                if r["review_id"] == original["review_id"] and r["revision"] == 1)
+                self.assertEqual(previous, original)
+                dialog.close()
+
     def test_partial_comparison_can_expand_change_and_restore_all_cases(self):
         review = new_review()
         review["candidates"] = [candidate_for(r, r["artifacts"][0]) for r in self.runs]

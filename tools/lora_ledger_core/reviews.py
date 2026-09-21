@@ -177,7 +177,16 @@ def select_cases(ledger, review, mode, prompt_ids):
     review.pop("case_selection_note", None)
 
 
+def prune_cases(review):
+    """Keep evidence only for candidates still present, without changing prompt scope."""
+    candidate_ids = {c["candidate_id"] for c in review["candidates"]}
+    for key in ("cases", "available_cases"):
+        if key in review:
+            review[key] = [c for c in review[key] if c["candidate_id"] in candidate_ids]
+
+
 def pair_cases(review):
+    prune_cases(review)
     if "cases" not in review:
         return
     cases = {}
