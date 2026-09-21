@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 
 from .storage import LedgerError, Cancelled, new_id, new_review, file_stat, now
 from .scanner import STATES, apply_scan, link_reference
-from .reviews import candidate_for, import_report, fingerprint_review, preference_pairs, pair_cases
+from library.generation_lora_strengths import format_strength_spec, serialize_strength_spec
+from .reviews import candidate_for, import_report, fingerprint_review, preference_pairs, pair_cases, select_cases
 
 
 class Worker(QThread):
@@ -412,12 +413,13 @@ class ComparisonDialog(QDialog):
 
     def populate(self):
         self.table.setRowCount(len(self.review["candidates"]))
-        available = {c["candidate_id"] for c in self.review.get("cases", [])}
+        available_cases = self.review.get("available_cases", self.review.get("cases"))
+        available = {c["candidate_id"] for c in available_cases or []}
         for i, candidate in enumerate(self.review["candidates"]):
             state = candidate.get("_ui", {})
             check = QCheckBox()
             check.setChecked(state.get("viewed", candidate["candidate_id"] in self.review.get("viewed_candidate_ids", [])))
-            check.setEnabled("cases" not in self.review or candidate["candidate_id"] in available)
+            check.setEnabled(available_cases is None or candidate["candidate_id"] in available)
             self.table.setCellWidget(i, 0, check)
             item = QTableWidgetItem(candidate["name"])
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -452,8 +454,8 @@ class ComparisonDialog(QDialog):
                 combo.addItem(candidate["name"], candidate["candidate_id"])
             index = combo.findData(selected)
             combo.setCurrentIndex(max(0, index))
-        count = len(self.review.get("cases", []))
-        self.case_label.setText(f"成功し、画像が残っている生成job: {count} 件" if "cases" in self.review else
+        count = len(available_cases or [])
+        self.case_label.setText(f"取り込んだ生成job: {count} 件（閲覧対象は対象promptで指定）" if available_cases is not None else
                                 "生成レポート未指定。条件が分からない欄は不明のまま保存できます。")
 
     def edit_strengths(self):
@@ -470,14 +472,14 @@ class ComparisonDialog(QDialog):
         entries = []
         for i, component in enumerate(candidate["components"]):
             name = Path(component.get("source_path", "")).name or f"LoRA {i + 1}"
-            strength = QLineEdit("" if component.get("strength") is None else str(component["strength"]))
-            strength.setPlaceholderText("不明なら空欄")
+            strength = QLineEdit("" if component.get("strength") is None else format_strength_spec(component["strength"]))
+            strength.setPlaceholderText("共通 / TE, UNet / TE1, TE2, UNet。不明なら空欄")
             lbw_value = component.get("lbw")
             lbw = QLineEdit("" if lbw_value is None else json.dumps(lbw_value) if isinstance(lbw_value, list) else str(lbw_value))
             lbw.setPlaceholderText("不明・未指定なら空欄。既存プリセット名や重み列")
             form.addRow(name + " の強度", strength)
             form.addRow("LBW", lbw)
-            entries.append((component, strength, lbw))
+            entries.append((component, strength, lbw, lbw.text()))
         layout.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -485,13 +487,12 @@ class ComparisonDialog(QDialog):
         layout.addWidget(buttons)
         if dialog.exec():
             try:
-                import math
                 updates = []
-                for component, strength, lbw in entries:
-                    value = float(strength.text()) if strength.text().strip() else None
-                    if value is not None and not math.isfinite(value):
-                        raise LedgerError("強度には有限の数値を入力してください")
-                    updates.append((component, value, lbw.text().strip() or None))
+                for component, strength, lbw, original_lbw_text in entries:
+                    value = serialize_strength_spec(strength.text()) if strength.text().strip() else None
+                    lbw_value = (component.get("lbw") if lbw.text() == original_lbw_text
+                                 else lbw.text().strip() or None)
+                    updates.append((component, value, lbw_value))
                 for component, value, lbw in updates:
                     component.update(strength=value, lbw=lbw)
                 self.populate()
@@ -573,7 +574,7 @@ class ComparisonDialog(QDialog):
                 raise LedgerError("採用する候補の「採用」にチェックしてください")
             review["adoption"] = {"status": status, "candidate_ids": adopted}
             review.update(use=self.use.text(), evidence_mode=self.evidence.currentData(),
-                          selection_mode=self.selection.currentData(), blinding=self.blind.currentData(),
+                          blinding=self.blind.currentData(),
                           evaluation_time_status="recorded_now" if self.evidence.currentData() == "current" else "original_date_unknown")
             if self.generation.toPlainText().strip():
                 review["generation"] = json.loads(self.generation.toPlainText())
@@ -582,15 +583,12 @@ class ComparisonDialog(QDialog):
             if not review["comparisons"] and status == "undecided" and all(
                     c.get("usability") == "unknown" and not c.get("usability_reason") for c in review["candidates"]):
                 raise LedgerError("好み・実用性・採用のいずれかの判断を入力してください")
-            selection_changed = (review["selection_mode"] != self.review.get("selection_mode") or
+            selection_mode = self.selection.currentData()
+            selection_changed = (selection_mode != self.review.get("selection_mode") or
                                  self.case_filter.text() != self.original_case_filter)
-            if review["selection_mode"] == "selected" and selection_changed:
+            if selection_changed:
                 ids = {s.strip() for s in self.case_filter.text().split(",") if s.strip()}
-                if "cases" in review and ids:
-                    review["cases"] = [c for c in review["cases"] if str(c.get("prompt_id")) in ids]
-                elif "cases" in review:
-                    review.pop("cases")
-                    review["case_selection_note"] = "一部を閲覧、個別ケースは未記録"
+                select_cases(self.ledger, review, selection_mode, ids)
             pair_cases(review)
             if any(not p["case_ids"] for p in review["comparisons"] if "case_ids" in p):
                 raise LedgerError("閲覧対象に共通する生成ケースがない候補対があります。候補・promptを確認してください")

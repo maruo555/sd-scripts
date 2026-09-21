@@ -512,13 +512,15 @@ def scan(ledger, progress=None, cancel=None, full=False):
     atomic_json(cache_path, {"parser_version": PARSER_VERSION, "entries": packed, "settings": shared})
     emit(f"走査完了: 学習候補 {len(rows):,} 件")
     return {"config_revision": config["revision"], "locations_hash": digest(roots), "rows": rows,
-            "related": related, "issues": issues, "file_count": len(entries), "scanned_at": now()}
+            "related": related, "issues": issues, "file_count": len(entries), "scanned_at": now(),
+            "audited_roots": sorted(online_roots)}
 
 
 def apply_scan(ledger, result, selected_ids=None, progress=None, cancel=None):
     ids = set(selected_ids) if selected_ids is not None else {
         row["run_id"] for row in result["rows"] if row["status"] in ("new", "additional")}
     applied, errors = [], []
+    audited_roots = result.get("audited_roots")
     with directory_lock(ledger.directory):
         ledger._recover()
         if ledger.config()["revision"] != result["config_revision"] or digest(ledger.locations()) != result["locations_hash"]:
@@ -532,6 +534,9 @@ def apply_scan(ledger, result, selected_ids=None, progress=None, cancel=None):
             try:
                 for ref in run["source_refs"] + [a["ref"] for a in run["artifacts"]]:
                     if ref.get("status") != "exists":
+                        continue
+                    # Offline/disabled roots retain their last known references.
+                    if audited_roots is not None and ref["root"] not in audited_roots:
                         continue
                     path = ledger.resolve_ref(ref)
                     if not same_stat(ref["observed"], file_stat(path)):

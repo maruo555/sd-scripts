@@ -72,6 +72,37 @@ class ExtendedTests(unittest.TestCase):
         self.assertEqual(result["rows"][0]["status"], "unchanged")
         self.assertEqual(len(self.ledger.reviews()), 1)
 
+    def test_offline_log_root_does_not_block_online_checkpoint_registration(self):
+        checkpoint(self.source / "a.safetensors", name="a")
+        logs = self.root / "separate_logs"
+        logs.mkdir()
+        (logs / "gradient_logs+a.txt").write_text("Epoch,Step,Loss\n0,0,1\n")
+        self.add_source(logs)
+        run = self.register()[0]
+        save_note(self.ledger, run, None, {"favorite_rating": 4}, confirm_hash=False)
+        previous = self.ledger.get_run(run["run_id"])
+        offline = self.root / "offline_logs"
+        self.assertTrue(logs.resolve().is_relative_to(self.root.resolve()))
+        self.assertTrue(offline.resolve().is_relative_to(self.root.resolve()))
+        logs.rename(offline)
+        checkpoint(self.source / "a-000020.safetensors", name="a", epoch="20")
+        result = scan(self.ledger)
+        self.assertEqual(result["rows"][0]["status"], "additional")
+        self.assertTrue(any(i["status"] == "offline" for i in result["issues"]))
+        applied = apply_scan(self.ledger, result)
+        self.assertEqual(applied["errors"], [])
+        updated = self.ledger.get_run(run["run_id"])
+        self.assertEqual(len(updated["artifacts"]), 2)
+        self.assertEqual(updated["source_refs"], previous["source_refs"])
+        self.assertEqual(self.ledger.reviews()[0]["annotations"][0]["favorite_rating"], 4)
+        # A file that was online during scan must still be checked at apply time.
+        path = self.source / "a-000030.safetensors"
+        checkpoint(path, name="a", epoch="30")
+        result = scan(self.ledger)
+        checkpoint(path, name="a", epoch="30", payload=b"changed after scan")
+        self.assertTrue(apply_scan(self.ledger, result)["errors"])
+        self.assertEqual(self.ledger.get_run(run["run_id"]), updated)
+
     def test_unresolved_report_and_failed_job_are_preserved(self):
         folder = self.root / "report"
         folder.mkdir()

@@ -1,17 +1,18 @@
 """Native Qt interaction tests with an offscreen platform, no production data writes."""
 import os
+import copy
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import unittest
 from unittest.mock import patch
 from pathlib import Path
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QDialog, QLineEdit
 from PySide6.QtCore import QTimer
 import test_lora_ledger as fixtures
 checkpoint = fixtures.checkpoint
 from tools.lora_ledger_core.gui import LedgerWindow
 from tools.lora_ledger_core.dialogs import ComparisonDialog, TaskDialog
-from tools.lora_ledger_core.storage import new_review, sha256_file
-from tools.lora_ledger_core.reviews import candidate_for, preference_pairs, fingerprint_review
+from tools.lora_ledger_core.storage import new_review, sha256_file, atomic_json
+from tools.lora_ledger_core.reviews import candidate_for, preference_pairs, fingerprint_review, import_report
 
 
 class GuiTests(unittest.TestCase):
@@ -176,6 +177,109 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(cleared["case_selection_note"])
         self.assertEqual(self.ledger.reviews(history=True)[0]["cases"], first["cases"])
         dialog.close()
+
+    def test_partial_comparison_can_expand_change_and_restore_all_cases(self):
+        review = new_review()
+        review["candidates"] = [candidate_for(r, r["artifacts"][0]) for r in self.runs]
+        ids = [c["candidate_id"] for c in review["candidates"]]
+        review["viewed_candidate_ids"] = ids
+        review["comparisons"] = preference_pairs(review["candidates"], ids, {"overall": ids[0]})
+        all_cases = [{"candidate_id": c, "case_id": p, "prompt_id": p}
+                     for c in ids for p in ("p1", "p2")]
+        review["cases"] = copy.deepcopy(all_cases)
+        steps = [("selected", "p1", {"p1"}), ("selected", "p1, p2", {"p1", "p2"}),
+                 ("selected", "p2", {"p2"}), ("all_cases", "p2", {"p1", "p2"}),
+                 ("selected", "", None), ("all_cases", "", {"p1", "p2"})]
+        for mode, prompt_text, expected in steps:
+            dialog = ComparisonDialog(self.window, self.ledger, review)
+            dialog.selection.setCurrentIndex(dialog.selection.findData(mode))
+            dialog.case_filter.setText(prompt_text)
+            dialog.hash_check.setChecked(False)
+            dialog.save()
+            dialog.close()
+            review = self.ledger.reviews()[0]
+            self.assertEqual(review["available_cases"], all_cases)
+            if expected is None:
+                self.assertNotIn("cases", review)
+                self.assertNotIn("case_ids", review["comparisons"][0])
+            else:
+                self.assertEqual({c["prompt_id"] for c in review["cases"]}, expected)
+                self.assertEqual(set(review["comparisons"][0]["case_ids"]), expected)
+        dialog = ComparisonDialog(self.window, self.ledger, review)
+        dialog.selection.setCurrentIndex(dialog.selection.findData("selected"))
+        dialog.case_filter.setText("p1, typo")
+        with patch("tools.lora_ledger_core.dialogs.show_error") as error:
+            dialog.save()
+        error.assert_called_once()
+        self.assertEqual(self.ledger.reviews()[0], review)
+        self.assertEqual(len(self.ledger.reviews(history=True)), len(steps))
+        dialog.close()
+
+    def test_legacy_partial_comparison_restores_only_the_original_report(self):
+        folder = self.root / "comparison_report"
+        folder.mkdir()
+        (folder / "image.png").write_bytes(b"image")
+        conditions = [{"id": str(i), "name": str(i), "items": [{"path": str(
+            self.ledger.resolve_ref(r["artifacts"][0]["ref"]))}]} for i, r in enumerate(self.runs)]
+        metadata = {"conditions": conditions, "jobs": [
+            {"condition_id": c["id"], "prompt_id": p, "status": "done", "returncode": 0,
+             "image": "image.png"} for c in conditions for p in ("p1", "p2")]}
+        atomic_json(folder / "metadata.json", metadata)
+        review = import_report(self.ledger, folder)
+        ids = [c["candidate_id"] for c in review["candidates"]]
+        review["viewed_candidate_ids"] = ids
+        review["comparisons"] = preference_pairs(review["candidates"], ids, {"overall": ids[0]})
+        review["selection_mode"] = "selected"
+        review["cases"] = [c for c in review["cases"] if c["prompt_id"] == "p1"]
+        original = self.ledger.save_review(review)
+        dialog = ComparisonDialog(self.window, self.ledger, original)
+        dialog.case_filter.setText("p1, p2")
+        dialog.hash_check.setChecked(False)
+        dialog.save()
+        dialog.close()
+        updated = self.ledger.reviews()[0]
+        self.assertEqual({c["prompt_id"] for c in updated["cases"]}, {"p1", "p2"})
+        self.assertEqual(len(updated["available_cases"]), len(ids) * 2)
+        self.assertEqual(self.ledger.reviews(history=True)[0], original)
+        metadata["created_at"] = "changed"
+        atomic_json(folder / "metadata.json", metadata)
+        dialog = ComparisonDialog(self.window, self.ledger, original)
+        dialog.case_filter.setText("p1, p2")
+        with patch("tools.lora_ledger_core.dialogs.show_error") as error:
+            dialog.save()
+        error.assert_called_once()
+        self.assertIn("変更", str(error.call_args.args[1]))
+        self.assertEqual(self.ledger.reviews()[0], updated)
+        dialog.close()
+
+    def test_strength_editor_preserves_split_strengths_and_validates_input(self):
+        run = self.runs[0]
+        for initial, text, expected in [(1.0, None, 1.0), ([.5, .9], None, [.5, .9]),
+                ([.5, .7, 1.0], None, [.5, .7, 1.0]), (1.0, ".4, .8, 1", [.4, .8, 1.0]),
+                (1.0, "", None), (1.0, "nan", 1.0), (1.0, "1, 2, 3, 4", 1.0)]:
+            with self.subTest(initial=initial, text=text):
+                review = new_review()
+                candidate = candidate_for(run, run["artifacts"][0], initial, [.1, .2])
+                candidate["usability"] = "usable"
+                review["candidates"] = [candidate]
+                saved = self.ledger.save_review(review)
+                dialog = ComparisonDialog(self.window, self.ledger, saved)
+                dialog.table.setCurrentCell(0, 2)
+                def accept(editor):
+                    if text is not None:
+                        editor.findChildren(QLineEdit)[0].setText(text)
+                    return QDialog.DialogCode.Accepted
+                with patch("tools.lora_ledger_core.dialogs.QDialog.exec", new=accept), \
+                     patch("tools.lora_ledger_core.dialogs.show_error") as error:
+                    dialog.edit_strengths()
+                self.assertEqual(error.call_count, int(text in ("nan", "1, 2, 3, 4")))
+                dialog.hash_check.setChecked(False)
+                dialog.save()
+                updated = next(r for r in self.ledger.reviews() if r["review_id"] == saved["review_id"])
+                component = updated["candidates"][0]["components"][0]
+                self.assertEqual(component["strength"], expected)
+                self.assertEqual(component["lbw"], [.1, .2])
+                dialog.close()
 
     def test_worker_can_cancel_without_blocking_gui(self):
         def operation(progress, cancel):

@@ -134,6 +134,49 @@ def import_report(ledger, folder):
     return review
 
 
+def select_cases(ledger, review, mode, prompt_ids):
+    """Keep the imported case pool separate from the currently viewed subset."""
+    previous_mode = review.get("selection_mode")
+    if "available_cases" not in review and "cases" in review and previous_mode != "selected":
+        review["available_cases"] = copy.deepcopy(review["cases"])
+    review["selection_mode"] = mode
+    if mode == "selected" and not prompt_ids:
+        review.pop("cases", None)
+        review["case_selection_note"] = "一部を閲覧、個別ケースは未記録"
+        return
+    if mode not in ("selected", "all_cases"):
+        return
+    pool = review.get("available_cases")
+    if pool is None:
+        pool = review.get("cases")
+        known = {str(c.get("prompt_id")) for c in pool or []}
+        # Older reviews retained only the subset. Recover it only from the same report.
+        if previous_mode == "selected" and (pool is not None or review.get("report")) and (
+                mode == "all_cases" or not prompt_ids <= known):
+            report = review.get("report", {})
+            if not report.get("path") or not report.get("metadata_sha256"):
+                raise LedgerError("元のケース一覧がありません。比較レポートを取り込み直してください。")
+            try:
+                restored = import_report(ledger, report["path"])
+            except (OSError, ValueError) as exc:
+                raise LedgerError("元の比較レポートを読めません。保存場所を確認してください。") from exc
+            if restored["report"]["metadata_sha256"] != report["metadata_sha256"]:
+                raise LedgerError("元の比較レポートが変更されています。比較レポートを取り込み直してください。")
+            pool = restored["cases"]
+            review["available_cases"] = copy.deepcopy(pool)
+    if pool is None:
+        return  # A manual comparison can have no recorded generation cases.
+    candidate_ids = {c["candidate_id"] for c in review["candidates"]}
+    pool = [c for c in pool if c["candidate_id"] in candidate_ids]
+    if mode == "selected":
+        missing = prompt_ids - {str(c.get("prompt_id")) for c in pool}
+        if missing:
+            raise LedgerError("記録にない対象promptです: " + ", ".join(sorted(missing)))
+        pool = [c for c in pool if str(c.get("prompt_id")) in prompt_ids]
+    review["cases"] = copy.deepcopy(pool)
+    review.pop("case_selection_note", None)
+
+
 def pair_cases(review):
     if "cases" not in review:
         return
