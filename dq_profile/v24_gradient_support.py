@@ -177,7 +177,14 @@ def build_gradient_support(
             common.add("no_sample_rows")
         if set(items) != reference_keys:
             common.add("candidate_probe_key_mismatch")
-        if set(items) & conflicting_norms:
+        # Check unsafe candidates against the safe references without letting
+        # their norms change the reference population for other candidates.
+        if set(items) & conflicting_norms or any(
+            (norm := _number(item["row"].get("grad_norm_noquant"))) is not None
+            and reference_norms.get(key)
+            and norm not in reference_norms[key]
+            for key, item in items.items()
+        ):
             common.add("reference_norm_mismatch_between_candidates")
         groups: dict[str, list[dict]] = defaultdict(list)
         d_reasons, a_reasons = set(common), set(common)

@@ -18,6 +18,7 @@
 対象は採用された同一runの `gradient_tail.csv` または `raw_gradient_tail.csv` の `record_type=sample` 行です。候補名とMulは既存model/scoreの対応を利用し、候補名から推測しません。
 
 - 測定keyは既存契約と同じ `(image_key, timestep_bin, noise_replica, quant_repeat)`。HardSafety合格候補のkey集合を使い、欠けた候補を共通部分に縮めて表示しません。画像とsourceの矛盾、候補/Mul不一致、候補間の基準norm不一致も検出します。
+- HardSafety不合格候補も、合格候補の基準normと照合します。不合格候補のnormは基準集合へ加えず、不一致の候補だけ追加指標を未算出にします。基準normが一致する不合格候補や他の合格候補には影響しません。
 - 完全重複は1観測。矛盾する重複は不整合。保存されたrun/snapshot/edge round等が混在する場合も未算出にします。
 - 余分なCSV列があるsample行は候補の追加指標を未算出にし、`malformed_sample_columns`を記録します。観測を黙って除外したり、追加集計だけの理由で既存診断全体を失敗させたりしません。
 - 明示されたtopology不一致、非finite、無効norm、保存された勾配無効理由を検査します。no-quant normが `1e-12` 以下の場合は、既存dataset diagnosticsの近ゼロ基準に沿って未算出にします。分母をepsilonへ置き換えません。

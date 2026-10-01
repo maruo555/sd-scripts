@@ -158,6 +158,30 @@ def test_saved_candidate_mapping_and_support(mutate, reason):
     assert any(reason in r["d_reasons"] and r["d_p50"] is None for r in result)
 
 
+@pytest.mark.parametrize("reference_norm", [1., 2.], ids=["matching", "mismatched"])
+def test_unsafe_reference_check_does_not_invalidate_other_candidates(reference_norm):
+    candidates = [
+        {"candidate": "safe", "range_mul": 2., "hard_safety_pass": True},
+        {"candidate": "unsafe_valid", "range_mul": 3., "hard_safety_pass": False},
+        {"candidate": "unsafe_checked", "range_mul": 4., "hard_safety_pass": False},
+    ]
+    rows = [dict(_row(candidate=c["candidate"], d=0.), range_mul=c["range_mul"]) for c in candidates]
+    baseline = _support(rows, candidates)["candidates"]
+    rows[-1].update(grad_norm_noquant=reference_norm, gradient_norm_ratio=1. / reference_norm,
+                    relative_gradient_distance=abs(1. - reference_norm) / reference_norm)
+    actual = _support(rows, candidates)["candidates"]
+    assert actual[:2] == baseline[:2]
+    assert all(c["status"] == "available" for c in actual[:2])
+    if reference_norm == 1.:
+        assert actual == baseline
+    else:
+        checked = actual[-1]
+        assert checked["status"] == "unavailable"
+        assert all(checked[key] is None for key in ("d_p50", "parallel_component_p50", "parallel_component_p05"))
+        assert checked["d_reasons"] == checked["parallel_component_reasons"] == ["reference_norm_mismatch_between_candidates"]
+    assert [c["hard_safety_pass"] for c in candidates] == [True, False, False]
+
+
 def test_mixed_context_and_saved_body_mismatch_are_unavailable():
     assert _one([_row("a", snapshot="pre"), _row("b", snapshot="post")])["status"] == "unavailable"
     result = _support([_row()], [{"candidate": "opaque", "range_mul": 1.37, "body": 99}])["candidates"][0]
