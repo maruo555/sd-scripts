@@ -501,11 +501,7 @@ footer{{font-size:11px;color:var(--muted);padding-top:22px}}code{{font-family:ui
   <div class="hero-top"><div><div class="eyebrow">Single dataset / fixed-mul local diagnostic</div><h1>{html.escape(str(dataset.get('label') or dataset.get('dataset_id')))}</h1><p>固定mulごとに、量子化した勾配がno_quantからどのように離れるかを可視化します。</p></div><span class="scope-badge">{html.escape(str(dataset.get('execution_mode') or 'unknown').title())} / Local-only</span></div>
   <div class="chart-card">
     {curve}
-    <div class="chart-explain">
-      <div><strong>Body</strong>全画像・timestepをまとめた、やや厳しめの代表値です。小さいほど幅広い条件でno_quantに近くなります。</div>
-      <div><strong>Tail</strong>各timestep帯の代表値のうち最大です。小さいほど厳しい帯でもno_quantに近くなります。</div>
-      <div><strong>ヒゲ（淡い縦棒）</strong>画像/sourceを再標本化したときの不確かさです。長いほど細かな順位を決めにくい状態です。</div>
-    </div>
+    <details><summary>Body・Tailと参考区間の読み方</summary><p>Bodyは全timestep帯をまとめたsource等重みのP95、Tailは帯別P95の最大です。ヒゲ（淡い縦棒）はsourceを再標本化したときの参考区間です。長いほど細かな順位を決めにくい状態です。</p></details>
   </div>
 </section>
 

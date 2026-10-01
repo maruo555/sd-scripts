@@ -51,6 +51,10 @@ def validate_copy_manifest(
     if payload.get("schema_version") != "1.0.0":
         raise CopyDriftError("copied_sources.json must use schema_version 1.0.0")
     source_commit = str(payload.get("source_commit", "")).strip()
+    verification_mode = payload.get("verification_mode", "git_commit")
+    if verification_mode not in {"git_commit", "normalized_sha256"}:
+        raise CopyDriftError(f"unsupported verification_mode: {verification_mode}")
+    check_git = verify_git and verification_mode == "git_commit"
     files = payload.get("files")
     if not source_commit:
         raise CopyDriftError("copied_sources.json has no source_commit")
@@ -59,7 +63,7 @@ def validate_copy_manifest(
 
     errors: list[str] = []
     checked: list[dict[str, str]] = []
-    if verify_git:
+    if check_git:
         resolved_commit = _git(root, "rev-parse", "--verify", f"{source_commit}^{{commit}}")
         if resolved_commit != source_commit:
             errors.append(
@@ -92,7 +96,7 @@ def validate_copy_manifest(
                 f"{copied_name}: diagnostic copy drifted "
                 f"({copied_hash} != {expected_copied_hash})"
             )
-        if verify_git:
+        if check_git:
             blob_oid = _git(root, "rev-parse", f"{source_commit}:{source_name}")
             expected_blob_oid = str(raw_record.get("source_git_blob_oid", ""))
             if blob_oid != expected_blob_oid:
@@ -114,6 +118,7 @@ def validate_copy_manifest(
     return {
         "status": "pass",
         "source_commit": source_commit,
+        "verification_mode": "git_commit" if check_git else "normalized_sha256",
         "manifest": str(path),
         "files": checked,
     }
@@ -136,7 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print(
             "DQ profiler copy drift check: PASS "
-            f"({len(result['files'])} copies, source {result['source_commit'][:12]})"
+            f"({len(result['files'])} copies, {result['verification_mode']})"
         )
     return 0
 

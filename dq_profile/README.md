@@ -54,6 +54,13 @@ Review the upstream change before updating the recorded hashes. A passing check
 means that the recorded copy relationship is current; it does not assert that
 the two files are textually identical.
 
+The source-only snapshot uses `verification_mode: normalized_sha256`: both
+current files are still checked against their reviewed hashes, without needing
+old Git objects. `source_commit` and `source_git_blob_oid` retain the original
+copy provenance; the normalized source hash tracks the latest reviewed source.
+Reviewed source-only changes are noted in the manifest. Older manifests without
+this mode retain the Git commit/blob checks.
+
 ## Version layers
 
 The profiler persists several independent contracts. They must not be compared

@@ -554,5 +554,5 @@ def test_fixed_affinity_scale_marks_overflow_without_rescaling() -> None:
     assert model["affinity_curve_scale"]["y_max"] == 4.0
     assert 'data-scale-mode="fixed" data-y-max="4.000000"' in rendered
     assert "上端で打ち切りました" in rendered
-    assert "正確な値は下の候補表" in rendered
+    assert "正確な値は点の数値表示・詳細内の候補表" in rendered
     assert "Y軸上限 4.0 を超過" in rendered

@@ -1407,6 +1407,15 @@ def _curve_svg(
     fixed_y_max: float | None = None,
     edge_direction: str = "resolved",
 ) -> str:
+    from dq_profile.v24_gradient_curve import stacked_curves
+
+    # Flatten only local display copies; descriptive values never enter the
+    # candidate selector, explanations, or the saved score/selection hashes.
+    cards = [
+        {**card, **{key: (card.get("gradient_curve_support") or {}).get(key)
+                   for key in ("d_p50", "parallel_component_p50", "parallel_component_p05")}}
+        for card in cards
+    ]
     width, height = 760, 330
     left, right, top, bottom = 58, 24, 28, 54
     plot_w = width - left - right
@@ -1420,7 +1429,7 @@ def _curve_svg(
         x_max += 0.1
     candidates_y = []
     for card in cards:
-        for key in ("body_ci_high", "tail_ci_high", "body", "tail"):
+        for key in ("body_ci_high", "tail_ci_high", "body", "tail", "d_p50"):
             value = _optional_float(card.get(key))
             if value is not None:
                 candidates_y.append(value)
@@ -1433,7 +1442,7 @@ def _curve_svg(
     overflow_values = [
         (float(card["range_mul"]), key, value)
         for card in cards
-        for key in ("body_ci_high", "tail_ci_high", "body", "tail")
+        for key in ("body_ci_high", "tail_ci_high", "body", "tail", "d_p50")
         if (value := _optional_float(card.get(key))) is not None and value > y_max
     ]
 
@@ -1443,7 +1452,7 @@ def _curve_svg(
     def sy(value: float) -> float:
         return top + plot_h - min(value, y_max) / y_max * plot_h
 
-    def line_segments(key: str, color: str) -> str:
+    def line_segments(key: str, color: str, dash: str = "") -> str:
         segments: list[list[str]] = []
         current: list[str] = []
         for card in cards:
@@ -1460,7 +1469,7 @@ def _curve_svg(
             segments.append(current)
         return "".join(
             f'<polyline points="{" ".join(segment)}" fill="none" '
-            f'stroke="{color}" stroke-width="3"/>'
+            f'data-metric="{key}" stroke="{color}" stroke-width="3" stroke-dasharray="{dash}"/>'
             for segment in segments
         )
 
@@ -1518,18 +1527,24 @@ def _curve_svg(
         for prefix, color, offset in (
             ("body", "#2563eb", -6.0),
             ("tail", "#d97706", 6.0),
+            ("d_p50", "#0f766e", 0.0),
         ):
             values = [
                 _optional_float(card.get(prefix)),
                 _optional_float(card.get(f"{prefix}_ci_high")),
             ]
-            if any(value is not None and value > y_max for value in values):
+            exceeded = [
+                f"{label} {value}"
+                for label, value in zip((prefix, f"{prefix} CI上限"), values)
+                if value is not None and value > y_max
+            ]
+            if exceeded:
                 marker_x = x + offset
                 overflow_markers.append(
                     f'<polygon points="{marker_x-5:.1f},{top+9:.1f} '
                     f'{marker_x+5:.1f},{top+9:.1f} {marker_x:.1f},{top+1:.1f}" '
                     f'fill="{color}"><title>mul {float(card["range_mul"]):.2f} '
-                    f'{prefix} はY軸上限 {y_max:.1f} を超過</title></polygon>'
+                    f'{", ".join(exceeded)} はY軸上限 {y_max:.1f} を超過</title></polygon>'
                 )
     reference_y = sy(ABSOLUTE_REFERENCE_DISTANCE)
     reference_line = (
@@ -1572,7 +1587,7 @@ def _curve_svg(
         if overflow_values:
             scale_note += (
                 f' CI上限等{len(overflow_values)}点が上限を超えたため、上向き三角で示して上端で打ち切りました。'
-                '正確な値は下の候補表を参照してください。'
+                '正確な値は点の数値表示・詳細内の候補表を参照してください。'
             )
         scale_note += "</p>"
     else:
@@ -1580,8 +1595,8 @@ def _curve_svg(
             '<p class="micro scale-note">この拡大図だけはdatasetごとの自動Y軸です。'
             '曲線の細かな形を見る用途で、別datasetとの高さ比較には使いません。</p>'
         )
-    return f"""
-<svg class="chart" data-scale-mode="{scale_mode}" data-y-max="{y_max:.6f}" viewBox="0 0 {width} {height}" role="img" aria-label="mulに対するBodyとTailの曲線">
+    upper = f"""
+<svg class="chart" data-scale-mode="{scale_mode}" data-y-max="{y_max:.6f}" viewBox="0 0 {width} {height}" role="group" aria-label="mulに対するBodyとTailとd P50の曲線">
   <style>.svg-label{{font:12px system-ui,sans-serif;fill:#536174}}.svg-reference{{font:11px system-ui,sans-serif;fill:#991b1b;font-weight:700}}.svg-preset{{font:10px system-ui,sans-serif;font-weight:700}}.svg-edge{{font:11px system-ui,sans-serif;fill:#6d28d9;font-weight:700}}</style>
   {''.join(y_ticks)}
   {reference_line}
@@ -1593,21 +1608,27 @@ def _curve_svg(
   {''.join(tail_errors)}
   {line_segments('body', '#2563eb')}
   {line_segments('tail', '#d97706')}
+  {line_segments('d_p50', '#0f766e', '6 4')}
   {''.join(f'<circle cx="{sx(float(card["range_mul"])):.1f}" cy="{sy(float(card["body"])):.1f}" r="4" fill="#2563eb"/>' for card in cards if card.get("body") is not None)}
   {''.join(f'<rect x="{sx(float(card["range_mul"]))-4:.1f}" y="{sy(float(card["tail"]))-4:.1f}" width="8" height="8" fill="#d97706"/>' for card in cards if card.get("tail") is not None)}
+  {''.join(f'<path d="M {sx(float(card["range_mul"])):.1f} {sy(float(card["d_p50"]))-5:.1f} l 5 5 l -5 5 l -5 -5 Z" fill="#0f766e"/>' for card in cards if card.get("d_p50") is not None)}
   {''.join(x_ticks)}
   {edge_hint}
   <text x="{width/2}" y="{height-3}" text-anchor="middle" class="svg-label">range_mul</text>
   <text x="16" y="{height/2}" transform="rotate(-90 16 {height/2})" text-anchor="middle" class="svg-label">gradient deformation（小さいほどno_quantに近い）</text>
   <g transform="translate({left+8},{top+8})">
-    <circle cx="0" cy="0" r="4" fill="#2563eb"/><text x="10" y="4" class="svg-label">Body</text>
-    <rect x="70" y="-4" width="8" height="8" fill="#d97706"/><text x="84" y="4" class="svg-label">Tail</text>
-    <line x1="132" x2="150" y1="0" y2="0" stroke="#7c3aed" stroke-width="2" stroke-dasharray="5 5"/><text x="156" y="4" class="svg-label">edge unresolved</text>
+    <circle cx="0" cy="0" r="4" fill="#2563eb"/><text x="10" y="4" class="svg-label">Body：P95</text>
+    <rect x="105" y="-4" width="8" height="8" fill="#d97706"/><text x="119" y="4" class="svg-label">Tail：帯別P95の最大</text>
+    <line x1="265" x2="285" y1="0" y2="0" stroke="#0f766e" stroke-width="3" stroke-dasharray="6 4"/><text x="292" y="4" class="svg-label">中央：P50</text>
+    <line x1="394" x2="412" y1="0" y2="0" stroke="#7c3aed" stroke-width="2" stroke-dasharray="5 5"/><text x="420" y="4" class="svg-label">edge unresolved</text>
   </g>
 </svg>
-<p class="micro">preset線は初期値の位置だけを示します。固定mul測定とauto presetの挙動は同一ではありません。</p>
-{scale_note}
 """
+    notes = '<p class="micro">preset線は初期値の位置だけを示します。固定mul測定とauto presetの挙動は同一ではありません。</p>' + scale_note
+    return stacked_curves(
+        upper, cards, sx=sx, upper_sy=sy, width=width, height=height,
+        left=left, right=right, top=top, bottom=bottom, x_ticks=x_ticks, notes=notes,
+    )
 
 
 def _cause_svg(cards: Sequence[Mapping[str, Any]]) -> str:
