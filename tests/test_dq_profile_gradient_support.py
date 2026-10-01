@@ -343,6 +343,14 @@ def test_normal_analysis_outputs_support_without_changing_selection(tmp_path, mo
     profile.mkdir()
     summary, rows = _fixture()
     (profile / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    from dq_profile.dataset_diagnostics import SCHEMA
+    data_dir = profile / "data_diagnostics"
+    data_dir.mkdir()
+    (data_dir / "dataset_summary.json").write_text(json.dumps({
+        "manifest": {"schema_version": SCHEMA, "mode": "warmup", "loss_metric": "raw_mse",
+                     "muls": sorted(c["initial_range_mul"] for c in summary["candidates"] if c["initial_range_mul"] is not None)},
+        "all": {"loss_pre": .3, "loss_post": .246, "paired_images": 4, "inventory_images": 4},
+    }), encoding="utf-8")
     (profile / "source_manifest.json").write_text(json.dumps({"source_contract": {"sha256": "cpu-fixture"}}))
     (profile / "local_natural_gradient.csv").write_text("image_key\n")
     with (profile / "gradient_tail.csv").open("w", newline="", encoding="utf-8") as stream:
@@ -356,6 +364,8 @@ def test_normal_analysis_outputs_support_without_changing_selection(tmp_path, mo
         raw.write_text("\n".join(lines) + "\n", encoding="utf-8")
     monkeypatch.setattr(analysis, "parse_args", lambda: Namespace(profile_dir=profile, output_dir=output, dataset_id="SYN", iterations=12, seed=2401))
     assert analysis.main() == 0
+    report_model = json.loads((output / "practical_report.json").read_text(encoding="utf-8"))
+    assert report_model["datasets"][0]["warmup_response"]["improvement_rel"] == pytest.approx(.18)
     support = json.loads((output / "gradient_curve_support.json").read_text(encoding="utf-8"))
     for candidate in support["candidates"]:
         if ragged_csv and candidate["candidate"] == rows[0]["candidate"]:

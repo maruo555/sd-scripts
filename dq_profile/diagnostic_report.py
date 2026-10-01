@@ -76,6 +76,15 @@ def promote_dataset_report(profile, run_dir, selection):
     manifest["local_selection"] = {k: selection.get(k) for k in ("selection_valid", "selection_status", "credible_muls", "edge_unresolved", "hard_unsafe_candidates", "hard_unsafe_reasons", "robustly_dominated_candidates")}
     write_json(dest / "manifest.json", manifest)
     rebuild(dest)
+    model_path = Path(run_dir) / "practical_report.json"
+    if model_path.is_file():
+        from dq_profile.v24_report_overview import attach_report_overview
+        from dq_profile.v24_beginner_report import render_beginner_report
+        from dq_profile.v24_practical_report import render_report
+        model = attach_report_overview(json.loads(model_path.read_text(encoding="utf-8")), dest, Path(run_dir))
+        write_json(model_path, model)
+        for name, render in (("report.html", render_report), ("beginner_report.html", render_beginner_report)):
+            (Path(run_dir) / name).write_text(render(model), encoding="utf-8")
     for name in ("report.html", "beginner_report.html", "technical_report.html"):
         path = Path(run_dir) / name
         if path.is_file():
@@ -85,4 +94,14 @@ def promote_dataset_report(profile, run_dir, selection):
             if count != 1:
                 raise ValueError(f"cannot link dataset report from {name}")
             path.write_text(html, encoding="utf-8")
+    analysis_path = Path(run_dir) / "analysis_manifest.json"
+    if analysis_path.is_file():
+        import hashlib
+        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+        reports = analysis.setdefault("reports", {})
+        for key, name in (("primary", "report.html"), ("beginner", "beginner_report.html"), ("technical", "technical_report.html")):
+            path = Path(run_dir) / name
+            if path.is_file():
+                reports.setdefault(key, {}).update(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+        write_json(analysis_path, analysis)
     return [p.relative_to(run_dir).as_posix() for p in dest.iterdir() if p.is_file()]

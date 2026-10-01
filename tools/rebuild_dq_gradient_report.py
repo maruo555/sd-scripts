@@ -12,6 +12,7 @@ from typing import Sequence
 from dq_profile.v24_beginner_report import render_beginner_report
 from dq_profile.v24_gradient_support import attach_gradient_support, build_gradient_support
 from dq_profile.v24_practical_report import render_report
+from dq_profile.v24_report_overview import attach_report_overview
 
 
 def _json(path: Path) -> dict:
@@ -67,6 +68,7 @@ def rebuild(run_dir: Path, output_dir: Path, *, gradient_csv: Path | None = None
         },
     )
     rebuilt = attach_gradient_support(model, support)
+    rebuilt = attach_report_overview(rebuilt, run_dir / "data_diagnostics", output_dir)
     # Render before writing anything, so unsupported source models do not
     # leave a partial result or alter any original selection/raw artifacts.
     outputs = {

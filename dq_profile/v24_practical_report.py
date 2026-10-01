@@ -14,6 +14,8 @@ import json
 import math
 from typing import Any, Mapping, Sequence
 
+from dq_profile.v24_report_overview import overview_anchor, render_overview
+
 
 PRACTICAL_REPORT_SCHEMA_VERSION = "2.4.4-practical-report-beta"
 LOCAL_ACCEPTANCE_METRIC_VERSION = "2.4.0"
@@ -1406,6 +1408,7 @@ def _curve_svg(
     *,
     fixed_y_max: float | None = None,
     edge_direction: str = "resolved",
+    overview_html: str = "",
 ) -> str:
     from dq_profile.v24_gradient_curve import stacked_curves
 
@@ -1628,6 +1631,7 @@ def _curve_svg(
     return stacked_curves(
         upper, cards, sx=sx, upper_sy=sy, width=width, height=height,
         left=left, right=right, top=top, bottom=bottom, x_ticks=x_ticks, notes=notes,
+        overview_html=overview_html,
     )
 
 
@@ -2076,7 +2080,7 @@ def _dataset_character_profile_html(dataset: Mapping[str, Any]) -> str:
   <div><strong>no_quant信号</strong><br>norm中央値 {_fmt(no_quant_signal.get('grad_norm_median'))}<br>q05–q95 {_fmt(no_quant_signal.get('grad_norm_q05'))}–{_fmt(no_quant_signal.get('grad_norm_q95'))}</div>
   <div><strong>画像カバレッジ</strong><br>{dataset.get('image_count_probed', dataset.get('image_count', 0))} / {dataset.get('image_count_total', dataset.get('image_count', 0))} ({_pct(dataset.get('image_coverage_fraction'))})<div class="micro">{html.escape(coverage_warning)}</div></div>
 </div>
-<details open>
+<details open id="{overview_anchor(dataset, 'source')}">
   <summary>量子化Tailのsource集中（説明専用）</summary>
   <p class="section-help">各mulのTail負担が一部sourceへ寄るかを、source等重みのq85/q90/q95で確認します。Sxxは匿名aliasです。絶対Tailが小さい場合、高い集中率だけで危険とは判断しません。また「最大負担source」と「外すとTailが最も下がるsource」は別概念です。</p>
   {localization_table}
@@ -2241,7 +2245,7 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
       <span class="scale-badge">Y軸固定 0–{AFFINITY_FIXED_Y_MAX:.1f}</span>
     </div>
     <div class="chart-card primary-chart">
-      {_curve_svg(dataset["candidate_cards"], fixed_y_max=AFFINITY_FIXED_Y_MAX, edge_direction=dataset["edge_direction"])}
+      {_curve_svg(dataset["candidate_cards"], fixed_y_max=AFFINITY_FIXED_Y_MAX, edge_direction=dataset["edge_direction"], overview_html=render_overview(dataset))}
       <div class="interpretation-strip" aria-label="gradient deformationの読み方">
         <div><strong>0</strong><span>no_quantと一致</span></div>
         <div><strong>0～1未満</strong><span>差分normが基準勾配norm未満。よりno_quantに近い</span></div>
@@ -2304,7 +2308,7 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
       <p class="section-help">symmetric、方向回転（angle）、勾配gain変化を説明用に表示します。候補選定の追加票にはしません。</p>
       {_cause_svg(dataset["candidate_cards"])}
     </div>
-    <details open>
+    <details open id="{overview_anchor(dataset, 'timestep')}">
       <summary>timestep別のTail候補</summary>
       <div class="table-wrap">{_timestep_table(dataset["timestep_rows"])}</div>
     </details>

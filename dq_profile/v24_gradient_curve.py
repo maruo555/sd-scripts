@@ -24,7 +24,7 @@ def stacked_curves(
     upper: str, cards: Sequence[Mapping[str, Any]], *,
     sx: Callable[[float], float], upper_sy: Callable[[float], float],
     width: int, height: int, left: int, right: int, top: int, bottom: int,
-    x_ticks: Sequence[str], notes: str,
+    x_ticks: Sequence[str], notes: str, overview_html: str = "",
 ) -> str:
     plot_h = height - top - bottom
     values = [v for c in cards for key in ("parallel_component_p50", "parallel_component_p05") if (v := _finite(c.get(key))) is not None]
@@ -126,6 +126,7 @@ def stacked_curves(
 {upper}{lower}
 <p class="curve-help">上：dは小さいほど量子化なしの勾配に近い。下：1は元方向への成分が同じ大きさ。<br>上下を合わせて判断する補助情報です。下段の値は特徴保持率ではなく、どちらも画質の合否を示しません。</p>
 <div class="curve-readout" role="status" aria-live="polite">点に触れると数値を表示。クリック・タップ・Enterで固定／解除、Escで解除。Tab・左右キーでも確認できます。</div>
+{overview_html}
 <details class="curve-values"><summary>追加指標の定義・全候補の数値・未算出理由</summary>
 <p>source等重み、source内の保存観測等重みで全binをまとめます。repeatやnoiseを先に平均しません。sourceと元絵の対応は未確認です。旧CSVのsource未記録時は既存Bodyと同じimage_keyを使い、topology未記録時は一致を認証しません。</p>
 <p>aは各行のgradient_norm_ratio × gradient_cosineです。P05は5パーセンタイルで、最小値・CI下限・最悪binではありません。a&lt;0は逆向き、a&gt;1は元方向成分の増幅です。aが1に近くても別方向への変形が小さいとは限りません。上下のP50が同じ観測を指すとは限りません。追加指標にCIはなく、selector_input=falseです。</p>
