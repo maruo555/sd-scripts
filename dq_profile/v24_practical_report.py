@@ -15,6 +15,7 @@ import math
 from typing import Any, Mapping, Sequence
 
 from dq_profile.v24_report_overview import overview_anchor, render_overview
+from dq_profile.v24_image_breakdown import render_image_breakdown
 
 
 PRACTICAL_REPORT_SCHEMA_VERSION = "2.4.4-practical-report-beta"
@@ -2245,7 +2246,7 @@ Tail {html.escape(str(loo["tail"]["modal_candidate"]))}（{loo["tail"]["modal_co
       <span class="scale-badge">Y軸固定 0–{AFFINITY_FIXED_Y_MAX:.1f}</span>
     </div>
     <div class="chart-card primary-chart">
-      {_curve_svg(dataset["candidate_cards"], fixed_y_max=AFFINITY_FIXED_Y_MAX, edge_direction=dataset["edge_direction"], overview_html=render_overview(dataset))}
+      {_curve_svg(dataset["candidate_cards"], fixed_y_max=AFFINITY_FIXED_Y_MAX, edge_direction=dataset["edge_direction"], overview_html=render_overview(dataset) + render_image_breakdown(dataset))}
       <div class="interpretation-strip" aria-label="gradient deformationの読み方">
         <div><strong>0</strong><span>no_quantと一致</span></div>
         <div><strong>0～1未満</strong><span>差分normが基準勾配norm未満。よりno_quantに近い</span></div>

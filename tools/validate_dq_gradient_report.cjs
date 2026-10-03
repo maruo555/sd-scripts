@@ -53,13 +53,40 @@ const { pathToFileURL } = require('node:url');
     assert.equal(await stack.locator('.curve-target[aria-pressed="true"]').count(), 0, 'touch unlocks');
     await upper.nth(0).focus();
     await page.keyboard.press('Enter');
+    const breakdown = stack.locator('.image-gradient-breakdown');
+    const mulPicker = breakdown.locator('select');
+    if (await mulPicker.count()) {
+      const scale = await breakdown.getAttribute('data-scale-max');
+      const pinned = await stack.locator('.curve-readout').textContent();
+      const options = await mulPicker.locator('option').evaluateAll(nodes => nodes.map(node => node.value));
+      for (const option of options) {
+        await mulPicker.selectOption(option);
+        assert.equal(await breakdown.locator('.ig-panel:not([hidden])').count(), 1);
+        const active = breakdown.locator(`.ig-panel[data-panel="${option}"]`);
+        assert(await active.isVisible());
+        const rows = active.locator('.ig-row');
+        for (const row of await rows.all()) assert(await row.locator('summary').isVisible(), 'every image row is displayed');
+        assert.equal(await breakdown.getAttribute('data-scale-max'), scale, 'Mul changes retain the common norm scale');
+        assert.equal(await stack.locator('.curve-readout').textContent(), pinned, 'image Mul does not change curve inspection');
+      }
+      const row = breakdown.locator('.ig-panel:not([hidden]) .ig-row').first();
+      if (await row.count()) {
+        await row.locator('summary').focus();
+        await page.keyboard.press('Enter');
+        assert(await row.evaluate(node => node.open), 'image measurement opens with keyboard');
+        await page.keyboard.press('Enter');
+      }
+    }
     if (process.argv[3]) await stack.screenshot({ path: path.resolve(process.argv[3]) });
     await page.setViewportSize({ width: 420, height: 900 });
     assert(await graphs.nth(0).isVisible() && await graphs.nth(1).isVisible(), 'mobile still renders both graphs');
     const mobileXs = await graphs.evaluateAll(svgs => svgs.map(svg => [...svg.querySelectorAll('.curve-hit')].map(hit => hit.getBoundingClientRect().x)));
     assert.deepEqual(mobileXs[0], mobileXs[1]);
+    if (await mulPicker.count()) {
+      assert(await breakdown.evaluate(node => node.scrollWidth <= node.clientWidth + 1), 'image list fits mobile width');
+    }
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ report, checks: 'two visible graphs, aligned X, hover, pin/unpin, touch, keyboard, mobile, no JS errors', screenshot: process.argv[3] || null }));
+    console.log(JSON.stringify({ report, checks: 'two visible graphs, aligned X, hover, pin/unpin, touch, keyboard, mobile, image list/Mul when available, no JS errors', screenshot: process.argv[3] || null }));
   } finally {
     await browser.close();
   }

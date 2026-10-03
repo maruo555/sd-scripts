@@ -241,6 +241,7 @@ def test_rebuild_is_cpu_only_and_preserves_raw_selection_and_hash_inputs(tmp_pat
     rows = [_row(candidate=c["candidate"], d=c["body"]) for c in model["datasets"][0]["candidate_cards"]]
     for row, card in zip(rows, model["datasets"][0]["candidate_cards"]):
         row["range_mul"] = card["range_mul"]
+        row["grad_diff_norm"] = row["relative_gradient_distance"] * row["grad_norm_noquant"]
     raw = source / "raw_gradient_tail.csv"
     with raw.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=rows[0])
@@ -252,6 +253,7 @@ def test_rebuild_is_cpu_only_and_preserves_raw_selection_and_hash_inputs(tmp_pat
     before = {p.name: p.read_bytes() for p in source.iterdir()}
     support = rebuild(source, destination)
     assert all(c["status"] == "available" for c in support["candidates"])
+    assert all(c["image_breakdown"]["available_image_count"] == 1 for c in support["candidates"])
     assert {p.name: p.read_bytes() for p in source.iterdir()} == before
     assert (destination / "beginner_report.html").is_file()
     # A fresh interpreter forbids torch/training imports and selector calls.
@@ -372,8 +374,10 @@ def test_normal_analysis_outputs_support_without_changing_selection(tmp_path, mo
             assert candidate["d_p50"] is None and candidate["parallel_component_p50"] is None
             assert "malformed_sample_columns" in candidate["d_reasons"]
             assert candidate["observation_count"] == candidate["expected_observation_count"]
+            assert candidate["image_breakdown"]["available_image_count"] == 0
         else:
             assert candidate["status"] == "available"
+            assert candidate["image_breakdown"]["available_image_count"] == 13
     assert json.loads((output / "status.json").read_text(encoding="utf-8"))["status"] == "complete"
     preserved = {name: (output / name).read_bytes() for name in ("local_selection.json", "local_acceptance.csv", "summary.json", "source_bootstrap.csv")}
     # Simulate unavailable extra metrics. Existing decisions and hash inputs

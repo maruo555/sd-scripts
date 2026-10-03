@@ -1,4 +1,4 @@
-# Body/TailのP50と元方向成分の補助グラフ
+# Body/Tailの補助グラフと画像別勾配一覧
 
 `beginner_report.html` と通常の `report.html` の共通グラフに、勾配距離dのP50と、直下の元方向成分P50/P05を表示します。通常レポートの自動スケール拡大図にも反映します。表示操作で候補選択や推薦Mulは変更しません。
 
@@ -12,6 +12,19 @@
 - **確認先**：既存のsource集中の参考Mul・最大負担sourceを示し、source別・ノイズ帯別の内訳へ移動できます。画像別レポートがある場合はリンクを表示します。原因や画像削除の必要性を断定しません。
 
 通常生成、production出力へのコピー、保存済みレポートの再生成で自動的に反映します。追加GPU測定はなく、通常学習・候補選択には利用しません。学習前後の要約は主レポートJSONにも保持し、詳細ファイルがない移動先ではリンクを表示しません。
+
+## 全測定画像の棒グラフ一覧
+
+二段グラフと要約カードの下に「画像ごとのdと、その内訳」を常時表示します。追加のCLI指定は不要です。画像ごとに元勾配・絶対差の二本の棒と最大dを約42pxの行にまとめ、全測定画像をページ内に並べます。画像キー順の番号はMul間で共通です。画像名を併記し、行を開くと完全な画像キー・測定条件・数値・未算出理由を確認できます。
+
+- **選ぶ測定**：warmup終了時の固定モデルで、選択したMul・画像の全保存観測（ノイズ帯、ノイズ反復、量子化反復）からdが最大だった1回を選びます。warmupの学習step中の最大値ではありません。同率なら `(timestep_bin, noise_replica, quant_repeat)` の昇順で先の測定を使います。
+- **同じ測定の値**：保存された `relative_gradient_distance`、`grad_norm_noquant`、`grad_diff_norm` をそのまま併記します。それぞれを別に最大化・平均化しません。絶対差は勾配ベクトル同士の差の大きさで、二つのnormの引き算ではありません。
+- **共通目盛り**：全画像・全Mulの表示可能な元勾配と絶対差の最大値で固定します。Mul変更時にも目盛りは変わりません。Mul切り替えは一覧の表示だけに作用し、候補判定・推薦や上のグラフの固定状態は変えません。
+- **表示範囲**：保存ログの測定画像を全件表示します。全データセットに未測定画像がある場合、それらの勾配を推定・補完しません。レポートに全画像数があれば測定画像数と併記します。
+- **不足・不整合**：候補の測定集合・run・基準norm等は既存の検証に従います。画像内に無効なdがあれば、その画像の最大値を確定しません。選ばれた行の絶対差が欠ける・非finite・負、またはdとnormの関係が不整合なら、その行を未算出にします。別の測定で代用しません。二つの等価な保存式の浮動小数誤差は許容します。新しい絶対差の検証は既存のP50・元方向成分に影響しません。
+- **解釈**：画像ごとの最大dは典型的な値とは限らず、Tail（帯別P95の最大）とも異なります。画質の合否や画像削除の必要性を示しません。
+
+追加データは既存の `gradient_curve_support.json` とレポートmodel内の各候補の `image_breakdown` に保存します（`image-gradient-breakdown-v1`、`selector_input=false`）。通常診断・CPU再生成・productionへのコピーは既存の経路を利用します。古いmodelだけをHTML化した場合は未生成と案内し、同じrunのsample CSVからCPU再生成できます。サンプルHTML・実データセット名・個別の実測値はソースに保存しません。
 
 ## 集計契約
 
@@ -77,11 +90,13 @@ CSVを別の場所へ移した場合は、明示的に指定できます。
 
 ## 検証
 
-今回の関連CPUテスト結果は **108 passed**（diffusersの既存FutureWarningが2件）です。概要・通常レポートの双方でオフラインブラウザ検証も通過しました。通常の診断完了経路では、追加指標の算出／未算出を切り替えても `local_selection.json`、`local_acceptance.csv`、`summary.json`、`source_bootstrap.csv` がバイト単位で不変でした。
+画像別一覧を含む関連CPUテスト結果は **154 passed**（diffusersの既存FutureWarningが2件）です。概要・通常レポートの双方でオフラインブラウザ検証も通過しました。通常の診断完了経路では、追加指標の算出／未算出を切り替えても `local_selection.json`、`local_acceptance.csv`、`summary.json`、`source_bootstrap.csv` がバイト単位で不変でした。
 
 ```powershell
 .\venv\Scripts\python.exe -m pytest `
+  tests/test_dq_profile_image_breakdown.py `
   tests/test_dq_profile_gradient_support.py `
+  tests/test_dq_profile_report_overview.py `
   tests/test_dq_profile_v24_practical_report.py `
   tests/test_dq_profile_v24_beginner_report.py `
   tests/test_dq_profile_v24_acceptance.py `
@@ -107,6 +122,7 @@ node tools/validate_dq_gradient_report.cjs `
 |---|---|
 | `dq_profile/v24_gradient_support.py` | CSVスカラー検証・追加分位点・表示用namespace |
 | `dq_profile/v24_gradient_curve.py` | 下段グラフ・上下連動・値と理由の詳細表示 |
+| `dq_profile/v24_image_breakdown.py` | 全測定画像の棒グラフ・Mul切り替え・同一測定の詳細表示 |
 | `dq_profile/v24_practical_report.py` | 既存グラフへd P50追加、上下グラフの共通描画 |
 | `dq_profile/v24_beginner_report.py` | 初期表示への反映、Body/Tail説明の整理 |
 | `tools/analyze_dq_v24_local.py` | 通常診断完了時の追加集計とJSON出力 |
@@ -114,6 +130,7 @@ node tools/validate_dq_gradient_report.cjs `
 | `tools/rebuild_dq_gradient_report.py` | 保存済み判定を使うCPU再生成CLI |
 | `tools/validate_dq_gradient_report.cjs` | オフラインブラウザ検証・画面保存 |
 | `tests/test_dq_profile_gradient_support.py` | 集計・異常入力・不変性・CLI/production fixture |
+| `tests/test_dq_profile_image_breakdown.py` | 画像別最大dの対応・欠損・共通目盛り・全件表示 |
 | `tests/test_dq_profile_v24_practical_report.py` | 数値確認先の説明変更に対応 |
 | `tests/test_dq_profile_v24_beginner_report.py` | P95/P50凡例と新しい説明を検証 |
 | `docs/dq-gradient-curve-support-ja.md` | 本文書 |

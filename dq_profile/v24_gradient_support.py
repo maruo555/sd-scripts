@@ -82,6 +82,67 @@ def _row_values(row: Mapping[str, Any]) -> tuple[float | None, float | None, lis
     return d, a, d_reasons, a_reasons
 
 
+def _image_breakdown(items: Mapping[tuple, Mapping], reference_keys: set[tuple], reasons: set[str]) -> dict:
+    """Select one complete saved observation per image, never independent maxima.
+
+    An invalid d anywhere in an image prevents claiming its maximum. A missing
+    absolute difference in the chosen observation only disables this new view;
+    it must not change the existing curves or choose a different observation.
+    """
+    by_image: dict[str, list[tuple]] = defaultdict(list)
+    expected: dict[str, int] = defaultdict(int)
+    for key in reference_keys:
+        expected[key[0]] += 1
+    for key in sorted(items):
+        by_image[key[0]].append(key)
+    images = []
+    for image in sorted(set(expected) | set(by_image)):
+        keys = by_image[image]
+        errors = set(reasons)
+        observations = []
+        for key in keys:
+            d, _, invalid, _ = _row_values(items[key]["row"])
+            errors.update(invalid)
+            if not invalid:
+                observations.append((d, key))
+        if not keys:
+            errors.add("no_image_sample_rows")
+        result = {
+            "image_key": image, "status": "unavailable",
+            "observation_count": len(keys), "expected_observation_count": expected.get(image, 0),
+            "relative_gradient_distance": None, "grad_norm_noquant": None, "grad_diff_norm": None,
+            "measurement": None,
+        }
+        if observations and not errors:
+            # Keys are sorted; ties select the first (bin, noise, repeat) key.
+            d, key = max(observations, key=lambda item: item[0])
+            row = items[key]["row"]
+            original = _number(row.get("grad_norm_noquant"))
+            difference = _number(row.get("grad_diff_norm"))
+            if difference is None or difference < 0:
+                errors.add("missing_or_invalid_gradient_difference_norm")
+            # Saved d and difference are evaluated through two equivalent
+            # formulas. Allow cancellation/roundoff near zero, not a different
+            # measurement or independently aggregated norm.
+            elif not math.isclose(difference / original, d, rel_tol=1e-6, abs_tol=1e-7):
+                errors.add("saved_distance_norm_mismatch")
+            if not errors:
+                result.update(
+                    status="available", relative_gradient_distance=d,
+                    grad_norm_noquant=original, grad_diff_norm=difference,
+                    measurement={field: key[index + 1] for index, field in enumerate(KEY_FIELDS)},
+                )
+        result["reasons"] = sorted(errors)
+        images.append(result)
+    return {
+        "schema_version": "image-gradient-breakdown-v1", "selector_input": False,
+        "selection": "maximum_saved_d_per_image_at_each_mul",
+        "tie_break": "ascending_timestep_bin_noise_replica_quant_repeat",
+        "available_image_count": sum(row["status"] == "available" for row in images),
+        "image_count": len(images), "images": images,
+    }
+
+
 def build_gradient_support(
     rows: Sequence[Mapping[str, Any]],
     candidates: Sequence[Mapping[str, Any]],
@@ -203,6 +264,7 @@ def build_gradient_support(
         if d_p95 is not None and saved_body is not None and not math.isclose(d_p95, saved_body, rel_tol=1e-10, abs_tol=1e-12):
             d_reasons.add("saved_body_population_mismatch")
             a_reasons.add("saved_body_population_mismatch")
+            common.add("saved_body_population_mismatch")
         result = {
             "candidate": name, "range_mul": float(card["range_mul"]),
             "selector_input": False, "metric_definition_version": METRIC_DEFINITION_VERSION,
@@ -218,6 +280,7 @@ def build_gradient_support(
             "image_count": len({key[0] for key in items}), "source_count": len(sources),
             "duplicate_row_count": duplicates[name],
             "topology_unrecorded_count": sum(not _present(item["row"].get("gradient_topology_matches")) for item in items.values()),
+            "image_breakdown": _image_breakdown(items, reference_keys, common),
         }
         result["status"] = "available" if not d_reasons and not a_reasons else "unavailable" if d_reasons and a_reasons else "partial"
         output.append(result)

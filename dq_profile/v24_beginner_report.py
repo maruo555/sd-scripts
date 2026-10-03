@@ -13,6 +13,7 @@ import math
 from typing import Any, Mapping, Sequence
 
 from dq_profile.v24_report_overview import overview_anchor, render_overview
+from dq_profile.v24_image_breakdown import render_image_breakdown
 
 from dq_profile.v24_practical_report import (
     AFFINITY_FIXED_Y_MAX,
@@ -451,7 +452,7 @@ def render_beginner_report(model: Mapping[str, Any]) -> str:
         cards,
         fixed_y_max=AFFINITY_FIXED_Y_MAX,
         edge_direction=str(dataset.get("edge_direction") or "resolved"),
-        overview_html=render_overview(dataset),
+        overview_html=render_overview(dataset) + render_image_breakdown(dataset),
     )
     payload = html.escape(
         json.dumps(
