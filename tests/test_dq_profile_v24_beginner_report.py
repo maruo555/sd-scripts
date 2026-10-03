@@ -135,10 +135,11 @@ def test_beginner_report_leads_with_curve_and_explains_each_channel() -> None:
     assert "診断レポート（概要）" in rendered
     assert rendered.index('class="chart-card"') < rendered.index("まず読む3行")
     assert 'data-scale-mode="fixed" data-y-max="4.000000"' in rendered
-    assert "<strong>Body</strong>" in rendered
-    assert "<strong>Tail</strong>" in rendered
-    assert "全画像・timestepをまとめた、やや厳しめの代表値" in rendered
-    assert "各timestep帯の代表値のうち最大" in rendered
+    assert "Body：P95" in rendered
+    assert "Tail：帯別P95の最大" in rendered
+    assert "中央：P50" in rendered
+    assert "全timestep帯をまとめたsource等重みのP95" in rendered
+    assert "元の勾配方向への成分" in rendered
     assert "ヒゲ（淡い縦棒）" in rendered
     assert "試したmulと役割" in rendered
     assert "橙の「注意」は安全だが相対的に強い摂動" in rendered

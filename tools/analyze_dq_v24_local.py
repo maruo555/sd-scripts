@@ -29,6 +29,8 @@ from dq_profile.v24_descriptive import (
     build_dataset_character_vector,
 )
 from dq_profile.v24_beginner_report import render_beginner_report
+from dq_profile.v24_gradient_support import attach_gradient_support, build_gradient_support
+from dq_profile.v24_report_overview import attach_report_overview
 from dq_profile.v24_practical_report import (
     build_single_dataset_report_model,
     render_report as render_practical_report,
@@ -457,6 +459,14 @@ def main() -> int:
                 "trajectory_product_role": "research_only_keep_product_local_only",
             },
         )
+        gradient_support = build_gradient_support(
+            gradient_tail_rows,
+            practical_model["datasets"][0]["candidate_cards"],
+            provenance={"input_path": str(tail_path), "input_sha256": sha256_file(tail_path)},
+        )
+        practical_model = attach_gradient_support(practical_model, gradient_support)
+        practical_model = attach_report_overview(practical_model, profile_dir / "data_diagnostics", output_dir)
+        write_json(output_dir / "gradient_curve_support.json", gradient_support)
         write_json(output_dir / "practical_report.json", practical_model)
         write_json(output_dir / "report_contract.json", practical_report_contract())
         (output_dir / "report.html").write_text(

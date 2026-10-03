@@ -1246,6 +1246,7 @@ PROMOTED_ANALYSIS_FILES = (
     "technical_report.html",
     "summary.json",
     "practical_report.json",
+    "gradient_curve_support.json",
     "report_contract.json",
     "analysis_manifest.json",
     "local_selection.json",

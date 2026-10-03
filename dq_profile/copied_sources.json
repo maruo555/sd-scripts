@@ -2,13 +2,15 @@
   "schema_version": "1.0.0",
   "purpose": "Track the ordinary source revision used to create the isolated diagnostic copies and detect later drift.",
   "source_commit": "9cda02a632edb25e89513de3b601abd73358b917",
+  "verification_mode": "normalized_sha256",
   "hash_definition": "sha256 after normalizing CRLF and CR line endings to LF",
   "files": {
     "dq_profile/copied_train_network.py": {
       "source": "train_network.py",
       "source_git_blob_oid": "d1dedba47512bc60bfc1959a13053d8b74178821",
-      "source_normalized_sha256": "6a6485e6a3b08d662335910e557d9be205b29914208c45a64e36931a04a7ba2b",
+      "source_normalized_sha256": "25dc638c03e3d5df406d0c49728944e293a63a7630a6349de5f05e846e457d7a",
       "copied_normalized_sha256": "d6e7097f36d21102a6a81b36fbc999329a2168a295251c952ee2de71b38e593f",
+      "reviewed_source_changes": "Ordinary trainer settings-provenance logging is intentionally not copied; it records resolved settings without changing training computations.",
       "diagnostic_changes": [
         "uses the isolated profiler NetworkTrainer runtime instead of the ordinary training entry",
         "captures reproducible snapshots, replay inputs, prefix fingerprints, and Local diagnostic artifacts",

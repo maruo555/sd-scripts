@@ -12,6 +12,9 @@ import json
 import math
 from typing import Any, Mapping, Sequence
 
+from dq_profile.v24_report_overview import overview_anchor, render_overview
+from dq_profile.v24_image_breakdown import render_image_breakdown
+
 from dq_profile.v24_practical_report import (
     AFFINITY_FIXED_Y_MAX,
     TIMESTEP_BIN_LABELS,
@@ -449,6 +452,7 @@ def render_beginner_report(model: Mapping[str, Any]) -> str:
         cards,
         fixed_y_max=AFFINITY_FIXED_Y_MAX,
         edge_direction=str(dataset.get("edge_direction") or "resolved"),
+        overview_html=render_overview(dataset) + render_image_breakdown(dataset),
     )
     payload = html.escape(
         json.dumps(
@@ -501,11 +505,7 @@ footer{{font-size:11px;color:var(--muted);padding-top:22px}}code{{font-family:ui
   <div class="hero-top"><div><div class="eyebrow">Single dataset / fixed-mul local diagnostic</div><h1>{html.escape(str(dataset.get('label') or dataset.get('dataset_id')))}</h1><p>固定mulごとに、量子化した勾配がno_quantからどのように離れるかを可視化します。</p></div><span class="scope-badge">{html.escape(str(dataset.get('execution_mode') or 'unknown').title())} / Local-only</span></div>
   <div class="chart-card">
     {curve}
-    <div class="chart-explain">
-      <div><strong>Body</strong>全画像・timestepをまとめた、やや厳しめの代表値です。小さいほど幅広い条件でno_quantに近くなります。</div>
-      <div><strong>Tail</strong>各timestep帯の代表値のうち最大です。小さいほど厳しい帯でもno_quantに近くなります。</div>
-      <div><strong>ヒゲ（淡い縦棒）</strong>画像/sourceを再標本化したときの不確かさです。長いほど細かな順位を決めにくい状態です。</div>
-    </div>
+    <details><summary>Body・Tailと参考区間の読み方</summary><p>Bodyは全timestep帯をまとめたsource等重みのP95、Tailは帯別P95の最大です。ヒゲ（淡い縦棒）はsourceを再標本化したときの参考区間です。長いほど細かな順位を決めにくい状態です。</p></details>
   </div>
 </section>
 
@@ -536,12 +536,12 @@ footer{{font-size:11px;color:var(--muted);padding-top:22px}}code{{font-family:ui
   <div class="character-panel">{_character_profile_html(dataset)}</div>
 </section>
 
-<section class="card">
+<section class="card" id="{overview_anchor(dataset, 'source')}">
   <h2>Tailはどの画像グループに偏っているか</h2><p class="section-help">sourceはTOML内の画像グループ（通常はimage_dir／subset）です。Tail基準を超えた変形をsource別の箱に分け、左で最大の箱の割合、右で1箱を計算上外したときのTail低下を見ます。</p>
   {_source_focus_html(dataset)}
 </section>
 
-<section class="card">
+<section class="card" id="{overview_anchor(dataset, 'timestep')}">
   <h2>timestep帯ごとの変形</h2><p class="section-help">行はmul、列はtimestep帯（右ほど高ノイズ）です。値が小さいほどno_quantに近く、大きいほどその帯で量子化による変形が強くなります。青は1.0未満、橙は1.0以上の注意帯です。特定の列だけが高ければ影響がその帯へ集中しています。画質判定ではありません。</p>
   {_timestep_heatmap(dataset)}
 </section>

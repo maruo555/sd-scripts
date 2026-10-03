@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,37 @@ def test_repository_copied_sources_manifest_is_current() -> None:
     result = validate_copy_manifest(REPO_ROOT)
     assert result["status"] == "pass"
     assert len(result["files"]) == 2
+
+
+@pytest.mark.parametrize("changed_file", ["train_network.py", "dq_profile/copied_train_network.py"])
+def test_snapshot_verification_without_git_history_still_detects_drift(tmp_path, changed_file):
+    # Isolate this fixture from any parent checkout's historical Git objects.
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    manifest = json.loads((REPO_ROOT / "dq_profile/copied_sources.json").read_text(encoding="utf-8"))
+    for copied, record in manifest["files"].items():
+        for name in (copied, record["source"]):
+            target = tmp_path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO_ROOT / name, target)
+    manifest_path = tmp_path / "dq_profile/copied_sources.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    result = validate_copy_manifest(tmp_path)
+    assert result["verification_mode"] == "normalized_sha256"
+    changed = tmp_path / changed_file
+    changed.write_bytes(changed.read_bytes() + b"\n# unreviewed change\n")
+    with pytest.raises(CopyDriftError, match="drifted"):
+        validate_copy_manifest(tmp_path)
+
+
+def test_legacy_manifest_keeps_git_provenance_checks(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    manifest = tmp_path / "copied_sources.json"
+    manifest.write_text(json.dumps({
+        "schema_version": "1.0.0", "source_commit": "0" * 40,
+        "files": {"copied.py": {"source": "source.py"}},
+    }), encoding="utf-8")
+    with pytest.raises(CopyDriftError, match="git rev-parse"):
+        validate_copy_manifest(tmp_path, manifest)
 
 
 def test_copy_drift_check_is_line_ending_independent_and_detects_changes(
