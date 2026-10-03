@@ -43,7 +43,7 @@
 
 - 測定keyは既存契約と同じ `(image_key, timestep_bin, noise_replica, quant_repeat)`。HardSafety合格候補のkey集合を使い、欠けた候補を共通部分に縮めて表示しません。画像とsourceの矛盾、候補/Mul不一致、候補間の基準norm不一致も検出します。
 - HardSafety不合格候補も、合格候補の基準normと照合します。不合格候補のnormは基準集合へ加えず、不一致の候補だけ追加指標を未算出にします。基準normが一致する不合格候補や他の合格候補には影響しません。
-- 完全重複は1観測。矛盾する重複は不整合。保存されたrun/snapshot/edge round等が混在する場合も未算出にします。
+- 完全重複は1観測。矛盾する重複は不整合。保存されたrun/snapshot/edge round等が混在する場合も未算出にします。各項目が全sample行で未記録の旧ログは利用できますが、一部の行だけに記録がある場合は不整合として扱います。
 - 余分なCSV列があるsample行は候補の追加指標を未算出にし、`malformed_sample_columns`を記録します。観測を黙って除外したり、追加集計だけの理由で既存診断全体を失敗させたりしません。
 - 明示されたtopology不一致、非finite、無効norm、保存された勾配無効理由を検査します。no-quant normが `1e-12` 以下の場合は、既存dataset diagnosticsの近ゼロ基準に沿って未算出にします。分母をepsilonへ置き換えません。
 - 量子化normが明示的に0で基準norm等が有効なら、cosineが未定義でもa=0です。
@@ -74,7 +74,7 @@ CSVを別の場所へ移した場合は、明示的に指定できます。
   --output-dir "D:\path\to\rebuilt-report"
 ```
 
-保存済みsummary/manifestにCSV hashがあれば一致を要求します。不一致・曖昧な複数CSV・CSV欠落では、理由付きの未算出グラフを生成します。hashが残っていない旧ログでは、同じフォルダのCSVまたは明示されたCSVとして出典を記録し、測定key・source・P95の検証を行います。hashによるrun同一性の検証はできません。
+保存済みsummary/manifest/modelの出典情報にCSV hashがあれば、記録されたhash同士と入力CSVの一致を要求します。記録間の矛盾は `conflicting_recorded_gradient_hashes` として未算出にし、再生成を繰り返しても検証根拠が失われないよう出典情報に残します。不一致・曖昧な複数CSV・CSV欠落でも、理由付きの未算出グラフを生成します。hashが残っていない旧ログでは、同じフォルダのCSVまたは明示されたCSVとして出典を記録し、測定key・source・P95の検証を行います。hashによるrun同一性の検証はできません。
 
 出力は追加JSON、追加namespaceを持つ `practical_report.json`、`beginner_report.html`、`report.html` です。元の技術レポートがあれば同じ内容をコピーします。rawログと既存判定ファイルは書き換えません。再生成先を入力と別にすれば、入力model/HTMLも維持できます。
 

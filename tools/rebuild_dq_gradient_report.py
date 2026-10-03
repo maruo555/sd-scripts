@@ -34,9 +34,17 @@ def rebuild(run_dir: Path, output_dir: Path, *, gradient_csv: Path | None = None
         raise ValueError("A saved single-dataset practical_report.json is required; selection is never rerun")
     summary = _json(run_dir / "summary.json")
     manifest = _json(run_dir / "analysis_manifest.json")
-    expected = summary.get("local_gradient_tail_sha256") or (manifest.get("inputs", {}).get("gradient_tail.csv") or {}).get("sha256")
-    if not expected:
-        expected = (model["datasets"][0].get("gradient_curve_support") or {}).get("provenance", {}).get("input_sha256")
+    saved_provenance = (model["datasets"][0].get("gradient_curve_support") or {}).get("provenance", {})
+    # Every recorded digest constrains the input; no source has precedence.
+    # Carry the evidence forward so another rebuild cannot erase a conflict.
+    recorded_hashes = sorted({digest for digest in (
+        summary.get("local_gradient_tail_sha256"),
+        (manifest.get("inputs", {}).get("gradient_tail.csv") or {}).get("sha256"),
+        saved_provenance.get("input_sha256"),
+        saved_provenance.get("expected_input_sha256"),
+        *saved_provenance.get("recorded_input_sha256s", []),
+    ) if digest})
+    expected = recorded_hashes[0] if len(recorded_hashes) == 1 else None
     paths = [gradient_csv.resolve()] if gradient_csv else [p for name in ("raw_gradient_tail.csv", "gradient_tail.csv") if (p := run_dir / name).is_file()]
     if not paths and not gradient_csv:
         # Analysis directories already record their exact source path/hash.
@@ -48,7 +56,10 @@ def rebuild(run_dir: Path, output_dir: Path, *, gradient_csv: Path | None = None
     matching = [path for path, digest in hashes.items() if digest == expected] if expected else list(hashes)
     error = None
     path = matching[0] if len({hashes[p] for p in matching}) == 1 else None
-    if not hashes:
+    if len(recorded_hashes) > 1:
+        error = "conflicting_recorded_gradient_hashes"
+        path = None
+    elif not hashes:
         error = "no_sample_csv"
     elif expected and not matching:
         error = "raw_csv_hash_mismatch_with_saved_analysis"
@@ -63,6 +74,7 @@ def rebuild(run_dir: Path, output_dir: Path, *, gradient_csv: Path | None = None
         provenance={
             "input_path": str(path) if path else None,
             "input_sha256": hashes.get(path), "expected_input_sha256": expected,
+            "recorded_input_sha256s": recorded_hashes,
             "input_identity": "saved_analysis_hash_verified" if expected and path else "same_directory_legacy_csv" if path and not gradient_csv else "explicit_csv_without_saved_hash" if path else "unavailable",
             "source_report_sha256": _sha(run_dir / "practical_report.json"),
         },

@@ -162,7 +162,7 @@ def build_gradient_support(
     errors: dict[str, set[str]] = {name: set() for name in by_name}
     duplicates = defaultdict(int)
     image_sources: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    contexts: dict[str, set[str]] = defaultdict(set)
+    contexts: dict[str, set[str | None]] = defaultdict(set)
     for raw in rows:
         if raw.get("record_type") != "sample":
             continue
@@ -192,8 +192,9 @@ def build_gradient_support(
             if mul is None or not math.isclose(mul, float(by_name[name]["range_mul"]), rel_tol=0, abs_tol=1e-12):
                 errors[name].add("candidate_mul_mismatch")
         for field in ("run_id", "snapshot", "snapshot_id", "post_state_hash", "edge_round", "probe_regime"):
-            if _present(row.get(field)):
-                contexts[field].add(str(row[field]))
+            # Entirely unrecorded fields are valid for legacy logs; a mix of
+            # recorded and missing values cannot identify one probe context.
+            contexts[field].add(str(row[field]) if _present(row.get(field)) else None)
         image_sources[image][source].add(name)
         # Compare all saved columns, so conflicting observations never win by
         # file order. String normalization also handles CSV and in-memory rows.

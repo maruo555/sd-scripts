@@ -189,6 +189,27 @@ def test_mixed_context_and_saved_body_mismatch_are_unavailable():
     assert result["parallel_component_p50"] is None
 
 
+@pytest.mark.parametrize("field", ["run_id", "snapshot", "snapshot_id", "post_state_hash", "edge_round", "probe_regime"])
+@pytest.mark.parametrize("missing", [None, "", "  "])
+def test_context_all_unrecorded_is_legacy_but_partial_presence_is_unavailable(field, missing):
+    candidates = [{"candidate": name, "range_mul": 1.37, "hard_safety_pass": True} for name in ("first", "second")]
+    rows = [_row(candidate="first"), _row(candidate="second", **{field: missing})]
+    # Missing columns, nulls and blank cells all mean unrecorded.
+    assert all(c["status"] == "available" for c in _support(rows, candidates)["candidates"])
+    rows[0][field] = "context-a"
+    for order in (rows, list(reversed(rows))):
+        result = _support(order, candidates)
+        for candidate in result["candidates"]:
+            assert candidate["status"] == "unavailable"
+            assert candidate["d_reasons"] == candidate["parallel_component_reasons"] == ["mixed_run_snapshot_or_probe_context"]
+            assert all(candidate[key] is None for key in ("d_p50", "parallel_component_p50", "parallel_component_p05"))
+            assert candidate["image_breakdown"]["available_image_count"] == 0
+    rows[1][field] = "context-a"
+    # Non-sample and no-quant rows do not form the candidate population.
+    ignored = [dict(_row(), record_type="summary"), _row(candidate="no_quant")]
+    assert all(c["status"] == "available" for c in _support(rows + ignored, candidates)["candidates"])
+
+
 def test_legacy_csv_without_sidecars_and_aggregate_only_are_distinct():
     row = _row()
     row.pop("gradient_topology_matches")
@@ -270,6 +291,63 @@ assert 'dq_profile.trainer_runtime' not in sys.modules
     raw.write_text(raw.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     mismatched = rebuild(source, destination)
     assert all("raw_csv_hash_mismatch_with_saved_analysis" in c["d_reasons"] for c in mismatched["candidates"])
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+@pytest.mark.parametrize("hash_sources", [
+    (None, None, None), ("A", None, None), (None, "A", None), (None, None, "A"),
+    ("A", "A", "A"),
+    ("A", "B", None), ("A", None, "B"), (None, "A", "B"),
+    ("A", "A", "B"), ("A", "B", "A"), ("B", "A", "A"),
+])
+def test_rebuild_requires_all_recorded_hashes_to_agree_and_retains_evidence(tmp_path, in_place, hash_sources):
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = source if in_place else tmp_path / "out"
+    model = _model()
+    rows = [dict(_row(candidate=c["candidate"], d=c["body"], grad_diff_norm=c["body"]), range_mul=c["range_mul"])
+            for c in model["datasets"][0]["candidate_cards"]]
+    raw = source / "raw_gradient_tail.csv"
+    with raw.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=rows[0])
+        writer.writeheader()
+        writer.writerows(rows)
+    digests = {None: None, "A": hashlib.sha256(raw.read_bytes()).hexdigest(), "B": hashlib.sha256(b"other input").hexdigest()}
+    summary_hash, manifest_hash, model_hash = [digests[key] for key in hash_sources]
+    (source / "summary.json").write_text(json.dumps({"local_gradient_tail_sha256": summary_hash}), encoding="utf-8")
+    manifest = {"inputs": {"gradient_tail.csv": {"path": str(raw), "sha256": manifest_hash}}}
+    (source / "analysis_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    model["datasets"][0]["gradient_curve_support"] = {"provenance": {"input_sha256": model_hash}}
+    (source / "practical_report.json").write_text(json.dumps(model), encoding="utf-8")
+    (source / "local_selection.json").write_text('{"unchanged": true}', encoding="utf-8")
+    original = {p.name: p.read_bytes() for p in source.iterdir()}
+    conflict = "B" in hash_sources
+    support = rebuild(source, destination, gradient_csv=raw if in_place else None)
+    assert support["provenance"]["recorded_input_sha256s"] == sorted({digests[key] for key in hash_sources if key})
+    expected_identity = "unavailable" if conflict else "saved_analysis_hash_verified" if any(hash_sources) else (
+        "explicit_csv_without_saved_hash" if in_place else "same_directory_legacy_csv")
+    assert support["provenance"]["input_identity"] == expected_identity
+    if conflict:
+        assert support["provenance"]["input_sha256"] is None
+        assert support["provenance"]["input_path"] is None
+    for candidate in support["candidates"]:
+        assert candidate["status"] == ("unavailable" if conflict else "available")
+        if conflict:
+            assert "conflicting_recorded_gradient_hashes" in candidate["d_reasons"]
+            assert "conflicting_recorded_gradient_hashes" in candidate["parallel_component_reasons"]
+    for name in ("raw_gradient_tail.csv", "summary.json", "local_selection.json"):
+        assert (source / name).read_bytes() == original[name]
+    updated_manifest = json.loads((destination / "analysis_manifest.json").read_text(encoding="utf-8"))
+    assert updated_manifest["inputs"] == manifest["inputs"]
+    if not in_place:
+        assert {p.name: p.read_bytes() for p in source.iterdir()} == original
+    # The output may no longer contain the summary or original model hash.
+    # Rebuilding that output must not forget conflicting saved evidence.
+    repeated = rebuild(destination, destination, gradient_csv=raw)
+    assert repeated["candidates"] == support["candidates"]
+    if conflict:
+        assert repeated["provenance"]["input_identity"] == "unavailable"
+        assert repeated["provenance"]["recorded_input_sha256s"] == support["provenance"]["recorded_input_sha256s"]
 
 
 def test_rebuild_aggregate_only_preserves_report_and_promote_includes_support(tmp_path):
