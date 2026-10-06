@@ -393,6 +393,13 @@ class DiagnosticProfileRuntime:
         self._stats_sequence = 1_000_000
         self._warnings: list[str] = []
 
+    def _configure_candidate_quantization(self, network, candidate, range_mul, shadow):
+        _set_fake_quant(network, self.args,
+            enabled=bool((candidate.quantized and not shadow) or shadow), range_mul=range_mul)
+
+    def _extra_quantization_metrics(self, exported):
+        return {}
+
     def _next_stats_step(self) -> int:
         self._stats_sequence += 1
         return self._stats_sequence
@@ -690,6 +697,9 @@ class DiagnosticProfileRuntime:
         hard_safety: bool = False,
         diagnostic_forward_only: bool = False,
     ) -> tuple[dict[str, Any], ExactGradient, list[dict[str, Any]]]:
+        budget_callback = getattr(self.args, "_dq_profile_budget_callback", None)
+        if budget_callback is not None and not diagnostic_forward_only:
+            budget_callback("diagnostic_update" if update else "diagnostic")
         observer = getattr(self.trainer, "_dataset_diagnostics", None)
         if observer is not None:
             observer.active = phase == "v2_tail_probe" or diagnostic_forward_only
@@ -717,12 +727,7 @@ class DiagnosticProfileRuntime:
         )
         if hasattr(unwrapped, "set_dq_profile_context"):
             unwrapped.set_dq_profile_context(self.quant_context)
-        _set_fake_quant(
-            unwrapped,
-            self.args,
-            enabled=bool((candidate.quantized and not shadow) or shadow),
-            range_mul=range_mul,
-        )
+        self._configure_candidate_quantization(unwrapped, candidate, range_mul, shadow)
 
         stats_step = self._next_stats_step()
         if hasattr(unwrapped, "set_dq_stats_state"):
@@ -874,6 +879,7 @@ class DiagnosticProfileRuntime:
                 "rng_digest_after": rng_digest_after,
                 **profile_trace,
                 **dq_metrics,
+                **self._extra_quantization_metrics(exported),
             }
             return row, exact_gradient, shadow_rows
         finally:

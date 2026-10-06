@@ -9,12 +9,13 @@
       "source": "train_network.py",
       "source_git_blob_oid": "d1dedba47512bc60bfc1959a13053d8b74178821",
       "source_normalized_sha256": "25dc638c03e3d5df406d0c49728944e293a63a7630a6349de5f05e846e457d7a",
-      "copied_normalized_sha256": "d6e7097f36d21102a6a81b36fbc999329a2168a295251c952ee2de71b38e593f",
+      "copied_normalized_sha256": "ef4a1dc96ad32e581052ea0340a0385ce1bcec2768847346f776f9fe5154908e",
       "reviewed_source_changes": "Ordinary trainer settings-provenance logging is intentionally not copied; it records resolved settings without changing training computations.",
       "diagnostic_changes": [
         "uses the isolated profiler NetworkTrainer runtime instead of the ordinary training entry",
         "captures reproducible snapshots, replay inputs, prefix fingerprints, and Local diagnostic artifacts",
-        "optional dataset raw-MSE observer, loader inventory, initial LoRA snapshot and actual warmup exposure counts; ordinary trainer unchanged"
+        "optional dataset raw-MSE observer, loader inventory, initial LoRA snapshot and actual warmup exposure counts; ordinary trainer unchanged",
+        "optional research-only runtime factory and cumulative budget callback; common warmup computations and ordinary trainer unchanged"
       ]
     },
     "dq_profile/copied_lora.py": {

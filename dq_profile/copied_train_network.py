@@ -3440,7 +3440,8 @@ class NetworkTrainer:
         if bool(getattr(args, "dq_profile_enabled", False)):
             from dq_profile.trainer_runtime import DiagnosticProfileRuntime
 
-            dq_profile_runtime = DiagnosticProfileRuntime(args=args, trainer=self)
+            runtime_class = getattr(args, "_dq_profile_runtime_class", DiagnosticProfileRuntime)
+            dq_profile_runtime = runtime_class(args=args, trainer=self)
             if getattr(args, "dq_profile_data_diagnostics", "off") != "off":
                 from dq_profile.diagnostic_eval import DatasetDiagnostics
                 # The local train_dataset_group was deleted after metadata setup;
@@ -3469,6 +3470,10 @@ class NetworkTrainer:
                 if initial_step > 0:
                     initial_step -= 1
                     continue
+                if dq_profile_runtime is not None and global_step < dq_delta_begin_step:
+                    budget_callback = getattr(args, "_dq_profile_budget_callback", None)
+                    if budget_callback is not None:
+                        budget_callback("warmup")
                 if (
                     dq_profile_runtime is not None
                     and dq_delta_begin_step is not None
