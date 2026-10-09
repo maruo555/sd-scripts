@@ -8,25 +8,27 @@
     "dq_profile/copied_train_network.py": {
       "source": "train_network.py",
       "source_git_blob_oid": "d1dedba47512bc60bfc1959a13053d8b74178821",
-      "source_normalized_sha256": "25dc638c03e3d5df406d0c49728944e293a63a7630a6349de5f05e846e457d7a",
-      "copied_normalized_sha256": "ef4a1dc96ad32e581052ea0340a0385ce1bcec2768847346f776f9fe5154908e",
-      "reviewed_source_changes": "Ordinary trainer settings-provenance logging is intentionally not copied; it records resolved settings without changing training computations.",
+      "source_normalized_sha256": "45610a6ff103555362cf71f1a6c975d5219ee19c0b37c296bc08b1fd92b58be2",
+      "copied_normalized_sha256": "dfd3d1ca060ff1fc938b2d01ee7b344ff6ca151643e4a955c3d8ab5f0b971fbe",
+      "reviewed_source_changes": "Ordinary-only settings provenance, optional fixed-mul CLI/metadata, and inactive-by-default observer hooks are not copied. With policy omitted and no observer, training arithmetic and ordinary TE enable behavior are unchanged; isolated runtime applies policies explicitly after its own setters. Explicit-policy resume identity is saved and checked by the ordinary trainer before state loading; legacy resumes without a policy record remain unchanged. Diagnostic entry points reject resume and do not copy these state hooks. Explicit-policy resume uses a scoped NumPy RNG array allowlist for older Accelerate with weights-only torch.load, without changing the legacy no-policy or fresh-run paths.",
       "diagnostic_changes": [
         "uses the isolated profiler NetworkTrainer runtime instead of the ordinary training entry",
         "captures reproducible snapshots, replay inputs, prefix fingerprints, and Local diagnostic artifacts",
         "optional dataset raw-MSE observer, loader inventory, initial LoRA snapshot and actual warmup exposure counts; ordinary trainer unchanged",
-        "optional research-only runtime factory and cumulative budget callback; common warmup computations and ordinary trainer unchanged"
+        "optional research-only runtime factory and cumulative budget callback; common warmup computations and ordinary trainer unchanged",
+        "Optional research warmup after-backward/after-update finite-state observers; absent by default and consume no random numbers. GPU boundary/prefix parity must still pass before accepting evidence."
       ]
     },
     "dq_profile/copied_lora.py": {
       "source": "networks/lora.py",
       "source_git_blob_oid": "9b81f347a2db706e89366d6da0e33a2e7fdc6b5c",
-      "source_normalized_sha256": "0173552b2139cc1f95ac214d52c7a2f45a91ec1981600cb74d7a659fa6e5cea8",
+      "source_normalized_sha256": "97cb8f5b95ff6dd0df98b90dce210bde8dc184e36698e7e444dc86154191b06f",
       "copied_normalized_sha256": "c2324276801d95abde12d5dba06ddb270cc51048829a28dea9242836e94d7353",
       "diagnostic_changes": [
         "accepts profiler quantization context and stateless common-random-number tensors",
         "supports shadow, Local, mechanism, parity, and descriptive research instrumentation without changing the ordinary LoRA module"
-      ]
+      ],
+      "reviewed_source_changes": "Ordinary LoRA adds opt-in resolved mul policies that survive common setters. Isolated LoRA retains profiler RNG/context handling and receives the same shared MulPolicy explicitly from the research runtime. No-policy ordinary outputs, gradients and RNG match the previous setter in CPU fixtures."
     }
   }
 }

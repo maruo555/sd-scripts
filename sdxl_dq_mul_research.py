@@ -56,7 +56,7 @@ def prepare(workspace):
     print("Execution contract finalized; no real-data job started.")
 
 
-def worker(workspace, mode, name, gate=None):
+def worker(workspace, mode, name, gate=None, *, runtime_class=None, guard_warmup=False):
     budget = ResearchBudget(workspace)
     active = budget.usage().get("active_job")
     if not active or active["name"] != name or not (budget.root / "runner.lock").is_file():
@@ -82,7 +82,7 @@ def worker(workspace, mode, name, gate=None):
         f"--dq_profile_source_group_map={budget.root / 'source_group_map.json'}",
         f"--dq_profile_max_images={8 if mode == 'prefix' else images}",
         "--dq_profile_timestep_bins=4", "--dq_profile_stochastic_repeats=2",
-        "--dq_profile_range_muls=2.70,3.15,3.75",
+        "--dq_profile_range_muls=" + ("2.70,3.15,3.45,3.75,4.05" if runtime_class is not None else "2.70,3.15,3.75"),
         "--dq_profile_protocol=" + ("v2-prefix-smoke" if mode == "prefix" else "v24-acceptance-local"),
     ]
     if gate:
@@ -100,8 +100,12 @@ def worker(workspace, mode, name, gate=None):
         raise ResearchStop("Research policy requires static channel/RMS stochastic delta quantization")
     args._dq_profile_budget_callback = budget.consume_forward_backward
     args._dq_research_budget = budget
+    if guard_warmup:
+        from dq_profile.full_training import check_backward, check_updated_state
+        args._dq_profile_after_backward = check_backward
+        args._dq_profile_after_update = check_updated_state
     if mode == "measure":
-        args._dq_profile_runtime_class = MulResearchRuntime
+        args._dq_profile_runtime_class = runtime_class or MulResearchRuntime
     artifacts = standard.ProfileArtifacts(args.dq_profile_run_dir)
     artifacts.initialize()
     artifacts.ensure_known_result()

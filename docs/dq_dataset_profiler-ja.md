@@ -39,6 +39,20 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 
 通常学習経路が診断コードをimportしないことは、研究中に守ってきた重要な隔離条件です。
 
+### Local診断のTE量子化
+
+`python -m dq_profile`のLocal計測は、**UNetとTEの量子化が既定**です。
+各grid点のmulを両方に適用します。従来のUNetのみの計測をする場合は、
+同じコマンドに`--dq-profile-no-te-quantized`を追加してください。
+TEの量子化を切ってもTEの学習は有効です。`--dq-profile-te-quantized`で
+ONを明示することもできます。両オプションの同時指定はできません。
+
+ON/OFFは`resolved_args.json`と`protocol_fingerprint.json`へ保存します。
+TEなしの過去の診断とは測定条件が異なります。既存のsnapshot・Prefix検算は
+維持しており、この変更で通常学習の全経路を再現したことにはなりません。
+standardモードの一律mulの5点gridと通常学習の処理は変更しません。
+場所別の指定については[固定mul研究ガイド](dq_mul_research-ja.md)を参照してください。
+
 ## 3. 現在の実用診断で行う処理
 
 通常利用の`canonical-v1`は、40 epochを最後まで学習する処理ではありません。

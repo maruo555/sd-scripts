@@ -59,6 +59,24 @@ class ResolvedProfileRequest:
     dispositions: tuple[dict[str, Any], ...]
     data_diagnostics: str = "off"
     group_map: Path | None = None
+    te_quantized: bool = False
+    policy_grid_file: Path | None = None
+
+    def fixed_policy_contract(self):
+        if not self.te_quantized and self.policy_grid_file is None:
+            return None
+        from types import SimpleNamespace
+        from dq_profile.fixed_policy import resolve_policy_grid
+        expected = self.preset.expected_explicit
+        args = SimpleNamespace(dq_profile_te_quantized=self.te_quantized,
+            dq_profile_policy_grid_file=self.policy_grid_file, dq_profile_protocol="v24-acceptance-local",
+            dq_profile_range_muls_resolved=self.execution_mode.core_grid,
+            dq_quantize_z=bool(expected.get("dq_quantize_z", False)),
+            dq_delta_stat=expected.get("dq_delta_stat"), dq_delta_bits=expected.get("dq_delta_bits"))
+        resolved = resolve_policy_grid(args)
+        return {"te_quantized": self.te_quantized, "resolved_policy_grid": resolved,
+                "source_sha256": getattr(args, "dq_profile_policy_grid_sha256", None),
+                "provisional": True, "not_image_quality": True}
 
     def provenance(self) -> dict[str, Any]:
         return {
@@ -76,6 +94,10 @@ class ResolvedProfileRequest:
             "data_diagnostics": self.data_diagnostics,
             "data_diagnostics_selector_input": False,
             "diagnostic_group_map": str(self.group_map) if self.group_map else None,
+            "te_quantized": self.te_quantized,
+            "fixed_policy_grid_file": str(self.policy_grid_file) if self.policy_grid_file else None,
+            "fixed_policy_extension_provisional": bool(self.te_quantized or self.policy_grid_file),
+            "fixed_policy_contract": self.fixed_policy_contract(),
             "policy": {
                 "unknown_options": "reject",
                 "unsupported_options": "reject",

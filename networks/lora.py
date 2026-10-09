@@ -2043,9 +2043,35 @@ class LoRANetwork(torch.nn.Module):
             if triton_stats is not None:
                 l.delta_q_triton_stats = bool(triton_stats)
 
+        # Explicit fixed policies survive bit/scale reconfiguration. No policy
+        # means exactly the legacy common-mul behavior.
+        if getattr(self, "_dq_mul_assignments", None):
+            self._apply_delta_mul_policy()
+
+    def set_delta_mul_policy(self, policy):
+        """Resolve once against the actual topology; exact names fail closed."""
+        from library.dq_mul_policy import digest
+
+        modules = self.text_encoder_loras + self.unet_loras
+        expanded = policy.expand([module.lora_name for module in modules])
+        self._dq_mul_assignments = [
+            (module, expanded[module.lora_name]["mul"], expanded[module.lora_name]["enabled"])
+            for module in modules
+        ]
+        self._apply_delta_mul_policy(enabled=True)
+        return {"declaration": policy.to_dict(), "assignments_sha256": digest(expanded), "modules": expanded}
+
+    def _apply_delta_mul_policy(self, enabled=None):
+        for module, mul, policy_enabled in getattr(self, "_dq_mul_assignments", ()):
+            module.delta_q_range_mul = mul
+            if enabled is not None:
+                module.delta_q_enabled = bool(enabled and policy_enabled)
+
     def set_delta_quant_enabled(self, enabled: bool):
         for l in self.text_encoder_loras + self.unet_loras:
             l.delta_q_enabled = enabled
+        if getattr(self, "_dq_mul_assignments", None):
+            self._apply_delta_mul_policy(enabled=enabled)
 
     def set_dq_stats_state(
         self,

@@ -98,6 +98,8 @@ def setup_parser() -> argparse.ArgumentParser:
     group.add_argument("--dq_profile_branch_steps", type=int, default=None)
     group.add_argument("--dq_profile_seed", type=int, default=None)
     group.add_argument("--dq_profile_range_muls", type=str, default=",".join(str(value) for value in DEFAULT_V2_RANGE_MULS))
+    group.add_argument("--dq_profile_te_quantized", action="store_true", help="Opt-in Local UNet+TE quantization; no change to ordinary diagnostic defaults")
+    group.add_argument("--dq_profile_policy_grid_file", type=str, default=None, help="Opt-in Local JSON mapping grid labels to explicit fixed mul policies")
     group.add_argument("--dq_profile_sweep_steps", type=int, default=64)
     group.add_argument("--dq_profile_branch_repeats", type=int, default=2)
     group.add_argument("--dq_profile_prefix_short_steps", type=int, default=64)
@@ -607,6 +609,9 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
         "v24-acceptance-local",
     } and int(args.dq_profile_branch_repeats) < 2:
         raise ValueError("v2 requires --dq_profile_branch_repeats>=2")
+
+    from dq_profile.fixed_policy import resolve_policy_grid
+    args.dq_profile_policy_grid_resolved = resolve_policy_grid(args)
 
     args.dq_profile_requested_network_module = requested_module
     args.dq_profile_requested_output_dir = getattr(args, "output_dir", None)

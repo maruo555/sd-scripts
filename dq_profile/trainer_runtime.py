@@ -396,6 +396,21 @@ class DiagnosticProfileRuntime:
     def _configure_candidate_quantization(self, network, candidate, range_mul, shadow):
         _set_fake_quant(network, self.args,
             enabled=bool((candidate.quantized and not shadow) or shadow), range_mul=range_mul)
+        grid = getattr(self.args, "dq_profile_policy_grid_resolved", {})
+        if grid and candidate.quantized:
+            if shadow:
+                raise ValueError("Explicit policy grids are supported by Local measurement, not shadow estimation")
+            from library.dq_mul_policy import MulPolicy, digest
+            declaration = grid[f"{float(range_mul):.12g}"]
+            expanded = MulPolicy.from_dict(declaration).apply(network)
+            policies = getattr(self, "_fixed_policy_records", {})
+            policies[candidate.name] = {"declaration": declaration, "assignments_sha256": digest(expanded), "modules": expanded}
+            if candidate.name not in getattr(self, "_fixed_policy_written", set()):
+                self._fixed_policy_records = policies
+                self.artifacts.root.mkdir(parents=True, exist_ok=True)
+                from dq_profile.research_budget import write_json
+                write_json(self.artifacts.root / "fixed_policy_assignments.json", {"policies": policies, "policy_grid_source_sha256": getattr(self.args, "dq_profile_policy_grid_sha256", None), "provisional": True, "not_image_quality": True})
+                self._fixed_policy_written = set(policies)
 
     def _extra_quantization_metrics(self, exported):
         return {}
@@ -826,12 +841,25 @@ class DiagnosticProfileRuntime:
             if safety_reason is not None:
                 skip = True
             lr_before = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
+            clip_input_norm = None
+            clip_output_norm = None
+            clipped_gradient_hash = None
+            amp_step_skipped = False
             if update and not skip:
                 if accelerator.sync_gradients:
                     self.trainer.all_reduce_network(accelerator, network)
                     if self.args.max_grad_norm != 0.0:
-                        accelerator.clip_grad_norm_(unwrapped.get_trainable_params(), self.args.max_grad_norm)
+                        clip_input_norm = accelerator.clip_grad_norm_(unwrapped.get_trainable_params(), self.args.max_grad_norm)
+                        if hard_safety:
+                            # Accelerate has unscaled these gradients before
+                            # clipping. Record what the optimizer actually sees.
+                            clipped = ExactGradient.capture(unwrapped.named_parameters(), scale=1.0)
+                            clip_output_norm = clipped.norm
+                            clipped_gradient_hash = exact_gradient_fingerprint(clipped)
+                            if not math.isfinite(clip_output_norm):
+                                raise FloatingPointError("Nonfinite clipped gradient before optimizer update")
                 optimizer.step()
+                amp_step_skipped = bool(getattr(accelerator, "optimizer_step_was_skipped", False))
                 lr_scheduler.step()
                 self.trainer._apply_te_lr_after_if_ready(optimizer, lr_scheduler, absolute_step + 1)
                 if self.args.round_lora_step is not None and self.args.round_lora_step > 0:
@@ -851,7 +879,7 @@ class DiagnosticProfileRuntime:
                 if post_step_reason is not None:
                     safety_reason = post_step_reason
             common_skip_matched = None if forced_skip is None else safety_reason is None
-            optimizer_step_performed = bool(update and not skip)
+            optimizer_step_performed = bool(update and not skip and not amp_step_skipped)
             optimizer.zero_grad(set_to_none=True)
             rng_digest_after = rng_fingerprint()
             row = {
@@ -866,6 +894,11 @@ class DiagnosticProfileRuntime:
                 "lr_before": lr_before,
                 "lr_after": [float(group.get("lr", 0.0)) for group in optimizer.param_groups],
                 "native_would_skip": native_would_skip,
+                "native_guardian_checked": bool(update and grad_norm_guardian is not None),
+                "amp_step_skipped": amp_step_skipped if update and not skip else None,
+                "clip_input_norm": None if clip_input_norm is None else float(clip_input_norm),
+                "clip_output_norm": clip_output_norm,
+                "clipped_gradient_hash": clipped_gradient_hash,
                 "common_skip_matched": common_skip_matched,
                 "forced_safety_abort": safety_reason is not None,
                 "invalid_reason": safety_reason,

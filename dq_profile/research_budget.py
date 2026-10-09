@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -14,16 +15,39 @@ class ResearchStop(RuntimeError):
     pass
 
 
+def _retry_permission_error(operation):
+    """Allow a short file-sharing collision without accepting stale data."""
+    deadline = None
+    retries = 0
+    while True:
+        try:
+            result = operation()
+        except PermissionError:
+            if deadline is None:
+                deadline = time.monotonic() + 1.0
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            retries += 1
+            time.sleep(min(0.02, remaining))
+        else:
+            if retries:
+                logging.getLogger(__name__).warning("Research file access recovered after %d permission retries", retries)
+            return result
+
+
 def read_json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    text = _retry_permission_error(lambda: Path(path).read_text(encoding="utf-8-sig"))
+    return json.loads(text)
 
 
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    text = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    _retry_permission_error(lambda: temporary.write_text(text, encoding="utf-8"))
+    _retry_permission_error(lambda: os.replace(temporary, path))
 
 
 def file_hash(path):
@@ -56,8 +80,10 @@ class ResearchBudget:
         self.counter_path = self.root / "counters.json"
         self.stage = "P1"
         self._checks = 0
+        contract_path = self.root / "execution_contract.json"
+        self.reserved_training_calls = int(read_json(contract_path).get("reserved_full_training_calls", 0)) if contract_path.exists() else 0
 
-    def validate_inputs(self, *, full_model_hash=False):
+    def validate_inputs(self, *, full_model_hash=False, check_code=True):
         if file_hash(self.manifest["dataset_toml"]) != self.manifest["dataset_toml_sha256"]:
             raise ResearchStop("Dataset TOML changed")
         for source in self.manifest["sources"]:
@@ -92,9 +118,14 @@ class ResearchBudget:
                 raise ResearchStop("Training baseline changed")
             if self.approval["approved_limits"] != contract["approved_limits"] or self.approval["approved_stages"] != contract["approved_stages"]:
                 raise ResearchStop("Approval scope changed")
-            for name, expected in contract["code_files"].items():
-                if file_hash(Path(contract["repository"]) / name) != expected:
-                    raise ResearchStop(f"Code changed during the experiment: {name}")
+            if check_code:
+                for name, expected in contract["code_files"].items():
+                    if file_hash(Path(contract["repository"]) / name) != expected:
+                        raise ResearchStop(f"Code changed during the experiment: {name}")
+            for section in ("prior_evidence_files", "support_files"):
+                for path, expected in contract.get(section, {}).items():
+                    if file_hash(path) != expected:
+                        raise ResearchStop("Frozen supporting evidence changed: " + path)
 
     def usage(self):
         path = self.root / "usage.json"
@@ -119,7 +150,8 @@ class ResearchBudget:
         if usage["first_started_at"] and time.time() - usage["first_started_at"] + reserve_seconds >= limit["elapsed_seconds_from_first_real_data_job"]:
             raise ResearchStop("Elapsed-time budget exhausted")
         counters = read_json(self.counter_path) if self.counter_path.exists() else {"forward_backward_calls": 0}
-        if counters["forward_backward_calls"] + reserve_fb > limit["real_data_forward_backward_calls_including_warmup_prefix_retries"]:
+        training_reserve = self.reserved_training_calls if self.stage != "P6" else 0
+        if counters["forward_backward_calls"] + reserve_fb + training_reserve > limit["real_data_forward_backward_calls_including_warmup_prefix_retries"]:
             raise ResearchStop("Forward/backward budget exhausted")
         if storage:
             if shutil.disk_usage(self.root).free < limit["minimum_free_bytes_on_D"]:

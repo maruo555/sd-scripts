@@ -553,6 +553,9 @@ def build_protocol_fingerprint(
         "profile_seed": int(request.preset.expected_explicit["seed"]),
         "scope": "local_body_tail_only",
     }
+    fixed_policy_contract = request.fixed_policy_contract()
+    if fixed_policy_contract is not None:
+        shared_local_contract["fixed_policy_extension"] = fixed_policy_contract
     payload = {
         "schema_version": RUN_SCHEMA_VERSION,
         "git_head": git_head(),
@@ -581,6 +584,7 @@ def build_protocol_fingerprint(
         "scope": "local_body_tail_only",
         "trajectory": "research_only_not_run",
         "not_quality_or_utility": True,
+        "fixed_policy_extension": fixed_policy_contract,
     }
     fingerprint_sha256 = canonical_sha256(payload)
     return {
@@ -964,6 +968,10 @@ def profile_command(
     ]
     if protocol == "v24-acceptance-local" and not snapshot_only:
         command.append(f"--dq_profile_data_diagnostics={request.data_diagnostics}")
+        if getattr(request, "te_quantized", False):
+            command.append("--dq_profile_te_quantized")
+        if getattr(request, "policy_grid_file", None) is not None:
+            command.append(f"--dq_profile_policy_grid_file={request.policy_grid_file}")
         if request.group_map is not None:
             command.append(f"--dq_profile_group_map={request.group_map}")
     if gate is not None:
@@ -989,6 +997,10 @@ def run_profile(
         request.model_path,
         launcher.run_dir / "protocol_fingerprint.json",
     )
+    if request.te_quantized or request.policy_grid_file:
+        frozen = json.loads((launcher.run_dir / "protocol_fingerprint.json").read_text(encoding="utf-8"))
+        if request.fixed_policy_contract() != frozen.get("fixed_policy_extension"):
+            raise RuntimeError("Fixed policy changed after preflight")
     # The subprocess reads the original image/caption/cache paths, not copies.
     # Re-hash them immediately before every worker so a long staged run cannot
     # silently combine bytes that differ from source_group_map.json.
@@ -1185,7 +1197,8 @@ def run_local_pipeline(
 
     selection = read_json(active_analysis / "local_selection.json")
     completed_edge_rounds = 0
-    for round_index in range(1, execution.max_edge_extension_rounds + 1):
+    max_edge_rounds = 0 if getattr(request, "policy_grid_file", None) else execution.max_edge_extension_rounds
+    for round_index in range(1, max_edge_rounds + 1):
         if selection.get("selection_valid") is not True:
             break
         additions = tuple(float(value) for value in selection.get("edge_extension_recommended", ()))
@@ -1291,6 +1304,7 @@ def promote_profile_provenance(run_dir: Path, profile_dir: Path) -> list[str]:
     mapping = {
         "source_manifest.json": "source_manifest.json",
         "candidate_definitions.json": "candidate_definitions.json",
+        "fixed_policy_assignments.json": "fixed_policy_assignments.json",
         "probe_manifest.json": "probe_manifest.json",
         "calibration_gate.json": "profile_calibration_gate.json",
         "gradient_tail.csv": "raw_gradient_tail.csv",

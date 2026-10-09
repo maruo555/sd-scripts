@@ -2,7 +2,7 @@
 
 `sdxl_dq_mul_research.py` は、事前に承認したローカルの実験契約を読み、
 共通のwarmup境界で量子化対象と固定mul配分を比較する研究用入口です。
-通常の学習CLIや `python -m dq_profile` のcanonical条件は変更しません。
+`python -m dq_profile` のcanonical条件は変更しません。
 この入口は短期学習・本学習・画像生成を実行しません。
 
 ## 実装範囲
@@ -29,9 +29,14 @@ TE学習を止めずに量子化だけを外す明示的な介入です。
 }
 ```
 
-優先順位は `group_overrides > components > base_mul` です。
+優先順位は `module_overrides > 役割＋部位 > 役割 > 大分類 > components > base_mul` です。
 UNet群は `unet.attn1`、`unet.attn2`、`unet.ff`、
-`unet.other_projection` の排他的な4群です。未知の成分・群・モジュール、
+`unet.other_projection` の排他的な4大分類です。attentionには
+`.q`、`.k`、`.v`、`.out` を追加でき、さらに `.input`、`.middle`、`.output`
+を追加できます。例: `unet.attn2.q.output`。
+`module_overrides` は実際のLoRAモジュール名からmulへの辞書です。
+同じ具体性の重複は拒否し、JSONの記載順では優先順位を変えません。
+未知の成分・群・モジュール、
 重複指定、対象のないoverride、非有限または0以下のmulは拒否します。
 OFFをmul=0で表現しません。
 
@@ -40,7 +45,37 @@ OFFをmul=0で表現しません。
 一度だけF/Bを実行します。state・画像・noise・timestep・dropoutが異なるcellへは
 このcacheを持ち越しません。別名と再利用元を記録し、F/B予算には実行数を使います。
 snapshotはモジュールごとのON/OFFとmulも復元します。この研究runtimeでは
-学習resumeやavg promoteへのpolicy導入は行っていません。
+学習resumeを行いません。
+
+## 通常学習への明示的な適用
+
+通常の `sdxl_train_network.py` に `--dq_delta_policy_file=policy.json` を
+追加すると、同じresolverを使って固定配分を適用します。固定bitsかつRMSの
+delta量子化を必須とし、自動mul調整・bits schedule・z量子化との併用は拒否します。
+この指定ではpolicyが量子化対象を決めるため、従来のscope指定に優先します。
+指定を省略した通常学習の挙動は変更しません。
+
+```json
+{
+  "base_mul": 2.70,
+  "components": {"te1": 3.75, "te2": 3.75},
+  "group_overrides": [
+    {"group_id": "unet.attn2.q.output", "range_mul": 3.75}
+  ]
+}
+```
+
+配分は実ネットワークに対して一度解決し、存在しない指定があれば学習前に
+停止します。warmupのOFF/ONと共通setterによる再設定の後も配分を維持します。
+TE OFFは量子化だけを無効にし、TEのtrainable状態を変えません。
+checkpointにはpolicy宣言、解決済み配分のSHA-256、policy版を保存します。
+これらは `--no_metadata` でも残します。policyファイルのパスはこのメタデータに
+含めません。avg promoteで重みを読み戻しても配分は維持されますが、既存の
+promoteモードのresume制約は変更しません。
+
+通常trainerには埋め込み実行用の任意observer hookがあります。CLIはobserverを
+設定しません。研究runnerはこのhookで学習batch、shadowのforward、backward後、
+更新後を記録・監視できます。通常trainerは研究用budgetやruntimeをimportしません。
 
 ## ローカル実験契約
 
@@ -77,7 +112,7 @@ GPUメモリ不足を理由にbatch、解像度、dtype、rank、TE対象を自�
 
 ## 比較と保存
 
-現在の研究スケジュールは、mul 2.70 / 3.15 / 3.75のscope比較、UNet/TEの
+初期版の研究スケジュールは、mul 2.70 / 3.15 / 3.75のscope比較、UNet/TEの
 高低交差、TEを高mulで固定したUNet4群の両方向介入、2ペア、独立noiseでの
 確認と別regimeのdropout確認です。実行前の契約にこの範囲を含めます。
 
@@ -99,3 +134,100 @@ P50は中央値、Bodyは95%点、Tailはtimestep帯別95%点の最大です。
 この数値は同一stateでの勾配変形を表し、画像品質の順位ではありません。
 独立noiseで同じ画像を再測定しても、未知画像での確認とは呼びません。
 学習後の品質、保存LoRAでの推論、resume、avgの検証は後段の実行範囲です。
+
+初期版のprobe乱数addressは画像の選択順を含みます。そのため、異なる画像部分集合の
+dropout OFF/ONの差をdropout単独の因果効果として扱えません。
+継続用の `stable-image-v1` addressは画像キー・timestep帯・noise番号で決まり、
+部分集合内の順序を含みません。モデルのdropout seedと量子化repeatも分離します。
+旧版のaddressは元の観測の再現に残し、新しい結果にはaddress版を明記します。
+
+更新を伴わないLocal passの `native_would_skip=false` はguardianの安全確認結果を
+意味しません。`native_guardian_checked` で実際に検査したかを区別します。
+更新passにはclip前normとAMPによるskipも記録し、`optimizer_step_performed` は
+guardian等のskipだけでなくAMPのskipも反映します。
+更新検査ではclip後の実勾配ノルム・hashと、同じ量子化repeatの対照候補に対する
+実パラメータ更新差も記録します。旧外れ値は元のmodel/quantization addressのまま
+実更新へ通し、更新前の勾配が旧記録と一致することを別途検査します。
+
+## 通常診断でのTE・場所別mul
+
+通常の `python -m dq_profile` は、Local診断の各mulをUNetとTEの双方に
+適用することを既定にしています。`--dq-profile-te-quantized` で明示もできます。
+従来のUNetのみの量子化は `--dq-profile-no-te-quantized` で選びます。
+TEなしは量子化だけを無効にする指定で、TEの学習を止める指定ではありません。
+通常のstandardモードの一律grid、2.70 / 3.15 / 3.45 / 3.75 / 4.05は維持します。
+
+TEのON/OFFは `resolved_args.json` と `protocol_fingerprint.json` に記録します。
+以前のTEなし診断とは条件が異なるため、数値を同一条件の反復として混ぜません。
+通常学習の挙動は変更しません。既存のsnapshot・Prefix検算も維持し、
+TE込みのLocal診断を、通常学習のdropout・更新・平均化まで再現したものとは扱いません。
+内部stage用の直接診断CLIは互換性のため省略時の挙動を維持し、
+LocalでTE込みにする場合は `--dq_profile_te_quantized` を指定します。
+
+場所別の比較は `--dq-profile-policy-grid-file=grid.json` を使います。
+直接診断CLIでは `--dq_profile_policy_grid_file` です。ファイルはgridの数値を
+キー、上記のpolicy宣言を値とするJSONオブジェクトで、全grid点の指定が必要です。
+この場合、ラベルの数値は比較条件の識別子であり、変更対象は各policyが決めます。
+明示的なgridでは範囲外への自動延長を止め、途中でファイルが変わると停止します。
+grid内のTE設定は上記ON/OFFと一致させます。不一致はGPU起動前にエラーにします。
+これらの指定は現在 `v24-acceptance-local` のみに対応します。
+`fixed_policy_assignments.json` に解決済み配分と入力hashを保存します。
+場所別gridは研究用の明示指定であり、画像評価を済ませた推奨プリセットではありません。
+
+## 段階的な継続研究と完走学習
+
+`sdxl_dq_mul_continue.py` は別の承認済みworkspaceを使います。`--prepare` で
+CPU検証記録・入力・コード・過去証拠・レビュー済みデスクトッププロセス一覧を
+固定し、その後の起動でprefix、段階的診断、独立初期化した本学習を直列実行します。
+実験開始後の契約変更は拒否し、失敗jobは原因のレビューなしに再試行しません。
+本学習前の検証実装を修正する場合のみ、停止・旧契約/コード/消費量の保存・修正理由と
+CPU再検証を揃えて `--prepare-revision` で新しい版を固定できます。旧成果物を
+上書きせず、時間とF/Bはリセットせず、同じjobの承認済み試行数を越えません。
+
+継続版のgridは2.70 / 3.15 / 3.45 / 3.75 / 4.05です。一律UNet＋TEとattn2を
+確認し、attn2の役割、部位、最大4個別モジュールへ順に絞ります。探索の順位は
+source除外時のP50改善の一貫性、次にP50差で決めます。個別モジュールの選定には
+介入に対する勾配差分エネルギーを使いますが、因果寄与とは解釈しません。
+attn2＋FFと、単独介入が支持された場合のみ1個別ペアを確認します。
+
+追加の本学習候補は、独立noiseでP50差とそのsource bootstrap区間が負、全sourceの
+leave-one-outで改善、dropout ONでもP50が改善してsource除外の悪化が最大1件、
+既定対照と異なる配分、という条件を満たすものから選びます。最良改善の10%以内なら
+変更モジュールの少ない方を優先します。適格候補がなければ6本目は作りません。
+これらの規則は画像品質の予測精度を保証しません。
+
+本学習は各条件40epoch、13,600予定stepで、有限値・実際のmul・guardian/AMPによる
+更新見送りを監視します。更新見送りを補うために予定stepを延長しません。
+追加監視の既定値は、非有限勾配を検出した時点で停止する `strict` です。
+通常のguardian/AMPによる見送りを維持する研究では、承認と実行契約の両方で
+`training_gradient_handling=verified_native_skip` を明示できます。この場合も
+通常学習のしきい値・clip・optimizer・AMPの処理は変えません。非有限勾配を
+検出したstepでは、既存処理が更新を見送り、パラメータとoptimizer状態が有限かつ
+前後でbyte単位に一致することを検証します。AMPによる見送りではloss scaleの
+低下も確認します。非有限loss・状態異常・当該stepでの更新・非有限勾配の3回連続
+発生は停止条件です。通常の有限なGradNormスパイクの見送りはこの連続回数に
+含めません。各イベントの明細と検証結果を研究フォルダへ記録します。
+
+同じseed・引数でも、GPU演算を含む全学習の数値軌跡が完全一致するとは限りません。
+設定と入力の一致、診断probeの再現性、全学習の数値的再現性を区別して確認します。
+再実行のlossや見送り回数に差があれば記録し、条件間の差をmulだけの効果と断定しません。
+一つの見送りstepの前後をbyte単位で検証することは、別実行同士の完全再現の証明とは
+異なります。通常レシピを維持する比較では、再現のために演算設定を黙って変更しません。
+
+各epoch、最終、final_rawの保存値・メタデータ・hashを確認して一覧化します。
+`final_raw` もそれ以前のpromoteの影響を含み得るため、平均化履歴を併記します。
+画像生成は行いません。学習用のF/B枠を診断開始前から確保し、latentsの準備と
+avg shadowのforwardのみの処理も保守的に計上します。
+
+明示的な場所別mulで保存した学習stateには、policy宣言と展開済み配分のhashも保存します。
+`--resume` は保存時と同じ宣言・配分でのみ許可します。policyファイルを移動しても
+内容と配分が同じなら再開できます。同じパスで内容を変えた場合、policy指定を外した
+場合、またはpolicy記録のない古いstateへ明示policyを追加した場合は再開を拒否します。
+設定を変える場合は別の学習runとして扱ってください。policyを指定しない従来のstateの
+再開動作は維持します。推論用LoRAのA/Bテンソル形式は変更しません。
+
+
+明示policyでresumeする場合は、NumPy乱数stateの復元に必要な型だけを、読み込みの間に
+限定して許可します。古いAccelerateと、`torch.load` が既定で `weights_only=True` の
+PyTorchを組み合わせたときの互換性対応です。任意のpickle読み込みを有効にはしません。
+policy未指定の従来resumeと、新規学習の経路は変更しません。

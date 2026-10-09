@@ -25,6 +25,8 @@ def run_profile_mode(
     open_report: bool = False,
     data_diagnostics: str = "off",
     group_map: Path | None = None,
+    te_quantized: bool = True,
+    policy_grid_file: Path | None = None,
 ) -> int:
     request = resolve_training_cli(
         training_argv,
@@ -37,7 +39,17 @@ def run_profile_mode(
         from dq_profile.dataset_diagnostics import load_group_map
         load_group_map(group_map)
         group_map = group_map.resolve(strict=True)
-    request = replace(request, data_diagnostics=data_diagnostics, group_map=group_map)
+    if policy_grid_file is not None:
+        policy_grid_file = policy_grid_file.resolve(strict=True)
+    request = replace(request, data_diagnostics=data_diagnostics, group_map=group_map,
+                      te_quantized=bool(te_quantized), policy_grid_file=policy_grid_file)
+    policy_contract = request.fixed_policy_contract()  # Validate before GPU setup.
+    if not te_quantized and policy_contract is not None:
+        if any(policy["te_quantized"] for policy in policy_contract["resolved_policy_grid"].values()):
+            raise ValueError("--dq-profile-no-te-quantized conflicts with a TE-on policy in the grid")
+    if policy_grid_file is not None:
+        request = replace(request, execution_mode=replace(request.execution_mode,
+            max_edge_extension_rounds=0, edge_policy="explicit_policy_grid_no_automatic_extrapolation"))
     result = run_profile_request(
         request,
         ProductionRunOptions(
@@ -54,6 +66,7 @@ def run_profile_mode(
                 "status": result.status,
                 "run_dir": str(result.run_dir),
                 "report": str(result.report) if result.report else None,
+                "local_te_quantized": request.te_quantized,
             },
             ensure_ascii=False,
             indent=2,

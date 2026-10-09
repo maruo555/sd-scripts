@@ -3713,6 +3713,9 @@ class NetworkTrainer:
                     )
 
                     accelerator.backward(loss)
+                    after_backward = getattr(args, "_dq_profile_after_backward", None)
+                    if after_backward is not None:
+                        after_backward(accelerator.unwrap_model(network), loss)
                     loss_scalar = loss.detach().item()
                     skip_step = False
                     if check_gradients_and_skip_update(network, epoch, step, loss_scalar):
@@ -3732,6 +3735,9 @@ class NetworkTrainer:
                                 accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                         optimizer.step()
+                        after_update = getattr(args, "_dq_profile_after_update", None)
+                        if after_update is not None:
+                            after_update(accelerator.unwrap_model(network), optimizer)
                         lr_scheduler.step()
                         self._apply_te_lr_after_if_ready(optimizer, lr_scheduler, global_step + 1)
                         optimizer.zero_grad(set_to_none=True)

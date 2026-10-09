@@ -90,12 +90,13 @@ def summarize_samples(samples, *, bins=4, iterations=2000, seed=2401):
     return results
 
 
-def recipient_energy(reference, value, *, denominator=None):
+def recipient_energy(reference, value, *, denominator=None, per_module=False):
     if set(reference.values) != set(value.values):
         raise ResearchStop("Gradient topology changed")
     totals = defaultdict(lambda: {"reference_sq": 0., "difference_sq": 0.})
     for name, left in reference.values.items():
-        group = module_group(name.split(".", 1)[0])
+        module_name = name.split(".", 1)[0]
+        group = module_name if per_module else module_group(module_name)
         right = value.values[name]
         if left.shape != right.shape:
             raise ResearchStop("Gradient shape changed")
@@ -106,6 +107,18 @@ def recipient_energy(reference, value, *, denominator=None):
 
 
 class MulResearchRuntime(DiagnosticProfileRuntime):
+    probe_address_version = "legacy-index-v1"
+    collect_module_energy = False
+
+    def _probe_addresses(self, image_index, bin_index, noise, image_key):
+        if self.probe_address_version == "stable-image-v1":
+            # Neither subset order nor dropout regime changes quant addresses.
+            # The model RNG uses its own phase and never quantization repeats.
+            return (f"tail-stable:{bin_index}:{noise}:{image_key}",
+                    f"image:{image_key}|bin:{bin_index}|noise:{noise}")
+        return (f"tail:{image_index}:{bin_index}:{noise}:{image_key}",
+                f"image:{image_index}|bin:{bin_index}|noise:{noise}|key:{image_key}")
+
     def __init__(self, *, args, trainer):
         super().__init__(args=args, trainer=trainer)
         self.budget = args._dq_research_budget
@@ -188,7 +201,7 @@ class MulResearchRuntime(DiagnosticProfileRuntime):
             first = canonical.setdefault(self.expanded[name]["sha256"], name)
             if first != name:
                 aliases[name] = first
-        measurement_identity = digest({"execution_contract": self.budget.approval["execution_contract_sha256"], "state": fingerprint_tree(snapshot.network_state), "replay": [s.digest for s in selected], "candidates": [(d["id"], self.expanded[d["id"]]["sha256"]) for d in definitions], "dropout": dropout, "noise_offset": noise_offset, "seed": self.protocol_seed, "pairs": list(pairs), "metric": "2.4.0", "pilot": pilot})
+        measurement_identity = digest({"execution_contract": self.budget.approval["execution_contract_sha256"], "state": fingerprint_tree(snapshot.network_state), "replay": [s.digest for s in selected], "candidates": [(d["id"], self.expanded[d["id"]]["sha256"]) for d in definitions], "dropout": dropout, "noise_offset": noise_offset, "seed": self.protocol_seed, "pairs": list(pairs), "metric": "2.4.0", "pilot": pilot, "probe_address_version": self.probe_address_version})
         for cached_path in sorted((self.budget.root / "runs").glob(f"measure_*/{label}/result.json")):
             cached_result = read_json(cached_path)
             if cached_result.get("status") != "complete" or cached_result.get("measurement_identity") != measurement_identity:
@@ -224,9 +237,8 @@ class MulResearchRuntime(DiagnosticProfileRuntime):
                 for noise_index in range(3):
                     noise = noise_index + noise_offset
                     probe = self._fixed_timestep_item(source, probe_replica=noise, bin_index=bin_index, bin_count=4, noise_scheduler=ctx["noise_scheduler"])
-                    probe_id = f"tail:{image_index}:{bin_index}:{noise}:{image_key}"
-                    seed_id = f"image:{image_index}|bin:{bin_index}|noise:{noise}|key:{image_key}"
-                    metadata = {"image_key": image_key, "source_group": source_map.resolve(image_key), "timestep_bin": bin_index, "noise_replica": noise, "probe_regime": regime}
+                    probe_id, seed_id = self._probe_addresses(image_index, bin_index, noise, image_key)
+                    metadata = {"image_key": image_key, "source_group": source_map.resolve(image_key), "timestep_bin": bin_index, "noise_replica": noise, "probe_regime": regime, "probe_address_version": self.probe_address_version, "model_seed_address": seed_id}
 
                     def run(name, quant_repeat=0):
                         seed_step_rng(self.protocol_seed, seed_id, phase="v2_tail_structural_model", repeat=0)
@@ -273,10 +285,12 @@ class MulResearchRuntime(DiagnosticProfileRuntime):
                             rows.append(row)
                             energies = recipient_energy(reference_gradient, gradient)
                             recipient_row = {**metadata, "candidate": name, "quant_repeat": quant_repeat, "reference_norm_sq": reference_gradient.norm_sq, "recipient_energy": energies}
-                            background = "U2.70_T3.75" if name.startswith("low_restore_") else "UT_3.75" if name.startswith("high_lower_") else None
+                            background = item.get("background_id") or ("U2.70_T3.75" if name.startswith("low_restore_") else "UT_3.75" if name.startswith("high_lower_") else None)
                             if background is not None and (background, quant_repeat) in cached:
                                 recipient_row["intervention_background"] = background
                                 recipient_row["intervention_recipient_energy"] = recipient_energy(cached[background, quant_repeat], gradient, denominator=reference_gradient.norm_sq)
+                                if self.collect_module_energy:
+                                    recipient_row["intervention_module_energy"] = recipient_energy(cached[background, quant_repeat], gradient, denominator=reference_gradient.norm_sq, per_module=True)
                             recipients.append(recipient_row)
                             cached[name, quant_repeat] = gradient
                             if pilot and image_index == 0 and bin_index == 0 and noise_index == 0 and name.startswith("U_"):
@@ -337,7 +351,7 @@ class MulResearchRuntime(DiagnosticProfileRuntime):
         print(f"RESEARCH_STAGE_COMPLETE {label} passes={executed_passes} measured_seconds={measurement_seconds:.1f}", flush=True)
         return result, recipients
 
-    def run_from_boundary(self, **kw):
+    def _prepare_research_boundary(self, **kw):
         if kw["global_step"] != kw["dq_delta_begin_step"] or kw["accelerator"].num_processes != 1:
             raise ResearchStop("Invalid shared warmup boundary")
         network = kw["accelerator"].unwrap_model(kw["network"])
@@ -378,6 +392,10 @@ class MulResearchRuntime(DiagnosticProfileRuntime):
         pilot_items = pilot_items[:self.budget.proposal["pilot"]["max_unique_images"]]
         if {source_map.resolve(s.image_keys[0]) for s in pilot_items} != set(by_source):
             raise ResearchStop("Pilot image cap cannot cover every source")
+        return snapshot, ctx, selected, pilot_items
+
+    def run_from_boundary(self, **kw):
+        snapshot, ctx, selected, pilot_items = self._prepare_research_boundary(**kw)
         scope, cross, interventions = initial_candidates()
         self._measure("P1_pilot", pilot_items, [scope[-2], scope[-1]], snapshot, ctx, pilot=True)
         self._measure("P2_scope", selected, scope, snapshot, ctx)
