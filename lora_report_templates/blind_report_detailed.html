@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SDXL LoRA 詳細ブラインド評価</title>
+<style>
+:root { color-scheme: light dark; --image-width: 320px; }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #f5f5f2; color: #202124; }
+header { position: sticky; top: 0; z-index: 3; background: #fffffff2; border-bottom: 1px solid #d8d8d0; padding: 12px 18px; }
+h1 { font-size: 18px; margin: 0 0 10px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; font-size: 13px; }
+.toolbar label { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.help, #progress, #storageStatus { font-size: 12px; margin: 8px 0 0; line-height: 1.5; }
+#storageStatus { color: #666; }
+main { padding: 18px; }
+.group { margin: 0 0 22px; background: white; border: 1px solid #d8d8d0; box-shadow: 0 1px 3px #0001; }
+.group h2 { margin: 0; padding: 10px 12px; font-size: 13px; background: #ecece6; border-bottom: 1px solid #d8d8d0; overflow-wrap: anywhere; }
+.choices { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 14px; padding: 14px; }
+.choice { width: min(calc(var(--image-width) + 22px), 100%); min-width: 0; border: 1px solid #d8d8d0; background: #fbfbf8; padding: 10px; }
+.choice-title { font-size: 12px; margin-bottom: 7px; font-weight: 650; }
+.choice img { width: 100%; height: auto; display: block; cursor: zoom-in; border: 1px solid #ccc; background: #eee; }
+.evaluation { border: 0; padding: 0; margin: 10px 0 0; min-width: 0; }
+.evaluation > legend { font-size: 12px; font-weight: 650; }
+.scores { display: flex; flex-wrap: wrap; gap: 8px; margin: 5px 0 8px; }
+.scores label { display: inline-flex; align-items: center; gap: 4px; border: 1px solid #ccc; border-radius: 4px; padding: 5px 7px; }
+.scores label:has(input:checked) { background: #dceefb; border-color: #3b7da7; }
+.flags { border-top: 1px solid #d8d8d0; padding-top: 8px; margin-top: 10px; }
+.flags label { display: flex; gap: 7px; align-items: center; margin: 7px 0; font-size: 13px; }
+label { cursor: pointer; }
+.clear-score { font-size: 12px; }
+.missing { min-height: 140px; display: grid; place-items: center; border: 1px dashed #aaa; color: #777; font-size: 12px; padding: 8px; }
+.answer { display: none; margin-top: 10px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+body.revealed .answer { display: block; }
+#results { margin: 18px 18px 0; padding: 12px; border: 1px solid #d8d8d0; background: white; }
+#results h2 { font-size: 16px; margin: 0 0 8px; }
+.table-scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+th, td { border: 1px solid #d8d8d0; padding: 7px 10px; text-align: right; white-space: nowrap; }
+th:nth-child(2), td:nth-child(2) { text-align: left; white-space: normal; min-width: 140px; overflow-wrap: anywhere; }
+th { background: #ecece6; }
+dialog { max-width: 96vw; max-height: 96vh; border: 0; padding: 0; background: transparent; }
+.viewer-card { margin: 0; color: #eee; }
+#viewerTitle { padding: 8px 10px; font-size: 13px; background: #111; overflow-wrap: anywhere; }
+dialog img { max-width: 96vw; max-height: 86vh; display: block; background: #111; }
+dialog::backdrop { background: rgba(0,0,0,.78); }
+button, input { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: default; }
+@media (prefers-color-scheme: dark) {
+  body { background: #1f211f; color: #eee; }
+  header, .group, .choice, #results { background: #282b28; }
+  .group h2, th { background: #343832; }
+  header, .group, .group h2, .choice, .flags, #results, th, td, .scores label { border-color: #474b43; }
+  .scores label:has(input:checked) { background: #24495d; border-color: #73b9e4; }
+  #storageStatus, .missing { color: #bbb; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>SDXL LoRA 詳細ブラインド評価</h1>
+  <div class="toolbar">
+    <label>画像サイズ <input id="size" type="range" min="160" max="768" step="16" value="320"> <span id="sizeLabel">320px</span></label>
+    <button id="reveal" type="button">集計・答え合わせ</button>
+    <button id="export" type="button" disabled>集計CSVを保存</button>
+  </div>
+  <p class="help">各画像に1〜3点を付けます（3点が最高）。チェック3項目は点数とは別に、複数選択できます。</p>
+  <p id="progress" aria-live="polite"></p>
+  <p id="storageStatus" role="status"></p>
+</header>
+<section id="results" hidden></section>
+<main id="report"></main>
+<dialog id="viewer"><figure class="viewer-card"><figcaption id="viewerTitle"></figcaption><img id="viewerImage" alt="拡大画像"></figure></dialog>
+<script>
+const reportData = __REPORT_DATA__;
+const storageKey = __STORAGE_KEY__;
+const byId = id => document.getElementById(id);
+const esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({"&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"}[ch]));
+const caseId = job => `p${String(job.prompt_index ?? 0).padStart(4, "0")} / ${job.prompt_id} / seed ${job.seed}`;
+const flagFields = [["faithful", "元画像に忠実"], ["flexible", "自由度が高い"], ["broken", "破綻している"]];
+const failedImages = new Set();
+const available = index => reportData.jobs[index].status === "done" && !failedImages.has(index);
+const ratings = Object.create(null);
+let revealed = false;
+let viewerEntries = [];
+let viewerIndex = 0;
+
+function cleanRating(value) {
+  return {
+    score: [1, 2, 3].includes(value?.score) ? value.score : null,
+    faithful: value?.faithful === true,
+    flexible: value?.flexible === true,
+    broken: value?.broken === true,
+  };
+}
+function restoreRatings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(storageKey) || "{}");
+    if (!saved || typeof saved !== "object" || Array.isArray(saved)) throw new Error("Invalid ratings");
+    reportData.jobs.forEach((job, index) => {
+      if (job.status === "done" && Object.hasOwn(saved, index)) ratings[index] = cleanRating(saved[index]);
+    });
+    byId("storageStatus").textContent = "評価はこのブラウザに自動保存します。再度開くと評価を復元し、画像順を並べ替えます。";
+  } catch {
+    byId("storageStatus").textContent = "保存済み評価を読み込めませんでした。採点はできます。集計後にCSVを保存してください。";
+  }
+}
+function saveRatings() {
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(ratings));
+    byId("storageStatus").textContent = "評価をこのブラウザに保存しました。評価結果を残すには、集計CSVも保存してください。";
+  } catch {
+    byId("storageStatus").textContent = "このブラウザでは評価を保存できません。ページを閉じる前に、集計CSVを保存してください。";
+  }
+}
+function shuffle(items) {
+  const result = [...items];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+}
+function buildGroups() {
+  const groups = new Map();
+  reportData.jobs.forEach((job, index) => {
+    const key = caseId(job);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({job, index});
+  });
+  return [...groups.entries()].map(([label, entries], index) => ({label, index, entries: shuffle(entries)}));
+}
+const renderedGroups = buildGroups();
+function choice(entry, groupIndex, choiceIndex) {
+  const {job, index} = entry;
+  const rating = cleanRating(ratings[index]);
+  const image = job.status === "done"
+    ? `<img src="${esc(job.image)}" alt="画像 ${choiceIndex + 1}" loading="lazy" data-group-index="${groupIndex}" data-choice-index="${choiceIndex}" data-job-index="${index}">`
+    : `<div class="missing">画像なし（${esc(job.status)}）</div>`;
+  return `<article class="choice" data-job-index="${index}">
+    <div class="choice-title">画像 ${choiceIndex + 1}</div>${image}
+    <fieldset class="evaluation" ${available(index) ? "" : "disabled"}><legend>スコア</legend>
+      <div class="scores">${[1, 2, 3].map(score => `<label><input type="radio" name="score_${index}" value="${score}" ${rating.score === score ? "checked" : ""}> ${score}点</label>`).join("")}</div>
+      <button class="clear-score" type="button">点数を解除</button>
+      <div class="flags">${flagFields.map(([field, label]) => `<label><input type="checkbox" data-flag="${field}" ${rating[field] ? "checked" : ""}> ${label}</label>`).join("")}</div>
+    </fieldset>
+    <div class="answer"></div>
+  </article>`;
+}
+function conditionLabel(job) {
+  const items = (job.condition_items || []).map(item => {
+    const strength = Array.isArray(item.strength) ? item.strength.join(" / ") : item.strength;
+    return `${esc(item.name || item.path)} x${esc(strength)} lbw=${esc(item.lbw ?? "")}`;
+  });
+  return [esc(job.condition_name), ...items].join("<br>");
+}
+function summarize() {
+  const totals = new Map(reportData.conditions.map(condition => [condition.id, {
+    id: condition.id, name: condition.name, images: 0, rated: 0, total: 0,
+    scores: [0, 0, 0], faithful: 0, flexible: 0, broken: 0,
+  }]));
+  reportData.jobs.forEach((job, index) => {
+    if (!available(index) || !totals.has(job.condition_id)) return;
+    const row = totals.get(job.condition_id);
+    const rating = cleanRating(ratings[index]);
+    row.images += 1;
+    if (rating.score !== null) {
+      row.rated += 1;
+      row.total += rating.score;
+      row.scores[rating.score - 1] += 1;
+    }
+    flagFields.forEach(([field]) => { if (rating[field]) row[field] += 1; });
+  });
+  const rows = [...totals.values()].sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
+  rows.forEach((row, index) => {
+    row.average = row.rated ? row.total / row.rated : null;
+    row.rank = !row.rated ? "—" : index > 0 && row.total === rows[index - 1].total ? rows[index - 1].rank : index + 1;
+  });
+  return rows;
+}
+const columns = ["順位", "LoRA条件", "採点数", "評価可能画像数", "合計点", "平均点", "1点", "2点", "3点", ...flagFields.map(([, label]) => label)];
+const cells = row => [row.rank, row.name, row.rated, row.images, row.total, row.average === null ? "—" : row.average.toFixed(2), ...row.scores, row.faithful, row.flexible, row.broken];
+function updateSummary() {
+  const rows = summarize();
+  const rated = rows.reduce((sum, row) => sum + row.rated, 0);
+  const images = rows.reduce((sum, row) => sum + row.images, 0);
+  byId("progress").textContent = `採点済み ${rated} / ${images}画像・未採点 ${images - rated}画像・画像なし ${reportData.jobs.length - images}件`;
+  if (!revealed) return;
+  byId("results").innerHTML = `<h2>LoRA別の集計</h2>
+    <p class="help">合計点の高い順です。同点は同順位。未採点は平均点から除外します。採点数が異なる場合は平均点も確認してください。チェック件数は採点の有無にかかわらず、各項目を独立して集計します。</p>
+    <div class="table-scroll"><table><thead><tr>${columns.map(label => `<th scope="col">${esc(label)}</th>`).join("")}</tr></thead>
+    <tbody>${rows.map(row => `<tr>${cells(row).map(value => `<td>${esc(value)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+function recordRating(card) {
+  const index = Number(card.dataset.jobIndex);
+  if (!available(index)) return;
+  const score = card.querySelector('input[type="radio"]:checked');
+  const rating = {score: score ? Number(score.value) : null};
+  flagFields.forEach(([field]) => { rating[field] = card.querySelector(`[data-flag="${field}"]`).checked; });
+  ratings[index] = cleanRating(rating);
+  saveRatings();
+  updateSummary();
+}
+function imageFailed(img) {
+  const index = Number(img.dataset.jobIndex);
+  if (failedImages.has(index) || !img.isConnected) return;
+  failedImages.add(index);
+  const card = img.closest(".choice");
+  card.querySelector("fieldset").disabled = true;
+  const placeholder = document.createElement("div");
+  placeholder.className = "missing";
+  placeholder.textContent = "画像を読み込めません。採点・集計の対象外です。";
+  img.replaceWith(placeholder);
+  updateSummary();
+}
+function openViewer(groupIndex, choiceIndex) {
+  const group = renderedGroups[groupIndex];
+  viewerEntries = group.entries.map((entry, index) => ({...entry, label: `画像 ${index + 1}`})).filter(entry => available(entry.index));
+  viewerIndex = viewerEntries.findIndex(entry => entry.index === group.entries[choiceIndex].index);
+  if (viewerIndex < 0) return;
+  updateViewer();
+  byId("viewer").showModal();
+}
+function updateViewer() {
+  const entry = viewerEntries[viewerIndex];
+  if (!entry) return;
+  byId("viewerImage").src = entry.job.image;
+  byId("viewerTitle").textContent = `${caseId(entry.job)} / ${entry.label}${revealed ? " / " + entry.job.condition_name : ""}`;
+}
+function reveal() {
+  revealed = true;
+  document.body.classList.add("revealed");
+  byId("report").querySelectorAll(".choice").forEach(card => {
+    card.querySelector(".answer").innerHTML = conditionLabel(reportData.jobs[Number(card.dataset.jobIndex)]);
+  });
+  byId("results").hidden = false;
+  byId("export").disabled = false;
+  updateSummary();
+  if (byId("viewer").open) updateViewer();
+}
+function exportCsv() {
+  if (!revealed) return;
+  const csvCell = value => {
+    let text = String(value);
+    // A condition name may otherwise be interpreted as a spreadsheet formula.
+    if (/^[=+@\-\t\r\n]/.test(text)) text = "'" + text;
+    return '"' + text.replace(/"/g, '""') + '"';
+  };
+  const lines = [columns, ...summarize().map(cells)].map(row => row.map(csvCell).join(","));
+  const url = URL.createObjectURL(new Blob(["\ufeff" + lines.join("\r\n")], {type: "text/csv;charset=utf-8"}));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "blind_report_detailed_scores.csv";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+restoreRatings();
+byId("report").innerHTML = renderedGroups.map(group => `<section class="group"><h2>${esc(group.label)}</h2><div class="choices">${group.entries.map((entry, index) => choice(entry, group.index, index)).join("")}</div></section>`).join("") || "<p>評価対象の画像がありません。</p>";
+byId("report").querySelectorAll(".choice").forEach(card => {
+  card.addEventListener("change", () => recordRating(card));
+  card.querySelector(".clear-score").addEventListener("click", () => {
+    card.querySelectorAll('input[type="radio"]').forEach(input => { input.checked = false; });
+    recordRating(card);
+  });
+});
+byId("report").querySelectorAll("img").forEach(img => {
+  img.addEventListener("error", () => imageFailed(img), {once: true});
+  img.addEventListener("click", () => openViewer(Number(img.dataset.groupIndex), Number(img.dataset.choiceIndex)));
+  if (img.complete && img.naturalWidth === 0) imageFailed(img);
+});
+byId("size").addEventListener("input", event => {
+  document.documentElement.style.setProperty("--image-width", `${event.target.value}px`);
+  byId("sizeLabel").textContent = `${event.target.value}px`;
+});
+byId("reveal").addEventListener("click", reveal);
+byId("export").addEventListener("click", exportCsv);
+byId("viewer").addEventListener("click", () => byId("viewer").close());
+document.addEventListener("keydown", event => {
+  if (!byId("viewer").open || viewerEntries.length === 0) return;
+  if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+    event.preventDefault();
+    viewerIndex = (viewerIndex + (event.key === "ArrowRight" ? 1 : -1) + viewerEntries.length) % viewerEntries.length;
+    updateViewer();
+  }
+});
+updateSummary();
+</script>
+</body>
+</html>
