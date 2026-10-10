@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 
 from dq_profile.spatial import STANDARD_VERSION, VIEWS, LEAVES, metrics_from_moments, balanced_mean, summarize
+from dq_profile.spatial_report_data import SHARED_DATA_VERSION, loss_contract, public_loss_values, local_image_context
 
 
 def read_lines(path):
@@ -23,7 +24,7 @@ def write_json(path, data):
     Path(path).write_text(json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n", encoding="utf-8")
 
 
-def build_data(contract, rows, *, inventory=(), references=(), iterations=2000):
+def build_data(contract, rows, *, inventory=(), references=(), thumbnails=None, iterations=2000):
     if contract["version"] != STANDARD_VERSION or not rows:
         raise ValueError("Missing or unsupported standard diagnostic observations")
     candidates = contract["conditions"]
@@ -61,7 +62,7 @@ def build_data(contract, rows, *, inventory=(), references=(), iterations=2000):
     paired = {}
     for row in rows:
         key = row["regime"], row["image_key"], row["timestep_bin"], row["noise_replica"]
-        identity = tuple(row[k] for k in ("input_id", "noise_digest", "dropout_mask_digest", "reference_hash", "reference_loss", "reference_mse"))
+        identity = tuple(row[k] for k in ("input_id", "noise_digest", "dropout_mask_digest", "reference_hash", "reference_loss")) + (row.get("reference_mse"),)
         if paired.setdefault(key, identity) != identity:
             raise ValueError("Candidate observations have mismatched reference inputs or gradients")
     image_ids = {key: f"I{i+1:03}" for i, key in enumerate(images)}
@@ -70,7 +71,8 @@ def build_data(contract, rows, *, inventory=(), references=(), iterations=2000):
     for row in rows:
         if source_by_image.setdefault(row["image_key"], row["source_group"]) != row["source_group"]:
             raise ValueError("Image source grouping changed between conditions")
-    has_mse = all(r.get("reference_mse") is not None and r.get("quantized_mse") is not None for r in rows)
+    loss_spec = loss_contract(rows)
+    has_mse = loss_spec["selected_kind"] == "raw_mse"
     loss_fields = ("reference_mse", "quantized_mse") if has_mse else ("reference_loss", "quantized_loss")
     public_rows = []
     by_image = defaultdict(list)
@@ -89,7 +91,7 @@ def build_data(contract, rows, *, inventory=(), references=(), iterations=2000):
                     "candidate": cid, "regime": regime, "bin": row["timestep_bin"], "noise": row["noise_replica"],
                     "repeat": row["quant_repeat"], "components": row["components"], "metrics": metrics,
                     "pairing": {key: row[key] for key in ("input_id", "noise_digest", "dropout_mask_digest", "reference_hash", "quantized_hash")},
-                    "reference_loss": row[loss_fields[0]], "quantized_loss": row[loss_fields[1]]})
+                    **public_loss_values(row, loss_spec["selected_kind"])})
             for view in VIEWS:
                 scores[view][cid] = summarize([{ "source_group": r["source_group"], "timestep_bin": r["timestep_bin"],
                     "value": r["metrics"][view]["distance"], "parallel": r["metrics"][view]["parallel"]} for r in transformed],
@@ -131,10 +133,11 @@ def build_data(contract, rows, *, inventory=(), references=(), iterations=2000):
                     "post": mean([r["raw_mse"] for r in post]) if paired else None, "q": q})
         samples.append({"id": image_ids[image_path], "name": item.get("name", path.name),
             "folder": item.get("folder_name", path.parent.name), "source": source_ids[source_by_image[image_path]],
-            "image_uri": path.resolve().as_uri(), "tags": item.get("tags", []), "bins": cells})
+            "tags": item.get("tags", []), "bins": cells,
+            **local_image_context(path, matches, thumbnails or {})})
     pre = mean([mean([b["pre"] for b in s["bins"]["off"]]) for s in samples])
     post = mean([mean([b["post"] for b in s["bins"]["off"]]) for s in samples])
-    warmup = {"available": pre is not None and post is not None and pre > 0, "before": pre, "after": post,
+    warmup = {"loss_kind": "raw_mse", "available": pre is not None and post is not None and pre > 0, "before": pre, "after": post,
               "reduction_pct": 100 * (pre-post)/pre if pre is not None and pre > 0 and post is not None else None,
               "reason": "対応する学習前後のraw MSEが未記録です。warmup診断を指定すると計測されます。"}
     dataset = {"id": "dataset", "label": "このデータセット", "short_label": "診断結果", "views": VIEWS,
@@ -142,7 +145,10 @@ def build_data(contract, rows, *, inventory=(), references=(), iterations=2000):
         "body_note": "一律5点・dropout OFFの既存Body代表選出規則。追加配分や部位選択で選び直しません。",
         "quant_scope": "UNet＋TE1＋TE2", "scope_note": "同じsnapshot・入力・noise・timestepで配分を比較。dropout ONは追加確認です。",
         "loss_label": "raw MSE" if has_mse else "学習目的関数のloss",
-        "loss_note": "予測誤差はモデル全体の値です。部位ごとへ分解しません。" if has_mse else "raw MSE未記録のため目的関数のlossを表示。raw MSEと混同しないでください。",
+        "loss_contract": loss_spec,
+        "loss_note": "予測誤差はモデル全体の値です。部位ごとへ分解しません。" if has_mse else
+            ("raw MSEが一部未記録のため、全条件を学習目的関数のlossに統一して表示します。" if loss_spec["selection_reason"] == "raw_mse_partially_missing" else
+             "raw MSE未記録のため学習目的関数のlossを表示します。") + "raw MSEとは異なります。",
         "warmup": warmup, "skipped": contract["skipped"], "meta": {"images": len(images), "groups": len(source_ids), "timestep_bins": contract["bins"],
             "noise_replicas": contract["candidate_noises"], "quant_repeats": contract["quant_repeats"], "step": contract["step"],
             "total_groups": contract["source_map"].get("source_group_count_total", len(source_ids)),
@@ -156,8 +162,20 @@ def write_standard_report(profile_dir, output_dir, *, iterations=2000):
     contract = json.loads((profile_dir / "spatial_contract.json").read_text(encoding="utf-8"))
     observations = read_lines(profile_dir / "spatial_observations.jsonl")
     data_dir = profile_dir / "data_diagnostics"
-    data, public = build_data(contract, observations, inventory=read_lines(data_dir / "inventory.jsonl"),
-        references=read_lines(data_dir / "reference_probes.jsonl"), iterations=iterations)
+    inventory = read_lines(data_dir / "inventory.jsonl")
+    from dq_profile.diagnostic_report import report_thumbnails
+    preview_dir = output_dir / "data_diagnostics"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    old_cache = data_dir / "thumbnails.json"
+    if old_cache.is_file() and not (preview_dir / "thumbnails.json").exists():
+        shutil.copyfile(old_cache, preview_dir / "thumbnails.json")
+    measured_paths = {str(Path(row["image_key"]).resolve()).casefold() for row in observations}
+    thumbnail_samples = [{**item, "measured": str(Path(item["path"]).resolve()).casefold() in measured_paths}
+                         for item in inventory if item.get("image_id")]
+    thumbnails = report_thumbnails(preview_dir, thumbnail_samples) if thumbnail_samples else {}
+    data, public = build_data(contract, observations, inventory=inventory,
+        references=read_lines(data_dir / "reference_probes.jsonl"), thumbnails=thumbnails, iterations=iterations)
+    data["datasets"][0]["legacy_detail_url"] = "data_diagnostics/dataset_report.html" if (preview_dir / "dataset_report.html").is_file() else None
     practical = output_dir / "practical_report.json"
     if practical.exists():
         original_body = json.loads(practical.read_text(encoding="utf-8"))["datasets"][0]["body_representative_mul"]
@@ -179,20 +197,20 @@ def write_standard_report(profile_dir, output_dir, *, iterations=2000):
     fingerprint_path = output_dir / "protocol_fingerprint.json"
     measurement_contract["protocol_fingerprint_sha256"] = (
         hashlib.sha256(fingerprint_path.read_bytes()).hexdigest() if fingerprint_path.is_file() else None)
-    write_json(output_dir / "ai_summary.json", {"version": STANDARD_VERSION, "conditions": contract["conditions"],
+    write_json(output_dir / "ai_summary.json", {"schema_version": SHARED_DATA_VERSION, "version": STANDARD_VERSION, "conditions": contract["conditions"],
         "body_mul": contract["body_mul"], "skipped": contract["skipped"], "measurement": dataset["meta"],
         "measurement_contract": measurement_contract,
+        "loss_contract": dataset["loss_contract"],
         "quant_scope": dataset["quant_scope"], "metrics": dataset["regimes"], "warmup": dataset["warmup"],
         "weighting": {"gradient": "source_equal_then_observation_equal", "warmup_and_image_loss": "image_equal"},
         "not_image_quality": True})
-    write_json(output_dir / "observations.json", {"version": STANDARD_VERSION, "rows": public})
+    write_json(output_dir / "observations.json", {"schema_version": SHARED_DATA_VERSION, "version": STANDARD_VERSION,
+        "loss_contract": dataset["loss_contract"], "rows": public})
     if (output_dir / "report.html").exists() and not (output_dir / "uniform_report.html").exists():
         shutil.copyfile(output_dir / "report.html", output_dir / "uniform_report.html")
     shutil.copyfile(output_dir / "beginner_report.html", output_dir / "report.html")
     outputs = ["report.html", "beginner_report.html", "dataset_report.html", "report.js", "report.css", "data.js", "plotly.min.js", "ai_summary.json", "observations.json"]
-    sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
-    write_json(output_dir / "standard_report_manifest.json", {"version": STANDARD_VERSION,
-        "inputs": {name: sha(profile_dir / name) for name in ("spatial_contract.json", "spatial_observations.jsonl")},
-        "outputs": {name: sha(output_dir / name) for name in outputs}, "external_network_required": False,
-        "validation": "component statistics and paired cells checked"})
+    from dq_profile.report_publication import finalize_report_manifests
+    finalize_report_manifests(output_dir, standard_version=STANDARD_VERSION,
+        inputs=[profile_dir / name for name in ("spatial_contract.json", "spatial_observations.jsonl")], outputs=outputs)
     return outputs + ["standard_report_manifest.json"]

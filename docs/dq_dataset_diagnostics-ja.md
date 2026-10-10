@@ -9,6 +9,9 @@
 名称・実験の背景・TE固定・dropoutの方針は
 [診断ガイドの標準仕様](dq_dataset_profiler-ja.md#spatial-diagnostic-spec)にまとめています。
 以下の「実行する」以降は追加画像診断の共通基盤と旧入口の説明です。v2はwarmup記録を既定で有効にします。
+画像詳細には保存時のcaption・学習設定・サムネイルを引き継ぎます。同じ画像の複数学習設定は
+混同せず併記し、必要に応じて「従来の画像詳細」リンクから提示履歴などを確認できます。
+ローカル表示用の`data.js`と、実パス・captionを含まない共有JSONは用途を分けてください。
 
 `dataset_report.html`上部の「mul選択」を**診断条件選択**へ拡張します。
 選択肢には一律5点と「attn2・TE高mul型」のBody基準2条件・固定基準を置きます。
@@ -67,7 +70,7 @@ python -m dq_profile `
 
 `warmup`は学習準備直後の実際のLoRA初期状態をCPUに保存します。Localで確定したlatent・noise・target・caption/token・crop/flip条件を使い、その初期状態でもforwardします。学習対象TEのembeddingも初期TE-LoRAから再計算します。backwardやoptimizer更新は行いません。前後のRNG・network・optimizer・scheduler・scaler・guardian等を照合し、復元失敗は実行エラーとします。
 
-既定は`off`です。小さなCPU/CUDAモデルと実際の診断用LoRAを用いたテストはありますが、全SDXLのoff/local/warmup比較は未実施です。warmupの既定有効化はその確認後に行います。`off`でも以下の52画像契約は共通です。
+旧`canonical-v1`の既定は`off`、新`canonical-v2`の既定は`warmup`です。小さなCPU/CUDAモデルと実際の診断用LoRAを用いたテストはありますが、新標準経路全体のSDXL GPU受入は未実施です。`off`でも以下の52画像契約は共通です。
 
 ## 「量子化前」と「量子化後」の区別
 

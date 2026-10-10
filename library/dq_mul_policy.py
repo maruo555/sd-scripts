@@ -193,7 +193,7 @@ class MulPolicy:
 
 
 def fixed_policy_resume_record(record):
-    """Persist semantic policy identity, independent of the input file path."""
+    """Persist the normalized declaration and resolved assignments, not the input path."""
     if record is None:
         return None
     declaration = MulPolicy.from_dict(record["declaration"]).to_dict()
@@ -216,7 +216,7 @@ def validate_fixed_policy_resume(train_state, current_record):
     if expected is None:
         raise ValueError("Resume state requires the same fixed mul settings (CLI overrides or dq_delta_policy_file).")
     if saved != expected:
-        raise ValueError("Fixed mul policy or resolved module assignments differ from the resume state. Start a new run for changed settings.")
+        raise ValueError("Fixed mul policy or resolved module assignments differ from the resume state. Resume with the original declaration; equivalent expanded values alone are insufficient. Start a new run when switching declaration formats or settings.")
 
 
 

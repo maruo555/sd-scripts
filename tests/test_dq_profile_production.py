@@ -858,15 +858,17 @@ def test_direct_module_entry_preserves_training_vector(monkeypatch: pytest.Monke
     assert result == 17
     assert captured["training_argv"] == training
     assert captured["kwargs"] == {
-        "preset_name": "canonical-v1",
+        "preset_name": "canonical-v2",
         "execution_mode_name": "standard",
         "output_base": DEFAULT_OUTPUT_BASE,
         "profile_name": "test",
         "preflight_only": False,
         "dry_run": False,
         "open_report": False,
-        "data_diagnostics": "off",
+        "data_diagnostics": None,
         "group_map": None,
+        "dropout_on": False,
+        "uniform_only": False,
     }
 
 

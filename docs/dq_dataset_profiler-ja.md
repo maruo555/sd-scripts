@@ -61,6 +61,8 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 独立Body解析、オフラインHTMLの表示を検証対象としています。
 **新プロトコル全体でのSDXL GPU実行・prefix/boundary受入は未実施**です。
 過去の研究実験の受入結果を、この新しい標準経路のGPU受入へ読み替えません。
+再実行できるCPUテスト、検証範囲、次のGPU受入項目は
+[標準診断の検証記録](dq_standard_validation-ja.md)を参照してください。
 
 ### 公開CLIと出力
 
@@ -98,6 +100,7 @@ attn2のQ/K/V/OutはDown/Mid/Upを通じて対象とし、FFは「その他UNet�
 | attn2・TE高mul型［Body基準・低側3.15］ | 3.15 | B | B / B | Body基準Aの低側3.15 |
 
 `B`は、一律5点・dropout OFF・全体集計で求めたBody代表mulです。
+この`B`は追加候補を作る規則であり、TEやattn2単独の最適mulや、最良画質を推定した値ではありません。
 名称が長い図では「固定基準」「Body基準 L=2.70」等に短縮し、配分表・ツールチップに
 `その他UNet / attn2 / TE1 / TE2`を明記します。旧ログの`attn2_A`等のID、学習済み
 重みのファイル名、元の観測記録は変更しません。新名称は表示名と旧称の対応として保存します。
@@ -191,7 +194,8 @@ Body推奨や安全判定を通過したことにはしません。
 ### dropout OFFを基本にする意味
 
 OFFは、量子化による変化をdropoutのマスク変動と分けて比較するための観測条件です。
-通常学習のdropoutを無効にする指定ではなく、warmup・prefixのdropout設定も変更しません。
+新しい配分・新しいデータセットや、dropoutを使う長時間学習の前には、OFFの結果が穏やかでも
+ONの追加確認を推奨します。通常学習のdropoutを無効にする指定ではなく、warmup・prefixのdropout設定も変更しません。
 既存研究ではOFF/ONの差が一様とは限らず、OFFだけで実学習の挙動を代表できるとは断定しません。
 
 ON追加確認では、候補とno-quantで同じマスクを使い、候補間でも入力・マスクを揃えます。
@@ -215,13 +219,16 @@ TEだけを変えた対照など、標準候補に含めない配分は研究用
   横軸はその他UNetのmul。一律は線と丸、Body基準は菱形、固定基準は星で区別し、
   高側mulは配分表示へ明記する。場所別の点を一律の線へ結んだり、未測定域を補間したりしない。
 - **元の勾配方向への成分**：元勾配との平行成分のP50/P05を表示する。
-  1は同じ強さ、0は平行成分なし、負は逆方向、1超は増幅。特徴の保持率や画質点とは呼ばない。
+  1は同じ平行成分、0は平行成分なし、負は逆方向、1超は増幅。
+  1でも直交方向の変化があり得るため、勾配全体が同じという意味ではない。特徴の保持率や画質点とは呼ばない。
 - **Warmupでの誤差減少（量子化OFF）**：共通warmup前後のモデル全体の誤差を表示する。
   未記録なら欠測とし、別runの初期値で埋めない。
 - **量子化による変化**：warmup後の同じ重み・同じ入力で量子化OFF/ONの誤差差を表示する。
   追加学習後の改善や、学習の強さを直接予測する値とはしない。
 
 基本の部位選択は「全体」「TE全体」「TE1」「TE2」「UNet全体」「attn2」「attn2以外のUNet」。
+部位別の値は、全体で量子化した結果としてその部位に現れた勾配反応です。
+TEの勾配変化をTE自身のdelta量子化誤差と同一視せず、原因の特定には介入条件の比較が必要です。
 部位を変えるのは勾配指標であり、モデル全体の予測誤差をTE用MSE等に分解しません。
 FF、attn1、Down/Mid/Up、Q/K/V/Outなどの追加軸は研究・詳細拡張に留め、基本画面には増やしません。
 
@@ -241,6 +248,16 @@ AI用データには条件ID、旧称、全配分、実際の量子化対象、r
 source-map版、候補の再利用元、部位別統計、欠測理由を保存します。必要に応じて
 匿名IDの観測行も書き出します。画面に出さない数値を捨てず、配布用の集計と
 実パス・captionを含むローカル記録を分けます。
+共有JSONの`schema_version=spatial-shared-v2`では、`loss_contract`に使用する誤差の種類・定義・
+raw MSEの記録率と欠測理由を保存します。観測行は`raw_mse`と`objective_loss`を別々に保持します。
+全行にraw MSEが揃う場合だけMSEで比較し、一部でも欠ければ全条件をobjective lossに統一します。
+互換用の`reference_loss`／`quantized_loss`には選択した種類を入れ、行の`loss_kind`で明示します。
+
+ローカルの画像詳細にはcaption・subset・repeat・提示履歴と保存済みサムネイルを残します。
+同じ画像に複数の学習設定がある場合は全設定を表示し、その中からwarmup反応を推測で選びません。
+これらの個人データは共有JSONに含めません。
+最終HTMLの全書き出し後に`analysis_manifest.json`と`standard_report_manifest.json`の
+出力パス・SHA-256を更新します。解析stageの元manifestと観測入力の記録は保持します。
 
 データセット間で絶対値を比べるときは、量子化対象・probe regime・モデル・warmup・
 重み付け等の測定条件も併記します。同じ目盛にしただけでは同じ比較条件にはなりません。
@@ -314,7 +331,7 @@ Local計測へ進みません。
 ここが製品レポートの診断本体です。optimizer更新を行わず、同じ画像、noise、timestepで
 no-quantと各固定mulの勾配を比較します。
 
-- 画像数: Standard／Strictとも8～32。上限を超えてもprobe budgetは増えない。
+- 画像数: Standard／Strictとも8～52。上限を超えてもprobe budgetは増えない。
 - timestep: 4帯。
 - no-quant: 3 noise replicas。
 - 各mul: 2 noise replicas × 2 stochastic quant repeats。
@@ -704,11 +721,11 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | 項目 | 固定値・動作 |
 |---|---|
 | 製品scope | Local Body／Tail Safety/Fidelity。最終画質Utilityではない |
-| probe画像数 | Standard／Strictとも`min(dataset実画像数, 32)`。最低8画像 |
+| probe画像数 | Standard／Strictとも`min(dataset実画像数, 52)`。最低8画像 |
 | timestep bins | `4` |
 | no-quant replicas | noise 3回 |
 | candidate replicas | noise 2回 × stochastic quant 2回 |
-| Local dropout | off (`structural_dropout_off`) |
+| Local dropout | 基本はoff (`structural_dropout_off`)。v2はCLI指定で対応付きON確認を追加 |
 | Prefix dropout | on。通常学習に近いprefix再現性検査 |
 | update branch | 製品Localでは0。128-step Trajectoryは研究専用で実行しない |
 | Guardian ablation | `common_only` |
@@ -719,6 +736,10 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 
 ### 6.5 execution modeごとのQA・候補探索契約
 
+以下のgrid・edge extension・GPU process数は旧`canonical-v1`の候補探索です。
+新`canonical-v2`では両modeとも一律5点を使い、edge extensionは行いません。
+その後にBody基準の追加配分を同じLocal workerで計測します。snapshot／prefixのQA深度は下表のままです。
+
 | 項目 | `standard` | `strict` |
 |---|---|---|
 | 用途 | 日常の正式dataset診断 | コード／CUDA／PyTorch／bitsandbytes変更後、リリース前、再現性調査 |
@@ -726,7 +747,7 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | Prefix | 8A／8B／16@8 | 64A／64B／128@64 |
 | state checkpoints | `0, 1, 4, 8` | `0, 1, 32, 64` |
 | Prefix branch updates | 64 | 512 |
-| Local画像上限 | 32 | 32 |
+| Local画像上限 | 52 | 52 |
 | 最初のgrid | `2.70, 3.15, 3.45, 3.75, 4.05` | `2.70, 3.15, 3.45` |
 | edge extension | なし。端点傾向は未解決として表示 | 最大2 round、拡張gridを再測定してparity検査 |
 | GPU process数 | 3 | 4～6 |

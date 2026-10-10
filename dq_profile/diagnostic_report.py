@@ -66,7 +66,7 @@ def write_report(path, payload):
     Path(path).write_text(template.replace("__DATASET_PAYLOAD__", data), encoding="utf-8")
 
 
-def promote_dataset_report(profile, run_dir, selection):
+def promote_dataset_report(profile, run_dir, selection, *, finalize=True):
     from dq_profile.dataset_diagnostics import rebuild, write_json
     source, dest = Path(profile) / "data_diagnostics", Path(run_dir) / "data_diagnostics"
     if not (source / "manifest.json").is_file():
@@ -94,14 +94,7 @@ def promote_dataset_report(profile, run_dir, selection):
             if count != 1:
                 raise ValueError(f"cannot link dataset report from {name}")
             path.write_text(html, encoding="utf-8")
-    analysis_path = Path(run_dir) / "analysis_manifest.json"
-    if analysis_path.is_file():
-        import hashlib
-        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
-        reports = analysis.setdefault("reports", {})
-        for key, name in (("primary", "report.html"), ("beginner", "beginner_report.html"), ("technical", "technical_report.html")):
-            path = Path(run_dir) / name
-            if path.is_file():
-                reports.setdefault(key, {}).update(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
-        write_json(analysis_path, analysis)
+    if finalize:
+        from dq_profile.report_publication import finalize_report_manifests
+        finalize_report_manifests(run_dir)
     return [p.relative_to(run_dir).as_posix() for p in dest.iterdir() if p.is_file()]

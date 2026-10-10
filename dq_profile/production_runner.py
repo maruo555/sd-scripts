@@ -537,7 +537,7 @@ def build_protocol_fingerprint(
     )
     if request.preset.name == "canonical-v2":
         code_files = (*code_files, *(REPO_ROOT / "dq_profile" / name for name in
-            ("spatial.py", "spatial_runtime.py", "spatial_report.py")),
+            ("spatial.py", "spatial_runtime.py", "spatial_report.py", "spatial_report_data.py", "report_publication.py")),
             *sorted((REPO_ROOT / "dq_profile" / "spatial_assets").glob("*")))
     tracked_state = git_tracked_state()
     training_contract = request.preset.contract()
@@ -1577,10 +1577,13 @@ def run_profile_request(
         selection = read_json(run_dir / "local_selection.json")
         if request.data_diagnostics != "off":
             from dq_profile.diagnostic_report import promote_dataset_report
-            promoted.extend(promote_dataset_report(active_profile, run_dir, selection))
+            promoted.extend(promote_dataset_report(active_profile, run_dir, selection, finalize=False))
         if request.preset.name == "canonical-v2":
             from dq_profile.spatial_report import write_standard_report
             promoted.extend(write_standard_report(active_profile, run_dir))
+        else:
+            from dq_profile.report_publication import finalize_report_manifests
+            finalize_report_manifests(run_dir)
         update_status(
             run_dir,
             status="complete",

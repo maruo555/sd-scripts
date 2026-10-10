@@ -241,11 +241,11 @@ def resolve_training_cli(
         if dest == "network_args":
             if _network_args_ok(value):
                 dispositions.append(
-                    _disposition(option, dest, value, "matched_preset", "canonical-v1 rank_dropout=0.2")
+                    _disposition(option, dest, value, "matched_preset", f"{preset.name} rank_dropout=0.2")
                 )
             else:
                 issues.append(
-                    CompatibilityIssue(option, dest, value, "canonical-v1 supports only network_args rank_dropout=0.2")
+                    CompatibilityIssue(option, dest, value, f"{preset.name} supports only network_args rank_dropout=0.2")
                 )
             continue
         if dest == "fp16_safe_norms":
@@ -254,15 +254,15 @@ def resolve_training_cli(
                     _disposition(option, dest, value, "matched_preset", "accepted as the strict safe-norms alias")
                 )
             else:
-                issues.append(CompatibilityIssue(option, dest, value, "canonical-v1 requires fp16 safe norms"))
+                issues.append(CompatibilityIssue(option, dest, value, f"{preset.name} requires fp16 safe norms"))
             continue
         if dest == "fp16_safe_norms_mode":
             if str(value).casefold() == "strict":
                 dispositions.append(
-                    _disposition(option, dest, value, "matched_preset", "canonical-v1 requires strict mode")
+                    _disposition(option, dest, value, "matched_preset", f"{preset.name} requires strict mode")
                 )
             else:
-                issues.append(CompatibilityIssue(option, dest, value, "canonical-v1 requires fp16_safe_norms_mode=strict"))
+                issues.append(CompatibilityIssue(option, dest, value, f"{preset.name} requires fp16_safe_norms_mode=strict"))
             continue
         if dest in preset.expected_explicit:
             expected = preset.expected_explicit[dest]

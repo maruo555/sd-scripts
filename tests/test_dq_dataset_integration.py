@@ -83,6 +83,9 @@ def test_promote_creates_links_and_keeps_selection_unchanged(tmp_path):
     before=copy.deepcopy(selection)
     for name in ('report.html','beginner_report.html','technical_report.html'):
         (run/name).write_text('<html><body>existing report</body></html>',encoding='utf-8')
+    from dq_profile.report_publication import file_record
+    manifest = {'reports': {name: file_record(run/name) for name in ('report.html','beginner_report.html','technical_report.html')}}
+    (run/'analysis_manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
     artifacts=promote_dataset_report(profile,run,selection)
     assert 'data_diagnostics/dataset_report.html' in artifacts
     assert selection==before
@@ -90,6 +93,10 @@ def test_promote_creates_links_and_keeps_selection_unchanged(tmp_path):
     summary=json.loads((run/'data_diagnostics/dataset_summary.json').read_text(encoding='utf-8'))
     assert summary['manifest']['local_selection']['selection_valid'] is False
     assert summary['manifest']['selector_input'] is False
+    import hashlib
+    published = json.loads((run/'analysis_manifest.json').read_text(encoding='utf-8'))
+    for record in published['reports'].values():
+        assert record['sha256']==hashlib.sha256(Path(record['path']).read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize("mode", ["off", "local", "warmup"])

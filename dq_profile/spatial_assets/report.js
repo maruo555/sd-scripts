@@ -82,6 +82,8 @@
     el('nav-beginner').href=`beginner_report.html?${params}`;
     if(state.regime==='both') params.set('regime','off');
     el('nav-dataset').href=`dataset_report.html?${params}`;
+    const legacy=el('legacy-detail');
+    if(legacy){legacy.hidden=!d.legacy_detail_url;if(d.legacy_detail_url)legacy.href=d.legacy_detail_url;}
   }
   function perSample(sample,cid,regime=activeRegime(),part=state.part) {
     const rows=(sample.bins[regime]||[]).filter(b=>state.bin==='all'||String(b.bin)===state.bin);
@@ -255,12 +257,35 @@
     plot('entity-comparison',traces,{margin:{l:metric==='d'?72:90,r:20,t:37,b:115},xaxis:{type:'category',categoryorder:'array',categoryarray:d.candidates.map(v=>v.short),tickangle:-30},yaxis:{title:{text:metric==='d'?`${d.views[state.part]}の平均d`:'予測誤差の差 C − B'},...(metric==='d'?{rangemode:'tozero'}:{tickformat:'.6f'}),gridcolor:'#e7edf4',zeroline:true,zerolinecolor:'#98abbe'}},p=>selectCondition(p.customdata[0]));
     el('entity-title').textContent=state.entityKind==='image'?`選んだ画像の条件別比較 · ${entity.id}`:`選んだグループの条件別比較 · ${entity.samples.length}入力`;
     el('sample-name').textContent=entity.label;
-    const preview=el('sample-preview');preview.hidden=state.entityKind!=='image'||!entity.samples[0].image_uri;
-    if(!preview.hidden){preview.src=entity.samples[0].image_uri;preview.alt=entity.samples[0].name;}else preview.removeAttribute('src');
+    imageContext(state.entityKind==='image'?entity.samples[0]:null);
     const selected=rows.find(x=>x.c.id===c.id).m;
     el('sample-info').innerHTML=[['入力数',String(entity.samples.length)],['観測する部位',d.views[state.part]],['選択中の平均d',fmt(selected.d)],['量子化OFFの誤差',fmt(selected.reference_loss,6)],['量子化ONの誤差',fmt(selected.quantized_loss,6)],['予測誤差の差',signed(selected.delta,6)]].map(([k,v])=>`<div class="keyline"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
     el('sample-loss-note').textContent=d.loss_note+' 各条件は同じ対象を使い、各入力を等重みで比較しています。';
     el('condition-table').innerHTML='<thead><tr><th>診断条件 / 配分</th><th>平均d</th><th>Bの予測誤差</th><th>Cの予測誤差</th><th>差 C−B</th><th>観測数</th></tr></thead><tbody>'+rows.map(({c:v,m})=>`<tr data-candidate="${esc(v.id)}" class="${v.id===c.id?'selected':''}"><td class="label"><button class="rowlink" data-candidate="${esc(v.id)}">${esc(v.label)}</button><span class="sub">${esc(v.assignment_label)}</span></td><td>${fmt(m.d)}</td><td>${fmt(m.reference_loss,6)}</td><td>${fmt(m.quantized_loss,6)}</td><td>${signed(m.delta,6)}</td><td>${m.observations}</td></tr>`).join('')+'</tbody>';
+  }
+  function imageContext(sample) {
+    const preview=el('sample-preview'),note=el('sample-preview-note'),panel=el('sample-context-panel'),content=el('sample-contexts');
+    preview.hidden=!sample?.image_uri;preview.onerror=null;note.textContent='';content.replaceChildren();
+    panel.hidden=!sample;
+    if(!sample){preview.removeAttribute('src');return;}
+    if(!preview.hidden){
+      preview.alt=sample.name;
+      preview.onerror=()=>{preview.hidden=true;note.textContent='保存済みサムネイルと元画像を表示できません。測定値は引き続き参照できます。';};
+      preview.src=sample.image_uri;
+      note.textContent=(sample.preview_kind==='cached_thumbnail'?'保存済みサムネイル':'元画像を参照')+'。学習時のcrop・変換後の入力とは異なる場合があります。';
+    }
+    const contexts=sample.contexts||[];
+    const warning=document.createElement('p');warning.className='small';
+    warning.textContent=sample.inventory_match==='multiple_contexts'?'同じ画像に複数の学習設定があります。どれか1つのcaptionやwarmup反応を、この測定の条件として決めつけません。':contexts.length?'診断時に保存した学習設定です。':'この測定にはcaption・学習設定を保存していません。';
+    content.append(warning);
+    for(const [index,context] of contexts.entries()){
+      const section=document.createElement('div');section.className='sample-context';
+      const title=document.createElement('h4');title.textContent=`学習設定 ${index+1}`;section.append(title);
+      const resolution=value=>Array.isArray(value)?value.join(' × '):value??'未記録';
+      const fields=[['caption',context.caption??'未記録'],['class tokens',context.class_tokens??'未記録'],['dataset / subset',`${context.dataset_index??'—'} / ${context.subset_index??'—'}`],['subset group',context.subset_group??'未記録'],['解像度 / bucket',`${resolution(context.resolution)} / ${resolution(context.bucket_resolution)}`],['repeat / 正則化画像',`${context.num_repeats??'—'} / ${context.is_reg==null?'未記録':context.is_reg?'あり':'なし'}`],['提示 / 更新 / skip回数',`${context.presented_count??'—'} / ${context.updated_count??'—'} / ${context.skipped_count??'—'}`]];
+      for(const [label,value] of fields){const line=document.createElement('p'),b=document.createElement('b'),text=document.createElement('span');b.textContent=label;text.textContent=String(value);line.append(b,text);section.append(line);}
+      content.append(section);
+    }
   }
   function datasetPage() {
     el('bin').value=state.bin;el('sort').value=state.sort;el('compare-metric').value=state.compareMetric;
