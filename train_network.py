@@ -5063,7 +5063,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=str,
         default="both",
         choices=["unet", "te", "both"],
-        help="Apply delta fake-quant to: unet, te, or both / Δのフェイク量子化の適用範囲（unet/te/both）",
+        help=(
+            "Legacy scope hint; ordinary networks.lora step control enables both UNet and TE. "
+            "Direct mul overrides also target both. Log/auto scope still follows this value. / "
+            "従来の対象指定。通常のnetworks.lora学習ではstep制御によりUNet・TEとも量子化。"
+            "部位別mul指定も両方が対象。ログ・自動調整の対象指定は引き続き有効"
+        ),
     )
     parser.add_argument(
         "--dq_quantize_z",

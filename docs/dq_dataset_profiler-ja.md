@@ -189,7 +189,11 @@ Body推奨や安全判定を通過したことにはしません。
 レポートには各条件の全配分と、`--dq_delta_range_mul`、`--dq_delta_range_mul_attn2`、
 `--dq_delta_range_mul_te`等の対応する引数を表示します。Body代表を使う場合も`B`という記号を
 渡さず、診断で確定した数値を記載します。利用者は同じ引数を手入力しても学習できます。
-直接指定の学習側実装と上書き順序は[通常学習への適用](dq_mul_research-ja.md#通常学習への明示的な適用)を参照してください。
+必要なら`--dq_delta_range_mul_te1` / `--dq_delta_range_mul_te2`でTE共通値を個別に上書きできます。
+直接指定は固定bits・RMSのdelta量子化用で、自動mul調整・bits schedule・z量子化とは併用できません。
+通常学習では`--dq_delta_scope unet`のままでもTE用mulが有効です。
+コマンド例とログ対象は[量子化ガイド](dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)、
+学習側実装・再開時の一致条件は[通常学習への適用](dq_mul_research-ja.md#通常学習への明示的な適用)を参照してください。
 
 ### dropout OFFを基本にする意味
 

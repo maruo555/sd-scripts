@@ -2,6 +2,12 @@
 
 **新規インストールは[README冒頭の「このforkのWindows導入手順」](README.md#windows-installation-maruo)を参照してください。** 確認済み構成、pip更新、NumPyの制約、導入確認、任意機能への案内を一か所にまとめています。
 
+このforkの場所別mul指定（`--dq_delta_range_mul_attn2`、`--dq_delta_range_mul_te`、
+`--dq_delta_range_mul_te1`、`--dq_delta_range_mul_te2`）は
+[量子化ガイド](docs/dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)、
+実用例は[SDXL LoRA推奨設定一覧](docs/sdxl_lora_recommended_settings-ja.md#dq_delta-関連オプション)、
+TE込みの新しい診断は[診断利用ガイド](docs/dq_dataset_profiler-ja.md)を参照してください。
+
 以下は本家由来の参考ドキュメントです。旧Windows導入・更新節は取り込み当時の内容を折りたたんで残しており、現在のforkには適用しません。
 
 ---

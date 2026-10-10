@@ -57,9 +57,32 @@
 
 Tritonの導入方法、コード上の対応条件、長時間学習で検証済みの範囲は [triton_windows_setup.md](triton_windows_setup.md) を参照。
 
-部位別mulの直接指定には診断ファイルは不要です。固定bits・RMSのdelta量子化に対応し、
-自動mul調整・bits schedule・z量子化とは併用できません。基本値への上書き順序と
-コマンド例は[通常学習への適用](dq_mul_research-ja.md#通常学習への明示的な適用)を参照してください。
+### 場所別の固定mulをCLIで指定する
+
+SDXLの`--network_module networks.lora`で、次の引数を通常の学習コマンドへ追加します。
+診断結果のJSONを読み込む必要はありません。これは研究で有望だった
+**attn2・TE高mul型**（旧候補A）の比較用設定例で、全データ共通の推奨値ではありません。
+
+```text
+--dq_delta_bits 8 --dq_delta_granularity channel --dq_delta_stat rms --dq_delta_mode stoch
+--dq_delta_begin_after_lr_warmup --dq_delta_scope both
+--dq_delta_range_mul 2.70 --dq_delta_range_mul_attn2 3.75 --dq_delta_range_mul_te 3.75
+```
+
+上は複数行で示した追加引数です。既存コマンドに加えるときは、使用するシェルに合わせて連結してください。
+その他UNetは2.70、attn2のQ/K/V/Outは3.75、TE1・TE2は3.75になります。
+`--dq_delta_range_mul_te2 3.45`も指定すれば、TE2だけ3.45です。
+
+- 基本値は`--dq_delta_range_mul`。attn2は専用値、TEは「個別値 > TE共通値 > 基本値」の順で解決します。コマンドに書いた順番には依存しません。
+- 新しい4引数はすべて既定`None`。指定しなければ従来の学習経路を維持します。mulは有限の正数で指定します。
+- 固定bits・`stat=rms`・delta量子化専用です。`--dq_delta_auto_range_mul`、`--dq_delta_bits_sched`、`--dq_quantize_z`、研究用`--dq_delta_policy_file`との併用はエラーになります。
+- 指定先のLoRAが存在しなければエラーです。例えばTE1だけを学習する構成では、TE2も指定する共通`_te`ではなく`_te1`を使います。学習対象や学習率を追加する引数ではありません。
+- `--dq_delta_scope unet`のままでもTE用mulは有効です。TE込みの意図を明示する新しいコマンドでは`both`を推奨します。TEの統計ログも必要なら`--dq_delta_log --dq_delta_log_scope both`を指定します。
+- `--resume`では保存時と同じ宣言・配分が必要です。省略・変更やJSONからCLIへの切替は、実効値が等しくても宣言が違えば拒否します。
+
+既存の自動調整レシピから切り替える場合は、上の引数を足すだけでなく、自動調整とbits scheduleを外してください。
+対応範囲・保存再開の詳細は[通常学習への適用](dq_mul_research-ja.md#通常学習への明示的な適用)、
+CPU検証済み／GPU受入待ちの区別は[検証記録](dq_standard_validation-ja.md)を参照してください。
 
 ### 現行通常学習のscopeと、`both`への移行
 
@@ -105,7 +128,7 @@ mulの推移や学習結果も変え得ます。自動調整を含む過去レ�
 
 通常学習のTE量子化を維持するため、部位別CLIの追加では従来のscopeの限定漏れを修正していません。
 診断のTE込み固定化と、既存`canonical-v1`の互換性については
-[次期標準診断の仕様](dq_dataset_profiler-ja.md#spatial-diagnostic-spec)を参照してください。
+[標準診断の仕様](dq_dataset_profiler-ja.md#spatial-diagnostic-spec)を参照してください。
 
 ### 量子化モードの前提
 

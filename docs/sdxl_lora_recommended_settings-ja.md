@@ -76,23 +76,68 @@
 
 ## dq_delta 関連オプション
 
-最初は付けずに学習する方が無難なので、量子化系オプションは別表に分離
+量子化なしを基準にしつつ、画風・ポーズの柔軟性と再現性のバランスを試すための設定です。
+以下は**固定mulで比較するときの共通設定**です。場所別配分と従来の自動調整は後の別表から選びます。
 
 | 設定項目 | 値 | 解説 | 補足説明 |
 |---|---|---|---|
-| `--dq_delta_bits`（独自） | 8 | dq_delta の量子化ビット数 | フェイク量子化の粗さ 基本は8bit(スケジュールする場合は上書きされる) 処理時間が1.5倍くらいになるが上手くいけば柔軟な学習結果になる |
+| `--dq_delta_bits`（独自） | 8 | dq_delta の量子化ビット数 | 固定8bit。追加コストと画像の変化は環境・データ・設定による |
 | `--dq_delta_granularity`（独自） | channel | dq_delta の粒度 | チャネル別に統計 |
 | `--dq_delta_stat`（独自） | rms | dq_delta の統計基準 | range_mul の基準 |
-| `--dq_delta_range_mul`（独自） | 3.0 | dq_delta のレンジ倍率 | 量子化レンジの広さ |
+| `--dq_delta_range_mul`（独自） | 比較する値（CLI既定3.0） | 全体の基本mul | 場所別指定がある部分だけ上書き。一律診断の5点は2.70 / 3.15 / 3.45 / 3.75 / 4.05 |
 | `--dq_delta_mode`（独自） | stoch | dq_delta の丸め方式 | 確率的丸め |
 | `--dq_delta_begin_after_lr_warmup`（独自） | 有効 | 学習率のwarmup完了後からdq_delta を開始 | 事前に学習率のwarmupをすることで量子化を安定させる |
-| `--dq_delta_scope`（独自） | unet | dq_delta の適用対象 | U-Net のみ |
-| `--dq_delta_bits_sched`（独自） | `0.0:8,0.9:10` | 進行率で bits を切替 | 終盤で刻みを細かくする 効果があるか不明　途中でbit数を増やすのと破綻しやすくなる可能性もありそう |
+| `--dq_delta_scope`（独自） | both | TE込みの意図を明示 | 現行の通常学習では`unet`指定でもstep処理後にTEが量子化される。場所別CLIはこの挙動を維持 |
 | `--dq_delta_log`（独自） | 有効 | dq_delta の統計ログを出力 | クリップ率等の確認用 |
-| `--dq_delta_auto_range_mul`（独自） | 有効 | clip_rate を見て range_mul を自動調整 | 過/不足クリップを自動補正 データセットによっては初期値から変わらないこともある |
-| `--dq_delta_auto_preset`（独自） | clip_rate_high | auto 調整のプリセット | clip_low/high を選択。`clip_rate_low_auto` はlow帯で開始し、`QErrPerClip` が高い状態が続くとmid帯へ逃がす |
-| `--dq_delta_auto_init_range_mul_from_band`（独自） | 有効 | clip 帯中心から range_mul 初期値を算出 | `stat=rms` 前提 適正なrange_mulからスタートすることで安定させる |
-| `--dq_delta_auto_use_raw`（独自） | 有効 | auto 判定に ema だけでなくraw も併用 | range_mulの変化をなだらかにする |
+| `--dq_delta_log_scope`（独自） | both | TEとUNetをログ集計 | 旧`scope=unet`のまま学習する場合も、TEのログが必要なら明示する |
+
+### 一律mulと、attn2・TE高mul型の比較
+
+SDXLの`--network_module networks.lora`用です。診断ファイルには依存せず、学習コマンドへ直接書けます。
+研究ではattn2・TE高mul型に好ましい質感や柔軟性が観察されたため比較候補に追加しました。
+全データに有効、または診断スコアが良ければ高画質になる、という意味ではありません。
+
+| 配分 | 追加するmul引数 | 読み方 |
+|---|---|---|
+| 一律の基準 | `--dq_delta_range_mul 3.75` | 全部位3.75の例。値は診断と画像評価に応じて選ぶ |
+| attn2・TE高mul型の固定参照（旧A） | `--dq_delta_range_mul 2.70 --dq_delta_range_mul_attn2 3.75 --dq_delta_range_mul_te 3.75` | その他UNet2.70、attn2 / TE1 / TE2は3.75 |
+| Body基準の追加候補 | 基本mulを2.70または3.15、attn2用mulとTE共通mulを診断のBody代表値にする | Bodyが求まらない・高低が逆転する場合は自動追加しない。同一配分は再利用する |
+
+新しく追加した4引数はすべて既定`None`です。
+
+| オプション | 対象・優先順位 |
+|---|---|
+| `--dq_delta_range_mul_attn2` | UNetのattn2 Q/K/V/Out。未指定なら基本mul |
+| `--dq_delta_range_mul_te` | TE1とTE2の共通値。未指定なら基本mul |
+| `--dq_delta_range_mul_te1` | TE1だけ。共通TE値より優先 |
+| `--dq_delta_range_mul_te2` | TE2だけ。共通TE値より優先 |
+
+例えば固定参照に`--dq_delta_range_mul_te2 3.45`を加えると、TE2だけ3.45です。
+指定先のLoRAがない場合はエラーになります。`--dq_delta_scope unet`のままでもTE用mulは適用されます。
+既存の学習率・dropout・平均化等は別の設定です。新しいmul引数がそれらを変更することはありません。
+
+**場所別指定では固定bits・RMSのdelta量子化が必須です。** `--dq_delta_auto_range_mul`、
+`--dq_delta_bits_sched`、`--dq_quantize_z`、`--dq_delta_policy_file`は併用せず、過去のコマンドから外してください。
+`--resume`では保存時と同じ宣言・配分を維持します。
+詳しいコマンド例・制約は[量子化ガイド](dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)を参照してください。
+
+標準診断はTE込み固定・dropout OFFが既定で、必要なら`--dq-profile-dropout-on`でONも追加確認できます。
+これは**診断の比較方法**で、通常学習の`--network_dropout` / `rank_dropout`を外す指定ではありません。
+新標準を最初から最後まで通す実SDXL GPU受入はまだ未実施です。
+[検証済み範囲と次の受入手順](dq_standard_validation-ja.md)を参照してください。
+
+### 従来の自動mul調整・bits schedule（場所別固定mulとは別）
+
+以下は従来の比較用設定例です。上の場所別mulの引数とは混ぜずに使います。
+自動調整を含む過去コマンドの`scope`を`unet`から`both`へ変えると、制御用統計も変わるため同条件の再実行にはなりません。
+
+| オプション | 従来の設定例 | 意味 |
+|---|---|---|
+| `--dq_delta_auto_range_mul` | 有効 | clip_rateを見てmulを自動調整 |
+| `--dq_delta_auto_preset` | clip_rate_high | 目標clip帯。`clip_rate_low_auto`は誤差負荷に応じてlow帯からmid帯へ退避 |
+| `--dq_delta_auto_init_range_mul_from_band` | 有効 | 目標帯から初期mulを設定（auto有効、RMS時） |
+| `--dq_delta_auto_use_raw` | 有効 | EMAに加えてraw統計も判定に使う |
+| `--dq_delta_bits_sched` | `0.0:8,0.9:10`（任意） | 終盤でbitsを変更。固定8bitとは別条件 |
 
 ### 量子化のヒント
 

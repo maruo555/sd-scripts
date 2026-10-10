@@ -90,13 +90,45 @@ py -3.10 -m venv venv
 | `--skip_grad_norm`, `--skip_grad_norm_max`, `--grad_norm_log`, `--grad_cosine_log`<br>`--nan_to_window`, `--inf_to_window`<br>`--skip_nan_immediate`, `--skip_inf_immediate`,<br>`--no-skip_nan_immediate`, `--no-skip_inf_immediate` | 混在 | 勾配ノルムのスキップ/ログ/NaN・Inf 挙動を詳細制御。<br>`--skip_grad_norm` は *N=200* の移動平均+2.5σで超過更新をスキップし、`--skip_grad_norm_max` で上限キャップ。<br>`--grad_norm_log` は 100 step ごとにログを追記し、`--grad_cosine_log` で類似度を追加。<br>NaN/Inf の窓混入や即時スキップの可否を切替可能。 | 主要既定値: `skip_grad_norm` 無効、`skip_grad_norm_max` 無制限、`grad_norm_log`/`grad_cosine_log` 無効、`nan_to_window`/`inf_to_window` False、`skip_nan_immediate`/`skip_inf_immediate` True。<br>foreach高速経路、従来経路との分岐、対応dtypeの解説: [docs/gradnorm_foreach_fastpath-ja.md](docs/gradnorm_foreach_fastpath-ja.md) |
 | `--group_loss_log`, `--group_loss_ema_beta`,<br>`--group_loss_log_every_n_steps`, `--group_loss_epoch_summary` | 無効 (`beta=0.98`, `flush_every=100`) | subsetの `group` 単位で loss をオンラインEMA集計し、step/epoch CSVを出力。stepログは全step記録し、`every_n_steps` でまとめてflush。学習配分の偏り観測に使う。 | `batch_size=1` 専用。`skip_grad_norm` でskipされたstep・NaN/Inf stepは集計除外。詳細: [docs/group_loss_ema_logging-ja.md](docs/group_loss_ema_logging-ja.md) |
 | `--avg_cp` | **False** | 有効化するとエポック間の LoRA 重みを平均して安定化（SWA/EMA 相当）。<br>  推奨プリセット：`--avg_cp --avg_window 4 --avg_begin 0.6 --avg_mode ema --avg_reset_stats`<br>  併用オプション:<br>  • `--avg_window <int>` 平均に使うチェックポイント数。<br>  • `--avg_begin <0-1>` 学習の進行率。ここを過ぎてから窓に溜め始め、<br>    窓が満杯になったエポック以降で平均が発動。<br>    流れ：①エポック末に raw ckpt を保存 → ②窓が満杯なら平均 → ③平均後の<br>    重みで次エポックを開始。<br>  • `--avg_mode {uniform,ema,metric}` 平均方法。`uniform`=等重み, `ema`=指数移動平均,<br>    `metric`=指標重み付き（準備中）。<br>  • `--avg_reset_stats / --no_avg_reset_stats` 平均直後に Optimizer のモーメンタム統計を<br>    安全にリセットして発散を防ぐかどうか。<br>    注: `AdamW8bit` は optimizer state に `state1` / `state2` 等を使い、現行のリセット対象である `exp_avg` / `exp_avg_sq` / `exp_avg_max` を持たないため、実質何もリセットされません。 | LoRAを学習後に最後の数エポックを平均するといい結果になるという話があるので、学習後半から平均しながら学習を進められるるようにする検証用。<br>詳細: [docs/avg_cp_behavior-ja.md](docs/avg_cp_behavior-ja.md) |
-| `--dq_delta_step` / `--dq_delta_bits` | `None` | 学習のforwardで、LoRAの“差分出力(Δ)”だけをフェイク量子化（STE）。重み自体は量子化しないため、勾配は恒等で流れる。<br>指定方法は2通り:<br>• `--dq_delta_step <float>` = 等間隔の刻み幅を直接指定。<br>• `--dq_delta_bits <int>` = Nビットの等間隔量子化を模擬（推奨: 8）。`stat`と`range_mul`からスケールを自動算出し、[-Qmax,Qmax]でクランプ（Qmax=2^(N-1)-1）。<br>併用オプション:<br>• `--dq_delta_mode {det,stoch}` `det`=最近傍、`stoch`=確率的丸め。<br>• `--dq_delta_begin <0-1>` 学習進行率。この割合以降のみ有効化。<br>• `--dq_delta_begin_after_lr_warmup` lr_warmup_steps 後に開始（`--dq_delta_begin` より優先）。<br>• `--dq_delta_scope {unet,te,both}` 適用対象の限定（U-Netのみ/Text Encoderのみ/両方）。<br>• `--dq_delta_granularity {tensor,channel}` 粒度（テンソル全体/チャネル別）。<br>• `--dq_delta_stat {rms,absmax,none}` bits/stepのスケール基準（per-channel時はチャネルごとに計算）。<br>• `--dq_delta_range_mul <float>` bitsモード×`stat=rms`時の有効レンジ倍率（range=倍率×RMS、既定3.0）。<br>• `--dq_delta_bits_sched 'p1:bits1,p2:bits2,...'` 学習進行率pでビット数を段階的に切替（例: `0.0:6,0.5:8,0.8:10`）。<br>• `--dq_quantize_z` = Δ ではなく z=A(x) を量子化（B(Q(z))）。rank r の z を対象に統計を取るため軽量化。 | 実装は `networks/lora.py` の LoRA forward 内。SDXL でも有効。<br>仕組みの解説: [docs/dq_delta_mechanism-ja.md](docs/dq_delta_mechanism-ja.md)<br>※ LoRA-FA (`networks/lora_fa.py`) は現在メンテ対象外であり、サポートしていません。<br>※ `--dq_delta_bits` は上記解説の仕様準拠設定を推奨。 |
+| `--dq_delta_step` / `--dq_delta_bits` | `None` | 学習のforwardで、LoRAの“差分出力(Δ)”だけをフェイク量子化（STE）。重み自体は量子化しないため、勾配は恒等で流れる。<br>指定方法は2通り:<br>• `--dq_delta_step <float>` = 等間隔の刻み幅を直接指定。<br>• `--dq_delta_bits <int>` = Nビットの等間隔量子化を模擬（推奨: 8）。`stat`と`range_mul`からスケールを自動算出し、[-Qmax,Qmax]でクランプ（Qmax=2^(N-1)-1）。<br>併用オプション:<br>• `--dq_delta_mode {det,stoch}` `det`=最近傍、`stoch`=確率的丸め。<br>• `--dq_delta_begin <0-1>` 学習進行率。この割合以降のみ有効化。<br>• `--dq_delta_begin_after_lr_warmup` lr_warmup_steps 後に開始（`--dq_delta_begin` より優先）。<br>• `--dq_delta_scope {unet,te,both}` 従来の対象指定。現行の通常学習ではstep制御がUNet・TEを再び有効にするため、`unet`でもTEを量子化。ログ・自動調整の対象はこの値に依存（詳細は量子化ガイド）。<br>• `--dq_delta_granularity {tensor,channel}` 粒度（テンソル全体/チャネル別）。<br>• `--dq_delta_stat {rms,absmax,none}` bits/stepのスケール基準（per-channel時はチャネルごとに計算）。<br>• `--dq_delta_range_mul <float>` bitsモード×`stat=rms`時の有効レンジ倍率（range=倍率×RMS、既定3.0）。<br>• `--dq_delta_bits_sched 'p1:bits1,p2:bits2,...'` 学習進行率pでビット数を段階的に切替（例: `0.0:6,0.5:8,0.8:10`）。<br>• `--dq_quantize_z` = Δ ではなく z=A(x) を量子化（B(Q(z))）。rank r の z を対象に統計を取るため軽量化。 | 実装は `networks/lora.py` の LoRA forward 内。SDXL でも有効。<br>仕組みの解説: [docs/dq_delta_mechanism-ja.md](docs/dq_delta_mechanism-ja.md)<br>※ LoRA-FA (`networks/lora_fa.py`) は現在メンテ対象外であり、サポートしていません。<br>※ `--dq_delta_bits` は上記解説の仕様準拠設定を推奨。 |
 | `--dq_delta_use_triton`<br>`--dq_delta_triton_stats` | 無効 | **dq_deltaのoptional Triton高速化**。対応するchannel RMS scaleとstochastic fake quantを高速化する。`--dq_delta_triton_stats`を併用すると、対応するsummary/basicのlog/auto統計もfake quant Bへ融合する。未対応設定やkernel失敗時はPyTorchへfallback。 | Tritonはrequirementsに含めないため別途導入が必要。長時間検証済みの中心設定はSDXL LoRAの`8bit/channel/rms/stoch`、delta、UNet、fp16、summary/basic。対応条件・未検証設定・Windows導入・検証結果は [docs/triton_windows_setup.md](docs/triton_windows_setup.md) を参照。 |
 | `--dq_delta_log`<br>`--dq_delta_auto_range_mul` | 無効 | **dq_delta のログ**と**range_mul の自動調整**。<br>• `--dq_delta_log` = dq_delta の統計ログを出力。<br>• `--dq_delta_auto_range_mul` = clip_rate を見て range_mul を自動調整。<br>• `--dq_delta_auto_preset {default,clip_rate_high,clip_rate_high_narrow,clip_rate_mid,clip_rate_low,clip_rate_low_auto}` = auto 調整プリセット（clip_low/high のみ切替）。`clip_rate_low_auto` はlow帯から開始し、誤差負荷が高い場合はmid帯へ一方向に退避。既定では進捗0.55まで切替を許可。<br>• `--dq_delta_auto_use_raw` = auto 判定に clip_rate_raw も使う（既定 OFF）。mul の変化がなだらかになるため、`clip_rate_high_narrow` / `clip_rate_low` を追加。<br>• `--dq_delta_auto_init_range_mul_from_band` = clip帯中心から range_mul 初期値を自動算出（auto 有効時、`stat=rms` のみ）。<br>• `--dq_delta_auto_warmup` / `--no-dq_delta_auto_warmup` = 序盤は EMA/ログのみ更新し、range_mul を変更しない（既定 ON）。<br>• `--dq_delta_auto_warmup_updates <int>` = warmup 回数の上書き（0=内部デフォルト）。<br>プリセット例: `--dq_delta_auto_range_mul --dq_delta_auto_preset clip_rate_high`<br>発動条件:<br>• `--dq_delta_log` は dq_delta 有効時のみ。<br>• `--dq_delta_auto_range_mul` は **bits モード + `stat=rms`** の時のみ有効（`--dq_delta_bits` または `--dq_delta_bits_sched` が必要）。 | 詳細は [docs/dq_delta_autotune_spec-ja.md](docs/dq_delta_autotune_spec-ja.md) を参照。 |
 | `--rank_log`<br>`--rank_log_every`<br>`--rank_log_mode`<br>`--rank_log_file` | 無効 (`every=100`, `mode=summary`) | LoRA重みから推定した rank 飽和指標（`RankSat*`, `RankTop1P95`, `RankEnergySum`）を独立ログとして出力。LRスナップショット（UNet / TE1 / TE2 の min/max）も併記。`--rank_log_mode per_module` の場合は診断レポート側で `down/mid/up` や `q/k/v/out` などの粗い group 集約グラフも生成可能。`--dq_delta_log` とは独立して動作し、dq_delta 無効時でも記録可能。 | 仕様は [docs/rank_log_spec-ja.md](docs/rank_log_spec-ja.md) を参照。 |
 | `--noise_offset_random_min_ratio`<br>`--noise_offset_random_max_ratio`<br>`--noise_offset_random_min_ratio_sched`<br>`--noise_offset_random_max_ratio_sched` | `0.0 / 1.0 / None / None` | `--noise_offset_random_strength` 有効時の `noise_offset` ランダム振れ幅を制御。<br>• `min_ratio` / `max_ratio` = 下限/上限比率（0〜1）。<br>• `min_ratio_sched` / `max_ratio_sched` = 進行率で最小/最大比率を線形補間（例: `"0.0:0.8,0.5:0.6,1.0:0.75"` / `"0.0:0.8,0.5:1.0,1.0:0.8"`）。<br>• 序盤固定（min=max）→中盤拡大→終盤縮小のような制御が可能。<br>• 対応範囲は `train_network.py` 系（`sdxl_train_network.py` 含む）のみ。 | 仕様・計算式・既存オプションとの関係は [docs/noise_offset_extension-ja.md](docs/noise_offset_extension-ja.md) を参照。 |
 | `--round_lora_step` | `None` | Optimizer更新の直後に、LoRAの学習対象パラメータを指定刻みで丸める実験機能。細部の記憶を抑え“特徴だけ”を残す方向に誘導。<br>併用オプション:<br>• `--round_lora_mode {det,stoch}` 丸め方式。`det`=最近傍丸め、`stoch`=確率的丸め。<br>• `--round_lora_every <int>` 同期更新のたびに N ステップごと適用。<br>• `--round_lora_begin <0-1>` 学習全体の進行率。この割合以降のみ丸めを開始。 | 実装は `train_network.py` の更新直後に `library/rounding_util.py` を呼び出し。SDXL でも有効（共通ループを利用）。 |
 
+
+### 場所別の固定mul（SDXL LoRA）
+
+通常学習の`--dq_delta_range_mul`に加え、次の4引数で一部のmulを上書きできます。
+診断結果のJSONは不要です。対応する学習ネットワークは`networks.lora`です。
+
+| 引数（いずれも既定`None`） | 適用先 |
+|---|---|
+| `--dq_delta_range_mul_attn2` | UNetのattn2 Q/K/V/Out |
+| `--dq_delta_range_mul_te` | TE1・TE2共通 |
+| `--dq_delta_range_mul_te1` | TE1個別。共通TE値より優先 |
+| `--dq_delta_range_mul_te2` | TE2個別。共通TE値より優先 |
+
+未指定の部位は基本mulを使います。研究で有望だった**attn2・TE高mul型**（旧候補A）の
+固定参照は、その他UNet2.70・attn2と両TE3.75です。通常の学習コマンドに追加する引数例:
+
+```text
+--dq_delta_bits 8 --dq_delta_granularity channel --dq_delta_stat rms --dq_delta_mode stoch
+--dq_delta_begin_after_lr_warmup --dq_delta_scope both
+--dq_delta_range_mul 2.70 --dq_delta_range_mul_attn2 3.75 --dq_delta_range_mul_te 3.75
+```
+
+各行は追加引数のまとまりです。使用するシェルに合わせて連結してください。
+固定bits・RMSのdelta量子化専用で、自動mul調整・bits schedule・z量子化・policy JSONとの併用はエラーです。
+下の従来Preset Gはbits scheduleを含むため、そのまま場所別指定を足すことはできません。
+新引数を省略した学習は従来どおりです。**`--dq_delta_scope unet`のままでもTE用mulは有効**です。
+新しいコマンドはTE込みの意図を表す`both`を推奨し、TEの統計ログも必要なら`--dq_delta_log --dq_delta_log_scope both`を指定します。
+
+これは比較候補であり、全データ共通の最適設定ではありません。
+[量子化ガイド](docs/dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)、
+[推奨設定一覧](docs/sdxl_lora_recommended_settings-ja.md#dq_delta-関連オプション)、
+[CPU検証済み範囲とGPU受入手順](docs/dq_standard_validation-ja.md)を参照してください。
 
 ### 推奨プリセット
 
@@ -124,7 +156,7 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 
 | ツール名 | 概要 | 説明 |
 |---|---|---|
-| `python -m dq_profile` | Experimental DQ Dataset Profilerを直接起動し、Local Body／Tailレポートを生成 | 既定は最大32画像・独立snapshot 1回の`standard`。二重snapshotとreference-depth検算は`strict`。出力は`lora_output/dq_dataset_profiler`。Safety/Fidelity診断であり最終画質推薦ではない。使い方: [docs/dq_dataset_profiler-ja.md](docs/dq_dataset_profiler-ja.md) |
+| `python -m dq_profile` | Experimental DQ Dataset Profilerを直接起動し、Local Body／Tailレポートを生成 | 既定はTE込み・最大52画像の`canonical-v2`。一律5点＋場所別mul候補、dropout OFF標準／ON任意。独立snapshot 1回の`standard`と二重snapshot検算の`strict`。出力は`lora_output/dq_dataset_profiler`。Safety/Fidelity診断であり最終画質推薦ではない。使い方: [docs/dq_dataset_profiler-ja.md](docs/dq_dataset_profiler-ja.md) |
 | `sdxl_tokenize.py` | SDXLのTE1/TE2トークン分割の表示と候補探索 | [docs/sdxl_tokenize_tool-ja.md](docs/sdxl_tokenize_tool-ja.md) |
 | `make_lora_diagnostic_report.py` | LoRA学習ログ（`grad_norm` / `dq_delta`）とLoRA重みを診断し、グラフ内蔵HTMLを生成 | 使い方とオプション詳細: [docs/make_lora_diagnostic_report-ja.md](docs/make_lora_diagnostic_report-ja.md) |
 | `sdxl_lora_report_gui.py` | SDXL LoRAの一括生成・比較HTMLレポートをGUIで作成 | [docs/sdxl_lora_report_README-ja.md](docs/sdxl_lora_report_README-ja.md) |
@@ -141,9 +173,17 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 
 この診断は最終画質、量子化の採用可否、best mulを自動判定するものではありません。
 比較可能性を保つため、初期Betaではrank 4、AdamW8bitFast、fp16 strictなどの
-検証済み条件を固定します。既定の`standard`は最大32画像と独立snapshot 1回を使う日常診断、
-`strict`は独立snapshot A/B、長いPrefix、bounded edge再測定を使う環境変更・リリース前・
-再現性調査用です。
+比較条件を固定します。新しい既定の`canonical-v2`はTEも量子化し、最大52実画像で
+一律mul 5点（2.70 / 3.15 / 3.45 / 3.75 / 4.05）と、attn2・TE高mul型を最大3配分追加して比較します。
+Body基準2配分と固定参照2.70/3.75を含み、同一配分は再利用するため最大8条件です。
+`standard`は独立snapshot 1回、`strict`は独立snapshot A/Bと長いPrefixで検算します。
+新標準ではどちらも追加の外側mul測定は行いません。新標準全体の実SDXL GPU受入は未実施です。
+
+- 診断のdropoutは**OFFが既定**。`--dq-profile-dropout-on`で同じ候補のON確認も追加できます。通常学習のdropout設定は変更しません。
+- `--dq-profile-uniform-only`で場所別配分を追加せず、TE込み一律5点だけを測れます。
+- 初期状態とwarmup後の比較も既定で出力します。`--dq-profile-data-diagnostics=local`なら初期状態の追加forwardを省略します。
+- TEを量子化しない旧方式は`--dq-profile-preset canonical-v1 --dq-profile-no-te-quantized`で明示します。新標準の追加配分とは別の診断です。
+- レポートでは一律曲線と追加配分の点、部位別の勾配変化、Warmupでの誤差減少、量子化の影響を確認できます。
 
 ```bat
 .\venv\Scripts\python.exe -m dq_profile ^

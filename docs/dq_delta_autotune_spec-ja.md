@@ -3,6 +3,13 @@
 本ドキュメントは、`--dq_delta_step / --dq_delta_bits` のフェイク量子化に対して、
 「ログ追加」と「range_mul のフィードバック制御（自動調律）」を導入するための仕様です。
 
+**場所別の固定mul指定とは別の運用です。** `--dq_delta_range_mul_attn2`、
+`--dq_delta_range_mul_te`、`--dq_delta_range_mul_te1`、`--dq_delta_range_mul_te2`は
+`--dq_delta_auto_range_mul`と併用できません。固定配分を比較するときは自動調整を外します。
+`--dq_delta_log`による観測は併用できます。`--dq_delta_scope unet`のままTEにも固定mulを
+指定した場合、TEのログも採るには`--dq_delta_log_scope both`を明示してください。
+使い分けとCLI例は[量子化ガイド](dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)を参照してください。
+
 ## 目的
 
 - dq_delta の当たり外れ要因（特に clip 過多/過少）をログで可視化する

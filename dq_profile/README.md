@@ -31,6 +31,30 @@ measurement, automatic extra candidates, optional matched dropout ON, and integr
 reports are implemented. CPU toy-LoRA and offline UI checks cover the new path;
 full-SDXL GPU acceptance of the complete new protocol remains pending.
 
+## Using a measured allocation in ordinary training
+
+The report prints direct training CLI arguments; no diagnostic JSON is required.
+For example, append the following fixed 8-bit RMS delta settings to an SDXL
+`networks.lora` training command (join the lines for your shell):
+
+```text
+--dq_delta_bits 8 --dq_delta_stat rms --dq_delta_granularity channel --dq_delta_mode stoch
+--dq_delta_begin_after_lr_warmup --dq_delta_scope both
+--dq_delta_range_mul 2.70 --dq_delta_range_mul_attn2 3.75 --dq_delta_range_mul_te 3.75
+```
+
+`--dq_delta_range_mul_te1` and `--dq_delta_range_mul_te2` override the common TE
+value individually. Unspecified parts inherit `--dq_delta_range_mul`.
+The example is a comparison candidate, not a universal quality recommendation.
+Remove automatic mul tuning and bit scheduling when using these overrides;
+z quantization and a policy JSON cannot be combined with them either.
+Existing `--dq_delta_scope unet` training commands still apply explicit TE mul;
+use `--dq_delta_log_scope both` if the logs should include TE as well.
+See the [training CLI guide](../docs/dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)
+for target requirements, resume checks, and compatibility limits.
+
+## Research protocols
+
 The older staged custom-dataset runners remain research/reproduction tools;
 they are not the ordinary product entry.
 
