@@ -535,6 +535,10 @@ def build_protocol_fingerprint(
         REPO_ROOT / "tools" / "analyze_dq_v24_local.py",
         REPO_ROOT / "tools" / "check_dq_calibration_gate.py",
     )
+    if request.preset.name == "canonical-v2":
+        code_files = (*code_files, *(REPO_ROOT / "dq_profile" / name for name in
+            ("spatial.py", "spatial_runtime.py", "spatial_report.py")),
+            *sorted((REPO_ROOT / "dq_profile" / "spatial_assets").glob("*")))
     tracked_state = git_tracked_state()
     training_contract = request.preset.contract()
     local_contract = request.local_measurement.contract()
@@ -706,6 +710,27 @@ def build_execution_plan(
         + estimated_local_seconds(len(execution.core_grid))
     )
     maximum_seconds = base_seconds
+    if request.preset.name == "canonical-v2":
+        cells = int(probe_budget) * local.timestep_bins * local.candidate_noise_replicas
+        minimum_extra = 0 if request.uniform_only else 1
+        maximum_extra = 0 if request.uniform_only else 3
+        def extra_passes(count):
+            off = cells * (1 + count * local.stochastic_quant_repeats) if count else 0
+            on = cells * (1 + (5 + count) * local.stochastic_quant_repeats) if request.dropout_on else 0
+            return off + on
+        core_counts.update({"minimum_unique_conditions": 5 + minimum_extra,
+            "maximum_unique_conditions": 5 + maximum_extra,
+            "minimum_total_probes_with_additions": core_counts["total_local_probes"] + extra_passes(minimum_extra),
+            "maximum_total_probes_with_additions": core_counts["total_local_probes"] + extra_passes(maximum_extra),
+            "dropout_on_confirmation": request.dropout_on,
+            "additional_reference_probes_included": True,
+            "warmup_initial_forward_only": int(probe_budget) * local.timestep_bins * local.no_quant_noise_replicas if request.data_diagnostics == "warmup" else 0})
+        base_seconds += extra_passes(minimum_extra) * reference_local_probe_seconds
+        maximum_seconds += extra_passes(maximum_extra) * reference_local_probe_seconds
+        # Conservative forward-only allowance; the historical coefficient includes backward.
+        initial_seconds = core_counts["warmup_initial_forward_only"] * reference_local_probe_seconds
+        base_seconds += initial_seconds
+        maximum_seconds += initial_seconds
     projected_edge_mul_counts: list[int] = []
     for round_index in range(1, execution.max_edge_extension_rounds + 1):
         # Strict historically adds one adjacent edge point per round.  The
@@ -785,7 +810,9 @@ def build_execution_plan(
         },
         "reference_time_estimate": {
             "minutes": estimate_minutes,
-            "excludes_dataset_initial_forwards_and_cpu_reporting": True,
+            "excludes_dataset_initial_forwards_and_cpu_reporting": request.preset.name != "canonical-v2",
+            "excludes_cpu_reporting": True,
+            "initial_forward_allowance_included": request.preset.name == "canonical-v2" and request.data_diagnostics == "warmup",
             "is_guarantee": False,
             "basis": "single historical RTX 5080 run with 13 probe images and warmup boundary 420",
             "calibration": {
@@ -967,6 +994,12 @@ def profile_command(
         f"--dq_profile_source_group_map={source_map}",
     ]
     if protocol == "v24-acceptance-local" and not snapshot_only:
+        if request.preset.name == "canonical-v2":
+            command.append("--dq_profile_standard_version=2")
+            if request.dropout_on:
+                command.append("--dq_profile_dropout_on")
+            if request.uniform_only:
+                command.append("--dq_profile_uniform_only")
         command.append(f"--dq_profile_data_diagnostics={request.data_diagnostics}")
         if getattr(request, "te_quantized", False):
             command.append("--dq_profile_te_quantized")
@@ -1484,7 +1517,8 @@ def run_profile_request(
         f"{time_text}; see execution_plan.json for assumptions"
     )
     if request.data_diagnostics == "warmup":
-        launcher.log(f"Additional initial forward-only probes per Local worker: {work['dataset_initial_forward_only_per_local_worker']}; their time is not included above. Strict edge reruns repeat this evaluation.")
+        allowance = "a conservative time allowance is included above" if request.preset.name == "canonical-v2" else "their time is not included above; Strict edge reruns repeat this evaluation"
+        launcher.log(f"Additional initial forward-only probes per Local worker: {work['dataset_initial_forward_only_per_local_worker']}; {allowance}.")
     try:
         if options.preflight_only:
             update_status(
@@ -1544,6 +1578,9 @@ def run_profile_request(
         if request.data_diagnostics != "off":
             from dq_profile.diagnostic_report import promote_dataset_report
             promoted.extend(promote_dataset_report(active_profile, run_dir, selection))
+        if request.preset.name == "canonical-v2":
+            from dq_profile.spatial_report import write_standard_report
+            promoted.extend(write_standard_report(active_profile, run_dir))
         update_status(
             run_dir,
             status="complete",

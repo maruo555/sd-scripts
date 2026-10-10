@@ -343,7 +343,14 @@ STANDARD_MODE = ExecutionMode(
 )
 
 
-PRESETS = {CANONICAL_V1.name: CANONICAL_V1}
+CANONICAL_V2 = replace(
+    CANONICAL_V1,
+    name="canonical-v2",
+    description="TE-inclusive standard: uniform five-point OFF scan, Body-based attn2/TE allocation and optional matched dropout ON",
+    expected_explicit={**CANONICAL_V1.expected_explicit, "dq_delta_scope": "both"},
+    training_tokens=tuple("--dq_delta_scope=both" if token == "--dq_delta_scope=unet" else token for token in CANONICAL_V1.training_tokens),
+)
+PRESETS = {CANONICAL_V1.name: CANONICAL_V1, CANONICAL_V2.name: CANONICAL_V2}
 LOCAL_MEASUREMENT_CONTRACTS = {
     LOCAL_BODY_TAIL_V1.name: LOCAL_BODY_TAIL_V1,
     LOCAL_BODY_TAIL_V2.name: LOCAL_BODY_TAIL_V2,

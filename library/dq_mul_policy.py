@@ -90,15 +90,39 @@ class MulPolicy:
     @classmethod
     def from_training_args(cls, args):
         path = getattr(args, "dq_delta_policy_file", None)
-        if not path:
+        fields = ("attn2", "te", "te1", "te2")
+        direct = {field: getattr(args, f"dq_delta_range_mul_{field}", None) for field in fields}
+        direct = {field: value for field, value in direct.items() if value is not None}
+        if path and direct:
+            raise ValueError("Direct mul overrides cannot be combined with dq_delta_policy_file")
+        if not path and not direct:
             return None
         if (getattr(args, "dq_delta_bits", 0) or 0) <= 0 or getattr(args, "dq_delta_bits_sched", None):
-            raise ValueError("dq_delta_policy_file requires fixed dq_delta_bits")
+            raise ValueError("Fixed mul settings require fixed dq_delta_bits")
         if getattr(args, "dq_delta_stat", None) != "rms" or getattr(args, "dq_quantize_z", False):
-            raise ValueError("dq_delta_policy_file requires RMS delta quantization")
+            raise ValueError("Fixed mul settings require RMS delta quantization")
         if getattr(args, "dq_delta_auto_range_mul", False):
             raise ValueError("Fixed mul policies cannot be combined with automatic mul tuning")
-        return cls.from_file(path)
+        if path:
+            return cls.from_file(path)
+
+        # Compile CLI overrides into the same declaration used by the network,
+        # checkpoint metadata and resume guard. No diagnostic artifact is needed.
+        direct = {field: positive_mul(value) for field, value in direct.items()}
+        components = {}
+        for component in ("te1", "te2"):
+            value = direct.get(component, direct.get("te"))
+            if value is not None:
+                components[component] = value
+        groups = []
+        if "attn2" in direct:
+            groups.append({"group_id": "unet.attn2", "range_mul": direct["attn2"]})
+        return cls.from_dict({
+            "base_mul": getattr(args, "dq_delta_range_mul", 3.0),
+            "components": components,
+            "group_overrides": groups,
+            "te_quantized": True,
+        })
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "MulPolicy":
@@ -190,7 +214,7 @@ def validate_fixed_policy_resume(train_state, current_record):
     if saved is None:
         raise ValueError("Resume state has no fixed mul policy record. Start a new run instead of changing policy during resume.")
     if expected is None:
-        raise ValueError("Resume state requires its saved dq_delta_policy_file setting.")
+        raise ValueError("Resume state requires the same fixed mul settings (CLI overrides or dq_delta_policy_file).")
     if saved != expected:
         raise ValueError("Fixed mul policy or resolved module assignments differ from the resume state. Start a new run for changed settings.")
 

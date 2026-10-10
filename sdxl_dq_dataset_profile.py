@@ -100,6 +100,9 @@ def setup_parser() -> argparse.ArgumentParser:
     group.add_argument("--dq_profile_range_muls", type=str, default=",".join(str(value) for value in DEFAULT_V2_RANGE_MULS))
     group.add_argument("--dq_profile_te_quantized", action="store_true", help="Opt-in Local UNet+TE quantization; no change to ordinary diagnostic defaults")
     group.add_argument("--dq_profile_policy_grid_file", type=str, default=None, help="Opt-in Local JSON mapping grid labels to explicit fixed mul policies")
+    group.add_argument("--dq_profile_standard_version", type=int, choices=(1, 2), default=1)
+    group.add_argument("--dq_profile_dropout_on", action="store_true")
+    group.add_argument("--dq_profile_uniform_only", action="store_true")
     group.add_argument("--dq_profile_sweep_steps", type=int, default=64)
     group.add_argument("--dq_profile_branch_repeats", type=int, default=2)
     group.add_argument("--dq_profile_prefix_short_steps", type=int, default=64)
@@ -612,6 +615,16 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
 
     from dq_profile.fixed_policy import resolve_policy_grid
     args.dq_profile_policy_grid_resolved = resolve_policy_grid(args)
+    if args.dq_profile_standard_version == 2 and protocol == "v24-acceptance-local":
+        from dq_profile.spatial import UNIFORM_MULS
+        if not args.dq_profile_te_quantized or args.dq_profile_policy_grid_file:
+            raise ValueError("Standard v2 requires TE-inclusive measurement without a custom policy grid")
+        if tuple(args.dq_profile_range_muls_resolved) != UNIFORM_MULS:
+            raise ValueError("Standard v2 requires the uniform five-point grid")
+        from dq_profile.spatial_runtime import SpatialDiagnosticRuntime
+        args._dq_profile_runtime_class = SpatialDiagnosticRuntime
+    elif args.dq_profile_dropout_on or args.dq_profile_uniform_only:
+        raise ValueError("Standard comparison flags require standard v2 Local measurement")
 
     args.dq_profile_requested_network_module = requested_module
     args.dq_profile_requested_output_dir = getattr(args, "output_dir", None)

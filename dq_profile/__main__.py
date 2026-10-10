@@ -34,8 +34,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--dq-profile-preset",
-        default="canonical-v1",
-        help="versioned compatibility preset (default: canonical-v1)",
+        default="canonical-v2",
+        help="versioned preset (default: canonical-v2; canonical-v1 preserves earlier measurements)",
     )
     parser.add_argument(
         "--dq-profile-mode",
@@ -61,7 +61,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="open report.html after a successful Windows run",
     )
-    parser.add_argument("--dq-profile-data-diagnostics", choices=("off", "local", "warmup"), default="off", help="optional dataset report; warmup adds initial forward evaluation (experimental)")
+    parser.add_argument("--dq-profile-data-diagnostics", choices=("off", "local", "warmup"), default=None, help="dataset report; canonical-v2 defaults to warmup (adds initial forward evaluation); canonical-v1 defaults off")
+    parser.add_argument("--dq-profile-dropout-on", action="store_true", help="add matched dropout-ON measurements of the candidates selected with dropout OFF")
+    parser.add_argument("--dq-profile-uniform-only", action="store_true", help="measure the TE-inclusive uniform five-point grid without spatial candidates")
     parser.add_argument("--dq-profile-group-map", type=Path, help="optional diagnostic group-map JSON")
     te_scope = parser.add_mutually_exclusive_group()
     te_scope.add_argument(
@@ -92,6 +94,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         open_report=bool(selectors.dq_profile_open_report),
         data_diagnostics=selectors.dq_profile_data_diagnostics,
         group_map=selectors.dq_profile_group_map,
+        dropout_on=selectors.dq_profile_dropout_on,
+        uniform_only=selectors.dq_profile_uniform_only,
         **extensions,
     )
 

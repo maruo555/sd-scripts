@@ -213,12 +213,20 @@ def main() -> int:
         if not source_contract:
             raise ValueError("local profile source_manifest has no source contract")
         gradient_tail_rows = _read_csv(tail_path)
+        standard_options = {}
+        if (profile_dir / "spatial_contract.json").is_file():
+            from dq_profile.spatial import STANDARD_VERSION, UNIFORM_MULS
+            spatial_contract = _read_json(profile_dir / "spatial_contract.json")
+            if spatial_contract.get("version") != STANDARD_VERSION:
+                raise ValueError("unsupported standard diagnostic protocol")
+            standard_options["core_grid"] = UNIFORM_MULS
         result = analyze_local_profile(
             summary=raw_summary,
             gradient_tail_rows=gradient_tail_rows,
             dataset_id=str(args.dataset_id),
             bootstrap_iterations=int(args.iterations),
             bootstrap_seed=int(args.seed),
+            **standard_options,
         )
         natural = analyze_natural_gradient_rows(
             _read_csv(natural_path),

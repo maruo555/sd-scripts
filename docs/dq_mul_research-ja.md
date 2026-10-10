@@ -2,8 +2,27 @@
 
 `sdxl_dq_mul_research.py` は、事前に承認したローカルの実験契約を読み、
 共通のwarmup境界で量子化対象と固定mul配分を比較する研究用入口です。
-`python -m dq_profile` のcanonical条件は変更しません。
+この研究用入口から、`python -m dq_profile` のpresetは変更しません。
+標準診断側は下記の `canonical-v2`、旧条件の再現は `canonical-v1` で区別します。
 この入口は短期学習・本学習・画像生成を実行しません。
+
+## 研究結果を通常診断へ取り入れる仕様
+
+2026-10-10に、旧称「元A／候補A」を**attn2・TE高mul型［固定基準］**と命名しました。
+配分は、その他UNet=2.70、attn2=3.75、TE1=TE2=3.75です。
+以下の最初のPolicy例はこの固定基準に対応します。
+
+複数データセットの完走学習と画像評価で、一律mulとは違う質感やポーズの自由度を持つ例が
+見られたため、通常診断へ比較候補として取り入れます。診断の低スコアが良い画像を保証した
+わけではなく、TE単独・attn2単独の寄与も確定していません。
+一律診断から得たBody代表をattn2・TEの高側mulにし、その他UNetを2.70／3.15とした
+2配分を追加し、固定基準も参照用に残す設計です。同一配分は重複計測しません。
+
+[標準診断の採用仕様](dq_dataset_profiler-ja.md#spatial-diagnostic-spec)に、
+実験の背景、名称、TE込み固定、dropout OFFを基本とするON追加確認、部位別指標、
+レポート構成を記載しています。自動追加と統合レポートは `canonical-v2` に実装しました。
+新標準全体のSDXL GPU受入は未実施で、過去の研究実験とは区別しています。
+旧条件IDや実験記録・学習済みファイル名は改名しません。
 
 ## 実装範囲
 
@@ -49,11 +68,48 @@ snapshotはモジュールごとのON/OFFとmulも復元します。この研究
 
 ## 通常学習への明示的な適用
 
-通常の `sdxl_train_network.py` に `--dq_delta_policy_file=policy.json` を
-追加すると、同じresolverを使って固定配分を適用します。固定bitsかつRMSの
-delta量子化を必須とし、自動mul調整・bits schedule・z量子化との併用は拒否します。
-この指定ではpolicyが量子化対象を決めるため、従来のscope指定に優先します。
-指定を省略した通常学習の挙動は変更しません。
+2026-10-10から、通常の`sdxl_train_network.py`でmulをCLIへ直接指定できます。
+診断の実行や診断結果ファイルの読み込みは必要ありません。基本値は従来の
+`--dq_delta_range_mul`とし、指定した部位だけ上書きします。
+
+| 指定 | 適用先・省略時の扱い |
+|---|---|
+| `--dq_delta_range_mul` | 基本値。部位別の指定がなければ全体に適用（既定3.0） |
+| `--dq_delta_range_mul_attn2` | 全Down/Mid/Upのattn2 Q/K/V/Out。省略時は基本値 |
+| `--dq_delta_range_mul_te` | TE1・TE2共通。省略時は基本値 |
+| `--dq_delta_range_mul_te1` | TE1個別。TE共通値より優先 |
+| `--dq_delta_range_mul_te2` | TE2個別。TE共通値より優先 |
+
+attn2・TE高mul型［固定基準］にする場合、既存の学習コマンドの量子化設定を次のように
+指定します。その他のoptimizer・dropout・warmup・平均化の引数はそのままです。
+
+```text
+--dq_delta_bits 8 --dq_delta_stat rms --dq_delta_scope both --dq_delta_range_mul 2.70 --dq_delta_range_mul_attn2 3.75 --dq_delta_range_mul_te 3.75
+```
+
+Body基準ならattn2とTE共通値の`3.75`を診断に表示された具体的なBody代表mulへ置き換え、
+基本値を`2.70`または`3.15`にします。学習コマンドが診断結果から自動選択することはありません。
+TE1・TE2で分ける場合は、例えば`--dq_delta_range_mul_te 3.75 --dq_delta_range_mul_te2 3.45`
+ならTE1=3.75、TE2=3.45になります。
+
+部位別の直接指定はUNetとTEを量子化対象とし、従来のscope指定に優先します。
+**`--dq_delta_scope unet`のままでも`--dq_delta_range_mul_te`は無視されず、
+量子化開始後のTE1・TE2へ適用されます。** 個別TE指定がある場合はそちらが優先します。
+意図を明示するため`--dq_delta_scope both`を推奨します。固定bitsかつRMSのdelta量子化を
+必須とし、自動mul調整・bits schedule・z量子化との併用は拒否します。
+各mulは有限の正数とし、0で量子化OFFを表現しません。存在しないTEやattn2への指定は
+実ネットワークへの解決時にエラーにします。部位別指定をすべて省略した通常学習の挙動は変更しません。
+
+直接指定も既存の固定policy resolverへ変換するため、warmup中の量子化OFF、再設定後の配分保持、
+保存メタデータとresumeの一致検査は共通です。再開時も同じ配分の指定を渡してください。
+設定を省略・変更して途中から別配分へ切り替える再開は拒否します。
+
+### 研究用JSONとの互換性
+
+既存の`--dq_delta_policy_file=policy.json`は過去の研究設定の再利用用に残します。
+通常の直接指定にJSONは不要で、部位別の直接指定とこのファイル指定は併用できません。
+JSON側は量子化対象もpolicyが決め、従来のscope指定に優先します。
+以下はattn2全体ではなく、Upのattn2 Qだけを変える研究用の例です。
 
 ```json
 {

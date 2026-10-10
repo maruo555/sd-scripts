@@ -43,16 +43,69 @@
 | `--dq_delta_mode {det,stoch}` | `det`=最近傍、`stoch`=確率的丸め。 |
 | `--dq_delta_begin <0-1>` | 学習進行率。この割合以降のみ有効化。 |
 | `--dq_delta_begin_after_lr_warmup` | lrウォームアップ後に dq_delta を開始（`--dq_delta_begin` より優先）。例: `--lr_scheduler constant_with_warmup --lr_warmup_steps 1000` と併用し、**lr_warmup 後に量子化を開始して学習を安定化させる**狙い。 |
-| `--dq_delta_scope {unet,te,both}` | 適用対象の限定（U-Netのみ/Text Encoderのみ/両方）。 |
+| `--dq_delta_scope {unet,te,both}` | 適用対象の指定（既定`both`）。現行通常trainerではstepごとの共通ON/OFF処理により`unet`/`te`の限定が維持されない。下記の現行挙動を参照。 |
 | `--dq_delta_granularity {tensor,channel}` | 粒度（テンソル全体/チャネル別）。 |
 | `--dq_delta_stat {rms,absmax,none}` | bits/step のスケール基準（per-channel時はチャネルごとに計算）。 |
 | `--dq_delta_range_mul <float>` | bits モード×`stat=rms`時の有効レンジ倍率（range=倍率×RMS、既定3.0）。 |
+| `--dq_delta_range_mul_attn2 <float>` | UNetのattn2 Q/K/V/Outだけの固定mul。未指定の部位は基本値を使用。 |
+| `--dq_delta_range_mul_te <float>` | TE1・TE2共通の固定mul。 |
+| `--dq_delta_range_mul_te1 <float>` / `--dq_delta_range_mul_te2 <float>` | TE個別の固定mul。TE共通値より優先。 |
 | `--dq_delta_bits_sched 'p1:bits1,p2:bits2,...'` | 学習進行率 p でビット数を段階的に切替（例: `0.0:6,0.5:8,0.8:10`）。 |
 | `--dq_quantize_z` | Δ ではなく `z=A(x)` を量子化（`B(Q(z))`）。rank r の z を対象に統計を取るため軽量化。 |
 | `--dq_delta_use_triton` | 対応するdq_delta scale/fake quantをoptional Triton kernelで高速化。未対応時はPyTorchへfallback。 |
 | `--dq_delta_triton_stats` | `--dq_delta_use_triton`と併用し、対応するbasic log/auto statsをfake quant Bへ融合。 |
 
 Tritonの導入方法、コード上の対応条件、長時間学習で検証済みの範囲は [triton_windows_setup.md](triton_windows_setup.md) を参照。
+
+部位別mulの直接指定には診断ファイルは不要です。固定bits・RMSのdelta量子化に対応し、
+自動mul調整・bits schedule・z量子化とは併用できません。基本値への上書き順序と
+コマンド例は[通常学習への適用](dq_mul_research-ja.md#通常学習への明示的な適用)を参照してください。
+
+### 現行通常学習のscopeと、`both`への移行
+
+2026-10-10の`train_network.py`と`networks/lora.py`で確認した挙動です。
+通常trainerは初期化時に`unet`ならTEの`delta_q_enabled`をOFFにしますが、
+各学習stepの`set_delta_quant_enabled(quant_enabled)`がTEとUNetの両方を再設定します。
+明示policyがない場合、量子化開始後は`unet`指定でもTE側LoRAが有効になります。
+warmup中は両方OFFです。TE LoRAが存在しない学習へTEを追加する処理ではありません。
+
+**固定8bit・固定mul・自動mul調整なしで、TEも学習する通常の`networks.lora`経路では、
+`unet`と`both`は量子化の適用先とmul設定が同じになります。**
+今後TE込みで学習する意図を表すには、`--dq_delta_scope both`を明示する運用が適切です。
+ただし、次の差があるため、両オプションが完全な同義語であるとは扱いません。
+
+| 項目 | `unet` | `both` |
+|---|---|---|
+| 初期化直後のTE量子化フラグ | OFF | ON（量子化設定時） |
+| 共通step処理後・量子化開始後の適用先 | UNet＋TE | UNet＋TE |
+| `dq_delta_log_scope`を省略したログ対象 | UNet | UNet＋TE |
+| 自動mul調整が見る統計 | UNet | UNet＋TEの統合統計 |
+| 現行Tritonの検証プロファイル警告 | 他条件が一致すればscope由来の警告なし | `scope=both`を検証プロファイル外として警告 |
+
+固定mulのままTEのログも確認する場合は、例えば次を使います。
+
+```text
+--dq_delta_scope both --dq_delta_log_scope both
+```
+
+これまでとログ対象も揃えたい移行では、`--dq_delta_scope both --dq_delta_log_scope unet`
+と明示できます。ログ対象の拡張では統計収集量・実行経路も変わり得ます。
+この整理は量子化の設定・対象の説明であり、別runの重みの完全一致を保証しません。
+
+`--dq_delta_auto_range_mul`等を有効にするレシピでは、`both`への変更が制御用統計を変え、
+mulの推移や学習結果も変え得ます。自動調整を含む過去レシピを同一条件のまま移行したと
+扱ってはいけません。Tritonの上記警告は現在CLIのscope文字列を判定して出しており、
+`both`だけを理由に全処理をPyTorchへ切り替える指定ではありません。
+カーネルは実際の対応条件で選択されます。警告の更新は別途検証したうえで行います。
+
+部位別mulの直接指定、または`--dq_delta_policy_file`がある場合は、共通setterの後に解決済みpolicyのON/OFFとmulを
+再適用するため、**量子化対象はpolicyが優先**します。scopeだけ変えてpolicyの配分を変えることは
+できません。直接指定ではUNetとTEの両方が対象です。診断のLocal経路にも専用の対象制御があり、通常学習のこの限定漏れをそのまま
+診断のTE ON/OFFの意味へ適用してはいけません。
+
+通常学習のTE量子化を維持するため、部位別CLIの追加では従来のscopeの限定漏れを修正していません。
+診断のTE込み固定化と、既存`canonical-v1`の互換性については
+[次期標準診断の仕様](dq_dataset_profiler-ja.md#spatial-diagnostic-spec)を参照してください。
 
 ### 量子化モードの前提
 

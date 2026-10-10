@@ -2046,6 +2046,7 @@ class NetworkTrainer:
                 raise ValueError("The selected network module does not support fixed mul policies")
             dq_mul_policy_record = accelerator.unwrap_model(network).set_delta_mul_policy(dq_mul_policy)
             logger.info("fixed delta mul policy: %s", dq_mul_policy_record["assignments_sha256"])
+            logger.info("fixed delta mul declaration: %s", json.dumps(dq_mul_policy_record["declaration"], sort_keys=True))
 
         if args.network_weights is not None:
             # FIXME consider alpha of weights
@@ -5096,10 +5097,34 @@ def setup_parser() -> argparse.ArgumentParser:
         help="When bits mode with stat=rms, dynamic range = range_mul * RMS. / bitsモードかつstat=rms時の有効レンジ倍率（range=倍率×RMS）",
     )
     parser.add_argument(
+        "--dq_delta_range_mul_attn2",
+        type=float,
+        default=None,
+        help="Fixed mul for all UNet attn2 Q/K/V/Out LoRA deltas; other modules inherit dq_delta_range_mul. Direct overrides quantize UNet and TE, overriding legacy scope. / attn2のmulを上書き（UNet・TEを量子化）",
+    )
+    parser.add_argument(
+        "--dq_delta_range_mul_te",
+        type=float,
+        default=None,
+        help="Fixed mul shared by TE1 and TE2 LoRA deltas; individual TE overrides take precedence. Direct overrides quantize UNet and TE. / TE1・TE2共通のmulを上書き",
+    )
+    parser.add_argument(
+        "--dq_delta_range_mul_te1",
+        type=float,
+        default=None,
+        help="Fixed TE1 mul, overriding dq_delta_range_mul_te and dq_delta_range_mul. Direct overrides quantize UNet and TE. / TE1個別のmulを上書き",
+    )
+    parser.add_argument(
+        "--dq_delta_range_mul_te2",
+        type=float,
+        default=None,
+        help="Fixed TE2 mul, overriding dq_delta_range_mul_te and dq_delta_range_mul. Direct overrides quantize UNet and TE. / TE2個別のmulを上書き",
+    )
+    parser.add_argument(
         "--dq_delta_policy_file",
         type=str,
         default=None,
-        help="Optional fixed RMS delta-mul JSON: component, attention role/region, and exact module overrides. Overrides legacy scope; omitted preserves existing behavior.",
+        help="Research/compatibility fixed RMS delta-mul JSON; cannot be combined with direct mul overrides. Overrides legacy scope; omitted preserves existing behavior.",
     )
     parser.add_argument(
         "--dq_delta_bits_sched",
