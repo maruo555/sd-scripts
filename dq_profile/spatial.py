@@ -10,12 +10,37 @@ from library.dq_mul_policy import MulPolicy, module_group
 from dq_profile.v24_acceptance import _cluster_quantile, _index_rows, _body_tail
 
 STANDARD_VERSION = "attn2-te-standard-v1"
+FAILURE_POLICY = "exclude-condition-per-regime-v1"
+PROBE_FAILURE_REASONS = frozenset(("nonfinite_loss", "nonfinite_gradient_norm", "nonfinite_raw_mse",
+                                 "nonfinite_component_moments", "forced_safety_abort"))
 UNIFORM_MULS = (2.70, 3.15, 3.45, 3.75, 4.05)
 VIEWS = {"all": "全体", "te": "TE全体", "te1": "TE1", "te2": "TE2",
          "unet": "UNet全体", "attn2": "UNetのattn2", "unet_rest": "attn2以外のUNet"}
 LEAVES = ("te1", "te2", "attn2", "unet_rest")
 MEMBERS = {"all": LEAVES, "te": ("te1", "te2"), "te1": ("te1",), "te2": ("te2",),
            "unet": ("attn2", "unet_rest"), "attn2": ("attn2",), "unet_rest": ("unet_rest",)}
+
+
+def condition_statuses(conditions, regimes, rows):
+    """One invalid probe excludes the whole condition, independently for OFF/ON."""
+    result = {regime: {c["id"]: {"status": "available", "observations": 0,
+        "invalid_probe_count": 0, "reasons": []} for c in conditions} for regime in regimes}
+    for row in rows:
+        status = result[row["regime"]][row["candidate"]]
+        status["observations"] += 1
+        kind = row.get("measurement_status", "valid")
+        if kind not in {"valid", "invalid"}:
+            raise ValueError("Unknown diagnostic measurement status")
+        reasons = row.get("invalid_reasons", [])
+        if kind == "invalid":
+            if not reasons or not isinstance(reasons, list) or not set(reasons) <= PROBE_FAILURE_REASONS:
+                raise ValueError("Invalid probe must identify a supported numerical failure")
+            status["status"] = "unmeasurable"
+            status["invalid_probe_count"] += 1
+            status["reasons"] = sorted(set(status["reasons"]) | set(reasons))
+        elif reasons:
+            raise ValueError("Valid probe cannot carry invalid reasons")
+    return result
 
 
 def condition(cid, low, high=None, *, kind="uniform", label=None):
@@ -90,9 +115,18 @@ def component_moments(reference, candidate):
 
 
 def metrics_from_moments(moments):
+    for part in LEAVES:
+        for key in ("reference_sq", "quantized_sq", "dot", "difference_sq"):
+            value = moments[part][key]
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+                raise ValueError("Nonfinite or missing component moment")
+            if key != "dot" and value < 0:
+                raise ValueError("Squared component moment cannot be negative")
     result = {}
     for view, parts in MEMBERS.items():
         sums = {k: sum(moments[p][k] for p in parts) for k in ("reference_sq", "quantized_sq", "dot", "difference_sq")}
+        if not all(math.isfinite(value) for value in sums.values()):
+            raise ValueError("Nonfinite component moment sum")
         den = sums["reference_sq"]
         result[view] = {**sums, "distance": math.sqrt(sums["difference_sq"] / den) if den > 1e-30 else None,
                         "parallel": sums["dot"] / den if den > 1e-30 else None,

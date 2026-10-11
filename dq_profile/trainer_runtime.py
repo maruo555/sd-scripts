@@ -2361,6 +2361,8 @@ class DiagnosticProfileRuntime:
             nonfinite_probe_rows: list[dict[str, Any]] = []
             for probe_row in probe_rows:
                 fields: list[str] = []
+                if probe_row.get("forced_safety_abort"):
+                    fields.append("forced_safety_abort")
                 for field in (
                     "loss",
                     "gradient_norm",

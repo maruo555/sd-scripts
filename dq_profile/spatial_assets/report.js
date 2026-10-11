@@ -26,6 +26,15 @@
   const candidate = () => dataset().candidates.find(c=>c.id===state.condition);
   const candidates = () => dataset().candidates.filter(c=>state.showA || c.kind==='uniform');
   const score = (cid, regime=activeRegime(), part=state.part) => dataset().regimes[regime]?.scores[part]?.[cid] || {};
+  const conditionStatus = (cid, regime=activeRegime()) => dataset().regimes[regime]?.condition_status?.[cid];
+  const unavailable = (cid, regime=activeRegime()) => conditionStatus(cid,regime)?.status==='unmeasurable';
+  const reasonLabels = {nonfinite_loss:'lossがNaN/Inf',nonfinite_gradient_norm:'勾配がNaN/Inf',nonfinite_raw_mse:'予測誤差がNaN/Inf',nonfinite_component_moments:'部位別勾配の集計が非有限',forced_safety_abort:'安全判定で無効'};
+  function failureNote(cid,regime=activeRegime()) {
+    const s=conditionStatus(cid,regime);if(!unavailable(cid,regime))return '';
+    return `dropout ${regime.toUpperCase()}：計測不能（${s.invalid_probe_count}/${s.observations}観測で異常：${s.reasons.map(r=>reasonLabels[r]||r).join('・')}）。この条件全体を比較から除外しています。`;
+  }
+  const statusLabel = (c,regime=activeRegime()) => c.label+(unavailable(c.id,regime)?'［計測不能］':'');
+  const statusCell = cid => unavailable(cid)?`<span class="sub failure-text">${esc(failureNote(cid))}</span>`:'';
   const plain = node => { if (node?.data) Plotly.purge(node); if(node) node.innerHTML=''; };
   const empty = (id, title, message, link='') => {
     const node=el(id); plain(node);
@@ -72,8 +81,13 @@
     const regimeOptions=PAGE==='beginner'?[['off','OFFのみ（基本）'],['both','OFFとONを並べる'],['on','ONのみ']]:[['off','OFF'],['on','ON']];
     el('regime').innerHTML=optionList(regimeOptions.filter(([v])=>v==='off'||d.regimes.on),state.regime);
     el('regime').disabled=!d.regimes.on;
-    el('condition').innerHTML=optionList((PAGE==='beginner'?candidates():d.candidates).map(v=>[v.id,v.label]),state.condition);
+    el('condition').innerHTML=optionList((PAGE==='beginner'?candidates():d.candidates).map(v=>[v.id,statusLabel(v)]),state.condition);
     el('selection-name').textContent=c.label;
+    const failed=shownRegimes().flatMap(r=>d.candidates.filter(v=>unavailable(v.id,r)).map(v=>`${v.label} · ${failureNote(v.id,r)}`));
+    el('measurement-warnings').hidden=!failed.length;
+    el('measurement-warnings').innerHTML=failed.length?'<strong>一部の条件は計測不能です</strong><p>異常な観測だけを取り除くと有利に見えるため、そのdropout条件での配分全体を欠測にしています。正常な条件と、量子化OFFのwarmupは引き続き確認できます。</p><ul>'+failed.map(s=>`<li>${esc(s)}</li>`).join('')+'</ul>':'';
+    el('condition-status').hidden=!shownRegimes().some(r=>unavailable(c.id,r));
+    el('condition-status').textContent=shownRegimes().map(r=>failureNote(c.id,r)).filter(Boolean).join(' ');
     el('training-cli').textContent=c.training_cli;
     el('condition-notes').textContent=[...(c.aliases||[]).map(a=>a.label+' と同じ配分のため統合'),...(d.skipped||[]).map(x=>(x.label?x.label+': ':'')+({body_representative_unavailable:'Body代表なし：Body基準の追加配分は未測定',low_exceeds_body:'低側がBodyより高いため除外',spatial_comparison_disabled:'追加配分は指定により省略'}[x.reason]||x.reason))].join(' / ');
     el('allocation').innerHTML=['その他UNet','attn2','TE1','TE2'].map((s,i)=>`<span>${s} <b>${c.mul[i]===null?'量子化OFF':fmt(c.mul[i],2)}</b></span>`).join('');
@@ -107,12 +121,12 @@
     defs.forEach(([key,label,color])=>{
       ['uniform','adaptive','reference'].forEach(kind=>{
         const group=all.filter(c=>c.kind===kind);if(!group.length)return;
-        const values=group.map(c=>accessor?accessor(c,key,regime):score(c.id,regime)[key]);
+        const values=group.map(c=>(accessor?accessor(c,key,regime):score(c.id,regime)[key])??null);
         if(!values.some(finite))return;
         // Display-only displacement separates the families at the same true mul.
         // Keep the measured y and true allocation unchanged in the hover and exports.
         const offset={uniform:0,adaptive:.055,reference:-.055}[kind];
-        traces.push({type:'scatter',mode:kind==='uniform'?'lines+markers':'markers',name:label,legendgroup:key,showlegend:kind==='uniform',x:group.map(c=>c.mul[0]+offset),y:values,line:{color,width:2},marker:{color,symbol:group.map(c=>c.symbol),size:group.map(c=>c.kind==='uniform'?(c.id===state.condition?11:7):(c.id===state.condition?17:13)),line:{color:'#fff',width:1}},customdata:group.map(c=>[c.id,c.label,c.assignment_label,label,c.mul[0]]),hovertemplate:'<b>%{customdata[1]}</b><br>%{customdata[2]}<br>%{customdata[3]} = %{y:.4f}<br>実際のその他UNet mul = %{customdata[4]:.2f}'+(offset?'<br>重なりを避けるため表示位置のみ横に移動':'')+'<extra></extra>'});
+        traces.push({type:'scatter',connectgaps:false,mode:kind==='uniform'?'lines+markers':'markers',name:label,legendgroup:key,showlegend:kind==='uniform',x:group.map(c=>c.mul[0]+offset),y:values,line:{color,width:2},marker:{color,symbol:group.map(c=>c.symbol),size:group.map(c=>c.kind==='uniform'?(c.id===state.condition?11:7):(c.id===state.condition?17:13)),line:{color:'#fff',width:1}},customdata:group.map(c=>[c.id,c.label,c.assignment_label,label,c.mul[0]]),hovertemplate:'<b>%{customdata[1]}</b><br>%{customdata[2]}<br>%{customdata[3]} = %{y:.4f}<br>実際のその他UNet mul = %{customdata[4]:.2f}'+(offset?'<br>重なりを避けるため表示位置のみ横に移動':'')+'<extra></extra>'});
       });
     });
     return traces;
@@ -129,17 +143,21 @@
     const values=regimes.flatMap(r=>candidates().flatMap(c=>metricDefs.map(([k])=>score(c.id,r)[k]))).filter(finite);
     const max=state.fixed?4:Math.max(0.1,...values)*1.15;
     const xr={title:{text:'その他UNetのmul'},tickvals:[2.7,3.15,3.45,3.75,4.05],tickformat:'.2f',range:[2.60,4.14],gridcolor:'#edf1f5',zeroline:false};
-    regimes.forEach(r=>plot(`distance-${r}`,curveTraces(metricDefs,r),{xaxis:xr,yaxis:{title:{text:'相対勾配差 d'},range:[0,max],gridcolor:'#e7edf4'},shapes:[{type:'line',xref:'paper',x0:0,x1:1,y0:1,y1:1,line:{color:'#a6b4c5',width:1,dash:'dot'}}]},p=>selectCondition(p.customdata[0])));
+    regimes.forEach(r=>{
+      const traces=curveTraces(metricDefs,r);
+      if(!traces.length)empty(`distance-${r}`,'比較できる勾配差がありません','計測不能や元勾配が小さすぎる条件は、欠測として扱います。');
+      else plot(`distance-${r}`,traces,{xaxis:xr,yaxis:{title:{text:'相対勾配差 d'},range:[0,max],gridcolor:'#e7edf4'},shapes:[{type:'line',xref:'paper',x0:0,x1:1,y0:1,y1:1,line:{color:'#a6b4c5',width:1,dash:'dot'}}]},p=>selectCondition(p.customdata[0]));
+    });
     el('clip-note').textContent=values.some(v=>v>max)?'共通目盛の上限4を超えた点があります。「共通目盛」のチェックを外すと全範囲を表示します。表には実際の値を残しています。':'';
     const direction=panelCharts('direction-charts','parallel');
     el('direction-scope').textContent=dataset().views[state.part]+'の実測';
-    if(!direction.some(r=>candidates().some(c=>finite(score(c.id,r).parallel_p50)))) {
-      direction.forEach(r=>empty(`parallel-${r}`,'部位別の元方向成分は未記録です','保存されている部位別の二乗ノルムだけからは復元できません。全体へ切り替えると実測値を表示します。'));
-    } else {
-      const ys=direction.flatMap(r=>candidates().flatMap(c=>parallelDefs.map(([k])=>score(c.id,r)[k]))).filter(finite);
-      const yRange=[Math.min(0,...ys)*1.12,Math.max(1,...ys)*1.15];
-      direction.forEach(r=>plot(`parallel-${r}`,curveTraces(parallelDefs,r),{xaxis:xr,yaxis:{title:{text:'元方向への平行成分'},range:yRange,gridcolor:'#e7edf4'},shapes:[{type:'line',xref:'paper',x0:0,x1:1,y0:1,y1:1,line:{color:'#a6b4c5',width:1,dash:'dot'}}]},p=>selectCondition(p.customdata[0])));
-    }
+    const ys=direction.flatMap(r=>candidates().flatMap(c=>parallelDefs.map(([k])=>score(c.id,r)[k]))).filter(finite);
+    const yRange=[Math.min(0,...ys)*1.12,Math.max(1,...ys)*1.15];
+    direction.forEach(r=>{
+      const traces=curveTraces(parallelDefs,r);
+      if(!traces.length)empty(`parallel-${r}`,'比較できる元方向成分がありません','未記録・計測不能・元勾配が小さすぎる場合は欠測です。勾配差の大きさだけでは復元しません。');
+      else plot(`parallel-${r}`,traces,{xaxis:xr,yaxis:{title:{text:'元方向への平行成分'},range:yRange,gridcolor:'#e7edf4'},shapes:[{type:'line',xref:'paper',x0:0,x1:1,y0:1,y1:1,line:{color:'#a6b4c5',width:1,dash:'dot'}}]},p=>selectCondition(p.customdata[0]));
+    });
   }
   function metricsTable() {
     const c=candidate(),s=score(c.id),reg=activeRegime(),d=dataset();
@@ -150,8 +168,9 @@
       const other=score(v.id),diff=pct(s.body,other.body);
       return `<span>${esc(v.label)}に対して、Body ${fmt(other.body)} → <b>${fmt(s.body)}</b>（${signed(diff,1)}%）</span>`;
     }).join('<br>'):'一律条件の曲線を基準に、attn2・TE高mul型の同じ位置の点と比較してください。';
+    if(unavailable(c.id)||contrasts.some(v=>unavailable(v.id)))el('quick-compare').textContent='計測不能の条件を含むため、この対照との数値比較はできません。正常な条件を表で確認してください。';
     el('metrics-table').innerHTML='<thead><tr><th>診断条件 / 配分</th><th>P50</th><th>Body</th><th>Tail</th><th>元方向 P50</th><th>元方向 P05</th></tr></thead><tbody>'+candidates().map(v=>{
-      const t=score(v.id);return `<tr data-candidate="${esc(v.id)}" class="${v.id===c.id?'selected':''}"><td class="label"><button class="rowlink" data-candidate="${esc(v.id)}">${esc(v.label)}</button><span class="sub">${esc(v.assignment_label)}</span></td>${['p50','body','tail','parallel_p50','parallel_p05'].map(k=>`<td>${fmt(t[k])}</td>`).join('')}</tr>`;
+      const t=score(v.id);return `<tr data-candidate="${esc(v.id)}" class="${v.id===c.id?'selected':''}"><td class="label"><button class="rowlink" data-candidate="${esc(v.id)}">${esc(statusLabel(v))}</button><span class="sub">${esc(v.assignment_label)}</span>${statusCell(v.id)}</td>${['p50','body','tail','parallel_p50','parallel_p05'].map(k=>`<td>${fmt(t[k])}</td>`).join('')}</tr>`;
     }).join('')+'</tbody>';
     el('loss-note').textContent='この表は元画像グループを等重みで集計した分位値です。部位別のdは、その部位の元勾配を分母にしています。部位間の大小は全体への寄与率とは異なります。';
   }
@@ -166,6 +185,10 @@
     el('direction-value').textContent=finite(s.parallel_p05)?fmt(s.parallel_p05):'部位別は未記録';
     el('direction-value').classList.toggle('compact',!finite(s.parallel_p05));
     el('direction-note').textContent=finite(s.parallel_p05)?'元の方向へ押す強さの弱い側。長期学習での定着や絵の固さを直接示す値ではありません。':'全体のグラフで確認できます。勾配差の大きさだけからは計算できません。';
+    if(unavailable(c.id,r)){
+      ['change-value','direction-value'].forEach(id=>{el(id).textContent='計測不能';el(id).classList.add('compact');});
+      ['change-note','direction-note'].forEach(id=>el(id).textContent=failureNote(c.id,r));
+    } else el('change-value').classList.remove('compact');
     if(d.warmup.available) plot('warmup-chart',[{type:'bar',x:['学習前','warmup後'],y:[d.warmup.before,d.warmup.after],marker:{color:['#97b9d8','#387caf']},text:[fmt(d.warmup.before,4),fmt(d.warmup.after,4)],textposition:'outside',cliponaxis:false,hovertemplate:'%{x}<br>%{y:.6f}<extra></extra>'}],{showlegend:false,yaxis:{title:{text:'raw MSE'},rangemode:'tozero',range:[0,Math.max(d.warmup.before,d.warmup.after)*1.3],gridcolor:'#edf1f6'},margin:{l:72,r:25,t:25,b:50}});
     else empty('warmup-chart','この測定では、学習前の値が未記録です','対応する学習前後の記録がある場合だけ表示します。別測定の値では補いません。');
     const traces=[];
@@ -176,6 +199,7 @@
     });
     plot('loss-chart',traces,{margin:{l:90,r:20,t:38,b:66},xaxis:{title:{text:'その他UNetのmul'},tickvals:[2.7,3.15,3.45,3.75,4.05],tickformat:'.2f',range:[2.6,4.14]},yaxis:{title:{text:'予測誤差の差 · C − B'},tickformat:'.6f',gridcolor:'#edf1f6',zeroline:true,zerolinewidth:1.5,zerolinecolor:'#8799ae'}},p=>selectCondition(p.customdata[0]));
     el('global-loss-note').textContent=`${d.loss_note} 選択中: B ${fmt(m.reference_loss,6)} → C ${fmt(m.quantized_loss,6)}、差 ${signed(m.delta,6)}（${r.toUpperCase()}・画像等重み）。負なら同じ入力で誤差が減少、正なら増加。追加学習の結果ではありません。`;
+    if(unavailable(c.id,r))el('global-loss-note').textContent=d.loss_note+' '+failureNote(c.id,r);
   }
   function details() {
     if(!el('detail-section')?.open)return;
@@ -193,17 +217,18 @@
     });
     el('interval-table').innerHTML='<thead><tr><th>条件</th><th>Body / 参考95%区間</th><th>Tail / 参考95%区間</th></tr></thead><tbody>'+candidates().map(c=>{
       const s=score(c.id),ci=s.overall_ci||{};
-      return `<tr><td>${esc(c.label)}</td>${['body','tail'].map(k=>`<td>${fmt(s[k])} / ${ci[k]?ci[k].map(v=>fmt(v)).join(' 〜 '):'未算出'}</td>`).join('')}</tr>`;
+      return `<tr><td>${esc(statusLabel(c))}</td>${['body','tail'].map(k=>`<td>${fmt(s[k])} / ${ci[k]?ci[k].map(v=>fmt(v)).join(' 〜 '):'未算出'}</td>`).join('')}</tr>`;
     }).join('')+'</tbody>';
     const components=d.regimes[reg].contributions;
-    if(!components || !candidates().every(c=>components[c.id]&&['te1','te2','attn2','unet_rest'].every(k=>finite(components[c.id][k])))) {
+    const measured=candidates().filter(c=>components?.[c.id]&&['te1','te2','attn2','unet_rest'].every(k=>finite(components[c.id][k])));
+    if(!measured.length) {
       empty('contributions','部位ごとの寄与は未記録です','この既存診断では全体の勾配差を保存しています。');
       empty('shares','構成比は表示できません','未記録の値を0%として表示しません。');return;
     }
     const labels=['TE1','TE2','attn2','その他UNet'],colors=['#577fb2','#91b8db','#8c72bc','#9bc6aa'];
-    const values=candidates().map(c=>{const x=components[c.id];return [x.te1,x.te2,x.attn2,x.unet_rest];});
+    const values=measured.map(c=>{const x=components[c.id];return [x.te1,x.te2,x.attn2,x.unet_rest];});
     [false,true].forEach(share=>{
-      const traces=labels.map((name,i)=>({type:'bar',name,x:candidates().map(c=>c.short),y:values.map(v=>share?(v.reduce((a,b)=>a+b,0)>0?100*v[i]/v.reduce((a,b)=>a+b,0):null):v[i]),marker:{color:colors[i]},customdata:candidates().map(c=>[c.id,c.assignment_label]),hovertemplate:`${name}<br>%{x}<br>%{y:.4f}${share?'%':''}<br>%{customdata[1]}<extra></extra>`}));
+      const traces=labels.map((name,i)=>({type:'bar',name,x:measured.map(c=>c.short),y:values.map(v=>share?(v.reduce((a,b)=>a+b,0)>0?100*v[i]/v.reduce((a,b)=>a+b,0):null):v[i]),marker:{color:colors[i]},customdata:measured.map(c=>[c.id,c.assignment_label]),hovertemplate:`${name}<br>%{x}<br>%{y:.4f}${share?'%':''}<br>%{customdata[1]}<extra></extra>`}));
       plot(share?'shares':'contributions',traces,{barmode:'stack',margin:{l:65,r:10,t:37,b:100},xaxis:{tickangle:-35},yaxis:{title:{text:share?'割合（%）':'平均d² · 共通の分母'},rangemode:'tozero',...(share?{range:[0,100]}:{}),gridcolor:'#edf1f6'},legend:{orientation:'h',x:0,y:1.16,font:{size:11}}},p=>selectCondition(p.customdata[0]));
     });
     el('contributions').previousElementSibling.textContent=`総量と内訳 · 平均d² · ${reg.toUpperCase()}`;
@@ -242,7 +267,8 @@
     const scale=d.samples.flatMap(s=>d.candidates.flatMap(c=>Object.keys(d.regimes).map(r=>perSample(s,c.id,r))));
     const xmax=Math.max(.001,...scale.map(v=>v.reference_loss).filter(finite))*1.12;
     const ymax=Math.max(.001,...scale.map(v=>v.d).filter(finite))*1.12;
-    plot('quant-chart',q,{margin:{l:67,r:25,t:34,b:68},xaxis:{title:{text:`Bの${d.loss_label}`},range:[0,xmax],gridcolor:'#e7edf4'},yaxis:{title:{text:`${d.views[state.part]}の平均d`},range:[0,ymax],gridcolor:'#e7edf4'}},p=>selectSample(p.customdata[0]));
+    if(unavailable(cid))empty('quant-chart','選択した条件は計測不能です',failureNote(cid));
+    else plot('quant-chart',q,{margin:{l:67,r:25,t:34,b:68},xaxis:{title:{text:`Bの${d.loss_label}`},range:[0,xmax],gridcolor:'#e7edf4'},yaxis:{title:{text:`${d.views[state.part]}の平均d`},range:[0,ymax],gridcolor:'#e7edf4'}},p=>selectSample(p.customdata[0]));
     el('quant-axes').textContent=`量子化OFFの誤差 × ${d.views[state.part]}の平均勾配変化 · dropout ${activeRegime().toUpperCase()}`;
     datasetPlotSnapshot={learning:traces('learning').map(t=>({x:t.x,y:t.y})),quant:q.map(t=>({x:t.x,y:t.y}))};
   }
@@ -267,7 +293,7 @@
     const selected=rows.find(x=>x.c.id===c.id).m;
     el('sample-info').innerHTML=[['入力数',String(entity.samples.length)],['観測する部位',d.views[state.part]],['選択中の平均d',fmt(selected.d)],['量子化OFFの誤差',fmt(selected.reference_loss,6)],['量子化ONの誤差',fmt(selected.quantized_loss,6)],['予測誤差の差',signed(selected.delta,6)]].map(([k,v])=>`<div class="keyline"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
     el('sample-loss-note').textContent=d.loss_note+' 各条件は同じ対象を使い、各入力を等重みで比較しています。';
-    el('condition-table').innerHTML='<thead><tr><th>診断条件 / 配分</th><th>平均d</th><th>Bの予測誤差</th><th>Cの予測誤差</th><th>差 C−B</th><th>観測数</th></tr></thead><tbody>'+rows.map(({c:v,m})=>`<tr data-candidate="${esc(v.id)}" class="${v.id===c.id?'selected':''}"><td class="label"><button class="rowlink" data-candidate="${esc(v.id)}">${esc(v.label)}</button><span class="sub">${esc(v.assignment_label)}</span></td><td>${fmt(m.d)}</td><td>${fmt(m.reference_loss,6)}</td><td>${fmt(m.quantized_loss,6)}</td><td>${signed(m.delta,6)}</td><td>${m.observations}</td></tr>`).join('')+'</tbody>';
+    el('condition-table').innerHTML='<thead><tr><th>診断条件 / 配分</th><th>平均d</th><th>Bの予測誤差</th><th>Cの予測誤差</th><th>差 C−B</th><th>集計観測数</th></tr></thead><tbody>'+rows.map(({c:v,m})=>`<tr data-candidate="${esc(v.id)}" class="${v.id===c.id?'selected':''}"><td class="label"><button class="rowlink" data-candidate="${esc(v.id)}">${esc(statusLabel(v))}</button><span class="sub">${esc(v.assignment_label)}</span>${statusCell(v.id)}</td><td>${fmt(m.d)}</td><td>${fmt(m.reference_loss,6)}</td><td>${fmt(m.quantized_loss,6)}</td><td>${signed(m.delta,6)}</td><td>${m.observations}</td></tr>`).join('')+'</tbody>';
   }
   function activeEntity(entity) {
     const sample=state.entityKind==='image'?entity.samples[0]:null;

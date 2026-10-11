@@ -8,7 +8,8 @@ import math
 from pathlib import Path
 import shutil
 
-from dq_profile.spatial import STANDARD_VERSION, VIEWS, LEAVES, metrics_from_moments, balanced_mean, summarize
+from dq_profile.spatial import (STANDARD_VERSION, FAILURE_POLICY, VIEWS, LEAVES, condition_statuses,
+    metrics_from_moments, balanced_mean, summarize)
 from dq_profile.spatial_report_data import SHARED_DATA_VERSION, loss_contract, public_loss_values, local_image_context
 
 
@@ -71,7 +72,31 @@ def build_data(contract, rows, *, inventory=(), references=(), thumbnails=None, 
     for row in rows:
         if source_by_image.setdefault(row["image_key"], row["source_group"]) != row["source_group"]:
             raise ValueError("Image source grouping changed between conditions")
-    loss_spec = loss_contract(rows)
+    statuses = condition_statuses(candidates, regimes, rows)
+    invalid = [r for r in rows if r.get("measurement_status") == "invalid"]
+    if invalid and contract.get("failure_policy") != FAILURE_POLICY:
+        raise ValueError("Invalid probes require the explicit condition exclusion policy")
+    if "condition_status" in contract and contract["condition_status"] != statuses:
+        raise ValueError("Condition status disagrees with recorded diagnostic observations")
+    for row in rows:
+        if row.get("measurement_status") != "invalid":
+            loss_contract([row])  # Validate even healthy cells of an excluded condition.
+            continue
+        if row.get("components") is not None:
+            raise ValueError("Invalid probes must not publish component metrics")
+        for field in ("reference_loss", "reference_mse", "quantized_loss", "quantized_mse"):
+            value = row.get(field)
+            if value is None and (field.endswith("_mse") or
+                    (field == "quantized_loss" and "nonfinite_loss" in row["invalid_reasons"])):
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+                raise ValueError(f"Invalid or unsanitized diagnostic metric: {field}")
+    eligible = lambda regime, cid: statuses[regime][cid]["status"] == "available"
+    eligible_rows = [r for r in rows if eligible(r["regime"], r["candidate"])]
+    if not eligible_rows:
+        raise ValueError("No complete diagnostic condition remains")
+    loss_spec = loss_contract(eligible_rows)
+    loss_spec["selection_scope"] = "One kind for all eligible conditions/regimes; excluded conditions contribute no comparison values."
     has_mse = loss_spec["selected_kind"] == "raw_mse"
     loss_fields = ("reference_mse", "quantized_mse") if has_mse else ("reference_loss", "quantized_loss")
     public_rows = []
@@ -83,23 +108,31 @@ def build_data(contract, rows, *, inventory=(), references=(), thumbnails=None, 
         for cid in ids:
             transformed = []
             for row in grouped[regime, cid]:
-                metrics = metrics_from_moments(row["components"])
+                metrics = metrics_from_moments(row["components"]) if row.get("measurement_status") != "invalid" else None
                 entry = {**row, "metrics": metrics}
-                by_image[regime, row["image_key"], row["timestep_bin"], cid].append(entry)
-                transformed.append(entry)
+                if eligible(regime, cid):
+                    by_image[regime, row["image_key"], row["timestep_bin"], cid].append(entry)
+                    transformed.append(entry)
                 public_rows.append({"sample": image_ids[row["image_key"]], "source": source_ids[row["source_group"]],
                     "candidate": cid, "regime": regime, "bin": row["timestep_bin"], "noise": row["noise_replica"],
                     "repeat": row["quant_repeat"], "components": row["components"], "metrics": metrics,
+                    "measurement_status": row.get("measurement_status", "valid"),
+                    "invalid_reasons": row.get("invalid_reasons", []), "eligible_for_comparison": eligible(regime, cid),
                     "pairing": {key: row[key] for key in ("input_id", "noise_digest", "dropout_mask_digest", "reference_hash", "quantized_hash")},
                     **public_loss_values(row, loss_spec["selected_kind"])})
             for view in VIEWS:
                 scores[view][cid] = summarize([{ "source_group": r["source_group"], "timestep_bin": r["timestep_bin"],
                     "value": r["metrics"][view]["distance"], "parallel": r["metrics"][view]["parallel"]} for r in transformed],
                     bins=contract["bins"], iterations=iterations if view == "all" else 0)
+                if not eligible(regime, cid):
+                    scores[view][cid] = {"missing_reason": "condition_unmeasurable", "observations": 0,
+                        **{key: None for key in ("p05", "p10", "p25", "p50", "p75", "p90", "p95", "body", "tail",
+                                                 "parallel_p50", "parallel_p05", "mean_sq_d")}}
             contributions[cid] = {part: balanced_mean([{ "source_group": r["source_group"],
                 "value": r["components"][part]["difference_sq"] / r["metrics"]["all"]["reference_sq"]
                          if r["metrics"]["all"]["reference_sq"] > 1e-30 else None} for r in transformed], "value") for part in LEAVES}
-        summaries[regime] = {"scores": scores, "contributions": contributions, "state_sha256": contract["state_sha256"]}
+        summaries[regime] = {"scores": scores, "contributions": contributions,
+            "condition_status": statuses[regime], "state_sha256": contract["state_sha256"]}
     inventory_by_path = defaultdict(list)
     for item in inventory:
         inventory_by_path[str(Path(item["path"]).resolve()).casefold()].append(item)
@@ -128,7 +161,8 @@ def build_data(contract, rows, *, inventory=(), references=(), thumbnails=None, 
                         "parallel_by_part": {view: mean([r["metrics"][view]["parallel"] for r in measured]) for view in VIEWS},
                         "parallel": mean([r["metrics"]["all"]["parallel"] for r in measured]),
                         "reference_loss": ref, "quantized_loss": quant,
-                        "delta": mean([r[loss_fields[1]] - r[loss_fields[0]] for r in measured]), "observations": len(measured)}
+                        "delta": mean([r[loss_fields[1]] - r[loss_fields[0]] for r in measured]), "observations": len(measured),
+                        "status": statuses[regime][cid]["status"]}
                 cells[regime].append({"bin": bin_index, "pre": mean([r["raw_mse"] for r in pre]) if paired else None,
                     "post": mean([r["raw_mse"] for r in post]) if paired else None, "q": q})
         samples.append({"id": image_ids[image_path], "name": item.get("name", path.name),
@@ -145,7 +179,7 @@ def build_data(contract, rows, *, inventory=(), references=(), thumbnails=None, 
         "body_note": "一律5点・dropout OFFの既存Body代表選出規則。追加配分や部位選択で選び直しません。",
         "quant_scope": "UNet＋TE1＋TE2", "scope_note": "同じsnapshot・入力・noise・timestepで配分を比較。dropout ONは追加確認です。",
         "loss_label": "raw MSE" if has_mse else "学習目的関数のloss",
-        "loss_contract": loss_spec,
+        "loss_contract": loss_spec, "failure_policy": FAILURE_POLICY,
         "loss_note": "予測誤差はモデル全体の値です。部位ごとへ分解しません。" if has_mse else
             ("raw MSEが一部未記録のため、全条件を学習目的関数のlossに統一して表示します。" if loss_spec["selection_reason"] == "raw_mse_partially_missing" else
              "raw MSE未記録のため学習目的関数のlossを表示します。") + "raw MSEとは異なります。",
@@ -175,7 +209,9 @@ def write_standard_report(profile_dir, output_dir, *, iterations=2000):
     thumbnails = report_thumbnails(preview_dir, thumbnail_samples) if thumbnail_samples else {}
     data, public = build_data(contract, observations, inventory=inventory,
         references=read_lines(data_dir / "reference_probes.jsonl"), thumbnails=thumbnails, iterations=iterations)
-    data["datasets"][0]["legacy_detail_url"] = "data_diagnostics/dataset_report.html" if (preview_dir / "dataset_report.html").is_file() else None
+    has_invalid = any(r.get("measurement_status") == "invalid" for r in observations)
+    # The old image detail page does not implement whole-condition exclusion.
+    data["datasets"][0]["legacy_detail_url"] = "data_diagnostics/dataset_report.html" if not has_invalid and (preview_dir / "dataset_report.html").is_file() else None
     practical = output_dir / "practical_report.json"
     if practical.exists():
         original_body = json.loads(practical.read_text(encoding="utf-8"))["datasets"][0]["body_representative_mul"]
@@ -200,12 +236,12 @@ def write_standard_report(profile_dir, output_dir, *, iterations=2000):
     write_json(output_dir / "ai_summary.json", {"schema_version": SHARED_DATA_VERSION, "version": STANDARD_VERSION, "conditions": contract["conditions"],
         "body_mul": contract["body_mul"], "skipped": contract["skipped"], "measurement": dataset["meta"],
         "measurement_contract": measurement_contract,
-        "loss_contract": dataset["loss_contract"],
+        "loss_contract": dataset["loss_contract"], "failure_policy": FAILURE_POLICY,
         "quant_scope": dataset["quant_scope"], "metrics": dataset["regimes"], "warmup": dataset["warmup"],
         "weighting": {"gradient": "source_equal_then_observation_equal", "warmup_and_image_loss": "image_equal"},
         "not_image_quality": True})
     write_json(output_dir / "observations.json", {"schema_version": SHARED_DATA_VERSION, "version": STANDARD_VERSION,
-        "loss_contract": dataset["loss_contract"], "rows": public})
+        "loss_contract": dataset["loss_contract"], "failure_policy": FAILURE_POLICY, "rows": public})
     if (output_dir / "report.html").exists() and not (output_dir / "uniform_report.html").exists():
         shutil.copyfile(output_dir / "report.html", output_dir / "uniform_report.html")
     shutil.copyfile(output_dir / "beginner_report.html", output_dir / "report.html")

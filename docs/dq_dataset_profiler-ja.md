@@ -545,9 +545,31 @@ d = sqrt(1 + norm_ratio^2 - 2 * norm_ratio * gradient_cosine)
 
 NaN、Inf、極端なgradient explosion、optimizer stateの非finiteがなかった候補です。
 これは最低限の安全条件であり、画質保証ではありません。
-1件でも非finiteなgradient probeが出たmulは、その候補全体を数値比較から外して
+従来の一律mul診断では、1件でも非finiteなgradient probeが出たmulは、その候補全体を数値比較から外して
 `Hard unsafe`として残します。他の有限なmulはbootstrapとHTML生成を継続するため、
 1候補の異常だけで診断全体を失敗させません。原因と非finite件数はsummary／候補カードへ保存します。
+
+**現行の`canonical-v2`:** この候補単位の除外を、場所別mul・部位別の標準診断にも適用します。
+初期の標準v2では1件の非finiteでrun全体を停止していましたが、現在は量子化候補のLocal
+loss・勾配ノルム・raw MSE・部位別勾配集計にNaN/Inf等が出た場合、**その配分×dropout条件全体**を
+「計測不能」として、正常な条件の集計とレポート作成を続けます。OFFとONは別判定なので、
+ONだけで異常が出ても正常なOFFの値は残ります。異常が出た一律mulはOFFのBody代表選出からも外します。
+
+予定した画像・noise・反復の測定記録は残し、異常probeには無効理由を付けます。
+異常条件は全7部位のグラフ・予測誤差比較で欠測にし、表に理由と件数を表示します。
+健全な条件の式・重み付け・測定対象は変更しません。共通warmupのA→Bも維持します。
+AI用JSONには条件別の状態と`eligible_for_comparison`を保存し、異常条件の正常だった観測も
+比較対象外と明示します。補助の従来画像詳細ページは候補全体の除外に未対応なため、異常条件がある場合は案内リンクを表示しません。
+
+通常学習のstepスキップは不正な勾配で重みを更新しない処理です。一方、診断で失敗probeだけを
+捨てると、条件ごとの評価対象が変わり、苦手な場面を落としたBody／Tailが有利に見えるおそれがあります。
+そのため、正常probeだけの再集計・ゼロ埋め・自動再試行・loss scaleの自動変更は行いません。
+全条件から同じprobeを除く集計も、この標準診断には含めません。
+
+量子化OFFの共通参照が非finiteなら比較の基準が成立しないため停止します。一律mulに有効候補が
+一つも残らない場合も、従来の判定と同じく停止します。入力／dropoutの対応不一致、勾配の構造不一致、
+読み書きの失敗等、数値異常以外のエラーも握りつぶしません。「計測不能」はこの診断条件での判定であり、
+そのデータセットで通常学習できない、または画質が悪いと断定するものではありません。
 
 ### Fidelity retained
 
@@ -849,6 +871,18 @@ source groupがmodeの画像上限を超える場合もpreflightでは拒否し�
   `no_quant_timestep_profile.csv`: no-quant短期勾配の規模と偏り
 - `dataset_character_vector.json`: 合成点を作らないdataset体質の5 channel
 - 実行ログ
+
+標準v2のLocal probeに数値異常が出た場合、Local workerの出力先に
+`spatial_failure.json`（直近に記録した異常）と`spatial_failure_連番.json`を残します。
+詳細の採取は配分×OFF/ONごとの最初の異常です。失敗した配分、OFF/ON、画像識別子、時刻帯、noise・量子化反復、
+loss、勾配ノルム、loss scale、非finite勾配を持つパラメータを確認できます。
+JSONの非finite数値は`null`とし、`nonfinite_values`に`nan`／`inf`等の種別を記録します。
+診断を完了できた場合は、無効probeも`spatial_observations.jsonl`に状態付きで残し、
+`spatial_contract.json`に`failure_policy=exclude-condition-per-regime-v1`と条件別の理由・件数を保存します。
+共通参照の異常等で途中停止した場合に限り、途中までの記録を`spatial_observations.partial.jsonl`、件数と停止理由を
+`spatial_progress.partial.json`へ保存します。これらは**調査用の未完了データ**であり、
+正式なレポート入力や再開用checkpointではありません。失敗詳細には実パス等を含み得るため、
+匿名の共有用JSONとは区別してください。保存先への書き込み自体が失敗した場合はログへ記録します。
 
 ## 8. 実測比較例
 
