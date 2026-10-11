@@ -507,6 +507,20 @@ DQ_DELTA_AUTO_BANDS = {
 }
 
 
+def resolve_dq_delta_auto_scope(args):
+    """Keep UNet-driven tuning independent of how many scopes are logged."""
+    explicit = getattr(args, "dq_delta_auto_scope", None)
+    if explicit is not None:
+        if explicit not in ("unet", "te", "both"):
+            raise ValueError("dq_delta_auto_scope must be unet, te or both")
+        return explicit
+    if getattr(args, "network_train_text_encoder_only", False):
+        return "te"
+    if getattr(args, "network_train_unet_only", False):
+        return "unet"
+    return "te" if getattr(args, "dq_delta_scope", "both") == "te" else "unet"
+
+
 def resolve_dq_delta_auto_settings(args):
     auto_preset = getattr(args, "dq_delta_auto_preset", None)
     if auto_preset is not None:
@@ -1261,6 +1275,11 @@ class NetworkTrainer:
         rank_log_mode = getattr(args, "rank_log_mode", "summary")
 
         dq_auto_enabled = bool(getattr(args, "dq_delta_auto_range_mul", False))
+        dq_auto_scope = resolve_dq_delta_auto_scope(args)
+        if dq_auto_enabled:
+            logger.info("dq_delta auto tuning scope=%s; log scope=%s", dq_auto_scope, dq_log_scope)
+            if getattr(args, "dq_delta_auto_scope", None) is None and getattr(args, "dq_delta_scope", "both") == "both":
+                logger.info("Auto scope is now independent of dq_delta_scope=both. Use --dq_delta_auto_scope both for legacy combined tuning.")
         (
             dq_auto_preset,
             dq_auto_clip_low,
@@ -1523,7 +1542,7 @@ class NetworkTrainer:
 
         def _dq_auto_log_header(full_schema: bool, include_near_zero: bool):
             if full_schema:
-                return _dq_log_header("summary", include_near_zero, include_qerr_per_clip=True, detail="full")
+                return _dq_log_header("summary", include_near_zero, include_qerr_per_clip=True, detail="full") + ",AutoQuantErrRatioRaw,AutoQuantErrRatioEMA"
             return (
                 "TrainStep,Scope,Target,Bits,ClipRateRaw,ClipRateEMA,RangeMulBefore,RangeMulAfter,AutoApplied,"
                 "WarmupActive,WarmupRemain,AutoReason,AutoInitMulApplied,AutoInitMulValue,AutoInitClipTarget,"
@@ -1531,7 +1550,7 @@ class NetworkTrainer:
                 "ClipRateLowAutoState,ClipRateLowAutoDecision,ClipRateLowAutoReason,ClipRateLowAutoBad,ClipRateLowAutoBadStreak,"
                 "TrainProgress,ClipRateLowAutoMinProgress,ClipRateLowAutoFreezeProgress,"
                 "ClipRateLowAutoThresholdQErrRatio,ClipRateLowAutoThresholdQErrPerClip,"
-                "ClipRateLowAutoPhase,ClipRateLowAutoCanEscape"
+                "ClipRateLowAutoPhase,ClipRateLowAutoCanEscape,AutoQuantErrRatioRaw,AutoQuantErrRatioEMA"
             )
 
         def _dq_qerr_per_clip(quant_err_ratio, clip_rate):
@@ -2755,6 +2774,10 @@ class NetworkTrainer:
             metadata["ss_dq_mul_assignments_sha256"] = dq_mul_policy_record["assignments_sha256"]
             metadata["ss_dq_mul_policy_version"] = "1"
 
+        metadata["ss_dq_delta_scope"] = getattr(args, "dq_delta_scope", "both")
+        metadata["ss_dq_delta_log_scope"] = dq_log_scope
+        metadata["ss_dq_delta_auto_scope"] = dq_auto_scope
+        metadata["ss_dq_delta_auto_range_mul"] = dq_auto_enabled
         metadata = {k: str(v) for k, v in metadata.items()}
 
         # make minimum metadata for filtering
@@ -2878,6 +2901,8 @@ class NetworkTrainer:
                 "te_selection_indices": te_selection_indices,
                 "dq_bits_sched": dq_bits_sched,
                 "dq_auto_enabled": dq_auto_enabled,
+                "dq_auto_scope": dq_auto_scope,
+                "dq_log_scope": dq_log_scope,
                 "dq_auto_preset": dq_auto_preset,
                 "dq_auto_active_band": dq_auto_active_band,
                 "dq_auto_active_clip_low": dq_auto_active_clip_low,
@@ -3484,6 +3509,8 @@ class NetworkTrainer:
             col_idx = {name: idx for idx, name in enumerate(cols)}
             if "TrainStep" in col_idx:
                 row[col_idx["TrainStep"]] = 0
+            if "Scope" in col_idx:
+                row[col_idx["Scope"]] = dq_auto_scope
             if "AutoInitMulApplied" in col_idx:
                 row[col_idx["AutoInitMulApplied"]] = dq_auto_init_applied
             if "AutoInitMulValue" in col_idx:
@@ -3674,7 +3701,7 @@ class NetworkTrainer:
                                 collect_detail=collect_detail,
                                 log_mode=dq_log_mode,
                                 log_scope=dq_log_scope,
-                                auto_scope=getattr(args, "dq_delta_scope", "both"),
+                                auto_scope=dq_auto_scope,
                                 target=target,
                             )
                             dq_stats_state_fn = accelerator.unwrap_model(network).set_dq_stats_state
@@ -4295,6 +4322,10 @@ class NetworkTrainer:
                                 if dq_stats["do_auto"] and accelerator.is_main_process and dq_auto_log_path:
                                     include_near_zero = "near_zero_rate" in dq_log_extra
                                     header = _dq_auto_log_header(dq_auto_log_format == "full_schema", include_near_zero)
+                                    auto_error_values = [
+                                        auto_metrics.get("quant_err_ratio"),
+                                        dq_low_auto_quant_err_ratio_ema_state if dq_low_auto_enabled else None,
+                                    ]
                                     if dq_auto_log_format == "full_schema":
                                         row = [
                                             epoch + 1,
@@ -4358,7 +4389,7 @@ class NetworkTrainer:
                                             dq_auto_init_value if dq_auto_init_value is not None else "",
                                             dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
                                         ]
-                                        _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
+                                        _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row + auto_error_values))
                                     else:
                                         row = [
                                             step_idx,
@@ -4394,7 +4425,7 @@ class NetworkTrainer:
                                             low_auto_phase if dq_low_auto_enabled else "",
                                             low_auto_can_escape if dq_low_auto_enabled else "",
                                         ]
-                                        _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
+                                        _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row + auto_error_values))
                     if rank_log_enabled and accelerator.is_main_process and rank_log_path and (not skip_step_flag):
                         step_idx = global_step
                         if step_idx % rank_log_every == 0:
@@ -5065,9 +5096,9 @@ def setup_parser() -> argparse.ArgumentParser:
         choices=["unet", "te", "both"],
         help=(
             "Legacy scope hint; ordinary networks.lora step control enables both UNet and TE. "
-            "Direct mul overrides also target both. Log/auto scope still follows this value. / "
+            "Direct mul overrides also target both. Log scope follows this value; auto scope is independent. / "
             "従来の対象指定。通常のnetworks.lora学習ではstep制御によりUNet・TEとも量子化。"
-            "部位別mul指定も両方が対象。ログ・自動調整の対象指定は引き続き有効"
+            "部位別mul指定も両方が対象。ログ対象はこの値を継承、自動調整対象はdq_delta_auto_scopeで独立指定"
         ),
     )
     parser.add_argument(
@@ -5221,6 +5252,17 @@ def setup_parser() -> argparse.ArgumentParser:
         "--dq_delta_auto_range_mul",
         action="store_true",
         help="Enable auto range_mul tuning / range_mul の自動調整を有効化",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_scope",
+        type=str,
+        default=None,
+        choices=["unet", "te", "both"],
+        help=(
+            "Statistics used to tune the shared mul, independent of log scope. Default: UNet (TE for TE-only training/scope). "
+            "Use both for legacy combined tuning. / 共通mulの自動調整で見る統計の対象。既定はUNet、TE専用時はTE。"
+            "旧bothの統合統計による調整を再現するにはbothを明示。ログや量子化の対象は変えません"
+        ),
     )
     parser.add_argument(
         "--dq_delta_auto_preset",

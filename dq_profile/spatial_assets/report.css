@@ -6,3 +6,38 @@
 .cli-box{padding:16px;background:#eef5ff;border:1px solid #d4e0ee;border-radius:10px;margin:16px 0}.cli-box pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}
 
 #sample-context-panel{margin:12px 0} .sample-context{border-top:1px solid #e2eaf1;padding:8px 0} .sample-context p{margin:7px 0;overflow-wrap:anywhere} .sample-context b,.sample-context span{display:block} .sample-context span{white-space:pre-wrap;font-size:12px}
+
+/* Offset in-page destinations without moving sticky controls when they receive focus. */
+#sample-section,#ai-section{scroll-margin-top:calc(var(--controls-height,160px) + 16px)}
+.report-controls{position:sticky;top:0;z-index:30;background:var(--bg);padding:10px 0;border-bottom:1px solid #d3dfeb;box-shadow:0 7px 9px -8px #7890a5;margin:12px 0 0}
+.report-controls .toolbar{margin:0 0 8px}
+.report-controls .selection{padding:9px 12px;gap:12px;min-width:0}
+.report-controls .selection>div,.report-controls .selection>label{min-width:0}
+.report-controls .selection strong{font-size:14px}
+.report-controls .allocation{margin-top:4px;gap:5px}
+.report-controls .allocation span{padding:2px 6px}
+.active-entity{display:flex;align-items:center;gap:9px;min-width:160px;max-width:300px;color:var(--ink);border:1px solid #cfdeee;border-radius:7px;background:#fff;padding:5px 8px}
+.active-entity:hover{background:#f7faff;text-decoration:none}
+.active-entity img{width:52px;height:56px;object-fit:contain;background:#f3f6fa;border-radius:4px;flex:none}
+.active-entity>span{min-width:0}.active-entity span span,.active-entity strong{display:block;line-height:1.45}
+.active-entity strong{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.active-entity .small{font-size:11px}
+#dataset-help{max-width:280px;font-size:11px;margin:4px 0 0}
+select:disabled{cursor:default;background:#f2f5f8;color:#64748b}
+@media(max-width:820px){
+  .report-controls{padding:7px 0;max-height:46vh;overflow-y:auto;overscroll-behavior:contain}
+  .report-controls .toolbar{gap:6px 9px}
+  .report-controls .toolbar>label{min-width:125px;font-size:11px}
+  .report-controls select{width:100%;min-width:0;padding:5px 6px;font-size:12px}
+  .report-controls .toolbar label.inline{min-width:auto;flex:none;padding-bottom:0}
+  .report-controls .selection{display:flex;flex-wrap:wrap;padding:7px 9px;gap:6px}
+  .report-controls .selection>div{flex:1;min-width:170px}
+  .report-controls .selection>label{width:100%}
+  .report-controls .selection>div>strong{display:none}
+  .report-controls .selection select{margin-top:0}
+  .report-controls .allocation span{font-size:10px}
+  .active-entity{flex:1;min-width:135px;max-width:none;padding:3px 5px;gap:6px}
+  .active-entity img{width:38px;height:44px}
+  .active-entity strong{font-size:11px!important}
+  .active-entity .small{font-size:10px}
+}

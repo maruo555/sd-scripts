@@ -65,6 +65,8 @@
   function shared() {
     const d=dataset(),c=candidate();
     el('dataset').innerHTML=optionList(DATA.datasets.map(v=>[v.id,v.label]),d.id);
+    el('dataset').disabled=DATA.datasets.length===1;
+    el('dataset-help').textContent=DATA.datasets.length===1?'このレポートに含まれる診断データは1件です。':'このレポートに保存された診断データを切り替えます。';
     el('part').innerHTML=optionList(Object.entries(d.views),state.part);
     el('part').disabled=Object.keys(d.views).length===1;
     const regimeOptions=PAGE==='beginner'?[['off','OFFのみ（基本）'],['both','OFFとONを並べる'],['on','ONのみ']]:[['off','OFF'],['on','ON']];
@@ -107,7 +109,10 @@
         const group=all.filter(c=>c.kind===kind);if(!group.length)return;
         const values=group.map(c=>accessor?accessor(c,key,regime):score(c.id,regime)[key]);
         if(!values.some(finite))return;
-        traces.push({type:'scatter',mode:kind==='uniform'?'lines+markers':'markers',name:label,legendgroup:key,showlegend:kind==='uniform',x:group.map(c=>c.mul[0]),y:values,line:{color,width:2},marker:{color,symbol:group.map(c=>c.symbol),size:group.map(c=>c.kind==='uniform'?(c.id===state.condition?11:7):(c.id===state.condition?17:13)),line:{color:'#fff',width:1}},customdata:group.map(c=>[c.id,c.label,c.assignment_label,label]),hovertemplate:'<b>%{customdata[1]}</b><br>%{customdata[2]}<br>%{customdata[3]} = %{y:.4f}<extra></extra>'});
+        // Display-only displacement separates the families at the same true mul.
+        // Keep the measured y and true allocation unchanged in the hover and exports.
+        const offset={uniform:0,adaptive:.055,reference:-.055}[kind];
+        traces.push({type:'scatter',mode:kind==='uniform'?'lines+markers':'markers',name:label,legendgroup:key,showlegend:kind==='uniform',x:group.map(c=>c.mul[0]+offset),y:values,line:{color,width:2},marker:{color,symbol:group.map(c=>c.symbol),size:group.map(c=>c.kind==='uniform'?(c.id===state.condition?11:7):(c.id===state.condition?17:13)),line:{color:'#fff',width:1}},customdata:group.map(c=>[c.id,c.label,c.assignment_label,label,c.mul[0]]),hovertemplate:'<b>%{customdata[1]}</b><br>%{customdata[2]}<br>%{customdata[3]} = %{y:.4f}<br>実際のその他UNet mul = %{customdata[4]:.2f}'+(offset?'<br>重なりを避けるため表示位置のみ横に移動':'')+'<extra></extra>'});
       });
     });
     return traces;
@@ -257,11 +262,25 @@
     plot('entity-comparison',traces,{margin:{l:metric==='d'?72:90,r:20,t:37,b:115},xaxis:{type:'category',categoryorder:'array',categoryarray:d.candidates.map(v=>v.short),tickangle:-30},yaxis:{title:{text:metric==='d'?`${d.views[state.part]}の平均d`:'予測誤差の差 C − B'},...(metric==='d'?{rangemode:'tozero'}:{tickformat:'.6f'}),gridcolor:'#e7edf4',zeroline:true,zerolinecolor:'#98abbe'}},p=>selectCondition(p.customdata[0]));
     el('entity-title').textContent=state.entityKind==='image'?`選んだ画像の条件別比較 · ${entity.id}`:`選んだグループの条件別比較 · ${entity.samples.length}入力`;
     el('sample-name').textContent=entity.label;
+    activeEntity(entity);
     imageContext(state.entityKind==='image'?entity.samples[0]:null);
     const selected=rows.find(x=>x.c.id===c.id).m;
     el('sample-info').innerHTML=[['入力数',String(entity.samples.length)],['観測する部位',d.views[state.part]],['選択中の平均d',fmt(selected.d)],['量子化OFFの誤差',fmt(selected.reference_loss,6)],['量子化ONの誤差',fmt(selected.quantized_loss,6)],['予測誤差の差',signed(selected.delta,6)]].map(([k,v])=>`<div class="keyline"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('');
     el('sample-loss-note').textContent=d.loss_note+' 各条件は同じ対象を使い、各入力を等重みで比較しています。';
     el('condition-table').innerHTML='<thead><tr><th>診断条件 / 配分</th><th>平均d</th><th>Bの予測誤差</th><th>Cの予測誤差</th><th>差 C−B</th><th>観測数</th></tr></thead><tbody>'+rows.map(({c:v,m})=>`<tr data-candidate="${esc(v.id)}" class="${v.id===c.id?'selected':''}"><td class="label"><button class="rowlink" data-candidate="${esc(v.id)}">${esc(v.label)}</button><span class="sub">${esc(v.assignment_label)}</span></td><td>${fmt(m.d)}</td><td>${fmt(m.reference_loss,6)}</td><td>${fmt(m.quantized_loss,6)}</td><td>${signed(m.delta,6)}</td><td>${m.observations}</td></tr>`).join('')+'</tbody>';
+  }
+  function activeEntity(entity) {
+    const sample=state.entityKind==='image'?entity.samples[0]:null;
+    const preview=el('active-preview'),note=el('active-preview-note');
+    el('active-entity-label').textContent=sample?'選択中の画像':'選択中のグループ';
+    el('active-entity-name').textContent=sample?`${sample.id} · ${sample.name}`:entity.label;
+    preview.onerror=null;preview.hidden=!sample?.image_uri;preview.removeAttribute('src');
+    note.textContent=sample?(sample.image_uri?'押すと画像の詳細へ':'サムネイルなし · 押すと詳細へ'):`${entity.samples.length}入力 · 押すとグループの詳細へ`;
+    if(sample?.image_uri){
+      preview.alt=sample.name;
+      preview.onerror=()=>{preview.hidden=true;note.textContent='画像を表示できません · 押すと詳細へ';};
+      preview.src=sample.image_uri;
+    }
   }
   function imageContext(sample) {
     const preview=el('sample-preview'),note=el('sample-preview-note'),panel=el('sample-context-panel'),content=el('sample-contexts');
@@ -298,11 +317,21 @@
     const selected=list.find(e=>e.id===state.entityId);if(selected)entityComparison(selected);
   }
   async function render() {
-    normalize();shared();plots=[];
-    if(PAGE==='beginner')beginner();else datasetPage();
-    await Promise.all(plots);
-    document.documentElement.dataset.ready='true';
-    window.previewState={...state};window.previewPlotSnapshot=datasetPlotSnapshot;
+    const position={x:window.scrollX,y:window.scrollY},root=document.documentElement;
+    const anchoring=root.style.overflowAnchor;
+    // Rebuilding charts and changing card text must not move the current viewport.
+    root.style.overflowAnchor='none';
+    try {
+      normalize();shared();plots=[];
+      if(PAGE==='beginner')beginner();else datasetPage();
+      await Promise.all(plots);
+      await new Promise(resolve=>requestAnimationFrame(resolve));
+      window.scrollTo(position.x,position.y);
+      root.dataset.ready='true';
+      window.previewState={...state};window.previewPlotSnapshot=datasetPlotSnapshot;
+    } finally {
+      root.style.overflowAnchor=anchoring;
+    }
   }
   function refresh() {
     const current=++version;document.documentElement.dataset.ready='false';
@@ -333,5 +362,9 @@
     const cand=e.target.closest('[data-candidate]');if(cand){selectCondition(cand.dataset.candidate);return;}
     const sample=e.target.closest('[data-sample]');if(sample){state.entityId=sample.dataset.sample;refresh();}
   });
+  const controls=el('report-controls');
+  const updateControlHeight=()=>document.documentElement.style.setProperty('--controls-height',`${Math.ceil(controls.getBoundingClientRect().height)}px`);
+  new ResizeObserver(updateControlHeight).observe(controls);
+  updateControlHeight();
   refresh();
 })();

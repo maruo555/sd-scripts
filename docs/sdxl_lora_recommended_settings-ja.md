@@ -126,14 +126,27 @@ SDXLの`--network_module networks.lora`用です。診断ファイルには依�
 新標準を最初から最後まで通す実SDXL GPU受入はまだ未実施です。
 [検証済み範囲と次の受入手順](dq_standard_validation-ja.md)を参照してください。
 
-### 従来の自動mul調整・bits schedule（場所別固定mulとは別）
+### 自動mul調整・bits schedule（場所別固定mulとは別）
 
 以下は従来の比較用設定例です。上の場所別mulの引数とは混ぜずに使います。
-自動調整を含む過去コマンドの`scope`を`unet`から`both`へ変えると、制御用統計も変わるため同条件の再実行にはなりません。
+**最新仕様では`both`にしても、mulの自動判定はUNetの値を使います。**
+通常は下記のように、UNet＋TEを記録しつつ、従来の`unet`指定と同じUNet統計で調整します。
+
+```text
+--dq_delta_scope both --dq_delta_log_scope both --dq_delta_auto_scope unet
+```
+
+未指定でも通常の`unet`／`both`学習はUNet統計を使います（TE専用時はTE）。
+UNet＋TEの統合統計へ意図的に変更したい場合のみ`--dq_delta_auto_scope both`を明示します。
+調整されるのはTEにも使う共通mulです。UNetだけのmulを調整する機能ではありません。
+2026-10-11の変更では、旧`both`実装との互換性より、`unet`で運用していた自動判定を今後も保つことを優先しました。
+場所別固定mulと自動調整の併用はエラーです。場所別に自動調整する機能はありません。
+この対象選択の変更はCPU検証済み、GPU学習での受入は未実施です。
 
 | オプション | 従来の設定例 | 意味 |
 |---|---|---|
 | `--dq_delta_auto_range_mul` | 有効 | clip_rateを見てmulを自動調整 |
+| `--dq_delta_auto_scope` | `unet` | 調整の判定に使う統計の対象。量子化やログ対象とは独立 |
 | `--dq_delta_auto_preset` | clip_rate_high | 目標clip帯。`clip_rate_low_auto`は誤差負荷に応じてlow帯からmid帯へ退避 |
 | `--dq_delta_auto_init_range_mul_from_band` | 有効 | 目標帯から初期mulを設定（auto有効、RMS時） |
 | `--dq_delta_auto_use_raw` | 有効 | EMAに加えてraw統計も判定に使う |
