@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+# Research intervention groups; optional conv LoRA is not another candidate.
 UNET_GROUPS = ("unet.attn1", "unet.attn2", "unet.ff", "unet.other_projection")
 ATTENTION_ROLES = ("q", "k", "v", "out")
 UNET_REGIONS = ("input", "middle", "output")
@@ -36,7 +37,9 @@ def module_group(name: str) -> str:
         return "unet.ff"
     if "_proj_in" in name or "_proj_out" in name:
         return "unet.other_projection"
-    raise ValueError(f"Unclassified UNet LoRA: {name}")
+    # conv_dim also adds ResNet, resampling and time-embedding adapters.
+    # They inherit the UNet/base mul without becoming attention/projection overrides.
+    return "unet.other"
 
 
 def positive_mul(value: Any) -> float:

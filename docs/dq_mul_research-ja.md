@@ -49,10 +49,13 @@ TE学習を止めずに量子化だけを外す明示的な介入です。
 ```
 
 優先順位は `module_overrides > 役割＋部位 > 役割 > 大分類 > components > base_mul` です。
-UNet群は `unet.attn1`、`unet.attn2`、`unet.ff`、
-`unet.other_projection` の排他的な4大分類です。attentionには
+研究で個別に比較するUNet群は `unet.attn1`、`unet.attn2`、`unet.ff`、
+`unet.other_projection` の排他的な4分類です。attentionには
 `.q`、`.k`、`.v`、`.out` を追加でき、さらに `.input`、`.middle`、`.output`
 を追加できます。例: `unet.attn2.q.output`。
+`conv_dim`等で追加したResNet・Downsample・UpsampleのLoRAは、時間埋め込みのLinearも含め、
+展開結果の`unet.other`に分類します。研究用の群指定は増やさず、`components.unet`、未指定なら
+`base_mul`を引き継ぎます。通常CLIでは`--dq_delta_range_mul`に相当します。
 `module_overrides` は実際のLoRAモジュール名からmulへの辞書です。
 同じ具体性の重複は拒否し、JSONの記載順では優先順位を変えません。
 未知の成分・群・モジュール、

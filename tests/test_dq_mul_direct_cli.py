@@ -69,6 +69,78 @@ def test_partial_overrides_inherit_and_individual_te_wins(parser, extra, expecte
     assert rows[NAMES[2]]["mul"] == 2.7
 
 
+@pytest.mark.parametrize("conv_dim", [None, 4])
+@pytest.mark.parametrize("extra", [
+    ["--dq_delta_range_mul_te", "4.05"],
+    ["--dq_delta_range_mul_attn2", "4.05", "--dq_delta_range_mul_te", "4.05"],
+])
+def test_cli_policy_applies_to_sdxl_network_with_optional_conv(parser, monkeypatch, conv_dim, extra):
+    from transformers import CLIPTextConfig
+    from transformers.models.clip.modeling_clip import CLIPMLP
+    from library.sdxl_original_unet import ResnetBlock2D, Downsample2D, Upsample2D, Transformer2DModel
+    from networks.lora import LoRANetwork, create_network
+
+    # The production constructor extends this list in place for conv LoRA.
+    monkeypatch.setattr(LoRANetwork, "UNET_TARGET_REPLACE_MODULE", list(LoRANetwork.UNET_TARGET_REPLACE_MODULE))
+    config = CLIPTextConfig(hidden_size=8, intermediate_size=16)
+    encoders = [torch.nn.Sequential(CLIPMLP(config)).requires_grad_(False) for _ in range(2)]
+    unet = torch.nn.Module()
+    unet.input_blocks = torch.nn.ModuleList([
+        torch.nn.Identity(),
+        torch.nn.ModuleList([ResnetBlock2D(32, 64), Transformer2DModel(1, 32, 64, 8)]),
+        torch.nn.ModuleList([Downsample2D(64, 64)]),
+    ])
+    unet.output_blocks = torch.nn.ModuleList([torch.nn.ModuleList([Upsample2D(64, 64)])])
+    unet.requires_grad_(False)
+    kwargs = {} if conv_dim is None else {"conv_dim": str(conv_dim)}
+    network = create_network(1.0, 4, 1.0, None, encoders, unet, **kwargs)
+    modules = network.text_encoder_loras + network.unet_loras
+    originals = [module.org_module for module in modules]
+    network.apply_to(encoders, unet)
+    network.set_delta_fake_quant(None, "stoch", granularity="channel", stat="rms", bits=8, range_mul=2.7)
+    record = network.set_delta_mul_policy(policy(parser, extra))
+    extra_names = {
+        "lora_unet_input_blocks_1_0_in_layers_2",
+        "lora_unet_input_blocks_1_0_out_layers_3",
+        "lora_unet_input_blocks_1_0_emb_layers_1",
+        "lora_unet_input_blocks_1_0_skip_connection",
+        "lora_unet_input_blocks_2_0_op",
+        "lora_unet_output_blocks_0_0_conv",
+    }
+    assert set(record["modules"]) & extra_names == (set() if conv_dim is None else extra_names)
+    for enabled in (False, True):
+        network.set_delta_quant_enabled(enabled)
+        network.set_delta_fake_quant(None, "stoch", bits=8, range_mul=100)
+        for module in modules:
+            name = module.lora_name
+            high = name.startswith("lora_te") or ("_attn2_" in name and "--dq_delta_range_mul_attn2" in extra)
+            assert module.delta_q_range_mul == (4.05 if high else 2.7)
+            assert module.delta_q_enabled is enabled
+
+    # Exercise quantized Conv2d and Linear adapters with synthetic CPU inputs.
+    losses = []
+    for module, original in zip(modules, originals):
+        with torch.no_grad():
+            module.lora_up.weight.normal_(0, .1)
+        shape = (2, original.in_channels, 6, 6) if isinstance(original, torch.nn.Conv2d) else (2, original.in_features)
+        losses.append(original(torch.randn(shape)).square().mean())
+    loss = sum(losses)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in network.parameters() if p.requires_grad)
+
+
+def test_other_unet_modules_inherit_component_and_exact_overrides():
+    names = ["lora_unet_input_blocks_1_0_in_layers_2", "lora_unet_output_blocks_0_0_conv"]
+    rows = MulPolicy.from_dict({"base_mul": 2.7, "components": {"unet": 3.15},
+                               "module_overrides": {names[1]: 3.45}}).expand(names)
+    assert rows[names[0]]["mul"] == 3.15
+    assert rows[names[1]]["mul"] == 3.45
+    assert all(row["component"] == "unet" and row["enabled"] for row in rows.values())
+    with pytest.raises(ValueError, match="Unknown LoRA component"):
+        MulPolicy.from_dict({"base_mul": 2.7}).expand(["unknown_input_blocks_1_0_conv"])
+
+
 @pytest.mark.parametrize("flag", ["--dq_delta_range_mul", "--dq_delta_range_mul_attn2",
                                   "--dq_delta_range_mul_te", "--dq_delta_range_mul_te1", "--dq_delta_range_mul_te2"])
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])

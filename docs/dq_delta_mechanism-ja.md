@@ -74,6 +74,7 @@ SDXLの`--network_module networks.lora`で、次の引数を通常の学習コ�
 `--dq_delta_range_mul_te2 3.45`も指定すれば、TE2だけ3.45です。
 
 - 基本値は`--dq_delta_range_mul`。attn2は専用値、TEは「個別値 > TE共通値 > 基本値」の順で解決します。コマンドに書いた順番には依存しません。
+- `conv_dim`等で追加したResNet・Downsample・UpsampleのLoRA（時間埋め込みのLinearも含む）は、その他UNetとして基本値を使います。attn2・TE用の値は適用しません。
 - 新しい4引数はすべて既定`None`。指定しなければ従来の学習経路を維持します。mulは有限の正数で指定します。
 - 固定bits・`stat=rms`・delta量子化専用です。`--dq_delta_auto_range_mul`、`--dq_delta_bits_sched`、`--dq_quantize_z`、研究用`--dq_delta_policy_file`との併用はエラーになります。
 - 指定先のLoRAが存在しなければエラーです。例えばTE1だけを学習する構成では、TE2も指定する共通`_te`ではなく`_te1`を使います。学習対象や学習率を追加する引数ではありません。
