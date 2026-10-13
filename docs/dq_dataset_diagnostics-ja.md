@@ -33,10 +33,14 @@
 過去の配分名「候補A」とは別の記号です。初期評価がない場合は未算出の表示を残します。
 
 散布図の目盛は比較する条件間で揃えます。画像詳細の平均dは、beginnerレポートの
-source均等重みのP50／Body／Tailとは別の集計であることを表示します。
+source均等重みのP50／P75／Body／Tailとは別の集計であることを表示します。
 ONの計測を追加していないrunではONを選べず、旧ログに部位別値・raw MSEがなければ
 欠測理由を表示します。学習用objective lossをraw MSEと読み替えません。
 既存のcaption表示、sample文脈、サムネイル、絞り込み、group-map、CSV再集計の意味は維持します。
+
+新標準の確率的丸めの測定は1回が既定です。`--dq-profile-quant-repeats=2`で2回にすると、
+この画像・グループ別集計にも2回分が反映されます。拡散ノイズ数・dropoutマスク数は変えません。
+旧ログの反復数は読み替えず、保存された測定条件を表示します。
 
 ## 実行する
 
@@ -105,9 +109,9 @@ A → Bの図は、右ほど初期誤差が大きく、上ほど誤差の減少�
 
 production standard/strictは`local-body-tail-v2`、最大52実画像を使います。旧`local-body-tail-v1`の32画像契約は読み取り・再現用途に保持します。画像を複製して52枠を埋めません。従来のBody/Tail計算・Hard Safety・候補絞り込みはそのままで、母集団が増えたことによる数値変化は起こり得ます。
 
-standardの5候補では、選択実画像数をVとしてLocalは92V回のforward/backwardです。上限を使い切る場合、32画像の2,944回から52画像の4,784回へ62.5%増えます。元から32枚以下なら上限増による増加はありません。
+一律5候補のOFF測定では、選択実画像数をV、丸め反復数をQとしてLocalは`4V × (3 + 10Q)`回のforward/backwardです。新標準の既定Q=1では52V回、`--dq-profile-quant-repeats=2`では従来通り92V回です。場所別配分とdropout ONの追加測定、warmupとPrefixの費用は別枠です。元から32枚以下なら画像上限増による増加はありません。
 
-`warmup`はさらに12V回のforwardのみを追加します（52画像なら624回）。実行計画に別枠で表示し、未測定のforward時間係数を既存の時間見積もりへ混ぜません。standardのstandalone snapshot/prefix workerでは初期評価しません。strictのedge再走査は各Local workerで初期評価も繰り返します。
+`warmup`はさらに12V回のforwardのみを追加します（52画像なら624回）。実行計画に別枠で表示します。standardは1回のwarmup状態をPrefixとLocalで共有し、初期状態と実warmupの履歴を保持します。Prefix中は画像診断の収集を止め、終了後に状態を復元してからLocalを測定するため、A→Bの図にPrefixの更新は入りません。strictのedge再走査は各Local workerで初期評価も繰り返します。
 
 ## 出力と操作
 

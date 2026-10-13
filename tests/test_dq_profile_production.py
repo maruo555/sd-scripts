@@ -65,12 +65,14 @@ def test_standard_mode_keeps_the_shared_local_ruler_and_shortens_only_qa() -> No
     assert standard.execution_mode.prefix_checkpoints == (0, 1, 4, 8)
     assert standard.execution_mode.prefix_branch_updates == 64
     assert standard.execution_mode.max_edge_extension_rounds == 0
-    assert standard.execution_mode.standalone_snapshot_count == 1
-    assert standard.execution_mode.gpu_process_count_range == (3, 3)
+    assert standard.execution_mode.standalone_snapshot_count == 0
+    assert standard.execution_mode.shared_warmup is True
+    assert standard.execution_mode.gpu_process_count_range == (1, 1)
     assert strict.execution_mode.prefix_checkpoints == (0, 1, 32, 64)
     assert strict.execution_mode.prefix_branch_updates == 512
     assert strict.execution_mode.max_edge_extension_rounds == 2
     assert strict.execution_mode.standalone_snapshot_count == 2
+    assert strict.execution_mode.shared_warmup is False
     assert strict.execution_mode.gpu_process_count_range == (4, 6)
 
 
@@ -130,6 +132,30 @@ def test_full_legacy_style_cli_is_explicit_about_overrides() -> None:
     assert ("max_data_loader_n_workers", "overridden_with_reason") in actions
     assert ("dq_delta_auto_preset", "overridden_with_reason") in actions
     assert request.output_name == "sample_r4"
+
+
+def test_rounding_repeats_are_part_of_the_local_fingerprint(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset.toml"
+    dataset.write_text("[general]\nresolution=1024\n", encoding="utf-8")
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"synthetic model identity")
+    argv = [f"--pretrained_model_name_or_path={model}", f"--dataset_config={dataset}"]
+    fingerprints = []
+    for repeats in (1, 2):
+        request = resolve_training_cli(argv, preset_name="canonical-v2", quant_repeats=repeats)
+        assert request.provenance()["local_measurement_contract"]["stochastic_quant_repeats"] == repeats
+        fingerprints.append(build_protocol_fingerprint(request, source_map_payload=()))
+    first, second = fingerprints
+    for field in ("local_probe_contract_sha256", "local_measurement_contract_sha256"):
+        assert first["contract_hashes"][field] != second["contract_hashes"][field]
+    for field in ("training_contract_sha256", "dataset_contract_sha256", "execution_qa_contract_sha256"):
+        assert first["contract_hashes"][field] == second["contract_hashes"][field]
+
+
+@pytest.mark.parametrize("value", [0, 3, -1, 1.5, True])
+def test_invalid_programmatic_rounding_count_is_rejected(value) -> None:
+    with pytest.raises(ValueError, match="quant-repeats must be 1 or 2"):
+        resolve_training_cli(minimal_cli(), preset_name="canonical-v2", quant_repeats=value)
 
 
 def test_canonical_long_training_command_can_be_reused() -> None:
@@ -636,7 +662,7 @@ def test_standard_profile_command_carries_distinct_execution_and_internal_levels
     assert "--dq_profile_range_muls=2.70,3.15,3.45,3.75,4.05" in command
 
 
-def test_dry_run_serializes_the_required_prefix_gate(
+def test_dry_run_serializes_the_shared_prefix_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -689,18 +715,15 @@ def test_dry_run_serializes_the_required_prefix_gate(
         ),
     )
     payload = json.loads((result.run_dir / "dry_run_command.json").read_text(encoding="utf-8"))
-    expected_gate = (
-        result.run_dir
-        / production_runner.stage_names()["prefix"]
-        / "calibration_gate.json"
-    )
-    assert payload["requires_prefix_gate"] == str(expected_gate)
-    assert f"--dq_profile_prefix_gate_file={expected_gate}" in payload["argv"]
+    assert payload["requires_prefix_gate"] is None
+    assert payload["shared_warmup"] is True
+    assert "--dq_profile_shared_warmup" in payload["argv"]
+    assert not any(value.startswith("--dq_profile_prefix_gate_file") for value in payload["argv"])
     plan = json.loads((result.run_dir / "execution_plan.json").read_text(encoding="utf-8"))
     assert plan["execution_mode"] == "standard"
     assert plan["qa_depth"] == "standard_smoke"
-    assert plan["work_volume"]["gpu_process_count"] == 3
-    assert plan["work_volume"]["standalone_snapshot_count"] == 1
+    assert plan["work_volume"]["gpu_process_count"] == 1
+    assert plan["work_volume"]["standalone_snapshot_count"] == 0
     assert plan["work_volume"]["prefix"]["total_branch_updates"] == 64
     assert plan["work_volume"]["local"]["fixed_grid"] == [2.7, 3.15, 3.45, 3.75, 4.05]
     assert plan["work_volume"]["local"]["total_local_probes"] == 736
@@ -740,9 +763,10 @@ def test_execution_plan_matches_the_known_13_image_standard_work_volume(
     plan = build_execution_plan(request, image_count=13, probe_budget=13)
     work = plan["work_volume"]
     assert work["warmup_boundary_updates"] == 1040
-    assert work["gpu_process_count"] == 3
-    assert work["standalone_snapshot_count"] == 1
-    assert work["total_warmup_updates"] == 3120
+    assert work["gpu_process_count"] == 1
+    assert work["standalone_snapshot_count"] == 0
+    assert work["total_warmup_updates"] == 1040
+    assert work["snapshot_validation"] == "shared_state_restore"
     assert work["prefix"]["checkpoints"] == [0, 1, 4, 8]
     assert work["prefix"]["total_branch_updates"] == 64
     assert work["local"]["no_quant_probes"] == 156
@@ -750,11 +774,13 @@ def test_execution_plan_matches_the_known_13_image_standard_work_volume(
     assert work["local"]["total_local_probes"] == 1196
     assert plan["reference_time_estimate"]["minutes"]["minimum"] > 0
 
-def test_standard_pipeline_skips_the_redundant_second_snapshot(
+@pytest.mark.parametrize("mode", ["standard", "strict"])
+def test_pipeline_shares_standard_warmup_but_keeps_strict_independent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    mode: str,
 ) -> None:
-    request = resolve_training_cli(minimal_cli(), execution_mode_name="standard")
+    request = resolve_training_cli(minimal_cli(), execution_mode_name=mode)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     profile_calls: list[tuple[str, bool]] = []
@@ -802,16 +828,20 @@ def test_standard_pipeline_skips_the_redundant_second_snapshot(
         dataset_id="standard",
     )
     names = production_runner.stage_names()
-    assert profile_calls == [
-        (names["snapshot_a"], True),
-        (names["prefix"], False),
-        (names["core_raw"], False),
-    ]
-    assert parity_calls == [
-        (names["snapshot_a"], names["prefix"], names["prefix_snapshot_parity"])
-    ]
-    assert not (run_dir / names["snapshot_b"]).exists()
-    assert not (run_dir / names["snapshot_parity"]).exists()
+    if mode == "standard":
+        assert profile_calls == [(names["core_raw"], False)]
+        assert parity_calls == []
+        assert not (run_dir / names["snapshot_a"]).exists()
+        assert not (run_dir / names["prefix"]).exists()
+    else:
+        assert profile_calls == [
+            (names["snapshot_a"], True), (names["snapshot_b"], True),
+            (names["prefix"], False), (names["core_raw"], False),
+        ]
+        assert parity_calls == [
+            (names["snapshot_a"], names["snapshot_b"], names["snapshot_parity"]),
+            (names["snapshot_b"], names["prefix"], names["prefix_snapshot_parity"]),
+        ]
 
 
 def test_product_artifacts_are_promoted_to_run_root(tmp_path: Path) -> None:
@@ -831,12 +861,14 @@ def test_product_artifacts_are_promoted_to_run_root(tmp_path: Path) -> None:
         (analysis / name).write_text(name, encoding="utf-8")
     (profile / "source_manifest.json").write_text("{}", encoding="utf-8")
     (profile / "candidate_definitions.json").write_text("{}", encoding="utf-8")
+    (profile / "shared_warmup.json").write_text('{"passed": true}', encoding="utf-8")
     promoted = promote_analysis(run_dir, analysis)
     promoted.extend(promote_profile_provenance(run_dir, profile))
     assert (run_dir / "report.html").is_file()
     assert (run_dir / "beginner_report.html").is_file()
     assert (run_dir / "source_manifest.json").is_file()
     assert "candidate_definitions.json" in promoted
+    assert json.loads((run_dir / "shared_warmup.json").read_text(encoding="utf-8"))["passed"]
 
 
 def test_direct_module_entry_preserves_training_vector(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -869,6 +901,7 @@ def test_direct_module_entry_preserves_training_vector(monkeypatch: pytest.Monke
         "group_map": None,
         "dropout_on": False,
         "uniform_only": False,
+        "quant_repeats": None,
     }
 
 

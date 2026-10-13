@@ -705,7 +705,7 @@ def build_execution_plan(
 
     base_seconds = (
         execution.standalone_snapshot_count * reference_warmup_seconds
-        + reference_warmup_seconds
+        + (0 if execution.shared_warmup else reference_warmup_seconds)
         + execution.prefix_branch_updates * reference_prefix_update_seconds
         + estimated_local_seconds(len(execution.core_grid))
     )
@@ -770,6 +770,8 @@ def build_execution_plan(
             "total_warmup_updates_min": warmup * minimum_processes,
             "total_warmup_updates_max": warmup * maximum_processes,
             "standalone_snapshot_count": execution.standalone_snapshot_count,
+            "shared_warmup": execution.shared_warmup,
+            "snapshot_validation": "shared_state_restore" if execution.shared_warmup else "independent_warmup_parity",
             "snapshot_replica_count": execution.standalone_snapshot_count,
             "prefix": {
                 "candidates": ["no_quant", f"mul_{execution.prefix_anchor_mul:.2f}"],
@@ -781,6 +783,8 @@ def build_execution_plan(
             },
             "local": {
                 **core_counts,
+                "candidate_noise_replicas": local.candidate_noise_replicas,
+                "stochastic_quant_repeats": local.stochastic_quant_repeats,
                 "fixed_grid": list(execution.core_grid),
                 "edge_extension": execution.edge_policy,
                 "maximum_edge_extension_rounds": execution.max_edge_extension_rounds,
@@ -994,6 +998,9 @@ def profile_command(
         f"--dq_profile_source_group_map={source_map}",
     ]
     if protocol == "v24-acceptance-local" and not snapshot_only:
+        command.append(f"--dq_profile_quant_repeats={local.stochastic_quant_repeats}")
+        if execution.shared_warmup and gate is None:
+            command.append("--dq_profile_shared_warmup")
         if request.preset.name == "canonical-v2":
             command.append("--dq_profile_standard_version=2")
             if request.dropout_on:
@@ -1141,6 +1148,18 @@ def run_local_pipeline(
 ) -> tuple[Path, Path, tuple[float, ...], int]:
     names = stage_names()
     execution = request.execution_mode
+    if execution.shared_warmup:
+        update_status(launcher.run_dir, status="running", current_stage="shared_warmup_prefix_local")
+        active_grid = tuple(float(value) for value in execution.core_grid)
+        active_profile = run_profile(
+            launcher, request, source_map=source_map, name=names["core_raw"],
+            protocol="v24-acceptance-local", range_muls=active_grid, max_images=probe_budget,
+        )
+        active_analysis = run_local_analysis(
+            launcher, request=request, profile=active_profile,
+            output_name=names["core_analysis"], dataset_id=dataset_id,
+        )
+        return active_profile, active_analysis, active_grid, 0
     update_status(launcher.run_dir, status="running", current_stage="snapshot_a")
     snapshot_a = run_profile(
         launcher,
@@ -1339,6 +1358,7 @@ def promote_profile_provenance(run_dir: Path, profile_dir: Path) -> list[str]:
         "candidate_definitions.json": "candidate_definitions.json",
         "fixed_policy_assignments.json": "fixed_policy_assignments.json",
         "probe_manifest.json": "probe_manifest.json",
+        "shared_warmup.json": "shared_warmup.json",
         "calibration_gate.json": "profile_calibration_gate.json",
         "gradient_tail.csv": "raw_gradient_tail.csv",
         "local_natural_gradient.csv": "raw_local_natural_gradient.csv",
@@ -1532,7 +1552,7 @@ def run_profile_request(
             return ProductionRunResult(run_dir, "preflight_complete", None)
         if options.dry_run:
             names = stage_names()
-            gate = run_dir / names["prefix"] / "calibration_gate.json"
+            gate = None if request.execution_mode.shared_warmup else run_dir / names["prefix"] / "calibration_gate.json"
             command = profile_command(
                 request,
                 run_dir=run_dir,
@@ -1548,8 +1568,12 @@ def run_profile_request(
                 {
                     "stage": names["core_raw"],
                     "argv": command,
-                    "requires_prefix_gate": str(gate),
+                    "requires_prefix_gate": str(gate) if gate else None,
+                    "shared_warmup": request.execution_mode.shared_warmup,
                     "note": (
+                        "The Core worker warms up once, validates Prefix from that snapshot, "
+                        "restores it, then measures Local. A failed gate prevents Local measurement."
+                        if request.execution_mode.shared_warmup else
                         "This is the resolved Core worker command. The normal runner first "
                         "creates and validates the referenced prefix gate."
                     ),

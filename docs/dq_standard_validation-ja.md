@@ -36,6 +36,22 @@ README、量子化ガイド、TE設定、推奨設定一覧では、新しい4�
 
 ## CPUテストの再実行
 
+2026-10-12のP75追加・丸め反復数の変更は、関連CPUテスト126件で確認しています。
+公開CLIからworkerへの1回／2回の伝達、計画・fingerprint・保存契約への反映と、
+合成モデルでのOFF/ON測定を確認しました。2回測定の1回目は1回測定と一致し、
+2回目でも拡散ノイズ・参照勾配・dropoutマスクを維持します。P75は既存のsource均等重みの75%点です。
+HTML保存に関する7件はWindowsのパス解決制限で失敗したため、GPUを無効にした通常権限で再実行して合格を確認しました。
+合成データのHTMLをオフラインで表示し、全7部位・OFF/ONの336個のグラフ座標と比較表を保存値に照合しました。
+P75の欠測表示、旧2回測定の条件表示、スクロール保持、画像診断ページ、狭い画面も確認し、スクリーンショットを目視しました。
+この変更での実SDXL GPU診断と短縮時間は未検証です。
+
+2026-10-12のStandard warmup共有では、合成CPUモデルで実際のPrefix更新を実行し、
+重み・optimizer・scheduler・RNG・module状態とreplayの復元、画像診断observerの保護、
+失敗時の停止を検証します。対象は`tests/test_dq_profile_shared_warmup.py`です。
+共有経路12件を含む関連CPU回帰テスト117件を確認しました。HTML出力1件はWindowsの
+実行制限でパス解決が拒否されたため、GPUを無効にした通常権限で再実行し、合格を確認しています。
+共有経路の実SDXL GPU比較・短縮時間は未検証です。以前の独立warmup実行の記録とは区別します。
+
 プロジェクトの依存パッケージを導入済みの環境で、リポジトリ直下から実行します。
 `--basetemp`には他の用途で使っていない一時フォルダを指定してください。
 
@@ -43,11 +59,15 @@ README、量子化ガイド、TE設定、推奨設定一覧では、新しい4�
 $env:CUDA_VISIBLE_DEVICES=''
 $env:HF_HUB_OFFLINE='1'
 $env:TRANSFORMERS_OFFLINE='1'
-python -B -m pytest tests/test_dq_mul_policy_training.py tests/test_dq_mul_direct_cli.py tests/test_dq_spatial_standard.py tests/test_dq_spatial_report_contract.py tests/test_dq_dataset_report.py tests/test_dq_dataset_integration.py tests/test_dq_profile_production.py tests/test_dq_profile_copy_drift.py --basetemp=.tmp/dq_standard_cpu_tests -q
+python -B -m pytest tests/test_dq_mul_policy_training.py tests/test_dq_mul_direct_cli.py tests/test_dq_spatial_standard.py tests/test_dq_spatial_report_contract.py tests/test_dq_dataset_report.py tests/test_dq_dataset_integration.py tests/test_dq_profile_production.py tests/test_dq_profile_shared_warmup.py tests/test_dq_profile_copy_drift.py --basetemp=.tmp/dq_standard_cpu_tests -q
 ```
 
 追加テストは実データもpretrained modelも読み込みません。CPUで実行した回数を
 実データの診断・学習回数には数えません。テスト関数内の小型モデルと値は合成fixtureです。
+
+P75・丸め回数の変更を重点確認する場合は、`tests/test_dq_profile_production.py`、
+`tests/test_dq_profile_entry_v2.py`、`tests/test_dq_profile_shared_warmup.py`、
+`tests/test_dq_spatial_standard.py`、`tests/test_dq_spatial_report_contract.py`を実行します。
 
 ## 次に必要なGPU受入
 

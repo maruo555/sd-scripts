@@ -60,20 +60,26 @@ TRAIN=['--pretrained_model_name_or_path=synthetic.safetensors','--dataset_config
 
 @pytest.mark.parametrize('mode',['standard','strict'])
 @pytest.mark.parametrize('flags',[[],['--dq-profile-dropout-on'],['--dq-profile-uniform-only']])
-def test_public_standard(monkeypatch,tmp_path,mode,flags):
+@pytest.mark.parametrize('quant_repeats',[None,2])
+def test_public_standard(monkeypatch,tmp_path,mode,flags,quant_repeats):
     import dq_profile.__main__ as cli
     import dq_profile.production_entry as entry
     from dq_profile.production_runner import profile_command
     seen=[]
     monkeypatch.setattr(entry,'run_profile_request',lambda request,options:(seen.append(request) or NS(status='test',run_dir=tmp_path,report=None)))
-    assert cli.main(TRAIN+['--dq-profile-mode='+mode]+flags)==0
+    quant_flags=[] if quant_repeats is None else [f'--dq-profile-quant-repeats={quant_repeats}']
+    assert cli.main(TRAIN+['--dq-profile-mode='+mode]+flags+quant_flags)==0
     r=seen[0]
     assert r.preset.name=='canonical-v2' and r.te_quantized
     assert r.execution_mode.core_grid==UNIFORM_MULS and r.execution_mode.max_edge_extension_rounds==0
     assert r.data_diagnostics=='warmup'
+    repeats=1 if quant_repeats is None else quant_repeats
+    assert r.local_measurement.stochastic_quant_repeats==repeats
+    assert r.local_measurement.candidate_noise_replicas==2
     argv=profile_command(r,protocol='v24-acceptance-local',run_dir=tmp_path,source_map=tmp_path/'map.json',name='local',range_muls=UNIFORM_MULS,max_images=8)
     assert '--dq_profile_standard_version=2' in argv
     assert '--dq_profile_te_quantized' in argv
+    assert f'--dq_profile_quant_repeats={repeats}' in argv
     assert ('--dq_profile_dropout_on' in argv)==('--dq-profile-dropout-on' in flags)
     assert r.fixed_policy_contract()['standard_version']==STANDARD_VERSION
 
@@ -88,11 +94,12 @@ def test_scope_legacy_and_rejections(monkeypatch,tmp_path):
     assert not seen
     cli.main(TRAIN+['--dq-profile-preset=canonical-v1','--dq-profile-no-te-quantized'])
     assert not seen[-1].te_quantized and seen[-1].data_diagnostics=='off'
+    assert seen[-1].local_measurement.stochastic_quant_repeats==2
     cli.main(TRAIN+['--dq_delta_scope=unet'])
     assert seen[-1].preset.expected_explicit['dq_delta_scope']=='both'
 
 
-def run_cpu_runtime(root,dropout=True,uniform=False):
+def run_cpu_runtime(root,dropout=True,uniform=False,quant_repeats=1):
     root.mkdir(parents=True,exist_ok=True)
     torch.manual_seed(817)
     net=TinyDiagnosticNetwork()
@@ -110,7 +117,7 @@ def run_cpu_runtime(root,dropout=True,uniform=False):
         dq_quantize_z=False,dq_delta_use_triton=False,dq_delta_step=None,dq_delta_mode='stoch',dq_delta_scope='unet',
         dq_profile_stochastic_repeats=2,gradient_checkpointing=False,dq_profile_timestep_bins=4,
         dq_profile_max_images=8,dq_profile_safety_no_quant_noise_replicas_resolved=3,
-        dq_profile_safety_candidate_noise_replicas_resolved=2,dq_profile_safety_quant_repeats_resolved=2,
+        dq_profile_safety_candidate_noise_replicas_resolved=2,dq_profile_safety_quant_repeats_resolved=quant_repeats,
         dq_profile_dropout_on=dropout,dq_profile_uniform_only=uniform,
         dq_profile_policy_grid_resolved={f'{v:.12g}':MulPolicy.from_dict({'base_mul':v}).to_dict() for v in UNIFORM_MULS})
     runtime=SpatialDiagnosticRuntime(args=args,trainer=trainer)
@@ -131,7 +138,8 @@ def run_cpu_runtime(root,dropout=True,uniform=False):
     assert fingerprint_tree(net.state_dict())==before
     assert scheduler.last_epoch==0 and not optimizer.state
     contract=json.loads((root/'spatial_contract.json').read_text(encoding='utf-8'))
-    assert len(runtime.spatial_rows)==len(contract['conditions'])*8*4*2*2*(2 if dropout else 1)
+    assert len(runtime.spatial_rows)==len(contract['conditions'])*8*4*2*quant_repeats*(2 if dropout else 1)
+    assert contract['quant_repeats']==quant_repeats
     return runtime,contract
 
 
@@ -206,7 +214,8 @@ def test_compatibility_error_identifies_the_selected_preset(preset,option):
     assert preset in str(error.value)
 
 
-def test_public_dry_run_counts_without_gpu(monkeypatch,tmp_path):
+@pytest.mark.parametrize('quant_repeats',[1,2])
+def test_public_dry_run_counts_without_gpu(monkeypatch,tmp_path,quant_repeats):
     import dq_profile.__main__ as cli
     import dq_profile.production_runner as runner
     sources=[]
@@ -219,7 +228,8 @@ def test_public_dry_run_counts_without_gpu(monkeypatch,tmp_path):
     monkeypatch.setattr(runner,'preflight',lambda *a:None)
     monkeypatch.setattr(runner,'validate_output_base',lambda p,**kw:p.resolve())
     assert cli.main(['--pretrained_model_name_or_path='+str(model),'--dataset_config='+str(dataset),
-        '--dq-profile-output-dir='+str(tmp_path/'reports'),'--dq-profile-dry-run','--dq-profile-dropout-on'])==0
+        '--dq-profile-output-dir='+str(tmp_path/'reports'),'--dq-profile-dry-run','--dq-profile-dropout-on',
+        f'--dq-profile-quant-repeats={quant_repeats}'])==0
     plan=json.loads(next((tmp_path/'reports').rglob('execution_plan.json')).read_text(encoding='utf-8'))
     # Every quantized probe has a backward; no-quant references and warmup forwards are explicit.
     text=json.dumps(plan)
@@ -229,8 +239,9 @@ def test_public_dry_run_counts_without_gpu(monkeypatch,tmp_path):
             if k in d:return d[k]
             return next((x for v in d.values() if (x:=find(v,k)) is not None),None)
     assert find(plan,'maximum_unique_conditions')==8
-    assert find(plan,'minimum_total_probes_with_additions')==8*4*(3+20)+8*4*2*((1+2)+(1+6*2))
-    assert find(plan,'maximum_total_probes_with_additions')==8*4*(3+20)+8*4*2*((1+6)+(1+8*2))
+    assert find(plan,'stochastic_quant_repeats')==quant_repeats
+    assert find(plan,'minimum_total_probes_with_additions')==8*4*(3+10*quant_repeats)+8*4*2*((1+quant_repeats)+(1+6*quant_repeats))
+    assert find(plan,'maximum_total_probes_with_additions')==8*4*(3+10*quant_repeats)+8*4*2*((1+3*quant_repeats)+(1+8*quant_repeats))
 
 
 def test_uniform_only_runtime_has_no_additional_probes(tmp_path):
@@ -238,5 +249,30 @@ def test_uniform_only_runtime_has_no_additional_probes(tmp_path):
     runtime,contract=run_cpu_runtime(ROOT/'uniform_runtime',dropout=False,uniform=True)
     assert len(contract['conditions'])==5
     assert contract['additional_reference_probes']==0
-    assert contract['local_forward_backward_calls']==8*4*(3+20)
+    assert contract['local_forward_backward_calls']==8*4*(3+10)
     assert {r['regime'] for r in runtime.spatial_rows}=={'off'}
+
+
+def test_rounding_repeats_preserve_matched_first_draw_and_dropout_masks(tmp_path):
+    # Same synthetic inputs/state; the second rounding draw must not move the first.
+    once, first_contract=run_cpu_runtime(tmp_path/'runtime',uniform=True,quant_repeats=1)
+    twice, second_contract=run_cpu_runtime(tmp_path/'runtime',uniform=True,quant_repeats=2)
+    assert once.spatial_rows==[r for r in twice.spatial_rows if r['quant_repeat']==0]
+    assert len(twice.spatial_rows)==2*len(once.spatial_rows)
+    for contract in (first_contract,second_contract):
+        assert contract['candidate_noises']==2 and contract['bins']==4
+    masks={}
+    for row in twice.spatial_rows:
+        key=(row['regime'],row['candidate'],row['image_index'],row['timestep_bin'],row['noise_replica'])
+        value=(row['dropout_mask_digest'],row['noise_digest'],row['reference_hash'])
+        assert masks.setdefault(key,value)==value
+    data,_=build_data(second_contract,twice.spatial_rows,iterations=0)
+    assert data['datasets'][0]['meta']['quant_repeats']==2
+
+
+@pytest.mark.parametrize('value',['0','3','-1','1.5'])
+def test_invalid_public_quant_repeats_rejected_before_launch(monkeypatch,value):
+    import dq_profile.__main__ as cli
+    monkeypatch.setattr(cli,'run_profile_mode',lambda *a,**kw:pytest.fail('must not launch'))
+    with pytest.raises(SystemExit):
+        cli.main(TRAIN+[f'--dq-profile-quant-repeats={value}'])

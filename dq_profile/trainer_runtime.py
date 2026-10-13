@@ -2065,6 +2065,8 @@ class DiagnosticProfileRuntime:
         training_model: Any,
         on_step_start: Any,
         dq_delta_begin_step: int,
+        _prepared_boundary: Optional[tuple[TrainingSnapshot, ReplaySequence, dict[str, Any]]] = None,
+        _end_training: bool = True,
     ) -> dict[str, Any]:
         if int(global_step) != int(dq_delta_begin_step):
             raise RuntimeError(
@@ -2086,7 +2088,9 @@ class DiagnosticProfileRuntime:
                 "The requested normal-training preset clip_rate_low_auto is not a v1 candidate. "
                 "The profiler uses clip_rate_low; early branches do not evaluate the low-auto escape condition."
             )
-        snapshot = TrainingSnapshot.capture(
+        if _prepared_boundary is not None and self.profile_protocol != "v2-prefix-smoke":
+            raise ValueError("prepared shared boundary is only valid for internal Prefix validation")
+        snapshot = _prepared_boundary[0] if _prepared_boundary is not None else TrainingSnapshot.capture(
             network=unwrapped,
             optimizer=optimizer,
             scheduler=lr_scheduler,
@@ -2136,7 +2140,7 @@ class DiagnosticProfileRuntime:
             if self.profile_protocol.startswith("v24-")
             else ()
         )
-        sequence, capture_metadata = self._capture_batches(
+        sequence, capture_metadata = _prepared_boundary[1:] if _prepared_boundary is not None else self._capture_batches(
             first_batch=first_batch,
             epoch_iterator=epoch_iterator,
             train_dataloader=train_dataloader,
@@ -2161,14 +2165,33 @@ class DiagnosticProfileRuntime:
             trainer=self.trainer,
             guardian=grad_norm_guardian,
         )
-        self._materialize_replay(
-            sequence,
-            accelerator=accelerator,
-            vae=vae,
-            vae_dtype=vae_dtype,
-            weight_dtype=weight_dtype,
-            noise_scheduler=noise_scheduler,
-        )
+        if _prepared_boundary is None:
+            self._materialize_replay(
+                sequence,
+                accelerator=accelerator,
+                vae=vae,
+                vae_dtype=vae_dtype,
+                weight_dtype=weight_dtype,
+                noise_scheduler=noise_scheduler,
+            )
+        if bool(getattr(self.args, "dq_profile_shared_warmup", False)):
+            from dq_profile.shared_warmup import run_shared_prefix
+            self._shared_warmup_record = run_shared_prefix(
+                runtime=self, snapshot=snapshot, sequence=sequence,
+                boundary_context={
+                    "accelerator": accelerator, "network": network, "optimizer": optimizer,
+                    "lr_scheduler": lr_scheduler, "grad_norm_guardian": grad_norm_guardian,
+                    "global_step": global_step, "epoch": epoch, "data_step": data_step,
+                    "first_batch": first_batch, "epoch_iterator": epoch_iterator,
+                    "train_dataloader": train_dataloader, "current_epoch": current_epoch,
+                    "current_step": current_step, "num_train_epochs": num_train_epochs,
+                    "vae": vae, "vae_dtype": vae_dtype, "weight_dtype": weight_dtype,
+                    "noise_scheduler": noise_scheduler, "unet": unet, "text_encoders": text_encoders,
+                    "tokenizers": tokenizers, "train_unet": train_unet,
+                    "train_text_encoder": train_text_encoder, "training_model": training_model,
+                    "on_step_start": on_step_start, "dq_delta_begin_step": dq_delta_begin_step,
+                },
+            )
         bin_count = int(self.args.dq_profile_timestep_bins)
         diffusion_steps = int(noise_scheduler.config.num_train_timesteps)
         if self.profile_protocol == "v2-prefix-smoke":
@@ -2614,6 +2637,9 @@ class DiagnosticProfileRuntime:
                 }
             )
             v2_result["calibration_gate"] = calibration_gate
+        shared_record = getattr(self, "_shared_warmup_record", None)
+        if shared_record is not None:
+            source_manifest["shared_warmup"] = shared_record
         source_manifest_hash = canonical_sha256(source_manifest)
         preflight = _finite_json(getattr(self.args, "dq_profile_preflight", {}))
         current_controls = _current_control_contract(
@@ -2642,6 +2668,7 @@ class DiagnosticProfileRuntime:
         v2_summary = {
             "enabled": self.profile_protocol != "v1",
             "profile_protocol": self.profile_protocol,
+            "shared_warmup": getattr(self, "_shared_warmup_record", None),
             "diagnostic_target": (
                 "numerical_gradient_acceptance_by_fixed_range_mul"
                 if self.profile_protocol
@@ -2908,5 +2935,6 @@ class DiagnosticProfileRuntime:
             observer.finish(self.artifacts.root / "data_diagnostics")
         summary_hash = canonical_sha256(summary)
         self.artifacts.mark_complete(summary_hash)
-        accelerator.end_training()
+        if _end_training:
+            accelerator.end_training()
         return summary

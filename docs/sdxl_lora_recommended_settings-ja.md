@@ -122,6 +122,10 @@ SDXLの`--network_module networks.lora`用です。診断ファイルには依�
 詳しいコマンド例・制約は[量子化ガイド](dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)を参照してください。
 
 標準診断はTE込み固定・dropout OFFが既定で、必要なら`--dq-profile-dropout-on`でONも追加確認できます。
+`--dq-profile-mode=standard`は1回のwarmup後の状態をPrefix検算と診断本体で共有します。
+warmup共有の追加CLIは不要です。共有化自体は画像数・反復数を変えません。独立warmupの再現性まで検算する場合は`strict`を使います。
+その後の簡素化として、`canonical-v2`の確率的丸めは**既定1回**になりました。`--dq-profile-quant-repeats=2`で2回にできます（旧v1は既定2回）。
+拡散ノイズとdropoutマスクの数は維持します。冒頭のグラフ・比較表にはP75も追加し、P50・Body・Tailと併せて確認できます。Body基準の配分生成は従来通りです。
 これは**診断の比較方法**で、通常学習の`--network_dropout` / `rank_dropout`を外す指定ではありません。
 新標準を最初から最後まで通す実SDXL GPU受入はまだ未実施です。
 [検証済み範囲と次の受入手順](dq_standard_validation-ja.md)を参照してください。

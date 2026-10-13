@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from dq_profile.spatial import LEAVES, STANDARD_VERSION, build_conditions
+from dq_profile.spatial import LEAVES, VIEWS, STANDARD_VERSION, build_conditions
 from dq_profile.spatial_report import build_data, write_standard_report
 from dq_profile.report_publication import file_record, finalize_report_manifests
 
@@ -83,6 +83,19 @@ def test_nonfinite_metrics_fail_instead_of_changing_metric_kind(tmp_path):
     rows[0]["quantized_mse"] = float("nan")
     with pytest.raises(ValueError, match="Nonfinite"):
         build_data(contract, rows, iterations=0)
+
+
+def test_p75_uses_the_existing_source_weighted_distribution(tmp_path):
+    contract, rows = synthetic_observations(tmp_path)
+    # Four equally weighted values per source; the third is the 75th percentile.
+    data, _ = build_data(contract, rows, iterations=0)
+    for view in VIEWS:
+        scores = data["datasets"][0]["regimes"]["off"]["scores"][view]
+        for i, condition in enumerate(contract["conditions"]):
+            score = scores[condition["id"]]
+            assert score["p75"] == pytest.approx(.02 * (i + 3))
+            assert score["p50"] < score["p75"] < score["body"]
+            assert score["body"] == score["tail"]
 
 
 def assert_artifact_records(records):

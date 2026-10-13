@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from tools.lora_dq_report import aggregate_rows, build_auto_monitor, group_dq_rows, mul_settings
+from tools.lora_diagnostic_display import prepare_display
 from tools.make_lora_diagnostic_report import parse_dq_logs, build_chart_payload, build_html
 
 
@@ -122,6 +123,37 @@ class DQReportTests(unittest.TestCase):
         self.assertEqual(qerr['series'][1]['y'], [.279999])
         self.assertFalse(any('復元' in s for s in monitor['notes']))
 
+    def test_high_preset_error_samples_stay_gapped_and_unused_threshold_is_hidden(self):
+        data = {'auto_rows': [
+            dict(TrainStep=0, Scope='unet', ClipRateLowAutoThresholdQErrRatio=.25),
+            dict(TrainStep=100, Scope='unet', ClipRateRaw=.004, AutoQuantErrRatioRaw=.2),
+            dict(TrainStep=150, Scope='unet', ClipRateRaw=.004, AutoQuantErrRatioRaw=None),
+            dict(TrainStep=200, Scope='unet', ClipRateRaw=.004, AutoQuantErrRatioRaw=.3),
+        ]}
+        original = copy.deepcopy(data)
+        settings = {'values': {'dq_delta_auto_preset': 'clip_rate_high'}}
+        monitor = build_auto_monitor(data, settings)
+        qerr = next(c for c in monitor['charts'] if c['id'] == 'dq_auto_qerr_unet')
+        self.assertEqual(qerr['x'], [0, 100, 150, 200])
+        self.assertEqual(qerr['series'][0]['y'], [None, .2, None, .3])
+        self.assertTrue(all(v is None for v in qerr['series'][1]['y']))
+        self.assertFalse(any(s.get('is_reference') for s in qerr['series']))
+        self.assertIn('参考', qerr['title'])
+        self.assertIn('mul判定には使いません', qerr['subtitle'])
+        self.assertEqual(data, original)
+
+    def test_low_auto_keeps_thresholds_and_resolved_setting_wins(self):
+        data = {'auto_rows': [dict(TrainStep=50, Scope='unet', ClipRateEMA=.002,
+                QErrPerClip=140., QErrPerClipClipFloor=.0001,
+                ClipRateLowAutoThresholdQErrRatio=.25, ClipRateLowAutoThresholdQErrPerClip=130.)]}
+        for enabled in (True, False):
+            settings = {'values': {'dq_delta_auto_preset': 'clip_rate_low_auto'},
+                        'resolved': {'runtime': {'dq_low_auto_enabled': enabled}}}
+            monitor = build_auto_monitor(data, settings)
+            for suffix in ('qerr', 'qerr_per_clip'):
+                c = next(c for c in monitor['charts'] if c['id'] == 'dq_auto_' + suffix + '_unet')
+                self.assertEqual(any(s.get('is_reference') for s in c['series']), enabled)
+
     def test_partial_log_scope_cannot_stand_in_for_combined_controller_raw(self):
         data = parsed([row('unet', ClipRateEMA=.002)],
                       {'values': {'dq_delta_scope': 'both', 'dq_delta_log_scope': 'unet'}})
@@ -188,9 +220,36 @@ class DQReportTests(unittest.TestCase):
         html = build_html(report)
         self.assertIn("部位別mul（固定配分）", html)
         self.assertIn("id='dq-scope-view'", html)
-        self.assertIn("基準mul（ログ列）", html)
+        self.assertIn("共通設定値のログ（部位別mulではありません）", html)
         self.assertIn("TE1：4.05", html)
         self.assertIn("summaryログのTEはTE1＋TE2合算", html)
+
+    def test_spatial_mul_uses_allocation_without_uniform_constant_badge(self):
+        data = parsed([row('unet'), row('unet', 200)], {'values': {
+            'dq_delta_range_mul': 2.7, 'dq_delta_range_mul_attn2': 3.75, 'dq_delta_range_mul_te': 3.75}})
+        report = {'dq': data, 'charts': build_chart_payload(None, data, None, None, None)}
+        original = copy.deepcopy(report)
+        html_body = build_html(report).split('<script>')[0]
+        self.assertIn('unet.attn2：3.75', html_body)
+        self.assertIn('TE1：3.75', html_body)
+        self.assertNotIn('共通設定値（RangeMul列）', html_body)
+        view, _ = prepare_display(report)
+        mul = next(c for c in view['charts']['dq'] if c['id'] == 'dq_range_mul')
+        self.assertEqual(mul['display_mode'], 'constant')  # available in disclosure
+        self.assertEqual(mul['series'][0]['y'], [2.7, 2.7])
+        self.assertEqual(report, original)
+
+    def test_spatial_mul_does_not_hide_changing_base_log_or_uniform_run(self):
+        for settings in ({'values': {'dq_delta_range_mul': 2.7, 'dq_delta_range_mul_te': 3.75}}, {}):
+            for last_mul in (2.7, 3.0):
+                data = parsed([row('unet'), row('unet', 200, RangeMul=last_mul)], settings)
+                report = {'dq': data, 'charts': build_chart_payload(None, data, None, None, None)}
+                view, _ = prepare_display(report)
+                mul = next(c for c in view['charts']['dq'] if c['id'] == 'dq_range_mul')
+                self.assertEqual(mul['display_mode'], 'constant' if last_mul == 2.7 else 'chart')
+                self.assertEqual(mul['series'][0]['y'], [2.7, last_mul])
+                if not settings and last_mul == 2.7:
+                    self.assertIn('RangeMul', build_html(report).split('<script>')[0])
 
 
 if __name__ == "__main__":

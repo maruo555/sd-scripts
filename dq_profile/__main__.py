@@ -42,7 +42,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("standard", "strict"),
         default="standard",
         help=(
-            "production execution/QA depth; standard is the daily one-snapshot "
+            "production execution/QA depth; standard is the daily shared-warmup "
             "default and strict preserves the two-snapshot reference workflow"
         ),
     )
@@ -63,6 +63,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--dq-profile-data-diagnostics", choices=("off", "local", "warmup"), default=None, help="dataset report; canonical-v2 defaults to warmup (adds initial forward evaluation); canonical-v1 defaults off")
     parser.add_argument("--dq-profile-dropout-on", action="store_true", help="add matched dropout-ON measurements of the candidates selected with dropout OFF")
+    parser.add_argument(
+        "--dq-profile-quant-repeats", type=int, choices=(1, 2), default=None,
+        help="stochastic rounding measurements per matched input (canonical-v2 default: 1; legacy canonical-v1: 2); independent of diffusion noise and dropout masks",
+    )
     parser.add_argument("--dq-profile-uniform-only", action="store_true", help="measure the TE-inclusive uniform five-point grid without spatial candidates")
     parser.add_argument("--dq-profile-group-map", type=Path, help="optional diagnostic group-map JSON")
     te_scope = parser.add_mutually_exclusive_group()
@@ -96,6 +100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         group_map=selectors.dq_profile_group_map,
         dropout_on=selectors.dq_profile_dropout_on,
         uniform_only=selectors.dq_profile_uniform_only,
+        quant_repeats=selectors.dq_profile_quant_repeats,
         **extensions,
     )
 

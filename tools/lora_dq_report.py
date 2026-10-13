@@ -148,7 +148,7 @@ def mul_settings(settings):
             raise ValueError("invalid mul")
         return {"rows": rows, "source": source, "policy": policy, "base_mul": base,
                 "scope": values.get("dq_delta_scope"), "fixed": True,
-                "note": "RangeMulログ列は共通の基準値です。上書きされた部位のmulは、この保存配分で確認してください。"}
+                "note": "量子化に使うmulは上記の部位別配分です。RangeMulログ列の共通設定値は、上書きされた部位のmulを表しません。"}
     except (ValueError, TypeError, KeyError, AttributeError):
         return {"rows": [], "note": "保存されたmul配分を読み取れません。RangeMul列だけでは部位別の値を判断できません。"}
 
@@ -198,8 +198,9 @@ def scope_charts(charts, dq_data):
             # Keep historical scale floors while allowing all observations to fit.
             chart["y_max_ceil"] = chart.pop("y_max_fixed", None)
         if chart["id"] == "dq_range_mul" and dq_data.get("mul_settings", {}).get("rows"):
-            chart["title"] = "基準mul（部位別上書き前）"
-            chart["series"] = [{**s, "name": "基準mul（ログ列）"} for s in chart["series"]]
+            chart["title"] = "共通設定値のログ（部位別mulではありません）"
+            chart["subtitle"] = "部位別の適用値は上の固定配分で確認してください。このログは部位別上書き前の共通設定値です。"
+            chart["series"] = [{**s, "name": "共通設定値（RangeMul列）"} for s in chart["series"]]
         output.append(chart)
     if not multiple:
         return output
@@ -236,6 +237,10 @@ def build_auto_monitor(data, settings=None):
     settings = settings or {}
     values = settings.get("values") or {}
     runtime = (settings.get("resolved") or {}).get("runtime") or {}
+    low_auto_enabled = recorded_bool(runtime.get("dq_low_auto_enabled"))
+    preset = runtime.get("dq_auto_preset") or values.get("dq_delta_auto_preset")
+    if low_auto_enabled is None and preset:
+        low_auto_enabled = preset == "clip_rate_low_auto"
     declared_scope = runtime.get("dq_auto_scope") or values.get("dq_delta_auto_scope") or values.get("dq_delta_scope")
     auto_rows = data.get("auto_rows") or []
     observed_scopes = {r.get("Scope") for r in auto_rows if r.get("Scope")}
@@ -269,7 +274,11 @@ def build_auto_monitor(data, settings=None):
         notes.append("QErrPerClip・判定用の誤差EMA・mul変更履歴は未記録です。自動調整を実行した値としては補いません。")
     else:
         notes.append("判定対象のClip率・EMA・目標帯を表示します。上のUNet/TE表示の切り替えとは独立しています。")
-        notes.append("QuantErrRatioとQErrPerClipによる退避判定はclip_rate_low_auto用です。通常presetの調整判定はClip率を使います。")
+        if low_auto_enabled is False:
+            notes.append("この設定のmul判定はClip率を使います。相対量子化誤差は参考表示とし、使用しないlow_autoの閾値は表示しません。")
+        else:
+            notes.append("QuantErrRatioとQErrPerClipによる退避判定はclip_rate_low_auto用です。通常presetの調整判定はClip率を使います。")
+        notes.append("誤差の記録間隔は自動調整の間隔と異なる場合があります。未記録のstepは線で結ばないため、点だけになる場合があります。")
         if mode == "sampled":
             notes.append("auto専用ログがないため、通常ログに残った監視値だけを表示しています。AutoStepすべての履歴ではありません。")
     charts = []
@@ -293,7 +302,7 @@ def build_auto_monitor(data, settings=None):
                     row["AutoQuantErrRatioEMA"] = qpc * max(clip, floor)
                     restored = True
 
-        def chart(suffix, title, fields):
+        def chart(suffix, title, fields, subtitle=None):
             series = [{"name": name, "color": color, "is_reference": reference,
                        "y": [r.get(key) for r in rows]}
                       for key, name, color, reference in fields]
@@ -302,7 +311,7 @@ def build_auto_monitor(data, settings=None):
             charts.append({"id": "dq_auto_" + suffix + "_" + scope,
                            "title": label + " · " + title, "x_label": "TrainStep", "x": xs,
                            "y_min_fixed": 0, "series": series, "markers": data.get("markers", []),
-                           "subtitle": "自動調整OFF・参考表示" if mode == "reference" else "自動調整で使う範囲の記録"})
+                           "subtitle": subtitle or ("自動調整OFF・参考表示" if mode == "reference" else "自動調整で使う範囲の記録")})
 
         reference = mode == "reference"
         chart("clip", "Clip率と" + ("参考帯" if reference else "目標帯"), [
@@ -313,15 +322,20 @@ def build_auto_monitor(data, settings=None):
         ])
         if reference:
             continue
-        chart("qerr", "相対量子化誤差（low_auto用）", [
+        error_reference = low_auto_enabled is False
+        error_subtitle = "参考値・mul判定には使いません。未記録のstepは線で結びません。" if error_reference else None
+        qerr_fields = [
             ("AutoQuantErrRatioRaw", "AutoQuantErrRatioRaw", "#dc2626", False),
-            ("AutoQuantErrRatioEMA", "AutoQuantErrRatioEMA（判定値）", "#0f766e", False),
-            ("ClipRateLowAutoThresholdQErrRatio", "判定閾値", "#64748b", True),
-        ])
-        chart("qerr_per_clip", "QErrPerClip", [
+            ("AutoQuantErrRatioEMA", "AutoQuantErrRatioEMA（参考値）" if error_reference else "AutoQuantErrRatioEMA（判定値）", "#0f766e", False),
+        ]
+        qpc_fields = [
             ("QErrPerClip", "QErrPerClip", "#0f766e", False),
-            ("ClipRateLowAutoThresholdQErrPerClip", "判定閾値", "#64748b", True),
-        ])
+        ]
+        if not error_reference:
+            qerr_fields.append(("ClipRateLowAutoThresholdQErrRatio", "判定閾値", "#64748b", True))
+            qpc_fields.append(("ClipRateLowAutoThresholdQErrPerClip", "判定閾値", "#64748b", True))
+        chart("qerr", "相対量子化誤差（参考）" if error_reference else "相対量子化誤差（low_auto用）", qerr_fields, error_subtitle)
+        chart("qerr_per_clip", "QErrPerClip（参考）" if error_reference else "QErrPerClip", qpc_fields, error_subtitle)
         chart("mul", "mulの調整履歴", [
             ("RangeMulBefore", "変更前mul", "#94a3b8", False),
             ("RangeMulAfter", "変更後mul", "#2563eb", False),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -201,12 +201,19 @@ def resolve_training_cli(
     *,
     preset_name: str = "canonical-v1",
     execution_mode_name: str = "standard",
+    quant_repeats: int | None = None,
 ) -> ResolvedProfileRequest:
     preset = get_preset(preset_name)
     execution_mode = get_execution_mode(execution_mode_name)
     local_measurement = get_local_measurement_contract(
         execution_mode.local_measurement_name
     )
+    if quant_repeats is None:
+        # Preserve the legacy preset's measurement depth for explicit reproduction.
+        quant_repeats = 1 if preset.name == "canonical-v2" else local_measurement.stochastic_quant_repeats
+    if type(quant_repeats) is not int or quant_repeats not in (1, 2):
+        raise ValueError("--dq-profile-quant-repeats must be 1 or 2")
+    local_measurement = replace(local_measurement, stochastic_quant_repeats=quant_repeats)
     parser = _training_parser()
     namespace, unknown = parser.parse_known_args(list(argv))
     issues: list[CompatibilityIssue] = []

@@ -150,6 +150,8 @@ def build_source_manifest(
         root / "dq_profile" / "copied_sources.json",
         root / "dq_profile" / "sdxl_profile_trainer.py",
         root / "dq_profile" / "trainer_runtime.py",
+        root / "dq_profile" / "shared_warmup.py",
+        root / "dq_profile" / "diagnostic_eval.py",
         root / "dq_profile" / "mul_research.py",
         root / "dq_profile" / "mul_hierarchical.py",
         root / "dq_profile" / "full_training.py",

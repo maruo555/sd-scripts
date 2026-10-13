@@ -162,7 +162,7 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 
 | ツール名 | 概要 | 説明 |
 |---|---|---|
-| `python -m dq_profile` | Experimental DQ Dataset Profilerを直接起動し、Local Body／Tailレポートを生成 | 既定はTE込み・最大52画像の`canonical-v2`。一律5点＋場所別mul候補、dropout OFF標準／ON任意。独立snapshot 1回の`standard`と二重snapshot検算の`strict`。出力は`lora_output/dq_dataset_profiler`。Safety/Fidelity診断であり最終画質推薦ではない。使い方: [docs/dq_dataset_profiler-ja.md](docs/dq_dataset_profiler-ja.md) |
+| `python -m dq_profile` | Experimental DQ Dataset Profilerを直接起動し、Local Body／Tailレポートを生成 | 既定はTE込み・最大52画像の`canonical-v2`。一律5点＋場所別mul候補、dropout OFF標準／ON任意。warmupを1回で共有する`standard`と独立snapshot検算の`strict`。出力は`lora_output/dq_dataset_profiler`。Safety/Fidelity診断であり最終画質推薦ではない。使い方: [docs/dq_dataset_profiler-ja.md](docs/dq_dataset_profiler-ja.md) |
 | `sdxl_tokenize.py` | SDXLのTE1/TE2トークン分割の表示と候補探索 | [docs/sdxl_tokenize_tool-ja.md](docs/sdxl_tokenize_tool-ja.md) |
 | `make_lora_diagnostic_report.py` | LoRA学習ログ（`grad_norm` / `dq_delta`）とLoRA重みを診断し、グラフ内蔵HTMLを生成 | 使い方とオプション詳細: [docs/make_lora_diagnostic_report-ja.md](docs/make_lora_diagnostic_report-ja.md) |
 | `sdxl_lora_report_gui.py` | SDXL LoRAの一括生成・比較HTMLレポートをGUIで作成 | [docs/sdxl_lora_report_README-ja.md](docs/sdxl_lora_report_README-ja.md) |
@@ -182,14 +182,15 @@ bf16 環境での挙動は未検証です。GradScaler が不要になるため 
 比較条件を固定します。新しい既定の`canonical-v2`はTEも量子化し、最大52実画像で
 一律mul 5点（2.70 / 3.15 / 3.45 / 3.75 / 4.05）と、attn2・TE高mul型を最大3配分追加して比較します。
 Body基準2配分と固定参照2.70/3.75を含み、同一配分は再利用するため最大8条件です。
-`standard`は独立snapshot 1回、`strict`は独立snapshot A/Bと長いPrefixで検算します。
+`standard`は1回のwarmup後の状態を短いPrefix検算と診断本体で共有します。Prefix後は重み・optimizer・乱数などを復元し、一致を確認してから測定します。この共有化は従来の3回のwarmupを1回に減らすもので、共有化自体は画像数・反復数を変えません。CLIの追加は不要です。`strict`は従来通り独立snapshot A/Bと長いPrefixで検算します。
 新標準ではどちらも追加の外側mul測定は行いません。新標準全体の実SDXL GPU受入は未実施です。
 
 - 診断のdropoutは**OFFが既定**。`--dq-profile-dropout-on`で同じ候補のON確認も追加できます。通常学習のdropout設定は変更しません。
+- `canonical-v2`の**確率的丸めは1回が既定**。`--dq-profile-quant-repeats=2`で従来の2回にできます。拡散ノイズ数・dropoutマスク数を増減する指定ではありません。旧`canonical-v1`は2回が既定です。
 - `--dq-profile-uniform-only`で場所別配分を追加せず、TE込み一律5点だけを測れます。
 - 初期状態とwarmup後の比較も既定で出力します。`--dq-profile-data-diagnostics=local`なら初期状態の追加forwardを省略します。
 - TEを量子化しない旧方式は`--dq-profile-preset canonical-v1 --dq-profile-no-te-quantized`で明示します。新標準の追加配分とは別の診断です。
-- レポートでは一律曲線と追加配分の点、部位別の勾配変化、Warmupでの誤差減少、量子化の影響を確認できます。
+- レポートではP50・P75・Body・Tailの一律曲線と追加配分の点、部位別の勾配変化、Warmupでの誤差減少、量子化の影響を確認できます。
 
 ```bat
 .\venv\Scripts\python.exe -m dq_profile ^

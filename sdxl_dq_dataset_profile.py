@@ -95,6 +95,10 @@ def setup_parser() -> argparse.ArgumentParser:
     group.add_argument("--dq_profile_max_images", type=int, default=32)
     group.add_argument("--dq_profile_timestep_bins", type=int, default=4)
     group.add_argument("--dq_profile_stochastic_repeats", type=int, default=3)
+    group.add_argument(
+        "--dq_profile_quant_repeats", type=int, choices=(1, 2), default=None,
+        help="Local stochastic rounding repeats (standard v2 default: 1; legacy: 2)",
+    )
     group.add_argument("--dq_profile_branch_steps", type=int, default=None)
     group.add_argument("--dq_profile_seed", type=int, default=None)
     group.add_argument("--dq_profile_range_muls", type=str, default=",".join(str(value) for value in DEFAULT_V2_RANGE_MULS))
@@ -138,6 +142,11 @@ def setup_parser() -> argparse.ArgumentParser:
             "GPU kernel policy for reproducibility-gated v2 protocols "
             "(prefix, tail calibration, and v2.3 safety local/formal)"
         ),
+    )
+    group.add_argument(
+        "--dq_profile_shared_warmup",
+        action="store_true",
+        help="internal Standard Local worker: validate Prefix and measure Local from one warmup snapshot",
     )
     group.add_argument(
         "--dq_profile_snapshot_only",
@@ -211,6 +220,12 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
         raise ValueError("DQ Dataset Profiler requires a single process/GPU")
     if getattr(args, "resume", None):
         raise ValueError("--resume is not supported by the isolated profiler")
+    quant_repeats = getattr(args, "dq_profile_quant_repeats", None)
+    if quant_repeats is not None:
+        if type(quant_repeats) is not int or quant_repeats not in (1, 2):
+            raise ValueError("--dq_profile_quant_repeats must be 1 or 2")
+        if protocol != "v24-acceptance-local":
+            raise ValueError("--dq_profile_quant_repeats requires --dq_profile_protocol=v24-acceptance-local")
     requested_module = getattr(args, "network_module", None)
     allowed = {None, "", "networks.lora", "dq_profile.copied_lora"}
     if requested_module not in allowed:
@@ -266,7 +281,27 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
         "v24-acceptance-formal",
         "v24-trajectory-descriptive",
     }
-    if protocol in prefix_required_protocols:
+    if bool(getattr(args, "dq_profile_shared_warmup", False)):
+        if (
+            protocol != "v24-acceptance-local"
+            or args.dq_profile_execution_mode != "standard"
+            or args.dq_profile_qa_depth != "standard_smoke"
+            or (int(args.dq_profile_prefix_short_steps), int(args.dq_profile_prefix_long_steps)) != (8, 16)
+            or getattr(args, "dq_profile_prefix_gate_file", None)
+        ):
+            raise ValueError("shared warmup requires Standard Local with the 8/16-step internal Prefix gate, without an external gate")
+        contract_inputs = [args.dataset_config]
+        if getattr(args, "dq_profile_source_group_map", None):
+            contract_inputs.append(args.dq_profile_source_group_map)
+        current_manifest, _ = build_source_manifest(
+            Path(__file__).resolve().parent,
+            quant_rng_mode="stateless",
+            additional_files=tuple(contract_inputs),
+        )
+        args.dq_profile_shared_source_contract_sha256 = source_contract_from_manifest(current_manifest)["sha256"]
+        # The shared worker must produce and validate a real Prefix gate before
+        # Local probes. This hash also detects edits during its common warmup.
+    elif protocol in prefix_required_protocols:
         if not getattr(args, "dq_profile_prefix_gate_file", None):
             raise ValueError(
                 f"{protocol} requires --dq_profile_prefix_gate_file from "
@@ -589,7 +624,10 @@ def _validate_and_isolate(args: argparse.Namespace) -> None:
         args.dq_profile_timestep_bins = 4
         args.dq_profile_safety_no_quant_noise_replicas_resolved = 3
         args.dq_profile_safety_candidate_noise_replicas_resolved = 2
-        args.dq_profile_safety_quant_repeats_resolved = 2
+        args.dq_profile_safety_quant_repeats_resolved = (
+            quant_repeats if quant_repeats is not None
+            else 1 if args.dq_profile_standard_version == 2 else 2
+        )
     elif protocol in {"v24-acceptance-formal", "v24-trajectory-descriptive"}:
         args.dq_profile_range_muls_resolved = parse_range_muls(
             args.dq_profile_range_muls,
@@ -802,7 +840,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         image_count = int(summary.probe_images) if v24 else 16 if local_only else 32
         no_quant_replicas = 3 if local_only else 5
         candidate_noise_replicas = 2
-        quant_repeats = 2
+        quant_repeats = int(getattr(args, "dq_profile_safety_quant_repeats_resolved", 2))
         grid_count = len(args.dq_profile_range_muls_resolved)
         no_quant_probe_steps = image_count * 4 * no_quant_replicas
         candidate_probe_steps = (
@@ -825,6 +863,11 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
             + candidate_probe_steps
             + branch_steps
         )
+        shared_prefix_steps = (
+            2 * (int(args.dq_profile_prefix_short_steps) * 2 + int(args.dq_profile_prefix_long_steps))
+            if bool(getattr(args, "dq_profile_shared_warmup", False)) else 0
+        )
+        estimated += shared_prefix_steps
         args.dq_profile_probe_replicas_resolved = no_quant_replicas
         payload.update(
             {
@@ -845,6 +888,7 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
             "candidate_local_steps": candidate_probe_steps,
             "common_skip_branch_steps": branch_steps,
             "geometry_steps": 0,
+            "shared_prefix_branch_steps": shared_prefix_steps,
         }
         payload["v2"]["safety_stage"] = "local" if local_only else "formal"
         args.dq_profile_preflight = payload

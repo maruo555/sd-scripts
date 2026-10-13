@@ -293,7 +293,11 @@ def render_body(report, notes, heatmaps=""):
                 axis += "／縦線：epoch境界・イベント"
             content += f"<p class='axis-note'>{text(axis)}</p>"
         content += section_help(section, charts)
-        constants = "".join(constant_summary(c) for c in charts if c.get("display_mode") == "constant")
+        # The allocation above is authoritative for spatial mul. Keep the raw
+        # RangeMul chart in the disclosure, without a misleading uniform badge.
+        spatial_mul = section == "dq" and bool(((report.get("dq") or {}).get("mul_settings") or {}).get("rows"))
+        constants = "".join(constant_summary(c) for c in charts
+                            if c.get("display_mode") == "constant" and not (spatial_mul and c.get("id") == "dq_range_mul"))
         if constants:
             content += f"<div class='constant-values'>{constants}</div>"
         content += f"<div id='charts-{text(section)}' class='chart-grid'></div>" + extra

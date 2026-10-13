@@ -11,7 +11,7 @@
   const mean = values => values.length && values.every(finite) ? values.reduce((a,b)=>a+b,0)/values.length : null;
   const pct = (a,b) => finite(a) && finite(b) && b !== 0 ? 100*(a-b)/b : null;
   const familyColor = {uniform:'#2563ad', adaptive:'#168474', reference:'#8656b3'};
-  const metricDefs = [ ['p50','P50','#2563ad'], ['body','Body · P95','#17836c'], ['tail','Tail','#cc7427'] ];
+  const metricDefs = [ ['p50','P50','#2563ad'], ['p75','P75','#8a57b4'], ['body','Body · P95','#17836c'], ['tail','Tail','#cc7427'] ];
   const parallelDefs = [ ['parallel_p50','元方向 · P50','#6550a6'], ['parallel_p05','元方向 · P05','#338d9c'] ];
   const sourceColors = ['#3577b3','#1a987d','#c48735','#9263b2','#cd657b','#5d8c76'];
   const query = new URLSearchParams(location.search);
@@ -169,8 +169,8 @@
       return `<span>${esc(v.label)}に対して、Body ${fmt(other.body)} → <b>${fmt(s.body)}</b>（${signed(diff,1)}%）</span>`;
     }).join('<br>'):'一律条件の曲線を基準に、attn2・TE高mul型の同じ位置の点と比較してください。';
     if(unavailable(c.id)||contrasts.some(v=>unavailable(v.id)))el('quick-compare').textContent='計測不能の条件を含むため、この対照との数値比較はできません。正常な条件を表で確認してください。';
-    el('metrics-table').innerHTML='<thead><tr><th>診断条件 / 配分</th><th>P50</th><th>Body</th><th>Tail</th><th>元方向 P50</th><th>元方向 P05</th></tr></thead><tbody>'+candidates().map(v=>{
-      const t=score(v.id);return `<tr data-candidate="${esc(v.id)}" class="${v.id===c.id?'selected':''}"><td class="label"><button class="rowlink" data-candidate="${esc(v.id)}">${esc(statusLabel(v))}</button><span class="sub">${esc(v.assignment_label)}</span>${statusCell(v.id)}</td>${['p50','body','tail','parallel_p50','parallel_p05'].map(k=>`<td>${fmt(t[k])}</td>`).join('')}</tr>`;
+    el('metrics-table').innerHTML='<thead><tr><th>診断条件 / 配分</th><th>P50</th><th>P75</th><th>Body</th><th>Tail</th><th>元方向 P50</th><th>元方向 P05</th></tr></thead><tbody>'+candidates().map(v=>{
+      const t=score(v.id);return `<tr data-candidate="${esc(v.id)}" class="${v.id===c.id?'selected':''}"><td class="label"><button class="rowlink" data-candidate="${esc(v.id)}">${esc(statusLabel(v))}</button><span class="sub">${esc(v.assignment_label)}</span>${statusCell(v.id)}</td>${['p50','p75','body','tail','parallel_p50','parallel_p05'].map(k=>`<td>${fmt(t[k])}</td>`).join('')}</tr>`;
     }).join('')+'</tbody>';
     el('loss-note').textContent='この表は元画像グループを等重みで集計した分位値です。部位別のdは、その部位の元勾配を分母にしています。部位間の大小は全体への寄与率とは異なります。';
   }
@@ -181,7 +181,7 @@
     el('warmup-note').textContent=d.warmup.available?`raw MSE: ${fmt(d.warmup.before,4)} → ${fmt(d.warmup.after,4)}。量子化しない共通warmup。`:d.warmup.reason;
     el('change-title').textContent=`量子化による勾配変化 · ${d.views[state.part]}`;
     el('change-value').textContent=`Body ${fmt(s.body)}`;
-    el('change-note').textContent=`P50 ${fmt(s.p50)} / Tail ${fmt(s.tail)}。${c.label} · ${r.toUpperCase()}`;
+    el('change-note').textContent=`P50 ${fmt(s.p50)} / P75 ${fmt(s.p75)} / Tail ${fmt(s.tail)}。${c.label} · ${r.toUpperCase()}`;
     el('direction-value').textContent=finite(s.parallel_p05)?fmt(s.parallel_p05):'部位別は未記録';
     el('direction-value').classList.toggle('compact',!finite(s.parallel_p05));
     el('direction-note').textContent=finite(s.parallel_p05)?'元の方向へ押す強さの弱い側。長期学習での定着や絵の固さを直接示す値ではありません。':'全体のグラフで確認できます。勾配差の大きさだけからは計算できません。';

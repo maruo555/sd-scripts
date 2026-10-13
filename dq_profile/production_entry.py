@@ -29,11 +29,13 @@ def run_profile_mode(
     policy_grid_file: Path | None = None,
     dropout_on: bool = False,
     uniform_only: bool = False,
+    quant_repeats: int | None = None,
 ) -> int:
     request = resolve_training_cli(
         training_argv,
         preset_name=preset_name,
         execution_mode_name=execution_mode_name,
+        quant_repeats=quant_repeats,
     )
     standard = preset_name == "canonical-v2"
     if standard:
