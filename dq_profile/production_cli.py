@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -40,7 +40,7 @@ class ProfileCompatibilityError(ValueError):
             rendered = "<redacted>" if SENSITIVE_NAME.search(issue.destination) else repr(issue.value)
             lines.append(f"  {issue.option}={rendered}: {issue.reason}")
         lines.append(
-            "Use only canonical-v1 compatible options, or remove the conflicting option. "
+            "Use options compatible with the selected preset, or remove the conflicting option. "
             "The profiler never ignores an unsupported training option silently."
         )
         super().__init__("\n".join(lines))
@@ -59,6 +59,29 @@ class ResolvedProfileRequest:
     dispositions: tuple[dict[str, Any], ...]
     data_diagnostics: str = "off"
     group_map: Path | None = None
+    te_quantized: bool = False
+    policy_grid_file: Path | None = None
+    dropout_on: bool = False
+    uniform_only: bool = False
+
+    def fixed_policy_contract(self):
+        if not self.te_quantized and self.policy_grid_file is None:
+            return None
+        from types import SimpleNamespace
+        from dq_profile.fixed_policy import resolve_policy_grid
+        expected = self.preset.expected_explicit
+        args = SimpleNamespace(dq_profile_te_quantized=self.te_quantized,
+            dq_profile_policy_grid_file=self.policy_grid_file, dq_profile_protocol="v24-acceptance-local",
+            dq_profile_range_muls_resolved=self.execution_mode.core_grid,
+            dq_quantize_z=bool(expected.get("dq_quantize_z", False)),
+            dq_delta_stat=expected.get("dq_delta_stat"), dq_delta_bits=expected.get("dq_delta_bits"))
+        resolved = resolve_policy_grid(args)
+        return {"te_quantized": self.te_quantized, "resolved_policy_grid": resolved,
+                "source_sha256": getattr(args, "dq_profile_policy_grid_sha256", None),
+                "provisional": True, "not_image_quality": True,
+                **({"standard_version": "attn2-te-standard-v1", "dropout_on": self.dropout_on,
+                    "uniform_only": self.uniform_only, "maximum_unique_conditions": 5 if self.uniform_only else 8}
+                   if self.preset.name == "canonical-v2" else {})}
 
     def provenance(self) -> dict[str, Any]:
         return {
@@ -76,6 +99,12 @@ class ResolvedProfileRequest:
             "data_diagnostics": self.data_diagnostics,
             "data_diagnostics_selector_input": False,
             "diagnostic_group_map": str(self.group_map) if self.group_map else None,
+            "te_quantized": self.te_quantized,
+            "dropout_on_confirmation": self.dropout_on,
+            "uniform_only": self.uniform_only,
+            "fixed_policy_grid_file": str(self.policy_grid_file) if self.policy_grid_file else None,
+            "fixed_policy_extension_provisional": bool(self.te_quantized or self.policy_grid_file),
+            "fixed_policy_contract": self.fixed_policy_contract(),
             "policy": {
                 "unknown_options": "reject",
                 "unsupported_options": "reject",
@@ -172,12 +201,19 @@ def resolve_training_cli(
     *,
     preset_name: str = "canonical-v1",
     execution_mode_name: str = "standard",
+    quant_repeats: int | None = None,
 ) -> ResolvedProfileRequest:
     preset = get_preset(preset_name)
     execution_mode = get_execution_mode(execution_mode_name)
     local_measurement = get_local_measurement_contract(
         execution_mode.local_measurement_name
     )
+    if quant_repeats is None:
+        # Preserve the legacy preset's measurement depth for explicit reproduction.
+        quant_repeats = 1 if preset.name == "canonical-v2" else local_measurement.stochastic_quant_repeats
+    if type(quant_repeats) is not int or quant_repeats not in (1, 2):
+        raise ValueError("--dq-profile-quant-repeats must be 1 or 2")
+    local_measurement = replace(local_measurement, stochastic_quant_repeats=quant_repeats)
     parser = _training_parser()
     namespace, unknown = parser.parse_known_args(list(argv))
     issues: list[CompatibilityIssue] = []
@@ -212,11 +248,11 @@ def resolve_training_cli(
         if dest == "network_args":
             if _network_args_ok(value):
                 dispositions.append(
-                    _disposition(option, dest, value, "matched_preset", "canonical-v1 rank_dropout=0.2")
+                    _disposition(option, dest, value, "matched_preset", f"{preset.name} rank_dropout=0.2")
                 )
             else:
                 issues.append(
-                    CompatibilityIssue(option, dest, value, "canonical-v1 supports only network_args rank_dropout=0.2")
+                    CompatibilityIssue(option, dest, value, f"{preset.name} supports only network_args rank_dropout=0.2")
                 )
             continue
         if dest == "fp16_safe_norms":
@@ -225,25 +261,29 @@ def resolve_training_cli(
                     _disposition(option, dest, value, "matched_preset", "accepted as the strict safe-norms alias")
                 )
             else:
-                issues.append(CompatibilityIssue(option, dest, value, "canonical-v1 requires fp16 safe norms"))
+                issues.append(CompatibilityIssue(option, dest, value, f"{preset.name} requires fp16 safe norms"))
             continue
         if dest == "fp16_safe_norms_mode":
             if str(value).casefold() == "strict":
                 dispositions.append(
-                    _disposition(option, dest, value, "matched_preset", "canonical-v1 requires strict mode")
+                    _disposition(option, dest, value, "matched_preset", f"{preset.name} requires strict mode")
                 )
             else:
-                issues.append(CompatibilityIssue(option, dest, value, "canonical-v1 requires fp16_safe_norms_mode=strict"))
+                issues.append(CompatibilityIssue(option, dest, value, f"{preset.name} requires fp16_safe_norms_mode=strict"))
             continue
         if dest in preset.expected_explicit:
             expected = preset.expected_explicit[dest]
+            if preset.name == "canonical-v2" and dest == "dq_delta_scope" and value == "unet":
+                dispositions.append(_disposition(option, dest, value, "overridden_with_reason",
+                    "legacy training scope accepted; canonical-v2 explicitly measures UNet+TE with scope=both"))
+                continue
             if _equal(value, expected):
                 dispositions.append(
-                    _disposition(option, dest, value, "matched_preset", f"matches canonical-v1 value {expected!r}")
+                    _disposition(option, dest, value, "matched_preset", f"matches {preset.name} value {expected!r}")
                 )
             else:
                 issues.append(
-                    CompatibilityIssue(option, dest, value, f"canonical-v1 requires {dest}={expected!r}")
+                    CompatibilityIssue(option, dest, value, f"{preset.name} requires {dest}={expected!r}")
                 )
             continue
         ignored_reason = preset.ignored_explicit.get(dest)

@@ -117,6 +117,9 @@ def _capture_network_runtime(network: torch.nn.Module) -> dict[str, Any]:
     runtime["lora_quant_enabled"] = {
         lora.lora_name: bool(getattr(lora, "delta_q_enabled", False)) for lora in loras
     }
+    runtime["lora_quant_range_mul"] = {
+        lora.lora_name: copy.deepcopy(getattr(lora, "delta_q_range_mul", None)) for lora in loras
+    }
     return runtime
 
 
@@ -134,15 +137,18 @@ def _restore_network_runtime(network: torch.nn.Module, state: Mapping[str, Any])
     if hasattr(network, "set_multiplier") and "multiplier" in state:
         network.set_multiplier(state["multiplier"])
     for field, value in state.items():
-        if field in {"module_modes", "requires_grad", "lora_quant_enabled"}:
+        if field in {"module_modes", "requires_grad", "lora_quant_enabled", "lora_quant_range_mul"}:
             continue
         if hasattr(network, field):
             setattr(network, field, copy.deepcopy(value))
     enabled_map = state.get("lora_quant_enabled", {})
+    mul_map = state.get("lora_quant_range_mul", {})
     loras = getattr(network, "text_encoder_loras", []) + getattr(network, "unet_loras", [])
     for lora in loras:
         if lora.lora_name in enabled_map:
             lora.delta_q_enabled = bool(enabled_map[lora.lora_name])
+        if lora.lora_name in mul_map:
+            lora.delta_q_range_mul = copy.deepcopy(mul_map[lora.lora_name])
 
 
 def _move_optimizer_state_to_parameter_devices(optimizer: Any) -> None:

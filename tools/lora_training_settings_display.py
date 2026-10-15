@@ -10,6 +10,11 @@ LABELS = {
     "fp16_safe_norms_mode": "FP16 safe norms", "fp16_safe_norms_mode_resolved": "FP16 safe norms（確定）",
     "max_train_steps": "予定step数", "gradient_accumulation_steps": "Gradient accumulation",
     "dq_delta_auto_preset": "DQ auto presetの指定", "avg_cp": "チェックポイント平均化",
+    "dq_delta_scope": "DQ scopeの指定", "dq_delta_range_mul": "DQ 基準mul",
+    "dq_delta_range_mul_attn2": "DQ UNet attn2 mul", "dq_delta_range_mul_te": "DQ TE共通mul",
+    "dq_delta_range_mul_te1": "DQ TE1 mul", "dq_delta_range_mul_te2": "DQ TE2 mul",
+    "dq_delta_auto_range_mul": "DQ mul自動調整", "dq_delta_log_scope": "DQ ログ範囲の指定",
+    "dq_delta_auto_scope": "DQ 自動mul調整の判定範囲の指定",
     "pretrained_model_name_or_path": "ベースモデル", "sd_model_name": "ベースモデル名",
 }
 

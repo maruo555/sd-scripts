@@ -11,7 +11,7 @@ except ModuleNotFoundError:
 
 
 SECTION_NAMES = {
-    "grad": "GradNorm", "dq": "DQ Delta", "dq_guard": "DQ Guard", "dq_direct": "DQ Direct", "rank": "Rank",
+    "grad": "GradNorm", "dq": "DQ Delta", "dq_auto": "DQ 自動mul調整の監視", "dq_guard": "DQ Guard", "dq_direct": "DQ Direct", "rank": "Rank",
     "group_loss": "Group Loss", "lora_trend": "LoRA 情報密度エポック推移",
 }
 CONSTANT_CHARTS = {"rank_dim", "dq_rank_dim", "dq_bits", "dq_range_mul", "thresh_off"}
@@ -178,6 +178,41 @@ def constant_summary(chart):
     return "".join(items)
 
 
+def dq_context(data):
+    allocation = data.get("mul_settings") or {}
+    content = ""
+    if allocation.get("rows"):
+        content += "<h3>部位別mul（固定配分）</h3><div class='constant-values'>"
+        for item in allocation["rows"]:
+            value = number(item["mul"]) if item.get("enabled") else "量子化OFF"
+            content += f"<span class='constant-value'>{text(item['label'])}：{text(value)}</span>"
+        content += f"</div><p class='sub'>取得元：{text(allocation.get('source', '—'))}</p>"
+    if allocation.get("note"):
+        content += f"<p class='sub'>{text(allocation['note'])}</p>"
+    if data.get("auto_enabled") is False:
+        content += "<p class='sub'>自動mul調整：OFF（設定記録）。Clip率と参考帯は下の「自動mul調整の監視」に残しています。</p>"
+    scopes = data.get("scope_rows") or {}
+    if scopes:
+        scope_labels = {"unet": "UNet", "te": "TE（TE1＋TE2）", "both": "UNet＋TE", "unknown": "範囲未記録"}
+        content += "<p class='sub'>量子化ログの記録範囲：" + text("、".join(scope_labels.get(s, s) for s in scopes)) + "。記録のない部位のグラフは作りません。</p>"
+    if len(scopes) > 1:
+        labels = {"unet": "UNet", "te": "TE（TE1＋TE2）"}
+        options = "<option value='split'>部位別に並べる</option><option value='combined'>ログ対象合算</option>"
+        options += "".join(f"<option value='{text(s)}'>{text(labels.get(s, s))}</option>" for s in scopes)
+        content += f"<label class='dq-scope-control'>量子化指標の表示範囲 <select id='dq-scope-view'>{options}</select></label>"
+        content += "<p class='sub'>UNetとTEは別のグラフです。同じ指標は共通の縦軸目盛で比較できます。"
+        content += "学習ログの誤差EMAはログ対象合算の値で、部位別EMAは記録点からの再計算です（係数が未記録なら省略）。</p>"
+    content += details("量子化指標と集計の見方", "<p>Clip率は量子化範囲からはみ出した要素の割合です。"
+                       "相対量子化誤差（QuantErrRatioRaw）は誤差RMS ÷ 元のRMS、QuantErrRMSRawは誤差自体の大きさです。"
+                       "学習中のLoRA出力の量子化を測る値で、画像品質や勾配の変化率そのものではありません。</p>"
+                       "<p>合算はNumel（出力要素数）と二乗和から求めます。比率の単純平均ではありません。"
+                       "CSVの丸め値からの再集計のため微小な丸め差があります。"
+                       "部位別EMAは各部位の最初の有効な記録値を初期値とし、記録点ごとに更新しています。</p>"
+                       "<p>ClipRateEMAとActiveClipLow/Highは自動調整側の記録で、誤差EMAとは対象や更新間隔が異なる場合があります。"
+                       "summaryログのTEはTE1＋TE2合算です。このログからTE1・TE2別やattn2別の誤差は復元できません。</p>")
+    return content
+
+
 def render_body(report, notes, heatmaps=""):
     """Render visible sections, leaving numerical diagnostics and raw JSON intact."""
     diagnostics = report.get("diagnostics") or {}
@@ -194,7 +229,8 @@ def render_body(report, notes, heatmaps=""):
         ("Grad しきい値超過率", summary("grad").get("threshold_exceeded_ratio"), pct, ""),
         ("Loss MA 低下率", summary("grad").get("loss_ma_drop_ratio"), pct, "開始・終了側の各15%を比較"),
         ("DQ Auto in-band比率", summary("dq").get("in_band_ratio"), pct, ""),
-        ("最終 QuantErrRatioEMA", summary("dq").get("final_quant_err_ratio_ema"), dec, ""),
+        ("最終 QuantErrRatioEMA", summary("dq").get("final_quant_err_ratio_ema"), dec,
+         "ログ対象合算の学習ログ値" if len((report.get("dq") or {}).get("scope_rows") or {}) > 1 else "学習ログの記録値"),
         ("最終 RankSatP95", summary("rank").get("final_rank_sat_p95"), dec, ""),
     ])
     check_rows = []
@@ -241,6 +277,11 @@ def render_body(report, notes, heatmaps=""):
             return ""
         description = descriptions.get(section)
         content = f"<p class='sub'>{text(description)}</p>" if description else ""
+        if section == "dq":
+            content += dq_context(report.get("dq") or {})
+        if section == "dq_auto":
+            monitor = (report.get("dq") or {}).get("auto_monitor") or {}
+            content += "".join(f"<p class='sub'>{text(note)}</p>" for note in monitor.get("notes", []))
         if warnings:
             content += "<div class='analysis-errors'><strong>記録された確認事項</strong>" + "".join(f"<p>{text(w)}</p>" for w in warnings) + "</div>"
         if charts:
@@ -252,7 +293,11 @@ def render_body(report, notes, heatmaps=""):
                 axis += "／縦線：epoch境界・イベント"
             content += f"<p class='axis-note'>{text(axis)}</p>"
         content += section_help(section, charts)
-        constants = "".join(constant_summary(c) for c in charts if c.get("display_mode") == "constant")
+        # The allocation above is authoritative for spatial mul. Keep the raw
+        # RangeMul chart in the disclosure, without a misleading uniform badge.
+        spatial_mul = section == "dq" and bool(((report.get("dq") or {}).get("mul_settings") or {}).get("rows"))
+        constants = "".join(constant_summary(c) for c in charts
+                            if c.get("display_mode") == "constant" and not (spatial_mul and c.get("id") == "dq_range_mul"))
         if constants:
             content += f"<div class='constant-values'>{constants}</div>"
         content += f"<div id='charts-{text(section)}' class='chart-grid'></div>" + extra
@@ -309,6 +354,8 @@ def render_body(report, notes, heatmaps=""):
     source_specs += [(k, SECTION_NAMES.get(k, k.replace("_", " ").title()), "path") for k in extra_sections]
     for key, label, field in source_specs:
         data = report.get(key) or {}
+        if key == "dq_auto":
+            data = (report.get("dq") or {}).get("auto_monitor") or {}
         path = data.get(field)
         available = bool(path) if key in ("dq", "group_loss") else bool(data)
         state = "入力あり" if available else "解析結果なし"

@@ -16,6 +16,17 @@ SDXL の LoRA 学習では ViT-L (Text Encoder 1) と BiG-G (Text Encoder 2) の
 - 対象外のテキストエンコーダーに対して値を指定しても無視されます。例: `--network_te_train_targets te2` のときに `--text_encoder_lr1` を指定しても警告を出してスキップします。
 - 値に `0` を指定するとそのテキストエンコーダーの LoRA パラメータは最適化対象から除外されます。
 
+### `--dq_delta_range_mul_te`, `--dq_delta_range_mul_te1`, `--dq_delta_range_mul_te2`
+
+- TEのLoRA差分出力に使う、量子化レンジ倍率mulの固定値です。**学習率や学習対象の指定とは別です。**
+- `_te`はTE1・TE2共通値、`_te1` / `_te2`は各TEの個別値。優先順位は「個別 > 共通 > `--dq_delta_range_mul`」です。いずれも未指定なら従来どおりです。
+- 通常の`networks.lora`学習で`--dq_delta_scope unet`を使っていても、TE用mulは適用されます。TE込みの新しいコマンドでは`--dq_delta_scope both`を推奨します。
+- SDXLの`networks.lora`、固定bits・RMSのdelta量子化を対象とし、自動mul調整・bits schedule・z量子化とは併用できません。指定したTEのLoRAが存在しない場合は、学習率のオプションと違い、無視せずエラーにします。
+
+例: `--dq_delta_range_mul 2.70 --dq_delta_range_mul_attn2 3.75 --dq_delta_range_mul_te 3.75`
+では、attn2と両TEが3.75、その他UNetが2.70です。固定8bit等の必要な共通引数は
+[量子化ガイド](dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)を参照してください。
+
 ## 使用例
 
 ```bash
@@ -40,5 +51,5 @@ text_encoder_lr2 = 3.0e-6
 
 ## 注意点
 - 既定挙動を変えないように設計されています。オプションを指定しなければ従来通り両方のテキストエンコーダーが同じ学習率で更新されます。
-- LoRA ネットワーク以外 (DyLoRA / LoRA-FA など) でも同じオプションが利用できます。
+- TEの学習対象・学習率オプションはLoRA以外のネットワークでも利用できます。場所別mulの対応範囲は上の量子化ガイドを参照してください。
 - `text_encoder_lr1` / `text_encoder_lr2` を指定していても、該当するテキストエンコーダーを学習対象から外すと自動的に無視されます。

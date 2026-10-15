@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 PRESET_SCHEMA_VERSION = "2.0"
 LOCAL_MEASUREMENT_SCHEMA_VERSION = "1.1"
-EXECUTION_MODE_SCHEMA_VERSION = "1.2"
+EXECUTION_MODE_SCHEMA_VERSION = "1.3"
 
 
 @dataclass(frozen=True)
@@ -99,13 +99,17 @@ class ExecutionMode:
     prefix_long_steps: int
     local_measurement_name: str = "local-body-tail-v2"
     standalone_snapshot_count: int = 2
+    shared_warmup: bool = False
     prefix_anchor_mul: float = 3.15
     snapshot_a_max_images: int = 8
     internal_profile_level: str = "standard"
 
     def __post_init__(self) -> None:
-        if self.standalone_snapshot_count not in {1, 2}:
-            raise ValueError("standalone_snapshot_count must be 1 or 2")
+        if self.shared_warmup:
+            if self.standalone_snapshot_count != 0 or self.max_edge_extension_rounds != 0:
+                raise ValueError("shared warmup requires no standalone snapshots or edge workers")
+        elif self.standalone_snapshot_count not in {1, 2}:
+            raise ValueError("independent warmup requires 1 or 2 standalone snapshots")
 
     @property
     def prefix_checkpoints(self) -> tuple[int, ...]:
@@ -117,7 +121,7 @@ class ExecutionMode:
 
     @property
     def gpu_process_count_range(self) -> tuple[int, int]:
-        base = self.standalone_snapshot_count + 2
+        base = 1 if self.shared_warmup else self.standalone_snapshot_count + 2
         return base, base + self.max_edge_extension_rounds
 
     def contract(self) -> dict[str, Any]:
@@ -137,6 +141,8 @@ class ExecutionMode:
             "prefix_branch_updates": self.prefix_branch_updates,
             "local_measurement_name": self.local_measurement_name,
             "standalone_snapshot_count": self.standalone_snapshot_count,
+            "shared_warmup": self.shared_warmup,
+            "snapshot_validation": "shared_state_restore" if self.shared_warmup else "independent_warmup_parity",
             "snapshot_replica_count": self.standalone_snapshot_count,
             "snapshot_a_max_images": self.snapshot_a_max_images,
             "internal_profile_level": self.internal_profile_level,
@@ -330,7 +336,7 @@ STRICT_MODE = ExecutionMode(
 STANDARD_MODE = ExecutionMode(
     name="standard",
     description=(
-        "Daily-use QA with short prefix parity, one standalone snapshot, and one "
+        "Daily-use QA with one shared warmup, short prefix parity, and one "
         "fixed five-point Local scan."
     ),
     qa_depth="standard_smoke",
@@ -339,11 +345,19 @@ STANDARD_MODE = ExecutionMode(
     edge_policy="fixed_tested_envelope_no_extension",
     prefix_short_steps=8,
     prefix_long_steps=16,
-    standalone_snapshot_count=1,
+    standalone_snapshot_count=0,
+    shared_warmup=True,
 )
 
 
-PRESETS = {CANONICAL_V1.name: CANONICAL_V1}
+CANONICAL_V2 = replace(
+    CANONICAL_V1,
+    name="canonical-v2",
+    description="TE-inclusive standard: uniform five-point OFF scan, Body-based attn2/TE allocation and optional matched dropout ON",
+    expected_explicit={**CANONICAL_V1.expected_explicit, "dq_delta_scope": "both"},
+    training_tokens=tuple("--dq_delta_scope=both" if token == "--dq_delta_scope=unet" else token for token in CANONICAL_V1.training_tokens),
+)
+PRESETS = {CANONICAL_V1.name: CANONICAL_V1, CANONICAL_V2.name: CANONICAL_V2}
 LOCAL_MEASUREMENT_CONTRACTS = {
     LOCAL_BODY_TAIL_V1.name: LOCAL_BODY_TAIL_V1,
     LOCAL_BODY_TAIL_V2.name: LOCAL_BODY_TAIL_V2,

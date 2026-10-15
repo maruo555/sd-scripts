@@ -2,6 +2,7 @@
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import html
 import json
 import os
@@ -529,6 +530,8 @@ button, select, input {{ font: inherit; }}
     <label>Axis <select id="axis"><option value="condition">X: LoRA / Y: Prompt+Seed</option><option value="case">X: Prompt+Seed / Y: LoRA</option></select></label>
     <label>Image size <input id="size" type="range" min="160" max="768" step="16" value="320"> <span id="sizeLabel">320px</span></label>
     <button id="showAll">Show all</button>
+    <a href="blind_report.html">ブラインド評価</a>
+    <a href="blind_report_detailed.html">詳細ブラインド評価</a>
   </div>
 </header>
 <section class="panel">
@@ -828,6 +831,16 @@ render();
         f.write(report)
 
 
+def write_detailed_blind_report(output_dir: Path, metadata: dict):
+    data_json = json_for_script(metadata)
+    template_path = Path(__file__).resolve().parent / "lora_report_templates" / "blind_report_detailed.html"
+    report = template_path.read_text(encoding="utf-8")
+    # Keep saved ratings separate for every report and metadata revision.
+    storage_key = "sdxl-lora-detailed-v1:" + hashlib.sha256(data_json.encode("utf-8")).hexdigest()
+    report = report.replace("__STORAGE_KEY__", json.dumps(storage_key)).replace("__REPORT_DATA__", data_json)
+    (output_dir / "blind_report_detailed.html").write_text(report, encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate SDXL LoRA comparison images and an HTML report.")
     parser.add_argument("--config", required=True, help="Path to report JSON config.")
@@ -859,18 +872,21 @@ def run(args):
         metadata = write_metadata(output_dir, prompts, conditions, seeds, jobs)
         write_report(output_dir, metadata)
         write_blind_report(output_dir, metadata)
+        write_detailed_blind_report(output_dir, metadata)
         print_report_paths(output_dir)
         raise SystemExit(returncode)
 
     metadata = write_metadata(output_dir, prompts, conditions, seeds, jobs)
     write_report(output_dir, metadata)
     write_blind_report(output_dir, metadata)
+    write_detailed_blind_report(output_dir, metadata)
     print_report_paths(output_dir)
 
 
 def print_report_paths(output_dir: Path):
     print(f"Report: {output_dir / 'report.html'}")
     print(f"Blind report: {output_dir / 'blind_report.html'}")
+    print(f"Detailed blind report: {output_dir / 'blind_report_detailed.html'}")
 
 
 if __name__ == "__main__":

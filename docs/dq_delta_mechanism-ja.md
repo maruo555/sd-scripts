@@ -43,16 +43,112 @@
 | `--dq_delta_mode {det,stoch}` | `det`=最近傍、`stoch`=確率的丸め。 |
 | `--dq_delta_begin <0-1>` | 学習進行率。この割合以降のみ有効化。 |
 | `--dq_delta_begin_after_lr_warmup` | lrウォームアップ後に dq_delta を開始（`--dq_delta_begin` より優先）。例: `--lr_scheduler constant_with_warmup --lr_warmup_steps 1000` と併用し、**lr_warmup 後に量子化を開始して学習を安定化させる**狙い。 |
-| `--dq_delta_scope {unet,te,both}` | 適用対象の限定（U-Netのみ/Text Encoderのみ/両方）。 |
+| `--dq_delta_scope {unet,te,both}` | 適用対象の指定（既定`both`）。現行通常trainerではstepごとの共通ON/OFF処理により`unet`/`te`の限定が維持されない。下記の現行挙動を参照。 |
 | `--dq_delta_granularity {tensor,channel}` | 粒度（テンソル全体/チャネル別）。 |
 | `--dq_delta_stat {rms,absmax,none}` | bits/step のスケール基準（per-channel時はチャネルごとに計算）。 |
 | `--dq_delta_range_mul <float>` | bits モード×`stat=rms`時の有効レンジ倍率（range=倍率×RMS、既定3.0）。 |
+| `--dq_delta_range_mul_attn2 <float>` | UNetのattn2 Q/K/V/Outだけの固定mul。未指定の部位は基本値を使用。 |
+| `--dq_delta_range_mul_te <float>` | TE1・TE2共通の固定mul。 |
+| `--dq_delta_range_mul_te1 <float>` / `--dq_delta_range_mul_te2 <float>` | TE個別の固定mul。TE共通値より優先。 |
 | `--dq_delta_bits_sched 'p1:bits1,p2:bits2,...'` | 学習進行率 p でビット数を段階的に切替（例: `0.0:6,0.5:8,0.8:10`）。 |
 | `--dq_quantize_z` | Δ ではなく `z=A(x)` を量子化（`B(Q(z))`）。rank r の z を対象に統計を取るため軽量化。 |
 | `--dq_delta_use_triton` | 対応するdq_delta scale/fake quantをoptional Triton kernelで高速化。未対応時はPyTorchへfallback。 |
 | `--dq_delta_triton_stats` | `--dq_delta_use_triton`と併用し、対応するbasic log/auto statsをfake quant Bへ融合。 |
 
 Tritonの導入方法、コード上の対応条件、長時間学習で検証済みの範囲は [triton_windows_setup.md](triton_windows_setup.md) を参照。
+
+### 場所別の固定mulをCLIで指定する
+
+SDXLの`--network_module networks.lora`で、次の引数を通常の学習コマンドへ追加します。
+診断結果のJSONを読み込む必要はありません。これは研究で有望だった
+**attn2・TE高mul型**（旧候補A）の比較用設定例で、全データ共通の推奨値ではありません。
+
+```text
+--dq_delta_bits 8 --dq_delta_granularity channel --dq_delta_stat rms --dq_delta_mode stoch
+--dq_delta_begin_after_lr_warmup --dq_delta_scope both
+--dq_delta_range_mul 2.70 --dq_delta_range_mul_attn2 3.75 --dq_delta_range_mul_te 3.75
+```
+
+上は複数行で示した追加引数です。既存コマンドに加えるときは、使用するシェルに合わせて連結してください。
+その他UNetは2.70、attn2のQ/K/V/Outは3.75、TE1・TE2は3.75になります。
+`--dq_delta_range_mul_te2 3.45`も指定すれば、TE2だけ3.45です。
+
+- 基本値は`--dq_delta_range_mul`。attn2は専用値、TEは「個別値 > TE共通値 > 基本値」の順で解決します。コマンドに書いた順番には依存しません。
+- `conv_dim`等で追加したResNet・Downsample・UpsampleのLoRA（時間埋め込みのLinearも含む）は、その他UNetとして基本値を使います。attn2・TE用の値は適用しません。
+- 新しい4引数はすべて既定`None`。指定しなければ従来の学習経路を維持します。mulは有限の正数で指定します。
+- 固定bits・`stat=rms`・delta量子化専用です。`--dq_delta_auto_range_mul`、`--dq_delta_bits_sched`、`--dq_quantize_z`、研究用`--dq_delta_policy_file`との併用はエラーになります。
+- 指定先のLoRAが存在しなければエラーです。例えばTE1だけを学習する構成では、TE2も指定する共通`_te`ではなく`_te1`を使います。学習対象や学習率を追加する引数ではありません。
+- `--dq_delta_scope unet`のままでもTE用mulは有効です。TE込みの意図を明示する新しいコマンドでは`both`を推奨します。TEの統計ログも必要なら`--dq_delta_log --dq_delta_log_scope both`を指定します。
+- `--resume`では保存時と同じ宣言・配分が必要です。省略・変更やJSONからCLIへの切替は、実効値が等しくても宣言が違えば拒否します。
+
+既存の自動調整レシピから切り替える場合は、上の引数を足すだけでなく、自動調整とbits scheduleを外してください。
+場所別固定mulと自動調整は現行仕様では併用不可です。片方を無視せずエラーにします。
+固定した配分の一部または全部を自動で動かす方式は未定義で、必要になった場合の拡張として扱います。
+理由と未採用の拡張案は[オートチューナ仕様](dq_delta_autotune_spec-ja.md#場所別固定mulとの併用)を参照してください。
+対応範囲・保存再開の詳細は[通常学習への適用](dq_mul_research-ja.md#通常学習への明示的な適用)、
+CPU検証済み／GPU受入待ちの区別は[検証記録](dq_standard_validation-ja.md)を参照してください。
+
+### 現行通常学習のscopeと、`both`への移行
+
+2026-10-10の`train_network.py`と`networks/lora.py`で確認した挙動です。
+通常trainerは初期化時に`unet`ならTEの`delta_q_enabled`をOFFにしますが、
+各学習stepの`set_delta_quant_enabled(quant_enabled)`がTEとUNetの両方を再設定します。
+明示policyがない場合、量子化開始後は`unet`指定でもTE側LoRAが有効になります。
+warmup中は両方OFFです。TE LoRAが存在しない学習へTEを追加する処理ではありません。
+
+**固定8bit・固定mul・自動mul調整なしで、TEも学習する通常の`networks.lora`経路では、
+`unet`と`both`は量子化の適用先とmul設定が同じになります。**
+今後TE込みで学習する意図を表すには、`--dq_delta_scope both`を明示する運用が適切です。
+ただし、次の差があるため、両オプションが完全な同義語であるとは扱いません。
+
+| 項目 | `unet` | `both` |
+|---|---|---|
+| 初期化直後のTE量子化フラグ | OFF | ON（量子化設定時） |
+| 共通step処理後・量子化開始後の適用先 | UNet＋TE | UNet＋TE |
+| `dq_delta_log_scope`を省略したログ対象 | UNet | UNet＋TE |
+| `dq_delta_auto_scope`を省略した自動mul調整の統計（2026-10-11以降） | UNet | UNet |
+| 現行Tritonの検証プロファイル警告 | 他条件が一致すればscope由来の警告なし | `scope=both`を検証プロファイル外として警告 |
+
+固定mulのままTEのログも確認する場合は、例えば次を使います。
+
+```text
+--dq_delta_scope both --dq_delta_log_scope both
+```
+
+これまでとログ対象も揃えたい移行では、`--dq_delta_scope both --dq_delta_log_scope unet`
+と明示できます。ログ対象の拡張では統計収集量・実行経路も変わり得ます。
+この整理は量子化の設定・対象の説明であり、別runの重みの完全一致を保証しません。
+
+**最新仕様では、通常のUNet＋TE学習を`--dq_delta_scope both`で行っても、自動mul判定に使うのはUNetの値です。**
+`--dq_delta_auto_scope`を省略した場合も、従来の`unet`指定と同じUNetの統計・制御則で共通mulを調整します。
+TE専用学習または`dq_delta_scope=te`ではTEが既定です。明示指定はこれらの既定値より優先します。
+量子化・ログ・自動調整で見る対象は別々です。例えば次はUNet＋TEを記録し、調整にはUNetだけを使います。
+
+```text
+--dq_delta_scope both --dq_delta_log_scope both --dq_delta_auto_scope unet
+```
+
+これはUNetのmulだけを変更する設定ではありません。判定に使う統計をUNetに限定し、
+**TEにも適用される共通mul**を変更します。意図的にUNet＋TEの統合統計で判定したい場合は
+`--dq_delta_auto_scope both`を明示してください。場所別の固定mulと自動調整は引き続き併用できません。
+この変更はCPUで対象選択を検証済みですが、新しい指定によるGPU学習は未検証です。
+
+変更の背景（2026-10-11）：以前の実装では`dq_delta_scope both`にすると自動判定も統合統計へ変わりました。
+今回の移行元は`unet`基準の自動調整運用で、旧`both`の自動調整を維持する要件はありませんでした。
+そのため旧`both`との互換性よりも、今後TE込みの意図で`both`を指定しても従来のUNet基準の判定を保つことを優先しました。
+
+Tritonの上記警告は現在CLIのscope文字列を判定して出しており、
+`both`だけを理由に全処理をPyTorchへ切り替える指定ではありません。
+カーネルは実際の対応条件で選択されます。警告の更新は別途検証したうえで行います。
+
+部位別mulの直接指定、または`--dq_delta_policy_file`がある場合は、共通setterの後に解決済みpolicyのON/OFFとmulを
+再適用するため、**量子化対象はpolicyが優先**します。scopeだけ変えてpolicyの配分を変えることは
+できません。直接指定ではUNetとTEの両方が対象です。診断のLocal経路にも専用の対象制御があり、通常学習のこの限定漏れをそのまま
+診断のTE ON/OFFの意味へ適用してはいけません。
+
+通常学習のTE量子化を維持するため、部位別CLIの追加では従来のscopeの限定漏れを修正していません。
+診断のTE込み固定化と、既存`canonical-v1`の互換性については
+[標準診断の仕様](dq_dataset_profiler-ja.md#spatial-diagnostic-spec)を参照してください。
 
 ### 量子化モードの前提
 

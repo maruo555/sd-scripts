@@ -535,6 +535,10 @@ def build_protocol_fingerprint(
         REPO_ROOT / "tools" / "analyze_dq_v24_local.py",
         REPO_ROOT / "tools" / "check_dq_calibration_gate.py",
     )
+    if request.preset.name == "canonical-v2":
+        code_files = (*code_files, *(REPO_ROOT / "dq_profile" / name for name in
+            ("spatial.py", "spatial_runtime.py", "spatial_report.py", "spatial_report_data.py", "report_publication.py")),
+            *sorted((REPO_ROOT / "dq_profile" / "spatial_assets").glob("*")))
     tracked_state = git_tracked_state()
     training_contract = request.preset.contract()
     local_contract = request.local_measurement.contract()
@@ -553,6 +557,9 @@ def build_protocol_fingerprint(
         "profile_seed": int(request.preset.expected_explicit["seed"]),
         "scope": "local_body_tail_only",
     }
+    fixed_policy_contract = request.fixed_policy_contract()
+    if fixed_policy_contract is not None:
+        shared_local_contract["fixed_policy_extension"] = fixed_policy_contract
     payload = {
         "schema_version": RUN_SCHEMA_VERSION,
         "git_head": git_head(),
@@ -581,6 +588,7 @@ def build_protocol_fingerprint(
         "scope": "local_body_tail_only",
         "trajectory": "research_only_not_run",
         "not_quality_or_utility": True,
+        "fixed_policy_extension": fixed_policy_contract,
     }
     fingerprint_sha256 = canonical_sha256(payload)
     return {
@@ -697,11 +705,32 @@ def build_execution_plan(
 
     base_seconds = (
         execution.standalone_snapshot_count * reference_warmup_seconds
-        + reference_warmup_seconds
+        + (0 if execution.shared_warmup else reference_warmup_seconds)
         + execution.prefix_branch_updates * reference_prefix_update_seconds
         + estimated_local_seconds(len(execution.core_grid))
     )
     maximum_seconds = base_seconds
+    if request.preset.name == "canonical-v2":
+        cells = int(probe_budget) * local.timestep_bins * local.candidate_noise_replicas
+        minimum_extra = 0 if request.uniform_only else 1
+        maximum_extra = 0 if request.uniform_only else 3
+        def extra_passes(count):
+            off = cells * (1 + count * local.stochastic_quant_repeats) if count else 0
+            on = cells * (1 + (5 + count) * local.stochastic_quant_repeats) if request.dropout_on else 0
+            return off + on
+        core_counts.update({"minimum_unique_conditions": 5 + minimum_extra,
+            "maximum_unique_conditions": 5 + maximum_extra,
+            "minimum_total_probes_with_additions": core_counts["total_local_probes"] + extra_passes(minimum_extra),
+            "maximum_total_probes_with_additions": core_counts["total_local_probes"] + extra_passes(maximum_extra),
+            "dropout_on_confirmation": request.dropout_on,
+            "additional_reference_probes_included": True,
+            "warmup_initial_forward_only": int(probe_budget) * local.timestep_bins * local.no_quant_noise_replicas if request.data_diagnostics == "warmup" else 0})
+        base_seconds += extra_passes(minimum_extra) * reference_local_probe_seconds
+        maximum_seconds += extra_passes(maximum_extra) * reference_local_probe_seconds
+        # Conservative forward-only allowance; the historical coefficient includes backward.
+        initial_seconds = core_counts["warmup_initial_forward_only"] * reference_local_probe_seconds
+        base_seconds += initial_seconds
+        maximum_seconds += initial_seconds
     projected_edge_mul_counts: list[int] = []
     for round_index in range(1, execution.max_edge_extension_rounds + 1):
         # Strict historically adds one adjacent edge point per round.  The
@@ -741,6 +770,8 @@ def build_execution_plan(
             "total_warmup_updates_min": warmup * minimum_processes,
             "total_warmup_updates_max": warmup * maximum_processes,
             "standalone_snapshot_count": execution.standalone_snapshot_count,
+            "shared_warmup": execution.shared_warmup,
+            "snapshot_validation": "shared_state_restore" if execution.shared_warmup else "independent_warmup_parity",
             "snapshot_replica_count": execution.standalone_snapshot_count,
             "prefix": {
                 "candidates": ["no_quant", f"mul_{execution.prefix_anchor_mul:.2f}"],
@@ -752,6 +783,8 @@ def build_execution_plan(
             },
             "local": {
                 **core_counts,
+                "candidate_noise_replicas": local.candidate_noise_replicas,
+                "stochastic_quant_repeats": local.stochastic_quant_repeats,
                 "fixed_grid": list(execution.core_grid),
                 "edge_extension": execution.edge_policy,
                 "maximum_edge_extension_rounds": execution.max_edge_extension_rounds,
@@ -781,7 +814,9 @@ def build_execution_plan(
         },
         "reference_time_estimate": {
             "minutes": estimate_minutes,
-            "excludes_dataset_initial_forwards_and_cpu_reporting": True,
+            "excludes_dataset_initial_forwards_and_cpu_reporting": request.preset.name != "canonical-v2",
+            "excludes_cpu_reporting": True,
+            "initial_forward_allowance_included": request.preset.name == "canonical-v2" and request.data_diagnostics == "warmup",
             "is_guarantee": False,
             "basis": "single historical RTX 5080 run with 13 probe images and warmup boundary 420",
             "calibration": {
@@ -963,7 +998,20 @@ def profile_command(
         f"--dq_profile_source_group_map={source_map}",
     ]
     if protocol == "v24-acceptance-local" and not snapshot_only:
+        command.append(f"--dq_profile_quant_repeats={local.stochastic_quant_repeats}")
+        if execution.shared_warmup and gate is None:
+            command.append("--dq_profile_shared_warmup")
+        if request.preset.name == "canonical-v2":
+            command.append("--dq_profile_standard_version=2")
+            if request.dropout_on:
+                command.append("--dq_profile_dropout_on")
+            if request.uniform_only:
+                command.append("--dq_profile_uniform_only")
         command.append(f"--dq_profile_data_diagnostics={request.data_diagnostics}")
+        if getattr(request, "te_quantized", False):
+            command.append("--dq_profile_te_quantized")
+        if getattr(request, "policy_grid_file", None) is not None:
+            command.append(f"--dq_profile_policy_grid_file={request.policy_grid_file}")
         if request.group_map is not None:
             command.append(f"--dq_profile_group_map={request.group_map}")
     if gate is not None:
@@ -989,6 +1037,10 @@ def run_profile(
         request.model_path,
         launcher.run_dir / "protocol_fingerprint.json",
     )
+    if request.te_quantized or request.policy_grid_file:
+        frozen = json.loads((launcher.run_dir / "protocol_fingerprint.json").read_text(encoding="utf-8"))
+        if request.fixed_policy_contract() != frozen.get("fixed_policy_extension"):
+            raise RuntimeError("Fixed policy changed after preflight")
     # The subprocess reads the original image/caption/cache paths, not copies.
     # Re-hash them immediately before every worker so a long staged run cannot
     # silently combine bytes that differ from source_group_map.json.
@@ -1096,6 +1148,18 @@ def run_local_pipeline(
 ) -> tuple[Path, Path, tuple[float, ...], int]:
     names = stage_names()
     execution = request.execution_mode
+    if execution.shared_warmup:
+        update_status(launcher.run_dir, status="running", current_stage="shared_warmup_prefix_local")
+        active_grid = tuple(float(value) for value in execution.core_grid)
+        active_profile = run_profile(
+            launcher, request, source_map=source_map, name=names["core_raw"],
+            protocol="v24-acceptance-local", range_muls=active_grid, max_images=probe_budget,
+        )
+        active_analysis = run_local_analysis(
+            launcher, request=request, profile=active_profile,
+            output_name=names["core_analysis"], dataset_id=dataset_id,
+        )
+        return active_profile, active_analysis, active_grid, 0
     update_status(launcher.run_dir, status="running", current_stage="snapshot_a")
     snapshot_a = run_profile(
         launcher,
@@ -1185,7 +1249,8 @@ def run_local_pipeline(
 
     selection = read_json(active_analysis / "local_selection.json")
     completed_edge_rounds = 0
-    for round_index in range(1, execution.max_edge_extension_rounds + 1):
+    max_edge_rounds = 0 if getattr(request, "policy_grid_file", None) else execution.max_edge_extension_rounds
+    for round_index in range(1, max_edge_rounds + 1):
         if selection.get("selection_valid") is not True:
             break
         additions = tuple(float(value) for value in selection.get("edge_extension_recommended", ()))
@@ -1291,7 +1356,9 @@ def promote_profile_provenance(run_dir: Path, profile_dir: Path) -> list[str]:
     mapping = {
         "source_manifest.json": "source_manifest.json",
         "candidate_definitions.json": "candidate_definitions.json",
+        "fixed_policy_assignments.json": "fixed_policy_assignments.json",
         "probe_manifest.json": "probe_manifest.json",
+        "shared_warmup.json": "shared_warmup.json",
         "calibration_gate.json": "profile_calibration_gate.json",
         "gradient_tail.csv": "raw_gradient_tail.csv",
         "local_natural_gradient.csv": "raw_local_natural_gradient.csv",
@@ -1470,7 +1537,8 @@ def run_profile_request(
         f"{time_text}; see execution_plan.json for assumptions"
     )
     if request.data_diagnostics == "warmup":
-        launcher.log(f"Additional initial forward-only probes per Local worker: {work['dataset_initial_forward_only_per_local_worker']}; their time is not included above. Strict edge reruns repeat this evaluation.")
+        allowance = "a conservative time allowance is included above" if request.preset.name == "canonical-v2" else "their time is not included above; Strict edge reruns repeat this evaluation"
+        launcher.log(f"Additional initial forward-only probes per Local worker: {work['dataset_initial_forward_only_per_local_worker']}; {allowance}.")
     try:
         if options.preflight_only:
             update_status(
@@ -1484,7 +1552,7 @@ def run_profile_request(
             return ProductionRunResult(run_dir, "preflight_complete", None)
         if options.dry_run:
             names = stage_names()
-            gate = run_dir / names["prefix"] / "calibration_gate.json"
+            gate = None if request.execution_mode.shared_warmup else run_dir / names["prefix"] / "calibration_gate.json"
             command = profile_command(
                 request,
                 run_dir=run_dir,
@@ -1500,8 +1568,12 @@ def run_profile_request(
                 {
                     "stage": names["core_raw"],
                     "argv": command,
-                    "requires_prefix_gate": str(gate),
+                    "requires_prefix_gate": str(gate) if gate else None,
+                    "shared_warmup": request.execution_mode.shared_warmup,
                     "note": (
+                        "The Core worker warms up once, validates Prefix from that snapshot, "
+                        "restores it, then measures Local. A failed gate prevents Local measurement."
+                        if request.execution_mode.shared_warmup else
                         "This is the resolved Core worker command. The normal runner first "
                         "creates and validates the referenced prefix gate."
                     ),
@@ -1529,7 +1601,13 @@ def run_profile_request(
         selection = read_json(run_dir / "local_selection.json")
         if request.data_diagnostics != "off":
             from dq_profile.diagnostic_report import promote_dataset_report
-            promoted.extend(promote_dataset_report(active_profile, run_dir, selection))
+            promoted.extend(promote_dataset_report(active_profile, run_dir, selection, finalize=False))
+        if request.preset.name == "canonical-v2":
+            from dq_profile.spatial_report import write_standard_report
+            promoted.extend(write_standard_report(active_profile, run_dir))
+        else:
+            from dq_profile.report_publication import finalize_report_manifests
+            finalize_report_manifests(run_dir)
         update_status(
             run_dir,
             status="complete",

@@ -507,6 +507,20 @@ DQ_DELTA_AUTO_BANDS = {
 }
 
 
+def resolve_dq_delta_auto_scope(args):
+    """Keep UNet-driven tuning independent of how many scopes are logged."""
+    explicit = getattr(args, "dq_delta_auto_scope", None)
+    if explicit is not None:
+        if explicit not in ("unet", "te", "both"):
+            raise ValueError("dq_delta_auto_scope must be unet, te or both")
+        return explicit
+    if getattr(args, "network_train_text_encoder_only", False):
+        return "te"
+    if getattr(args, "network_train_unet_only", False):
+        return "unet"
+    return "te" if getattr(args, "dq_delta_scope", "both") == "te" else "unet"
+
+
 def resolve_dq_delta_auto_settings(args):
     auto_preset = getattr(args, "dq_delta_auto_preset", None)
     if auto_preset is not None:
@@ -1098,8 +1112,18 @@ class NetworkTrainer:
 
         return loss.mean()
 
+    def _notify_training_observer(self, event, **state):
+        """Optional embedding hook. The command-line trainer installs none."""
+        observer = getattr(self, "training_observer", None)
+        if observer is not None:
+            observer(event, **state)
+
     def train(self, args):
         requested_training_args = training_settings.snapshot(vars(args))
+        # Opt-in only: leave the legacy scope/setter behavior unchanged.
+        from library.dq_mul_policy import MulPolicy, fixed_policy_resume_record, validate_fixed_policy_resume, fixed_policy_resume_load_context
+        dq_mul_policy = MulPolicy.from_training_args(args)
+        dq_mul_policy_record = None
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
         train_util.verify_training_args(args)
@@ -1251,6 +1275,11 @@ class NetworkTrainer:
         rank_log_mode = getattr(args, "rank_log_mode", "summary")
 
         dq_auto_enabled = bool(getattr(args, "dq_delta_auto_range_mul", False))
+        dq_auto_scope = resolve_dq_delta_auto_scope(args)
+        if dq_auto_enabled:
+            logger.info("dq_delta auto tuning scope=%s; log scope=%s", dq_auto_scope, dq_log_scope)
+            if getattr(args, "dq_delta_auto_scope", None) is None and getattr(args, "dq_delta_scope", "both") == "both":
+                logger.info("Auto scope is now independent of dq_delta_scope=both. Use --dq_delta_auto_scope both for legacy combined tuning.")
         (
             dq_auto_preset,
             dq_auto_clip_low,
@@ -1513,7 +1542,7 @@ class NetworkTrainer:
 
         def _dq_auto_log_header(full_schema: bool, include_near_zero: bool):
             if full_schema:
-                return _dq_log_header("summary", include_near_zero, include_qerr_per_clip=True, detail="full")
+                return _dq_log_header("summary", include_near_zero, include_qerr_per_clip=True, detail="full") + ",AutoQuantErrRatioRaw,AutoQuantErrRatioEMA"
             return (
                 "TrainStep,Scope,Target,Bits,ClipRateRaw,ClipRateEMA,RangeMulBefore,RangeMulAfter,AutoApplied,"
                 "WarmupActive,WarmupRemain,AutoReason,AutoInitMulApplied,AutoInitMulValue,AutoInitClipTarget,"
@@ -1521,7 +1550,7 @@ class NetworkTrainer:
                 "ClipRateLowAutoState,ClipRateLowAutoDecision,ClipRateLowAutoReason,ClipRateLowAutoBad,ClipRateLowAutoBadStreak,"
                 "TrainProgress,ClipRateLowAutoMinProgress,ClipRateLowAutoFreezeProgress,"
                 "ClipRateLowAutoThresholdQErrRatio,ClipRateLowAutoThresholdQErrPerClip,"
-                "ClipRateLowAutoPhase,ClipRateLowAutoCanEscape"
+                "ClipRateLowAutoPhase,ClipRateLowAutoCanEscape,AutoQuantErrRatioRaw,AutoQuantErrRatioEMA"
             )
 
         def _dq_qerr_per_clip(quant_err_ratio, clip_rate):
@@ -2031,6 +2060,13 @@ class NetworkTrainer:
                 for l in unwrapped.text_encoder_loras:
                     l.delta_q_enabled = True
 
+        if dq_mul_policy is not None:
+            if not hasattr(network, "set_delta_mul_policy"):
+                raise ValueError("The selected network module does not support fixed mul policies")
+            dq_mul_policy_record = accelerator.unwrap_model(network).set_delta_mul_policy(dq_mul_policy)
+            logger.info("fixed delta mul policy: %s", dq_mul_policy_record["assignments_sha256"])
+            logger.info("fixed delta mul declaration: %s", json.dumps(dq_mul_policy_record["declaration"], sort_keys=True))
+
         if args.network_weights is not None:
             # FIXME consider alpha of weights
             info = network.load_weights(args.network_weights)
@@ -2377,6 +2413,8 @@ class NetworkTrainer:
                 "current_epoch": current_epoch.value,
                 "current_step": current_step.value + 1,
             }
+            if dq_mul_policy_record is not None:
+                train_state["dq_mul_policy"] = fixed_policy_resume_record(dq_mul_policy_record)
             if self._te_lr_after_cfg:
                 train_state["te_lr_after"] = {
                     "applied": bool(self._te_lr_after_cfg.get("applied", False)),
@@ -2404,6 +2442,7 @@ class NetworkTrainer:
             if os.path.exists(train_state_file):
                 with open(train_state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                validate_fixed_policy_resume(data, dq_mul_policy_record)
                 step_value = data.get("current_step")
                 try:
                     steps_from_state_local = int(step_value) if step_value is not None else None
@@ -2414,14 +2453,20 @@ class NetworkTrainer:
                 self._te_lr_after_resume_state = data.get("te_lr_after")
                 self._te_lr_after_resume_step = steps_from_state_local
                 logger.info(f"load train state from {train_state_file}: {data}")
-            elif getattr(args, "resume", False):
-                self._te_lr_after_resumed = True
+            else:
+                validate_fixed_policy_resume({}, dq_mul_policy_record)
+                if getattr(args, "resume", False):
+                    self._te_lr_after_resumed = True
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
         # resumeする
-        train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+        if dq_mul_policy_record is not None and args.resume:
+            with fixed_policy_resume_load_context():
+                train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+        else:
+            train_util.resume_from_local_or_hf_if_specified(accelerator, args)
         if self._te_lr_after_cfg:
             # load_model_hook で復元された情報を反映する（resume前には未取得）
             self._handle_te_lr_after_resume()
@@ -2724,12 +2769,24 @@ class NetworkTrainer:
                 vae_name = os.path.basename(vae_name)
             metadata["ss_vae_name"] = vae_name
 
+        if dq_mul_policy_record is not None:
+            metadata["ss_dq_mul_policy"] = json.dumps(dq_mul_policy_record["declaration"], sort_keys=True)
+            metadata["ss_dq_mul_assignments_sha256"] = dq_mul_policy_record["assignments_sha256"]
+            metadata["ss_dq_mul_policy_version"] = "1"
+
+        metadata["ss_dq_delta_scope"] = getattr(args, "dq_delta_scope", "both")
+        metadata["ss_dq_delta_log_scope"] = dq_log_scope
+        metadata["ss_dq_delta_auto_scope"] = dq_auto_scope
+        metadata["ss_dq_delta_auto_range_mul"] = dq_auto_enabled
         metadata = {k: str(v) for k, v in metadata.items()}
 
         # make minimum metadata for filtering
         minimum_metadata = {}
         for key in train_util.SS_METADATA_MINIMUM_KEYS:
             if key in metadata:
+                minimum_metadata[key] = metadata[key]
+        if dq_mul_policy_record is not None:
+            for key in ("ss_dq_mul_policy", "ss_dq_mul_assignments_sha256", "ss_dq_mul_policy_version"):
                 minimum_metadata[key] = metadata[key]
 
         # calculate steps to skip when resuming or starting from a specific step
@@ -2844,6 +2901,8 @@ class NetworkTrainer:
                 "te_selection_indices": te_selection_indices,
                 "dq_bits_sched": dq_bits_sched,
                 "dq_auto_enabled": dq_auto_enabled,
+                "dq_auto_scope": dq_auto_scope,
+                "dq_log_scope": dq_log_scope,
                 "dq_auto_preset": dq_auto_preset,
                 "dq_auto_active_band": dq_auto_active_band,
                 "dq_auto_active_clip_low": dq_auto_active_clip_low,
@@ -3341,6 +3400,7 @@ class NetworkTrainer:
             total_weight = 0
             with torch.no_grad():
                 for item in shadow_bank:
+                    self._notify_training_observer("before_shadow_forward", global_step=global_step)
                     runtime_batch, noisy_latents_rt, target_rt, timesteps_rt, huber_c_rt = _materialize_shadow_batch(item)
                     self._set_network_multiplier_from_batch(unwrapped_network, runtime_batch)
                     text_encoder_conds = self._get_text_conds_for_batch(
@@ -3360,6 +3420,7 @@ class NetworkTrainer:
                         weight_dtype,
                         train_unet=False,
                     )
+                    self._notify_training_observer("after_shadow_forward", loss=loss)
                     batch_size_for_score = int(runtime_batch["loss_weights"].shape[0])
                     total_loss += loss.detach().item() * batch_size_for_score
                     total_weight += batch_size_for_score
@@ -3448,6 +3509,8 @@ class NetworkTrainer:
             col_idx = {name: idx for idx, name in enumerate(cols)}
             if "TrainStep" in col_idx:
                 row[col_idx["TrainStep"]] = 0
+            if "Scope" in col_idx:
+                row[col_idx["Scope"]] = dq_auto_scope
             if "AutoInitMulApplied" in col_idx:
                 row[col_idx["AutoInitMulApplied"]] = dq_auto_init_applied
             if "AutoInitMulValue" in col_idx:
@@ -3500,6 +3563,12 @@ class NetworkTrainer:
                 return global_step >= dq_delta_begin_step
             return progress_frac >= args.dq_delta_begin
 
+        self._notify_training_observer(
+            "start", args=args, network=accelerator.unwrap_model(network),
+            optimizer=optimizer, scheduler=lr_scheduler, accelerator=accelerator,
+            guardian=grad_norm_guardian, global_step=global_step,
+            policy=dq_mul_policy_record,
+        )
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
@@ -3518,6 +3587,7 @@ class NetworkTrainer:
                 if initial_step > 0:
                     initial_step -= 1
                     continue
+                self._notify_training_observer("before_training_batch", global_step=global_step, epoch=epoch + 1)
                 if not progress_bar_started:
                     elapsed = time.time() - training_started_at
                     if accelerator.is_main_process:
@@ -3631,7 +3701,7 @@ class NetworkTrainer:
                                 collect_detail=collect_detail,
                                 log_mode=dq_log_mode,
                                 log_scope=dq_log_scope,
-                                auto_scope=getattr(args, "dq_delta_scope", "both"),
+                                auto_scope=dq_auto_scope,
                                 target=target,
                             )
                             dq_stats_state_fn = accelerator.unwrap_model(network).set_dq_stats_state
@@ -3724,6 +3794,7 @@ class NetworkTrainer:
                     )
 
                     accelerator.backward(loss)
+                    self._notify_training_observer("after_backward", loss=loss, global_step=global_step)
                     loss_scalar = loss.detach().item()
                     skip_step = False
                     if check_gradients_and_skip_update(network, epoch, step, loss_scalar):
@@ -3765,6 +3836,12 @@ class NetworkTrainer:
                                     exclude_param_ids=self._te_frozen_param_ids,
                                 )
                 current_loss = loss_scalar
+                self._notify_training_observer(
+                    "after_training_step", global_step=global_step + 1,
+                    epoch=epoch + 1, loss=loss_scalar,
+                    guardian_skipped=skip_step,
+                    amp_skipped=(None if skip_step else bool(accelerator.optimizer_step_was_skipped)),
+                )
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = self._apply_max_norm_regularization(
@@ -4245,6 +4322,10 @@ class NetworkTrainer:
                                 if dq_stats["do_auto"] and accelerator.is_main_process and dq_auto_log_path:
                                     include_near_zero = "near_zero_rate" in dq_log_extra
                                     header = _dq_auto_log_header(dq_auto_log_format == "full_schema", include_near_zero)
+                                    auto_error_values = [
+                                        auto_metrics.get("quant_err_ratio"),
+                                        dq_low_auto_quant_err_ratio_ema_state if dq_low_auto_enabled else None,
+                                    ]
                                     if dq_auto_log_format == "full_schema":
                                         row = [
                                             epoch + 1,
@@ -4308,7 +4389,7 @@ class NetworkTrainer:
                                             dq_auto_init_value if dq_auto_init_value is not None else "",
                                             dq_auto_init_clip_target if dq_auto_init_clip_target is not None else "",
                                         ]
-                                        _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
+                                        _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row + auto_error_values))
                                     else:
                                         row = [
                                             step_idx,
@@ -4344,7 +4425,7 @@ class NetworkTrainer:
                                             low_auto_phase if dq_low_auto_enabled else "",
                                             low_auto_can_escape if dq_low_auto_enabled else "",
                                         ]
-                                        _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row))
+                                        _write_csv(dq_auto_log_path, header, ",".join(_dq_format_value(v) for v in row + auto_error_values))
                     if rank_log_enabled and accelerator.is_main_process and rank_log_path and (not skip_step_flag):
                         step_idx = global_step
                         if step_idx % rank_log_every == 0:
@@ -5013,7 +5094,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=str,
         default="both",
         choices=["unet", "te", "both"],
-        help="Apply delta fake-quant to: unet, te, or both / Δのフェイク量子化の適用範囲（unet/te/both）",
+        help=(
+            "Legacy scope hint; ordinary networks.lora step control enables both UNet and TE. "
+            "Direct mul overrides also target both. Log scope follows this value; auto scope is independent. / "
+            "従来の対象指定。通常のnetworks.lora学習ではstep制御によりUNet・TEとも量子化。"
+            "部位別mul指定も両方が対象。ログ対象はこの値を継承、自動調整対象はdq_delta_auto_scopeで独立指定"
+        ),
     )
     parser.add_argument(
         "--dq_quantize_z",
@@ -5045,6 +5131,36 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=3.0,
         help="When bits mode with stat=rms, dynamic range = range_mul * RMS. / bitsモードかつstat=rms時の有効レンジ倍率（range=倍率×RMS）",
+    )
+    parser.add_argument(
+        "--dq_delta_range_mul_attn2",
+        type=float,
+        default=None,
+        help="Fixed mul for all UNet attn2 Q/K/V/Out LoRA deltas; other modules inherit dq_delta_range_mul. Direct overrides quantize UNet and TE, overriding legacy scope. / attn2のmulを上書き（UNet・TEを量子化）",
+    )
+    parser.add_argument(
+        "--dq_delta_range_mul_te",
+        type=float,
+        default=None,
+        help="Fixed mul shared by TE1 and TE2 LoRA deltas; individual TE overrides take precedence. Direct overrides quantize UNet and TE. / TE1・TE2共通のmulを上書き",
+    )
+    parser.add_argument(
+        "--dq_delta_range_mul_te1",
+        type=float,
+        default=None,
+        help="Fixed TE1 mul, overriding dq_delta_range_mul_te and dq_delta_range_mul. Direct overrides quantize UNet and TE. / TE1個別のmulを上書き",
+    )
+    parser.add_argument(
+        "--dq_delta_range_mul_te2",
+        type=float,
+        default=None,
+        help="Fixed TE2 mul, overriding dq_delta_range_mul_te and dq_delta_range_mul. Direct overrides quantize UNet and TE. / TE2個別のmulを上書き",
+    )
+    parser.add_argument(
+        "--dq_delta_policy_file",
+        type=str,
+        default=None,
+        help="Research/compatibility fixed RMS delta-mul JSON; cannot be combined with direct mul overrides. Overrides legacy scope; omitted preserves existing behavior.",
     )
     parser.add_argument(
         "--dq_delta_bits_sched",
@@ -5136,6 +5252,17 @@ def setup_parser() -> argparse.ArgumentParser:
         "--dq_delta_auto_range_mul",
         action="store_true",
         help="Enable auto range_mul tuning / range_mul の自動調整を有効化",
+    )
+    parser.add_argument(
+        "--dq_delta_auto_scope",
+        type=str,
+        default=None,
+        choices=["unet", "te", "both"],
+        help=(
+            "Statistics used to tune the shared mul, independent of log scope. Default: UNet (TE for TE-only training/scope). "
+            "Use both for legacy combined tuning. / 共通mulの自動調整で見る統計の対象。既定はUNet、TE専用時はTE。"
+            "旧bothの統合統計による調整を再現するにはbothを明示。ログや量子化の対象は変えません"
+        ),
     )
     parser.add_argument(
         "--dq_delta_auto_preset",

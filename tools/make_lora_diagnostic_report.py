@@ -11,8 +11,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from tools.lora_training_settings import load_training_settings
+    from tools.lora_dq_report import build_auto_monitor, group_dq_rows, mul_settings, recorded_bool, scope_charts
 except ModuleNotFoundError:
     from lora_training_settings import load_training_settings
+    from lora_dq_report import build_auto_monitor, group_dq_rows, mul_settings, recorded_bool, scope_charts
 
 ColorPalette = [
     "#0f766e",
@@ -359,6 +361,7 @@ def parse_dq_logs(
     dq_log_path: Optional[str],
     dq_auto_path: Optional[str],
     grad_data: Optional[Dict[str, Any]],
+    training_settings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     rows = read_csv_rows(dq_log_path) if dq_log_path else []
     parsed_rows: List[Dict[str, Any]] = []
@@ -374,6 +377,11 @@ def parse_dq_logs(
             {
                 "TrainStep": train_step,
                 "Epoch": epoch,
+                "Scope": (row.get("Scope") or "").strip().lower(),
+                "Target": (row.get("Target") or "").strip().lower(),
+                "Module": (row.get("Module") or "").strip(),
+                "RMS": safe_float(row.get("RMS")),
+                "Numel": safe_float(row.get("Numel")),
                 "Bits": safe_float(row.get("Bits")),
                 "RangeMul": safe_float(row.get("RangeMul")),
                 "ClipRateRaw": safe_float(row.get("ClipRateRaw")),
@@ -409,6 +417,8 @@ def parse_dq_logs(
             }
         )
     parsed_rows.sort(key=lambda item: item["TrainStep"])
+    grouped = group_dq_rows(parsed_rows)
+    analysis_rows = grouped["plot_rows"]
 
     auto_rows: List[Dict[str, Any]] = []
     if dq_auto_path and os.path.exists(dq_auto_path):
@@ -420,6 +430,10 @@ def parse_dq_logs(
             auto_rows.append(
                 {
                     "TrainStep": step,
+                    "Scope": (row.get("Scope") or "").strip().lower(),
+                    "Target": (row.get("Target") or "").strip().lower(),
+                    "AutoQuantErrRatioRaw": safe_float(row.get("AutoQuantErrRatioRaw")),
+                    "AutoQuantErrRatioEMA": safe_float(row.get("AutoQuantErrRatioEMA")),
                     "Bits": safe_float(row.get("Bits")),
                     "ClipRateRaw": safe_float(row.get("ClipRateRaw")),
                     "ClipRateEMA": safe_float(row.get("ClipRateEMA")),
@@ -453,7 +467,7 @@ def parse_dq_logs(
 
     markers: List[Dict[str, Any]] = []
     last_epoch: Optional[int] = None
-    for item in parsed_rows:
+    for item in analysis_rows:
         epoch = item.get("Epoch")
         if epoch is None:
             continue
@@ -461,7 +475,7 @@ def parse_dq_logs(
             markers.append({"x": item["TrainStep"], "label": f"E{epoch}"})
             last_epoch = epoch
 
-    bits_source = parsed_rows if parsed_rows else auto_rows
+    bits_source = analysis_rows if analysis_rows else auto_rows
     bits_values = [item["Bits"] for item in bits_source if item.get("Bits") is not None]
     bit_switches = 0
     if bits_values:
@@ -491,8 +505,8 @@ def parse_dq_logs(
         if target is not None:
             clip_target_values.append(target)
 
-    latest = parsed_rows[-1] if parsed_rows else (auto_rows[-1] if auto_rows else {})
-    clip_source = parsed_rows if parsed_rows else auto_rows
+    latest = analysis_rows[-1] if analysis_rows else (auto_rows[-1] if auto_rows else {})
+    clip_source = analysis_rows if analysis_rows else auto_rows
     clip_ema_values = [item["ClipRateEMA"] for item in clip_source if item.get("ClipRateEMA") is not None]
     clip_ema_cv = None
     if len(clip_ema_values) >= 8:
@@ -503,7 +517,7 @@ def parse_dq_logs(
             clip_ema_cv = math.sqrt(variance) / tail_mean
 
     auto_has_qerr_per_clip = any(item.get("QErrPerClip") is not None for item in auto_rows)
-    low_diag_source = auto_rows if auto_has_qerr_per_clip else parsed_rows
+    low_diag_source = auto_rows if auto_has_qerr_per_clip else analysis_rows
     qerr_per_clip_values = [item["QErrPerClip"] for item in low_diag_source if item.get("QErrPerClip") is not None]
     qerr_tail_mean = mean_tail(qerr_per_clip_values, 0.25, True) if qerr_per_clip_values else None
     qerr_max = max(qerr_per_clip_values) if qerr_per_clip_values else None
@@ -572,13 +586,15 @@ def parse_dq_logs(
                 freeze_progress_step = item.get("TrainStep")
                 break
 
-    clip_share_values = [item["ClipShare"] for item in parsed_rows if item.get("ClipShare") is not None]
-    round_share_values = [item["RoundShare"] for item in parsed_rows if item.get("RoundShare") is not None]
-    clip_err_ratio_values = [item["ClipErrRatio"] for item in parsed_rows if item.get("ClipErrRatio") is not None]
-    round_err_ratio_values = [item["RoundErrRatio"] for item in parsed_rows if item.get("RoundErrRatio") is not None]
+    clip_share_values = [item["ClipShare"] for item in analysis_rows if item.get("ClipShare") is not None]
+    round_share_values = [item["RoundShare"] for item in analysis_rows if item.get("RoundShare") is not None]
+    clip_err_ratio_values = [item["ClipErrRatio"] for item in analysis_rows if item.get("ClipErrRatio") is not None]
+    round_err_ratio_values = [item["RoundErrRatio"] for item in analysis_rows if item.get("RoundErrRatio") is not None]
 
     summary = {
         "rows": len(parsed_rows),
+        "steps": len(analysis_rows),
+        "scopes": list(grouped["scope_rows"]),
         "auto_rows": len(auto_rows),
         "bit_switches": bit_switches,
         "bits_unique": sorted(list({int(v) for v in bits_values})) if bits_values else [],
@@ -619,14 +635,20 @@ def parse_dq_logs(
         "final_zero_rate": latest.get("ZeroRate"),
     }
 
-    return {
+    result = {
         "path": dq_log_path,
         "auto_path": dq_auto_path,
         "rows": parsed_rows,
+        **grouped,
+        "mul_settings": mul_settings(training_settings),
+        "ema_beta": ((training_settings or {}).get("values") or {}).get("dq_delta_auto_ema"),
+        "auto_enabled": recorded_bool(((training_settings or {}).get("values") or {}).get("dq_delta_auto_range_mul")),
         "auto_rows": auto_rows,
         "markers": markers,
         "summary": summary,
     }
+    result["auto_monitor"] = build_auto_monitor(result, training_settings)
+    return result
 
 
 def parse_rank_logs(
@@ -1568,7 +1590,7 @@ def build_chart_payload(
     group_loss_data: Optional[Dict[str, Any]],
     lora_trend_data: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"grad": [], "dq": [], "rank": [], "group_loss": [], "lora_trend": []}
+    payload: Dict[str, Any] = {"grad": [], "dq": [], "dq_auto": [], "rank": [], "group_loss": [], "lora_trend": []}
 
     if grad_data:
         x = grad_data.get("x", [])
@@ -1636,7 +1658,7 @@ def build_chart_payload(
         ]
 
     if dq_data:
-        log_rows = dq_data.get("rows", [])
+        log_rows = dq_data.get("plot_rows", dq_data.get("rows", []))
         auto_rows = dq_data.get("auto_rows", [])
         rows = log_rows if log_rows else auto_rows
         auto_has_qerr_per_clip = any(item.get("QErrPerClip") is not None for item in auto_rows)
@@ -1912,6 +1934,13 @@ def build_chart_payload(
                     ),
                 }
             )
+
+        payload["dq"] = scope_charts(payload["dq"], dq_data)
+        payload["dq_auto"] = (dq_data.get("auto_monitor") or {}).get("charts", [])
+        if payload["dq_auto"]:
+            payload["dq"] = [c for c in payload["dq"] if c["id"] not in ("dq_qerr_per_clip", "dq_low_auto_bad")]
+            if not dq_data.get("rows"):
+                payload["dq"] = [c for c in payload["dq"] if c["id"] in ("dq_bits", "dq_range_mul")]
 
     if rank_data:
         rows = rank_data.get("rows", [])
@@ -2676,6 +2705,9 @@ summary:focus-visible {{ outline: 2px solid #2563eb; outline-offset: 3px; }}
 .constant-value {{ background: #f1f5f9; border-radius: 6px; padding: 6px 10px; font-size: 13px; }}
 .constant-charts {{ grid-column: 1 / -1; min-width: 0; }}
 .constant-charts .chart-grid {{ margin-top: 10px; }}
+.chart-card[hidden] {{ display: none; }}
+.dq-scope-control {{ display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 12px 0; }}
+.dq-scope-control select {{ padding: 8px 12px; border: 1px solid #b6c8df; border-radius: 6px; color: #173354; background: white; }}
 .table-scroll {{ overflow-x: auto; }}
 .wide-table table {{ min-width: 640px; }}
 .badge {{ white-space: nowrap; }}
@@ -3078,6 +3110,7 @@ function mountCharts(containerId, charts) {{
     const card = document.createElement('div');
     card.className = 'chart-card';
     card.dataset.chartId = chart.id || '';
+    if (chart.dq_scope) card.dataset.dqScope = chart.dq_scope;
     const title = document.createElement('div');
     title.className = 'chart-title';
     title.textContent = chart.title || `Chart ${{idx + 1}}`;
@@ -3113,7 +3146,16 @@ function mountCharts(containerId, charts) {{
     }});
   }};
   if (disclosure) disclosure.addEventListener('toggle', renderAll);
-  renderAll();
+  const scopeSelect = containerId === 'charts-dq' ? document.getElementById('dq-scope-view') : null;
+  const applyScope = () => {{
+    const selected = scopeSelect ? scopeSelect.value : 'all';
+    container.querySelectorAll('[data-dq-scope]').forEach(card => {{
+      card.hidden = selected === 'split' ? card.dataset.dqScope === 'combined' : selected !== 'all' && card.dataset.dqScope !== selected;
+    }});
+    renderAll();
+  }};
+  if (scopeSelect) scopeSelect.addEventListener('change', applyScope);
+  applyScope();
   window.addEventListener('resize', renderAll);
 }}
 
@@ -3202,8 +3244,9 @@ def main() -> None:
             f"入力ログが見つかりません: {args.input_dir} (gradient_logs+/dq_delta_logs+/dq_delta_auto+/rank_logs+/group_loss_logs+/group_loss_epoch+)"
         )
 
+    training_settings = load_training_settings(args.input_dir, args.base_name, model_path, args.training_settings)
     grad_data = parse_grad_log(grad_log_path, args.loss_ma_window) if grad_log_path else None
-    dq_data = parse_dq_logs(dq_log_path, dq_auto_log_path, grad_data) if (dq_log_path or dq_auto_log_path) else None
+    dq_data = parse_dq_logs(dq_log_path, dq_auto_log_path, grad_data, training_settings) if (dq_log_path or dq_auto_log_path) else None
     rank_module_param_counts = None
     if rank_log_path and os.path.exists(model_path):
         try:
@@ -3244,7 +3287,7 @@ def main() -> None:
     report = {
         "base_name": args.base_name,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "training_settings": load_training_settings(args.input_dir, args.base_name, model_path, args.training_settings),
+        "training_settings": training_settings,
         "grad": grad_data,
         "dq": dq_data,
         "rank": rank_data,

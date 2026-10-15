@@ -2,6 +2,46 @@
 
 2026-09-05。診断用trainerのLocal計測から実データを保存し、独立したHTMLを生成する追加機能です。通常の学習trainerは変更しません。
 
+## 標準拡張：一律mulと場所別配分の比較
+
+2026-10-10採用・実装。`canonical-v2` の標準レポートです。小型LoRAでのCPU検証と表示検証を行い、
+新標準経路全体のSDXL GPU受入は次段階とします。
+名称・実験の背景・TE固定・dropoutの方針は
+[診断ガイドの標準仕様](dq_dataset_profiler-ja.md#spatial-diagnostic-spec)にまとめています。
+以下の「実行する」以降は追加画像診断の共通基盤と旧入口の説明です。v2はwarmup記録を既定で有効にします。
+画像詳細には保存時のcaption・学習設定・サムネイルを引き継ぎます。同じ画像の複数学習設定は
+混同せず併記し、必要に応じて「従来の画像詳細」リンクから提示履歴などを確認できます。
+ローカル表示用の`data.js`と、実パス・captionを含まない共有JSONは用途を分けてください。
+
+`dataset_report.html`上部の「mul選択」を**診断条件選択**へ拡張します。
+選択肢には一律5点と「attn2・TE高mul型」のBody基準2条件・固定基準を置きます。
+同一配分はまとめ、各条件に`condition_id`、表示名、その他UNet／attn2／TE1／TE2の
+配分、量子化ON/OFF、dropout regime、測定契約を持たせます。
+数値mulの配列へ文字列だけを追加して済ませず、保存データも条件IDで参照します。
+旧レポートの一律条件は従来の実測から読み取り、未測定の場所別条件は作りません。
+
+条件選択に連動させるのは次の表示です。
+
+- 配分の表示、B ↔ Cの散布図、画像・フォルダ・タグ・元画像グループの量子化指標。
+- 選択した対象の条件別比較。一律5点の後に場所別配分を区別して並べ、
+  各対象内で条件間に共通する有効sampleを使う。点を選ぶと上部の条件も同期する。
+- 全体・TE・TE1・TE2・UNet・attn2・その他UNetの勾配指標。
+  モデル全体のMSEを部位別の値に置き換えない。
+
+**A → Bの量子化OFFの学習反応は共通**です。選ぶ配分・勾配の観測部位・
+量子化比較用のdropout表示を変えても書き換えません。ここでのA/B/Cは測定段階であり、
+過去の配分名「候補A」とは別の記号です。初期評価がない場合は未算出の表示を残します。
+
+散布図の目盛は比較する条件間で揃えます。画像詳細の平均dは、beginnerレポートの
+source均等重みのP50／P75／Body／Tailとは別の集計であることを表示します。
+ONの計測を追加していないrunではONを選べず、旧ログに部位別値・raw MSEがなければ
+欠測理由を表示します。学習用objective lossをraw MSEと読み替えません。
+既存のcaption表示、sample文脈、サムネイル、絞り込み、group-map、CSV再集計の意味は維持します。
+
+新標準の確率的丸めの測定は1回が既定です。`--dq-profile-quant-repeats=2`で2回にすると、
+この画像・グループ別集計にも2回分が反映されます。拡散ノイズ数・dropoutマスク数は変えません。
+旧ログの反復数は読み替えず、保存された測定条件を表示します。
+
 ## 実行する
 
 普段の診断コマンドに次を追加します。
@@ -34,7 +74,7 @@ python -m dq_profile `
 
 `warmup`は学習準備直後の実際のLoRA初期状態をCPUに保存します。Localで確定したlatent・noise・target・caption/token・crop/flip条件を使い、その初期状態でもforwardします。学習対象TEのembeddingも初期TE-LoRAから再計算します。backwardやoptimizer更新は行いません。前後のRNG・network・optimizer・scheduler・scaler・guardian等を照合し、復元失敗は実行エラーとします。
 
-既定は`off`です。小さなCPU/CUDAモデルと実際の診断用LoRAを用いたテストはありますが、全SDXLのoff/local/warmup比較は未実施です。warmupの既定有効化はその確認後に行います。`off`でも以下の52画像契約は共通です。
+旧`canonical-v1`の既定は`off`、新`canonical-v2`の既定は`warmup`です。小さなCPU/CUDAモデルと実際の診断用LoRAを用いたテストはありますが、新標準経路全体のSDXL GPU受入は未実施です。`off`でも以下の52画像契約は共通です。
 
 ## 「量子化前」と「量子化後」の区別
 
@@ -69,9 +109,9 @@ A → Bの図は、右ほど初期誤差が大きく、上ほど誤差の減少�
 
 production standard/strictは`local-body-tail-v2`、最大52実画像を使います。旧`local-body-tail-v1`の32画像契約は読み取り・再現用途に保持します。画像を複製して52枠を埋めません。従来のBody/Tail計算・Hard Safety・候補絞り込みはそのままで、母集団が増えたことによる数値変化は起こり得ます。
 
-standardの5候補では、選択実画像数をVとしてLocalは92V回のforward/backwardです。上限を使い切る場合、32画像の2,944回から52画像の4,784回へ62.5%増えます。元から32枚以下なら上限増による増加はありません。
+一律5候補のOFF測定では、選択実画像数をV、丸め反復数をQとしてLocalは`4V × (3 + 10Q)`回のforward/backwardです。新標準の既定Q=1では52V回、`--dq-profile-quant-repeats=2`では従来通り92V回です。場所別配分とdropout ONの追加測定、warmupとPrefixの費用は別枠です。元から32枚以下なら画像上限増による増加はありません。
 
-`warmup`はさらに12V回のforwardのみを追加します（52画像なら624回）。実行計画に別枠で表示し、未測定のforward時間係数を既存の時間見積もりへ混ぜません。standardのstandalone snapshot/prefix workerでは初期評価しません。strictのedge再走査は各Local workerで初期評価も繰り返します。
+`warmup`はさらに12V回のforwardのみを追加します（52画像なら624回）。実行計画に別枠で表示します。standardは1回のwarmup状態をPrefixとLocalで共有し、初期状態と実warmupの履歴を保持します。Prefix中は画像診断の収集を止め、終了後に状態を復元してからLocalを測定するため、A→Bの図にPrefixの更新は入りません。strictのedge再走査は各Local workerで初期評価も繰り返します。
 
 ## 出力と操作
 

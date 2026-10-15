@@ -34,7 +34,7 @@
 <label class="field" id="range-fields" hidden><span class="sr-only">表示範囲</span><input id="range-min" class="range-input" type="number" step="any" aria-label="範囲の開始"><span>〜</span><input id="range-max" class="range-input" type="number" step="any" aria-label="範囲の終了"><button id="apply-range">適用</button></label>
 </div>
 <details id="series-box" class="panel series-box"><summary id="series-summary">表示する系列</summary><div class="series-actions"><button id="series-all">すべて選択</button><button id="series-none">選択を解除</button></div><div id="series-list" class="series-list"></div></details>
-<div id="notices"></div><div id="run-legend" class="run-legend"></div><div id="plots" class="plot-grid"></div><p id="plot-note" class="plot-note"></p>
+<div id="notices"></div><section id="dq-context" class="panel runs" hidden><h3>量子化の設定と記録範囲</h3><div id="dq-context-body" class="run-list"></div></section><div id="run-legend" class="run-legend"></div><div id="plots" class="plot-grid"></div><p id="plot-note" class="plot-note"></p>
 <details id="statistics" class="panel table-panel"><summary>表示範囲の記録値</summary><p class="muted">平均は表示系列の有効な記録値の単純平均です。時間平均や画像品質の評価ではありません。</p><div class="table-scroll"><table><thead><tr><th>ラン</th><th>系列</th><th>記録数</th><th>平均</th><th>最小</th><th>最大</th><th>最終記録値</th></tr></thead><tbody id="stats-body"></tbody></table></div></details>
 <details id="source-notes" class="panel table-panel"><summary>元レポートの補足</summary><div id="source-notes-body"></div></details>
 </section></div>
@@ -45,7 +45,7 @@
 <script>
 (() => {
 'use strict';
-const VERSION='0.2.1', BUNDLE_VERSION=1;
+const VERSION='0.3.0', BUNDLE_VERSION=1;
 const originalHTML='<!doctype html>\n'+document.documentElement.outerHTML;
 const $=id=>document.getElementById(id), finite=v=>typeof v==='number'&&Number.isFinite(v);
 const array=v=>Array.isArray(v)?v:[], obj=v=>v&&typeof v==='object'&&!Array.isArray(v)?v:{};
@@ -54,7 +54,7 @@ const state={runs:[],selected:[],chart:'loss_ma',mode:'overlay',axis:'native',ra
 let renders=[],busy=false,dragDepth=0,resizeTimer,pinned=false,displayIndex=0,rangeDraft=null;
 const aliases={dq_rank_dim:'rank_dim',dq_rank_sat:'rank_sat',dq_rank_energy:'rank_energy',group_loss_ema_step:'group_loss_step_ema',group_loss_ema_epoch:'group_loss_epoch_ema'};
 const titles={grad_norm:'勾配ノルム・閾値',loss_ma:'Loss・移動平均',thresh_off:'ThreshOff',scale:'GradScaler Scale',cosine:'勾配 Cosine',cosine_by_epoch:'勾配の整列度（epoch）',dq_bits:'DQ Bits',dq_range_mul:'DQ RangeMul',dq_clip:'DQ ClipRate',dq_qerr_ratio:'DQ 量子化誤差比',dq_qerr_rms:'DQ 量子化誤差 RMS',dq_zero_rate:'DQ ZeroRate',dq_absmax:'DQ AbsMax',dq_range:'DQ Range',dq_qerr_per_clip:'DQ QErrPerClip',dq_low_auto_bad:'DQ Auto Bad / Streak',dq_error_part_ratio:'DQ Clip / Round 誤差比',dq_error_part_share:'DQ Clip / Round 構成比',rank_dim:'RankDim',rank_sat:'Rank 飽和度・Top1',rank_energy:'Rank 重み量',rank_lr:'学習率の記録',rank_group_path_energy_share:'Down / Mid / Up：重み構成比',rank_group_path_energy_share_per_param:'Down / Mid / Up：パラメータ当たり構成比',rank_group_path_sat:'Down / Mid / Up：RankSat',rank_group_role_energy_share:'役割別：重み構成比',rank_group_role_energy_share_per_param:'役割別：パラメータ当たり構成比',rank_group_role_sat:'役割別：RankSat',group_loss_step_ema:'Group Loss EMA（step）',group_loss_epoch_ema:'Group Loss EMA（epoch）',group_scale_applied_epoch:'Group Scale（epoch）',group_ratio_epoch:'Group Ratio（epoch）',group_ratio_ema_epoch:'Group Ratio EMA（epoch）',lora_trend_unet:'UNet 情報密度推移',lora_trend_te1:'TE1 情報密度推移',lora_trend_te2:'TE2 情報密度推移',dq_direct_ratio:'DQ Direct 誤差比',dq_direct_rms:'DQ Direct 誤差 RMS',dq_guard_direct_ratio:'DQ Guard 誤差比・上限',dq_guard_gain:'DQ Guard Gain',dq_guard_cadence:'DQ Guard サンプリング間隔',heat_energy_share_per_param:'最終重み構成比ヒートマップ',heat_rank_sat_wmean:'最終RankSatヒートマップ'};
-const groups={grad:'Loss・勾配',dq:'DQ',dq_direct:'DQ Direct',dq_guard:'DQ Guard',rank:'Rank',group_loss:'Group Loss',lora_trend:'情報密度推移',heatmap:'最終ヒートマップ'};
+const groups={grad:'Loss・勾配',dq:'DQ',dq_auto:'DQ 自動mul調整の監視',dq_direct:'DQ Direct',dq_guard:'DQ Guard',rank:'Rank',group_loss:'Group Loss',lora_trend:'情報密度推移',heatmap:'最終ヒートマップ'};
 const discrete=new Set(['thresh_off','scale','dq_bits','dq_range_mul','rank_dim','dq_low_auto_bad','dq_guard_gain','dq_guard_cadence','rank_lr','group_scale_applied_epoch']);
 const dash=['','7 3','2 3','10 3 2 3','12 3','4 2 1 2'];
 function el(tag,attrs={},content){const n=document.createElement(tag);for(const [k,v] of Object.entries(attrs)){if(k==='class')n.className=v;else n.setAttribute(k,v)}if(content!==undefined)n.textContent=content;return n}
@@ -66,12 +66,42 @@ function axisKind(label){return /epoch/i.test(label)?'epoch':/step/i.test(label)
 function hideTip(){pinned=false;$('tooltip').hidden=true;for(const r of renders){r.guide?.setAttribute('visibility','hidden');r.dots?.replaceChildren()}}
 function flash(message){$('status').textContent=message}
 function issue(message){$('errors').append(el('div',{},message))}
+const dqScopeLabels={unet:'UNet',te:'TE（TE1＋TE2）',both:'UNet＋TE合算',unknown:'範囲未記録'};
+const dqRawMetrics=['dq_clip','dq_qerr_ratio','dq_qerr_rms','dq_zero_rate','dq_absmax','dq_range','dq_error_part_ratio','dq_error_part_share'];
+function recordedBool(v){return v===true||v==='true'?true:v===false||v==='false'?false:null}
+function loggedDQScopes(report){
+ const dq=obj(report.dq),rows=array(dq.rows);
+ return [...new Set([...Object.keys(obj(dq.scope_rows)),...array(dq.summary?.scopes),...rows.map(r=>r?.Scope||r?.scope)].filter(s=>typeof s==='string'&&s))].sort();
+}
+function dqChartIdentity(raw,section,report){
+ const base=dqRawMetrics.find(id=>raw.id===id||['unet','te','both','unknown'].some(s=>raw.id===id+'_'+s));
+ if(section!=='dq'&&section!=='dq_auto')return null;
+ const observed=loggedDQScopes(report),suffix=raw.id.match(/_(unet|te|both|unknown)$/)?.[1];
+ let scope=raw.dq_scope||suffix;
+ if(!scope||scope==='combined')scope=observed.length===1?observed[0]:observed.length===2&&observed.includes('unet')&&observed.includes('te')?'both':'unknown';
+ if(!Object.hasOwn(dqScopeLabels,scope))scope='unknown';
+ if(base)return {id:base+'_'+scope,scope,title:dqScopeLabels[scope]+' · '+titles[base]};
+ if(section==='dq_auto')return {id:raw.id,scope,title:text(raw.title||raw.id)};
+ // Bits and RangeMul are common configuration columns, not a logged component.
+ if(raw.id==='dq_range_mul')return {id:raw.id,scope:'',title:'DQ 共通設定値（RangeMul列）'};
+ if(raw.id==='dq_bits')return {id:raw.id,scope:'',title:titles.dq_bits};
+ return null;
+}
+function dqContext(report){
+ const dq=obj(report.dq),settings=obj(report.training_settings),values=obj(settings.values),runtime=obj(settings.resolved?.runtime),mul=obj(dq.mul_settings);
+ const rows=array(mul.rows).filter(r=>r&&typeof r.label==='string'&&finite(r.mul)&&r.mul>0&&typeof r.enabled==='boolean').map(r=>({label:r.label,mul:r.mul,enabled:r.enabled}));
+ const hasSpatial=!!values.dq_delta_policy_file||values.dq_mul_policy!=null||settings.resolved?.metadata?.ss_dq_mul_policy!=null||['attn2','te','te1','te2'].some(k=>values['dq_delta_range_mul_'+k]!=null);
+ const auto=recordedBool(dq.auto_enabled)??recordedBool(runtime.dq_auto_enabled)??recordedBool(values.dq_delta_auto_range_mul);
+ return {mulRows:rows,mulSource:text(mul.source),mulNote:text(mul.note)||(!rows.length&&hasSpatial?'部位別mulの指定がありますが、表示用の配分は未収録です。診断JSONを再生成してください。':''),
+  logScopes:loggedDQScopes(report),autoEnabled:auto,monitorMode:text(dq.auto_monitor?.mode),monitorNotes:array(dq.auto_monitor?.notes).map(text),warnings:array(dq.warnings).map(text)};
+}
 function normalizeReport(report,name,fingerprint){
  if(!report||typeof report!=='object'||Array.isArray(report)||!report.charts||typeof report.charts!=='object')throw Error('診断レポートのJSONではありません（chartsが見つかりません）。');
  const charts=[],used=new Set();let dropped=0;
  for(const [section,items] of Object.entries(report.charts))for(const raw of array(items)){
   if(!raw||typeof raw!=='object'||typeof raw.id!=='string')continue;
-  const id=Object.hasOwn(aliases,raw.id)?aliases[raw.id]:raw.id;if(used.has(id))continue;
+  const dqIdentity=dqChartIdentity(raw,section,report);
+  const id=dqIdentity?.id||(Object.hasOwn(aliases,raw.id)?aliases[raw.id]:raw.id);if(used.has(id))continue;
   const seenNames=new Map(),ss=[];
   for(const [i,source]of array(raw.series).entries()){
    if(!source||typeof source!=='object')continue;
@@ -79,14 +109,14 @@ function normalizeReport(report,name,fingerprint){
    for(let j=0;j<Math.min(xx.length,yy.length);j++)if(finite(xx[j]))points.push([xx[j],finite(yy[j])?yy[j]:null]);
    if(!points.some(p=>finite(p[1])))continue;
    points.sort((a,b)=>a[0]-b[0]);
-   const label=text(source.name||'系列 '+(i+1));const duplicate=seenNames.get(label)||0;seenNames.set(label,duplicate+1);
+   const label=id==='dq_range_mul'?'共通設定値（RangeMul列）':text(source.name||'系列 '+(i+1));const duplicate=seenNames.get(label)||0;seenNames.set(label,duplicate+1);
    ss.push({name:duplicate?label+' ['+(duplicate+1)+']':label,points});
   }
   if(!ss.length){dropped++;continue}
   const sectionData=obj(report[section]),rows=array(sectionData.rows).length?sectionData.rows:array(sectionData.samples);
-  const scopes=[...new Set(rows.map(r=>text(r?.Scope||r?.scope)).filter(Boolean))].sort();
+  const scopes=dqIdentity?[dqIdentity.scope].filter(Boolean):[...new Set(rows.map(r=>text(r?.Scope||r?.scope)).filter(Boolean))].sort();
   const metric=text(sectionData.metric_version||rows.find(r=>r?.MetricVersion)?.MetricVersion);
-  charts.push({id,kind:'line',section:id.startsWith('rank_')?'rank':section,title:(Object.hasOwn(titles,id)?titles[id]:text(raw.title||id)),originalTitle:text(raw.title),subtitle:text(raw.subtitle),xLabel:text(raw.x_label||'x'),metric,scope:scopes.join(', '),series:ss,markers:array(raw.markers).filter(m=>finite(m?.x)).map(m=>({x:m.x,label:text(m.label)})),fixedMin:finite(raw.y_min_fixed)?raw.y_min_fixed:null,fixedMax:finite(raw.y_max_fixed)?raw.y_max_fixed:null,minFloor:finite(raw.y_min_floor)?raw.y_min_floor:null,maxCeil:finite(raw.y_max_ceil)?raw.y_max_ceil:null,tickStep:finite(raw.y_tick_step)&&raw.y_tick_step>0?raw.y_tick_step:null,tickPrecision:Number.isInteger(raw.y_tick_precision)&&raw.y_tick_precision>=0?Math.min(15,raw.y_tick_precision):null,tickInteger:raw.y_tick_integer===true,tickNiceInteger:raw.y_tick_nice_integer===true,discrete:discrete.has(id)});used.add(id);
+  charts.push({id,kind:'line',section:id.startsWith('rank_')?'rank':section,title:dqIdentity?.title||(Object.hasOwn(titles,id)?titles[id]:text(raw.title||id)),originalTitle:text(raw.title),subtitle:text(raw.subtitle),xLabel:text(raw.x_label||'x'),metric,scope:scopes.join(', '),series:ss,markers:array(raw.markers).filter(m=>finite(m?.x)).map(m=>({x:m.x,label:text(m.label)})),fixedMin:finite(raw.y_min_fixed)?raw.y_min_fixed:null,fixedMax:finite(raw.y_max_fixed)?raw.y_max_fixed:null,minFloor:finite(raw.y_min_floor)?raw.y_min_floor:null,maxCeil:finite(raw.y_max_ceil)?raw.y_max_ceil:null,tickStep:finite(raw.y_tick_step)&&raw.y_tick_step>0?raw.y_tick_step:null,tickPrecision:Number.isInteger(raw.y_tick_precision)&&raw.y_tick_precision>=0?Math.min(15,raw.y_tick_precision):null,tickInteger:raw.y_tick_integer===true,tickNiceInteger:raw.y_tick_nice_integer===true,discrete:discrete.has(id)||/^dq_auto_(mul|bad)_/.test(id)});used.add(id);
  }
  for(const [key,raw]of Object.entries(obj(report.rank?.final_heatmaps))){
   const rows=array(raw?.rows).map(r=>({label:text(r?.label),cells:array(r?.cells).map(c=>({role:text(c?.role),value:finite(c?.value)?c.value:null}))}));
@@ -94,7 +124,7 @@ function normalizeReport(report,name,fingerprint){
   const id='heat_'+key;charts.push({id,kind:'heatmap',section:'heatmap',title:(Object.hasOwn(titles,id)?titles[id]:key),rows,epoch:raw.Epoch,step:raw.TrainStep,scope:text(raw.Scope)});
  }
  if(!charts.length)throw Error('比較できるグラフデータがありません。');
- return {id:fingerprint,fingerprint,name:text(report.base_name||name.replace(/_diagnostic\.json$/i,'')),source:name,generated:text(report.generated_at),training_settings:report.training_settings||null,charts,dropped,color:0};
+ return {id:fingerprint,fingerprint,name:text(report.base_name||name.replace(/_diagnostic\.json$/i,'')),source:name,generated:text(report.generated_at),training_settings:report.training_settings||null,dq_context:dqContext(report),charts,dropped,color:0};
 }
 async function readFiles(files){
  if(busy)return;busy=true;$('errors').replaceChildren();$('add-files').disabled=true;
@@ -161,9 +191,10 @@ function render(){
  $('baseline').replaceChildren(...selected().map((r,i)=>{const option=el('option',{value:r.id},`${i+1} · ${r.name}`);return option}));$('baseline').value=state.baseline||'';
  for(const key of ['mode','axis','range'])$(key).value=state[key];
  $('range-fields').hidden=state.range!=='custom';$('range-min').value=(rangeDraft||state.custom)[0];$('range-max').value=(rangeDraft||state.custom)[1];
- $('plots').replaceChildren();$('notices').replaceChildren();$('run-legend').replaceChildren();$('stats-body').replaceChildren();$('source-notes-body').replaceChildren();
+ $('plots').replaceChildren();$('notices').replaceChildren();$('run-legend').replaceChildren();$('stats-body').replaceChildren();$('source-notes-body').replaceChildren();$('dq-context').hidden=true;
  if(!picked){$('plots').append(el('div',{class:'panel empty'},'表示するランに有効なグラフがありません。'));$('series-box').hidden=true;$('statistics').hidden=true;$('source-notes').hidden=true;return}
  const entries=selected().map(run=>({run,chart:run.charts.find(c=>c.id===state.chart)}));
+ renderDQContext(entries);
  const heat=picked.kind==='heatmap';$('series-box').hidden=heat;$('statistics').hidden=heat;for(const id of ['mode','axis','range'])$(id).disabled=heat;$('baseline').disabled=heat;$('baseline-field').hidden=state.mode!=='difference'||heat;
  if(heat){renderHeatmaps(entries);renderNotes(entries);return}
  const names=seriesNames(entries),chosen=chosenSeries(state.chart,names);
@@ -183,6 +214,21 @@ function renderRuns(){
 function assignColors(){selected().forEach((r,i)=>r.color=i)}
 function renderCatalogue(cats){const nav=$('catalog');nav.replaceChildren();let section='';for(const c of cats){if(c.section!==section){section=c.section;nav.append(el('h3',{},groups[section]||section))}const button=el('button',{class:'chart-choice','data-chart-id':c.id,'aria-current':String(c.id===state.chart)});button.append(document.createTextNode(c.title),el('span',{class:'chart-count'},`${c.count}/${state.selected.length}ラン`));button.onclick=()=>{state.chart=c.id;state.range='all';render();if(innerWidth<=720)$('catalog-details').open=false};nav.append(button)}}
 function notice(s){$('notices').append(el('div',{class:'notice'},s))}
+function renderDQContext(entries){
+ const active=entries.some(e=>['dq','dq_auto'].includes(e.chart?.section));$('dq-context').hidden=!active;$('dq-context-body').replaceChildren();if(!active)return;
+ for(const {run}of entries){
+  const ctx=obj(run.dq_context),block=el('div',{class:'run-card'});block.style.setProperty('--run-color',color(run));block.append(el('h3',{},run.name));
+  const rows=array(ctx.mulRows);if(rows.length){block.append(el('p',{},'部位別mul（保存配分）'));for(const row of rows)block.append(el('p',{class:'muted'},`${text(row.label)}：${row.enabled===false?'量子化OFF':fmt(row.mul)}`));if(ctx.mulSource)block.append(el('p',{class:'muted'},'取得元：'+text(ctx.mulSource)))}
+  else block.append(el('p',{class:'muted'},'部位別配分の表示データなし。RangeMul列は共通設定値です。'));
+  if(ctx.mulNote)block.append(el('p',{class:'muted'},text(ctx.mulNote)));
+  block.append(el('p',{class:'muted'},'量子化ログ：'+(array(ctx.logScopes).length?ctx.logScopes.map(s=>dqScopeLabels[s]||text(s)).join('、'):'範囲未記録（推定しません）')));
+  block.append(el('p',{class:'muted'},'自動mul調整：'+(ctx.autoEnabled===true?'ON':ctx.autoEnabled===false?'OFF':'未記録')));
+  for(const note of [...array(ctx.monitorNotes),...array(ctx.warnings)])block.append(el('p',{class:'muted'},text(note)));
+  $('dq-context-body').append(block);
+ }
+ if(state.chart==='dq_range_mul')notice('このグラフは上書き前の共通設定値です。同じ線でも部位別mulの配分が同じとは限りません。適用値は「量子化の設定と記録範囲」で確認してください。');
+ if(entries.some(e=>e.chart?.scope==='unknown'))notice('範囲の記録がない旧JSONはUNet・TEのグラフと統合しません。元ログがあれば、診断JSONを再生成すると記録範囲を取り込めます。');
+}
 function renderNotes(entries){
  let count=0;for(const {run,chart}of entries){if(!chart)continue;const lines=[chart.subtitle,chart.scope?'Scope: '+chart.scope:'',chart.metric?'Metric: '+chart.metric:'',chart.originalTitle&&chart.originalTitle!==chart.title?'元のグラフ名: '+chart.originalTitle:''].filter(Boolean);if(!lines.length)continue;const block=el('div',{style:'margin-top:9px'});block.append(el('h3',{},run.name));for(const line of lines)block.append(el('p',{class:'muted'},line));$('source-notes-body').append(block);count++}$('source-notes').hidden=!count;
 }

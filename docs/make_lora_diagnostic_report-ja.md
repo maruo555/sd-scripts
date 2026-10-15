@@ -15,10 +15,41 @@
 - 有効な実測値がないグラフ・系列、値のない数値カード、空の表・セクションを省略します。0は有効値です。閾値などの参考線だけではグラフを表示しません。
 - 一部欠測があるグラフは残し、欠測区間の線をつなぎません。観測が1点だけの場合は値と観測位置を表示します（複数点の参考線がある場合はグラフに点を表示）。
 - RankDim・Bits・RangeMulが記録期間中一定の場合、およびThreshOffが全件0の場合は数値表示にまとめます。「一定値のグラフを表示」でグラフを展開できます。欠測がある場合は「有効な記録では一定・一部欠測」と明記します。
+- 部位別mulの保存配分がある場合、RangeMulの一定値バッジは省き、上の配分一覧を主表示にします。元のログ列は「一定値のグラフを表示」に残し、部位別の適用値ではない共通設定値として明記します。ログ値が変動している場合はグラフを省略しません。
 - 指標の説明は各セクションの「見方」にまとめます。実行時閾値と固定参考値、DQ Direct・Guardの系列の違いなど、解釈に必要な注記はグラフの近くに残します。
 - 末尾の「入力データ・解析状況」で入力ファイル、表示を省略した項目、欠測、解析エラーの詳細を確認できます。解析エラーの概要は通常表示にも残します。
 
 この整理はHTMLの表示用データに適用します。出力JSONの解析値・診断スコア・グラフペイロードは変更しません。旧JSONでは未実行と未取得を区別できない場合があるため、理由が不明な項目は「解析結果なし」と表示します。過去HTMLは自動更新されません。
+
+## 場所別mul・UNetとTEのDQ表示
+
+レポート作成コマンドの追加オプションは不要です。学習で `--dq_delta_range_mul_attn2`、`--dq_delta_range_mul_te`、TE1/TE2の個別mulを指定した場合、対応する学習設定記録またはチェックポイントに保存されたmul policyから固定配分を表示します。ログの `RangeMul` 列は上書き前の**基準mul**であり、全部位に適用された値ではありません。保存配分が取得できない場合は現在のpolicyファイルを読み直して推測しません。
+
+従来の描画では `--dq_delta_scope both` などで同じstepにUNet行とTE行が記録されると、それらを1本の線で交互につなぎ、実際以上にギザギザに見える問題がありました。現在は `Scope` を保ち、以下を切り替えて表示します。
+
+- **部位別に並べる（基本）**：UNetとTEを別グラフにし、同じ指標には共通の縦軸目盛を使います。
+- **ログ対象合算**：記録されている範囲を要素数で合算したRawと、学習ログに保存されたEMAを表示します。
+- **UNetのみ／TEのみ**：選んだ範囲に絞ります。summaryログのTEはTE1＋TE2の合計です。TE1/TE2別やUNet attn2別の誤差は、このログからは復元できません。
+
+`QuantErrRatioRaw` は量子化誤差RMSを元のRMSで割った値です。合算時には `Numel` とRMSの二乗から二乗和を復元して求めます。比率の単純平均やLoRAパラメータ数での重み付けではありません。CSVの丸め値を使うため、内部計算とは微小な丸め差があります。`per_module` ログも同じ方法で範囲ごとに集計します。重みが未記録、範囲が欠ける、Targetが異なる、同じ観測が重複している場合などは無理に合算せず欠測とします。量子化範囲 `Range` はスケール数による平均なので、要素数だけでは合算しません。
+
+`both` の誤差EMAは、UNetとTEの各行に同じ**ログ対象合算**の値が記録されます。これを部位別EMAとして扱いません。部位別グラフのEMAは、保存された `dq_delta_auto_ema` の係数を使い、各部位の最初の有効な記録点から再計算した補助線です。係数が未記録なら省略します。`ClipRateEMA` とクリップ閾値は自動調整側の記録で、誤差EMAとは対象・更新間隔が異なる場合があります。
+
+「DQ 自動mul調整の監視」を別セクションに設け、部位別表示の切り替えにかかわらず監視指標を残します。
+autoログがある場合は、その`Scope`のClipRate Raw／EMAと目標帯、`clip_rate_low_auto`の判定用誤差EMA・QErrPerClip・閾値、mul変更履歴・Bad／Streakを記録がある範囲で表示します。
+新ログの`AutoQuantErrRatioRaw/EMA`を優先し、旧ログではQErrPerClip・ClipRateEMA・floorが揃う場合のみ判定用EMAを復元します。通常ログの合算誤差EMAは代用しません。
+
+`clip_rate_high`など、設定記録から`clip_rate_low_auto`を使っていないと確認できる場合、相対量子化誤差は「参考・mul判定には不使用」と表示し、使われないlow_autoの閾値を省きます。誤差EMAはlow_auto以外では未記録の場合があります。例えば自動調整が50 stepごと・通常ログが100 stepごとの場合、誤差は基本的に100 stepごとだけ記録されます。未記録の間を線で結ばないため点だけに見えても、計測失敗や自動調整の異常を示すものではありません。連続的な誤差の推移は上のDQ Deltaの部位別グラフで確認できます。
+
+設定記録からmul自動調整がOFFと確認できる場合も、記録された `ActiveClipLow/High` を**OFFの参考帯**としてこのセクションに残します。
+各部位のClipRate Rawと、係数が保存されている場合の再計算EMAを表示します。参考帯を外れても、この学習ではmulは変更されていません。
+未記録の判定用誤差・QErrPerClip・調整履歴は生成しません。設定記録がない場合にOFFとは推測しません。
+
+これらは学習中のLoRA出力の量子化指標です。学習前の `dq_profile` レポートの勾配変化率や、生成画像の品質スコアとは別です。`dq_delta_log_scope` で記録対象を限定している場合、学習で量子化した全部位をログで確認できるとは限りません。
+
+`--dq_delta_scope unet`のままTEのグラフも必要な場合は、学習時に`--dq_delta_log --dq_delta_log_scope both`を追加してください。過去のログにTEがない場合、後からグラフを復元することはできません。
+
+JSONでは元の `dq.rows` にScope・Target・Module・RMS・Numelを保持し、`dq.scope_rows`（範囲別）、`dq.plot_rows`（stepごとの合算）、`dq.mul_settings`（保存配分）、`dq.ema_beta`、`dq.auto_monitor`（制御用またはOFF参考の監視情報）を追加します。DQの要約は合算後のstep単位で計算します。重複行を観測数として数えた旧レポートから、一部の集計値が変わることがあります。
 
 ## `--input_dir` 内で使うログファイル名（固定）
 このツールは、`--input_dir` 配下の以下ファイル名を前提に読み込みます。
@@ -329,13 +360,14 @@ DQ logsに `ActiveClipBand=low` または `ClipRateLowAuto*` 列がある場合�
 
 ### `charts` セクション
 
-DQ autoログに該当列がある場合は、`QErrPerClip`（run指定閾値の水平線つき。130と異なる場合は固定130も表示）を追加します。古いログで `dq_delta_logs` 側にのみ `QErrPerClip` がある場合はfallbackとして使用します。DQ logsに該当列がある場合は、`clip_rate_low_auto Bad / Streak`、旧ログ互換の `ClipErrRatio / RoundErrRatio`、`ClipShare / RoundShare` のグラフを追加します。`--dq_delta_log_detail basic` の軽量ログでは `ZeroRate`、`AbsMax`、`Range` グラフは省略されます。
+DQ autoログのClip率・判定用誤差・`QErrPerClip`・mul推移などは`charts.dq_auto`へまとめ、閾値はrunに記録された値を使います。古いログで通常のDQログ側にのみ制御値がある場合は、間引かれた記録として注記します。通常のDQログに該当列がある場合は旧ログ互換の `ClipErrRatio / RoundErrRatio`、`ClipShare / RoundShare` も表示します。`--dq_delta_log_detail basic` の軽量ログでは `ZeroRate`、`AbsMax`、`Range` グラフは省略されます。
 `TrainProgress` と low_auto progress閾値がある場合は、min_progress / freeze_progress の位置をDQグラフの縦線マーカーに追加します。
 
 | JSONパス | 情報源 | 内容の概説 |
 |---|---|---|
 | `charts.grad[]` | `grad` から派生 | Grad系チャート定義 |
 | `charts.dq[]` | `dq` から派生 | DQ系チャート定義 |
+| `charts.dq_auto[]` | `dq.auto_monitor` から派生 | 自動mul調整の監視。自動調整OFFの場合は明示した参考表示 |
 | `charts.group_loss[]` | `group_loss` から派生 | Group loss系チャート定義 |
 | `charts.lora_trend[]` | `lora_trend` から派生 | LoRA推移チャート定義 |
 

@@ -1,0 +1,82 @@
+# 標準診断と場所別mul CLIの検証
+
+2026-10-10。対象は`canonical-v2`と、固定bits・RMSの場所別mulを直接指定する学習CLIです。
+公開済み`2c2b7870e9b6bdebd3dc7ae31ff92fe149616881`へのレビューを受け、
+本書と回帰テストを追加した修正版を検証しています。修正版のcommitは
+`git log -1 --format=%H -- docs/dq_standard_validation-ja.md`で確認できます。
+
+| 対象 | 検証方法 | 確認できた範囲 |
+|---|---|---|
+| 通常学習CLI | CPUの小型LoRAでforward/backward | policy優先順位、既存uniformとloss・勾配・乱数の一致、`scope=unet`でのTE指定、warmup/setter後の配分保持 |
+| 保存・再開 | CPUで保存済みpolicy記録と照合 | 同じ宣言・配分は受理。省略・変更や異なる宣言への切替は拒否。JSONファイルの移動だけなら受理 |
+| 標準診断 | 合成入力でOFF/ONの対応付きforward/backward | 5点と追加配分の重複処理、部位の加算性、比較前提の不一致検出、測定中に重み・optimizerを更新しないこと |
+| 統計・公開処理 | 独立Body解析から公開HTMLを生成 | Body選出との一致、最終manifestのパス・SHA-256整合、解析stageの元記録を保持 |
+| 共有JSON | MSEあり・なし・一部欠測のfixture | MSEとobjective lossの区別、欠測理由、全条件で同一の指標種別、非有限値の拒否 |
+| 画像詳細 | 合成画像・caption・複数subset | 元画像を失った後のサムネイル再利用、captionの文字としての表示、複数文脈の併記、共有JSONに実パス・captionを含めないこと |
+| HTML | CPUのオフラインブラウザ | 7部位×OFF/ONの描画値、条件切替、画像詳細、狭い画面幅。GPU計測の代用ではない |
+| 実SDXL | **新標準の一貫したGPU受入は未実施** | 過去の研究用GPU実験を、この修正版の受入として扱わない |
+
+汎用CPUテストは`tests/`でGit管理します。実データや個人パスを使う実験スクリプト、
+GPU実行記録、ブラウザのスクリーンショットはGit管理外に保存します。
+
+## GPU実測前の再点検
+
+2026-10-10に、直接CLIからmul配分を解決する処理、通常学習の初期化・warmup切替・
+保存再開、標準診断の5点→Body選出→追加配分・dropout ON確認、最終HTMLとmanifestの
+公開処理を再確認しました。確認した範囲で、GPU試験前に修正が必要な計算処理の不具合は
+見つかりませんでした。以下のCPU回帰テストは**146件合格**です。
+
+通常学習の`dq_delta_scope`ヘルプに残っていた「指定先だけに限定する」という説明を、
+現行のTE込み挙動に合わせました。変更はヘルプだけで、学習計算・乱数・skip規則は変えていません。
+診断用コピーは変更せず、その関係を記録するsource hashを更新しています。
+README、量子化ガイド、TE設定、推奨設定一覧では、新しい4引数・優先順位・併用制限・
+`unet`時のTE指定・ログ対象・再開条件と、新標準診断の既定値を整合させました。
+
+この再点検とCPU合格は、下記の実SDXL GPU受入を完了したという意味ではありません。
+
+## CPUテストの再実行
+
+2026-10-12のP75追加・丸め反復数の変更は、関連CPUテスト126件で確認しています。
+公開CLIからworkerへの1回／2回の伝達、計画・fingerprint・保存契約への反映と、
+合成モデルでのOFF/ON測定を確認しました。2回測定の1回目は1回測定と一致し、
+2回目でも拡散ノイズ・参照勾配・dropoutマスクを維持します。P75は既存のsource均等重みの75%点です。
+HTML保存に関する7件はWindowsのパス解決制限で失敗したため、GPUを無効にした通常権限で再実行して合格を確認しました。
+合成データのHTMLをオフラインで表示し、全7部位・OFF/ONの336個のグラフ座標と比較表を保存値に照合しました。
+P75の欠測表示、旧2回測定の条件表示、スクロール保持、画像診断ページ、狭い画面も確認し、スクリーンショットを目視しました。
+この変更での実SDXL GPU診断と短縮時間は未検証です。
+
+2026-10-12のStandard warmup共有では、合成CPUモデルで実際のPrefix更新を実行し、
+重み・optimizer・scheduler・RNG・module状態とreplayの復元、画像診断observerの保護、
+失敗時の停止を検証します。対象は`tests/test_dq_profile_shared_warmup.py`です。
+共有経路12件を含む関連CPU回帰テスト117件を確認しました。HTML出力1件はWindowsの
+実行制限でパス解決が拒否されたため、GPUを無効にした通常権限で再実行し、合格を確認しています。
+共有経路の実SDXL GPU比較・短縮時間は未検証です。以前の独立warmup実行の記録とは区別します。
+
+プロジェクトの依存パッケージを導入済みの環境で、リポジトリ直下から実行します。
+`--basetemp`には他の用途で使っていない一時フォルダを指定してください。
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES=''
+$env:HF_HUB_OFFLINE='1'
+$env:TRANSFORMERS_OFFLINE='1'
+python -B -m pytest tests/test_dq_mul_policy_training.py tests/test_dq_mul_direct_cli.py tests/test_dq_spatial_standard.py tests/test_dq_spatial_report_contract.py tests/test_dq_dataset_report.py tests/test_dq_dataset_integration.py tests/test_dq_profile_production.py tests/test_dq_profile_shared_warmup.py tests/test_dq_profile_copy_drift.py --basetemp=.tmp/dq_standard_cpu_tests -q
+```
+
+追加テストは実データもpretrained modelも読み込みません。CPUで実行した回数を
+実データの診断・学習回数には数えません。テスト関数内の小型モデルと値は合成fixtureです。
+
+P75・丸め回数の変更を重点確認する場合は、`tests/test_dq_profile_production.py`、
+`tests/test_dq_profile_entry_v2.py`、`tests/test_dq_profile_shared_warmup.py`、
+`tests/test_dq_spatial_standard.py`、`tests/test_dq_spatial_report_contract.py`を実行します。
+
+## 次に必要なGPU受入
+
+実行するcommitと入力を固定し、実行範囲・上限を確認してから行います。
+
+1. 最低画像数・source条件を満たす実データで、新標準をsnapshot／prefix／boundaryから最終HTMLまで一度通す。dropout ONも同じ候補集合で確認する。
+2. 実効mul、量子化開始境界、no-quantの再測定、候補・repeatの対応、重みの無更新、部位合算、Body選出、計画と実測F/B数、指標種別、manifestを照合する。
+3. 通常学習の直接CLIでwarmup境界を越える小規模smokeを行い、対応するモードで保存・再開を確認する。既存の平均化モード等のresume制約は維持する。
+
+比較検査が止まった場合は原因と契約を確認し、許容差を黙って広げて通過扱いにはしません。
+ここを通過してから長時間の本学習へ進む手順です。研究コードの大規模統合・削除や、
+乱数の識別方法・統計式の変更は、この接続部の修正とは分けて扱います。

@@ -2,6 +2,10 @@
 
 画像・フォルダ・キャラタグ別の追加診断、warmup前後比較、52画像化については、[データセット診断ガイド](dq_dataset_diagnostics-ja.md)を参照してください。
 
+TE込みの標準化、場所別mul、dropoutの追加確認、レポート拡張については、
+[2026-10-10採用の標準仕様](#spatial-diagnostic-spec)を参照してください。
+標準入口は `canonical-v2` です。旧 `canonical-v1` は再現用に残しています。
+
 ## 1. この診断機能は何を調べるものか
 
 SDXL DQ Dataset Profilerは、LoRA学習でdelta量子化を使ったときに、
@@ -39,12 +43,261 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 
 通常学習経路が診断コードをimportしないことは、研究中に守ってきた重要な隔離条件です。
 
-## 3. 現在の実用診断で行う処理
+### Local診断のTE量子化
 
-通常利用の`canonical-v1`は、40 epochを最後まで学習する処理ではありません。
-量子化開始直前の共通状態を複数回作り、その状態から再現性検査とLocal Body／Tail計測を
-行う多段protocolです。各GPU stageは独立processとして起動し、stage間で暗黙のmutable stateを
-共有しません。
+`python -m dq_profile`の新標準 `canonical-v2` は、**UNet＋TE1＋TE2の量子化を固定**します。
+一律5点と場所別配分を測り、dropout OFFを基本にします。`--dq-profile-dropout-on`を付けると
+同じ条件集合でON測定も追加します。通常学習のdropout設定を変える指定ではありません。
+
+従来のUNetのみの計測は `--dq-profile-preset=canonical-v1 --dq-profile-no-te-quantized` で
+再現できます。標準v2でTEを外す指定はエラーとし、互換モードへの明示的な切り替えを求めます。
+旧presetの既定値やコピーした学習経路は書き換えていません。
+
+<a id="spatial-diagnostic-spec"></a>
+## 標準診断：attn2・TE高mul型
+
+2026-10-10採用・実装。Body代表からの追加配分、dropout ON確認、部位別集計、統合HTMLを
+`canonical-v2` に組み込みました。小型LoRAのCPU forward/backward、通常学習CLIの回帰、
+独立Body解析、オフラインHTMLの表示を検証対象としています。
+**新プロトコル全体でのSDXL GPU実行・prefix/boundary受入は未実施**です。
+過去の研究実験の受入結果を、この新しい標準経路のGPU受入へ読み替えません。
+再実行できるCPUテスト、検証範囲、次のGPU受入項目は
+[標準診断の検証記録](dq_standard_validation-ja.md)を参照してください。
+
+### 公開CLIと出力
+
+```powershell
+python -m dq_profile --pretrained_model_name_or_path="D:\models\sdxl_base.safetensors" --dataset_config="D:\datasets\example\dataset.toml"
+```
+
+- 既定：`--dq-profile-preset=canonical-v2`。一律5点＋重複を除いた追加配分、TE込み、dropout OFF。
+- `--dq-profile-dropout-on`：OFFの後、同じ候補をONでも追加計測。ONだけでBodyを選び直さない。
+- `--dq-profile-quant-repeats=1`：新標準の既定。各画像・時刻帯・拡散ノイズ・候補で、確率的丸めを1回測る。`2`で従来の2回に戻せる。OFF/ON・一律・追加配分すべてに同じ回数を適用する。
+- `--dq-profile-uniform-only`：一律5点に絞る。TE込みと部位別記録は維持する。
+- `--dq-profile-data-diagnostics=warmup` がv2の既定。学習前の対応付きforwardも行う。
+  `local` は初期forwardを省き、`off` は画像inventory／raw MSE記録を省く。欠測は補わない。
+- `--dq-profile-mode=strict`：snapshot／prefixの検算を深くする。v2ではStrictも一律5点を使い、範囲外への自動拡張はしない。
+- `--dq-profile-dry-run`：GPUを使わず、コマンド・計画・見込みprobe数を保存する。
+- 旧TEなし：`--dq-profile-preset=canonical-v1 --dq-profile-no-te-quantized`。
+
+`report.html`／`beginner_report.html` は統合概要、`dataset_report.html` は画像・グループ別表示です。
+旧形式の詳細表示は `uniform_report.html` と `technical_report.html` に保持します。
+`ai_summary.json` と `observations.json` は匿名IDの共有用数値、`data.js` は画像表示用のローカル情報を
+含みます。画像・caption・実パスがある `data.js` を匿名の共有用JSONと混同しないでください。
+HTMLは同梱のPlotlyを読み、外部CDNへ接続しません。実行前に依存パッケージを更新してください。
+
+### 名称と追加の背景
+
+場所別mulの正式名称を **attn2・TE高mul型** とします。
+UNetのクロスアテンションであるattn2と、TE1・TE2のLoRAに高側mul `H`、
+attn2以外のUNet LoRAに低側mul `L` を適用する配分です。
+attn2のQ/K/V/OutはDown/Mid/Upを通じて対象とし、FFは「その他UNet」に含めます。
+「高mul」はその他UNetとの大小関係を表し、品質や安定性の保証ではありません。
+
+| 表示名 | その他UNet | attn2 | TE1 / TE2 | 旧称 |
+|---|---:|---:|---:|---|
+| attn2・TE高mul型［固定基準］ | 2.70 | 3.75 | 3.75 / 3.75 | 元A、候補A |
+| attn2・TE高mul型［Body基準・低側2.70］ | 2.70 | B | B / B | Body基準Aの低側2.70 |
+| attn2・TE高mul型［Body基準・低側3.15］ | 3.15 | B | B / B | Body基準Aの低側3.15 |
+
+`B`は、一律5点・dropout OFF・全体集計で求めたBody代表mulです。
+この`B`は追加候補を作る規則であり、TEやattn2単独の最適mulや、最良画質を推定した値ではありません。
+名称が長い図では「固定基準」「Body基準 L=2.70」等に短縮し、配分表・ツールチップに
+`その他UNet / attn2 / TE1 / TE2`を明記します。旧ログの`attn2_A`等のID、学習済み
+重みのファイル名、元の観測記録は変更しません。新名称は表示名と旧称の対応として保存します。
+
+一律の高mulでは形が保たれる一方で表現が硬くなり、一律の低mulでは柔軟性が出る一方で
+顔・衣装などの再現が弱くなる、という画像評価を出発点に場所別配分を調べました。
+2つのデータセットで診断と40 epochの学習を行い、固定基準の配分に、
+一律配分とは違う柔らかな質感やポーズの自由度が得られる例がありました。
+最初のデータセットでは別seedでも特徴のある質感が観察され、別のデータセットでも
+画像評価上の有望候補になりました。一方で顔の特徴が薄くなる例もありました。
+
+高側を4.05へ上げた配分が常に改善したわけではなく、衣装・髪型の再現が弱まる例も
+ありました。TEだけ、またはattn2だけを高mulにする比較にも、一貫した利点は確認できて
+いません。**attn2単独の効果や、TEとの相互作用の因果関係はまだ確定していません。**
+同一設定でも学習結果は変動し、診断の数値順位と画像の好みも一致するとは限りません。
+
+したがって、追加の目的は固定基準を「最良設定」と推薦することではなく、
+**一律mulだけでは見落とす配分を、同じ診断条件で比較できるようにすること**です。
+固定基準を実験の参照点として残し、Body基準の2配分でデータセットへの反応を確認します。
+公開ドキュメントには実データ名・画像・個人環境のパスを含めません。
+
+### 変更の経緯と、2026-10-10に採用した仕様
+
+当初の通常診断は、**UNetだけを量子化し、一律mulの5点をdropout OFFで比べる**構成でした。
+その後の研究で、比較対象の通常学習ではTE側LoRAも量子化されていることを確認し、
+診断との条件差を減らすため、先にLocal計測をTE込みが既定となるよう拡張しました。
+この研究段階では、TEを外すオプションと、場所別配分を明示するpolicy gridも用意しました。
+
+続く実学習・画像評価でattn2・TE高mul型が有望候補になったため、2026-10-10に、
+**TE込みを標準条件として固定し、一律5点へ少数の場所別配分を追加する仕様**を採用しました。
+以下は当初からの変更です。実装と検証範囲はこの節の冒頭に記載しています。
+
+| 項目 | 当初の通常診断 | 2026-10-10に採用した標準仕様 |
+|---|---|---|
+| TEの量子化 | UNetのみを量子化し、TEは量子化しない | **UNet＋TE1＋TE2を標準プロトコルの固定条件**にする |
+| 一律mul | 2.70 / 3.15 / 3.45 / 3.75 / 4.05 | 5点を維持する |
+| 場所別mul | 通常診断には含めず、一律mulを比較 | **Body基準2条件＋固定基準1条件**を通常の追加比較にする |
+| Local診断のdropout | OFF | **OFFを基本とし、CLIオプションでON測定を追加**する |
+| 部位別の表示 | 主に全体の集計 | 全体・TE・TE1・TE2・UNet・attn2・その他UNetを切り替える |
+| 冒頭のグラフ | 一律mulの曲線 | 同条件で測った場所別配分の点を重ねる |
+| 画像別レポート | 数値mulを選択 | 配分を持つ「診断条件」を選択し、量子化の表示を連動させる |
+
+TEを標準で固定する理由は、比較する通常学習でTE側LoRAも量子化していることと、
+TEの量子化が全体の勾配比較に影響するためです。ここでの量子化対象はLoRAのdeltaであり、
+ベースTEの重みを整数型へ置換する設定ではありません。
+
+UNetのみの測定は削除せず、**過去結果の再現・要因分離をする研究／互換経路**として分離します。
+`--dq-profile-no-te-quantized` は `canonical-v1` でのみ使用できます。
+標準v2と互換v1はpreset・fingerprintで区別します。
+TE ON/OFFを普段の標準診断の選択項目にはせず、OFFをONと同じ測定の反復として扱いません。
+互換経路ではTE込みBody基準の追加配分を自動作成しません。UNet内だけの配分研究は別指定です。
+
+通常学習の`--dq_delta_scope`と診断専用のTE指定は別です。
+現行`canonical-v1`には互換性のため`dq_delta_scope=unet`が残っています。
+通常学習用のコマンドを`both`へ移す方針を理由に、この既存presetを黙って変更しません。
+新しい `canonical-v2` は `both` を明示します。診断へ旧 `unet` を渡した場合は、
+上書き理由を記録してv2の `both` に統一します。通常学習自体の旧scope挙動は変更しません。
+
+### 条件の作り方と測定の揃え方
+
+1. 共通のwarmup状態で、TE込み・dropout OFFの一律5点を測定する。
+2. 既存の有効性・Hard Safety・Body代表選出規則を適用し、一律5点から`B`を決める。
+   追加配分で`B`を選び直す循環にはしない。部位別表示への切り替えでも`B`を変えない。
+3. `L=2.70, H=B`と`L=3.15, H=B`、固定基準`L=2.70, H=3.75`を測定する。
+4. ON追加確認が指定された場合は、OFFで確定した同じ候補集合をdropout ONでも測定する。
+
+同じ配分は1回の測定へまとめます。`L=B`なら一律条件を再利用し、`L>B`ならそのBody基準
+候補を省きます。`B=3.75`なら低側2.70と固定基準が重複します。
+したがって固有条件数は**最大8条件**です。代表が決められない場合は高側を推測せず、
+Body基準の自動追加を見送り、その理由を記録します。固定基準を実測しただけで
+Body推奨や安全判定を通過したことにはしません。
+
+候補間でsnapshot、画像入力、source group、noise、timestep、測定反復、重み付けを共通に
+します。TEの条件ごとにembeddingを再計算します。更新を伴わない同じLocal計測として
+一律と場所別配分を測り、別実験の曲線へ無条件に点を重ねません。
+重複・派生画像の所属は同じsource-map版に固定し、グループ数を結果に合わせて変えません。
+実行前の計画は6〜8条件の範囲、実測後の契約は重複除去後の実数を記録します。
+画像数をI、追加固有条件数をE、丸め反復数をQ（既定1）とすると、OFF追加は `I×4×2×(1+QE)` F/Bです。
+先頭の1は追加配分用に同じno-quantを再測定する費用です。ON追加は
+`I×4×2×(1+Q(5+E))` F/B。warmup前評価は別に `I×4×3` forwardのみを使います。
+一律のみ指定時はE=0でOFFの追加参照も省きます。HTMLの表示切り替えだけでは計測は増えません。
+
+### 診断から実学習へ
+
+実学習への受け渡しは、診断結果ファイルへの依存を作らず、**具体的なmulのCLI直接指定**とします。
+レポートには各条件の全配分と、`--dq_delta_range_mul`、`--dq_delta_range_mul_attn2`、
+`--dq_delta_range_mul_te`等の対応する引数を表示します。Body代表を使う場合も`B`という記号を
+渡さず、診断で確定した数値を記載します。利用者は同じ引数を手入力しても学習できます。
+必要なら`--dq_delta_range_mul_te1` / `--dq_delta_range_mul_te2`でTE共通値を個別に上書きできます。
+直接指定は固定bits・RMSのdelta量子化用で、自動mul調整・bits schedule・z量子化とは併用できません。
+通常学習では`--dq_delta_scope unet`のままでもTE用mulが有効です。
+コマンド例とログ対象は[量子化ガイド](dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)、
+学習側実装・再開時の一致条件は[通常学習への適用](dq_mul_research-ja.md#通常学習への明示的な適用)を参照してください。
+
+### dropout OFFを基本にする意味
+
+OFFは、量子化による変化をdropoutのマスク変動と分けて比較するための観測条件です。
+新しい配分・新しいデータセットや、dropoutを使う長時間学習の前には、OFFの結果が穏やかでも
+ONの追加確認を推奨します。通常学習のdropoutを無効にする指定ではなく、warmup・prefixのdropout設定も変更しません。
+既存研究ではOFF/ONの差が一様とは限らず、OFFだけで実学習の挙動を代表できるとは断定しません。
+
+ON追加確認では、候補とno-quantで同じマスクを使い、候補間でも入力・マスクを揃えます。
+OFF/ONは同じ画像集合とnoise/timestepを使い、異なる画像部分集合の差をdropoutだけの効果と
+呼びません。マスクの反復と量子化丸めの反復を区別して保存します。
+両regimeを混ぜて1本のBody曲線にせず、同じ目盛で横並びにします。
+ONで順位が変わる・差が広がる場合はそのまま示し、都合のよいregimeだけで推奨を選びません。
+公開CLIは `--dq-profile-dropout-on` です。マスクは画像・時刻帯・noiseごとに変わり、
+量子化丸めを`--dq-profile-quant-repeats=2`で2回にした場合も同じマスクを使います。
+新標準の既定は1回です。この回数はdropoutマスクの独立反復数ではありません。ONの結果は別regimeとして保存します。
+
+### 2026-10-12：P75の追加と丸め反復の簡素化
+
+従来はP50・Body（P95）・Tailを主に表示し、確率的な量子化丸めを2回ずつ測定していました。
+中央寄りの傾向も読みやすくするため、冒頭の曲線・場所別配分の点・比較表に**P75**を追加しました。
+P75は元画像グループを等重みで集計した75%点です。既存の保存観測から算出済みの値を使い、
+追加のGPU測定は必要ありません。部位選択とdropout OFF/ONの双方に対応します。
+P50・Body・Tailも残し、Bodyを使った高側mulの候補生成規則は変更しません。
+
+診断時間を減らすため、`canonical-v2`では丸め反復を**既定1回**に変更しました。
+`--dq-profile-quant-repeats=2`を付ければ2回測ります。Standard／Strict共通の設定で、
+旧`canonical-v1`は再現用に既定2回を維持します。通常の学習中の丸め処理は変更しません。
+画像集合・時刻帯・拡散ノイズ・dropoutマスク・warmup状態は回数指定で変えず、
+2回目の丸め観測だけを省きます。追加配分は引き続き、その実測で選んだBody代表から作るため、
+丸め回数による数値差でBody代表や配分が変わる可能性はあります。
+
+回数は測定契約・fingerprint・時間見積もり・レポート上部へ記録します。
+1回でもP75等は観測集合から計算できますが、丸め乱数のばらつきが無くなるわけではありません。
+2回でも独立した再学習の再現性は測れず、P75が低いことも低mul耐性や最終画質を保証しません。
+warmupとno-quant参照の計算は残るため、総実行時間が半分になる指定ではありません。
+
+### レポートの構成
+
+初期の表示案には、研究用の12配分を縦に並べる独立した比較図がありました。
+正式案では候補を一律5点と高mul型へ絞り、その比較を冒頭の曲線・追加点と数値表へ
+統合したため、この独立図は基本画面に置きません。元の研究記録は保持し、
+TEだけを変えた対照など、標準候補に含めない配分は研究用の比較として扱います。
+
+基本表示は、次の4項目を維持します。
+
+- **冒頭のmul曲線**：一律5点のP50・P75・Body・Tailに、高mul型の実測点を重ねる。
+  横軸はその他UNetのmul。一律は線と丸、Body基準は菱形、固定基準は星で区別し、
+  高側mulは配分表示へ明記する。場所別の点を一律の線へ結んだり、未測定域を補間したりしない。
+- **元の勾配方向への成分**：元勾配との平行成分のP50/P05を表示する。
+  1は同じ平行成分、0は平行成分なし、負は逆方向、1超は増幅。
+  1でも直交方向の変化があり得るため、勾配全体が同じという意味ではない。特徴の保持率や画質点とは呼ばない。
+- **Warmupでの誤差減少（量子化OFF）**：共通warmup前後のモデル全体の誤差を表示する。
+  未記録なら欠測とし、別runの初期値で埋めない。
+- **量子化による変化**：warmup後の同じ重み・同じ入力で量子化OFF/ONの誤差差を表示する。
+  追加学習後の改善や、学習の強さを直接予測する値とはしない。
+
+基本の部位選択は「全体」「TE全体」「TE1」「TE2」「UNet全体」「attn2」「attn2以外のUNet」。
+部位別の値は、全体で量子化した結果としてその部位に現れた勾配反応です。
+TEの勾配変化をTE自身のdelta量子化誤差と同一視せず、原因の特定には介入条件の比較が必要です。
+部位を変えるのは勾配指標であり、モデル全体の予測誤差をTE用MSE等に分解しません。
+FF、attn1、Down/Mid/Up、Q/K/V/Outなどの追加軸は研究・詳細拡張に留め、基本画面には増やしません。
+
+部位`S`ごとに`||g_ref,S||²`、`||g_quant,S||²`、`<g_ref,S, g_quant,S>`を保存し、
+相対勾配差と平行成分を求めます。部位の参照ノルムが小さすぎる場合は未算出にします。
+部位別の内積がない旧記録から平行成分は復元しません。全体の値を部位別として転用しません。
+P50／P75／Body／Tailには全体と同じsource均等重みの規則を用いますが、部位の分母が異なるため
+部位別P50やBodyを足して全体へ戻すことはできません。
+
+「もう少し詳しく」には、P10–P90・P25–P75の分布、source bootstrapの参考95%区間、
+TE1・TE2・attn2・その他UNetの重複しない4区分の内訳を置きます。
+内訳は全体の参照勾配を共通分母にした平均二乗差の総量と100%構成比を対で表示します。
+これは**勾配差が現れた場所**であり、誤差を発生させた原因の割合ではありません。
+分位幅、bootstrap区間、別seedでの再学習のばらつきも区別します。
+
+AI用データには条件ID、旧称、全配分、実際の量子化対象、regime、測定同一性、
+source-map版、候補の再利用元、部位別統計、欠測理由を保存します。必要に応じて
+匿名IDの観測行も書き出します。画面に出さない数値を捨てず、配布用の集計と
+実パス・captionを含むローカル記録を分けます。
+共有JSONの`schema_version=spatial-shared-v2`では、`loss_contract`に使用する誤差の種類・定義・
+raw MSEの記録率と欠測理由を保存します。観測行は`raw_mse`と`objective_loss`を別々に保持します。
+全行にraw MSEが揃う場合だけMSEで比較し、一部でも欠ければ全条件をobjective lossに統一します。
+互換用の`reference_loss`／`quantized_loss`には選択した種類を入れ、行の`loss_kind`で明示します。
+
+ローカルの画像詳細にはcaption・subset・repeat・提示履歴と保存済みサムネイルを残します。
+同じ画像に複数の学習設定がある場合は全設定を表示し、その中からwarmup反応を推測で選びません。
+これらの個人データは共有JSONに含めません。
+最終HTMLの全書き出し後に`analysis_manifest.json`と`standard_report_manifest.json`の
+出力パス・SHA-256を更新します。解析stageの元manifestと観測入力の記録は保持します。
+
+データセット間で絶対値を比べるときは、量子化対象・probe regime・モデル・warmup・
+重み付け等の測定条件も併記します。同じ目盛にしただけでは同じ比較条件にはなりません。
+この新仕様でも、診断だけで絵の硬さや顔・衣装の再現を判定せず、最終判断は画像評価で行います。
+
+## 3. 実用診断の共通基盤
+
+以下は共通のsnapshot／Prefix／一律Local基盤の説明です。v2の追加配分と新HTMLは上記仕様に従います。
+過去の計測時間例にはv2の追加配分・ON確認・初期forwardの費用を含みません。
+
+通常利用の`canonical-v2`と互換用`canonical-v1`は、40 epochを最後まで学習する処理ではありません。
+量子化開始直前の共通状態から再現性検査とLocal Body／Tail計測を行うprotocolです。
+Standardではその状態を1回だけ作り、同一process内で明示的なsnapshot復元を介して共有します。
+Strictでは各GPU stageを独立processとして起動し、warmupを個別に再実行して検算します。
 
 ### 3.1 Preflightと実行契約
 
@@ -56,8 +309,8 @@ datasetと`range_mul`の組み合わせが学習勾配へ与える数値的な�
 - 有効な`image_dir` groupの全inventoryをsource contractへ保存する。group数がprobe上限を超える場合は、TOMLの全source順序を均等に覆う決定的な部分集合をprobe対象とし、probe数／全group数とcoverageをレポートへ明示する。
 - `cache_latents`と両立しない`color_aug=true`または`random_crop=true`が、subset／dataset／`[general]`のfallback後に有効でないことを確認する。
 - DreamBooth loaderに必須の`resolution`が、datasetまたは`[general]`のfallback後に定義されていることを確認する。
-- TOMLの`[general]`／dataset／subset fallbackを解決し、batch・bucket設定（`bucket_no_upscale=false`を含む）が`canonical-v1`と一致することを確認する。
-- CLIが`canonical-v1`と互換である。
+- TOMLの`[general]`／dataset／subset fallbackを解決し、batch・bucket設定（`bucket_no_upscale=false`を含む）が選択したpresetと一致することを確認する。
+- CLIが選択したpresetと互換である。
 - 通常checkpoint、dataset、repositoryと診断出力先が重ならない。
 - Git HEAD、ソースhash、preset、model内容のSHA-256、dataset、source inventoryからprotocol fingerprintを作る。
 - 各GPU workerの起動直前にmodel内容とsource inventoryを再度hash照合し、長い多段runの途中でmodel、画像、caption、cache sidecarが変化した場合は混在させず停止する。
@@ -71,13 +324,22 @@ warmup境界、Prefix update数、Local probe数、固定grid、参考時間の�
 ### 3.2 量子化開始境界とsnapshot検算
 
 通常学習コードと同じ規則で`dq_delta_begin_step`を求め、量子化開始直前までno-quantで
-warmupします。`canonical-v1`では40 epoch相当の総stepと5% LR warmupから境界が決まります。
+warmupします。両presetとも40 epoch相当の総stepと5% LR warmupから境界が決まります。
 
-`strict`は、同じ初期状態からSnapshot AとSnapshot Bを別processで作り、LoRA重み、optimizer、
-scheduler、GradScaler、Guardian、RNG、replay位置などのfingerprintを比較します。`standard`は
-Snapshot Aを1回だけ作り、後続のPrefix processが同じ境界を再現できたかを比較します。
-どちらも境界fingerprintが一致しなければmul比較を開始しません。Standardは専用のSnapshot Bを
-省くぶん速い一方、同じsnapshot-only stageを2回作る検算深度はStrictより低くなります。
+`standard`は**1つのGPU processでwarmupを1回だけ実行**し、その境界snapshotをPrefix検算と
+Local診断で共有します。以前はSnapshot A・Prefix・Localがそれぞれwarmupしていましたが、
+診断の測定内容を保ったまま時間を短縮するため、重複する境界作成を省きました。公開CLIの追加は不要です。
+
+Prefixでは保存した状態から短い学習を試し、終了後にLoRA重み、optimizer、scheduler、
+GradScaler、Guardian、RNGを復元してfingerprintの一致を確認します。moduleのtrain/eval状態、
+buffer、requires_grad、量子化の実行時状態も復元します。画像・noise・timestepを含むreplayは
+一度だけ準備し、その先頭部分をPrefixに渡します。warmup前後の画像診断用データも保持し、
+Prefixの更新を混入させません。復元・Prefix gate・ソース／入力の照合が失敗したらLocalへ進みません。
+
+共有方式は「別processでwarmupを再実行して同じ状態になること」の検査ではありません。
+その確認には`strict`を使います。Strictは従来通りSnapshot A/Bを別processで作り、
+重み・optimizer・scheduler・GradScaler・Guardian・RNG・replay位置などを比較し、
+さらに独立したPrefix processとの境界parityを確認します。
 
 以下で時間例に使う小規模datasetは、通常学習が8,400 stepだったため、境界は
 `8,400 × 0.05 = 420 step`でした。
@@ -95,7 +357,7 @@ Snapshot Aを1回だけ作り、後続のPrefix processが同じ境界を再現�
 rank／network dropout、量子化乱数、Loss、LR、skip、勾配、LoRA重み、optimizer、scheduler、
 GradScaler、Guardian、replay cursorを検査します。このstageは通常学習に近い経路を検査するため
 dropout有効です。`standard`は短いsmoke QA、`strict`は環境変更・リリース前・
-再現性調査用のreference QAです。Standardは独立snapshot検算を1回減らします。同じ`PASS`でも深度が異なるため、`execution_mode`と
+再現性調査用のreference QAです。Standardは同一snapshotの共有・復元を検算します。同じ`PASS`でも深度が異なるため、`execution_mode`と
 `qa_depth`をJSONとレポートへ別々に記録します。prefix gateまたはsource contractが失敗した場合、
 Local計測へ進みません。
 
@@ -104,10 +366,10 @@ Local計測へ進みません。
 ここが製品レポートの診断本体です。optimizer更新を行わず、同じ画像、noise、timestepで
 no-quantと各固定mulの勾配を比較します。
 
-- 画像数: Standard／Strictとも8～32。上限を超えてもprobe budgetは増えない。
+- 画像数: Standard／Strictとも8～52。上限を超えてもprobe budgetは増えない。
 - timestep: 4帯。
 - no-quant: 3 noise replicas。
-- 各mul: 2 noise replicas × 2 stochastic quant repeats。
+- 各mul: 2 noise replicas × Q stochastic quant repeats。新標準はQ=1、`--dq-profile-quant-repeats=2`でQ=2（旧v1は既定Q=2）。
 - stateless量子化乱数を使い、共通候補間でcommon random numbersを保つ。
 - dropoutを無効にした`structural_dropout_off` regimeで測る。
 - module単位の勾配を集約し、Body、Tail、hard-safety、source別の不確実性を作る。
@@ -123,29 +385,34 @@ prefixへ混ぜないため、候補間比較の再現契約は変わりませ�
 このLocal結果だけを通常レポートのSafety/Fidelityと候補削減に使用します。dropout有効の
 128-step Trajectoryは研究専用の別channelであり、現在の製品入口では実行しません。
 
-画像数を`I`、そのstageで測るmul数を`M`とすると、概念的なLocal probe数は次です。
+画像数を`I`、一律mul数を`M`、丸め反復数を`Q`とすると、一律OFFのLocal probe数は次です。
 
 ```text
 no_quant probes = I × 4 timestep bins × 3 replicas
-candidate probes = I × 4 timestep bins × M × 2 noise replicas × 2 quant repeats
-total = I × 4 × (3 + 4M)
+candidate probes = I × 4 timestep bins × M × 2 noise replicas × Q quant repeats
+total = I × 4 × (3 + 2MQ)
 ```
+
+場所別配分やdropout ONの追加分は、対応するno-quant参照と各候補×Q回が加算されます。
+warmup・Prefix・初期forwardは別枠です。runごとの合計は`execution_plan.json`に記録します。
 
 各probeにはforward、backward、activation/gradient hook、module集計が含まれます。そのため、
 通常学習の単純な1 stepと完全に同じ費用ではありません。
 
 ### 3.5 StandardとStrictの候補探索
 
+新v2は両modeとも固定5点＋同じ追加配分です。以下の端点拡張は旧v1の説明です。
+
 `standard`は`2.70, 3.15, 3.45, 3.75, 4.05`を1 processで一度だけ測ります。
 端点でも改善傾向が続く場合は`edge_unresolved`と表示しますが、範囲外を追跡しません。
 この場合、単一代表を出さず、Fidelity retained候補を1点へ自動縮約しません。
 
 Standard／Strictとも最大52画像、4 timestep帯、no-quant 3 replicas、candidate 2 noise ×
-2 quant repeatsを使うため、Local Body／Tailの物差しは共通です。独立source groupが画像上限を
+Q quant repeats（同じpresetとCLI指定なら同じQ）を使うため、Local Body／Tailの物差しは共通です。独立source groupが画像上限を
 超えるdatasetも実行できますが、最大52群だけを決定的にprobeします。全groupはsource contractに
 残り、レポートには`probe / total`を表示します。未probe群がある結果は完全coverageと同一視しません。
 
-`strict`はcore grid `2.70, 3.15, 3.45`から開始します。候補集合が測定端に残る場合だけ、
+旧 `canonical-v1` の `strict` はcore grid `2.70, 3.15, 3.45`から開始します。候補集合が測定端に残る場合だけ、
 最大2段まで外側を追加します。下端側は`2.25`、なお未解決なら`1.80`、上端側は`3.75`、
 なお未解決なら`4.05`です。両端が残る場合は両方向を同じroundで追加します。
 edge追加時は以前のmulも含む拡張grid全体を別processで再測定し、共通mulの全probe行を
@@ -157,7 +424,7 @@ exact parityで検査します。Strictの再測定は校正能力を高めま�
 Fidelity retained set、robust dominance、source LOOなどを作ります。`report.html`、
 `beginner_report.html`、`technical_report.html`、JSON、CSVへ保存します。
 
-`beginner_report.html`は最上部のMul affinity curveから読み始められる概要版です。
+旧v1の`beginner_report.html`は最上部のMul affinity curveから読み始められる概要版です。
 Body／Tail／ヒゲ、候補の役割、Body × Tailマップ、5軸の性格カルテ、
 source／timestep偏りを短い説明付きで表示します。性格カルテの参照位置は、
 匿名化した固定Standard参照設定内での相対位置であり、良否の閾値や画質推薦には使いません。
@@ -228,10 +495,13 @@ preflight後に作られる`execution_plan.json`の`reference_time_estimate.minu
 
 ### 3.9 軽量化の境界
 
-`standard`は、最大52画像、4 timestep帯、no-quant 3 replicas、candidate 2 noise × 2 quant repeatsを
-Strictと同じまま保ちます。短縮するのは専用Snapshot B、長いPrefix検算、edge再測定です。
-Snapshot Aと後続Prefix processの境界parityは維持するため、同じLocal物差しを短いQAで使う
-日常modeです。
+`standard`は、最大52画像、4 timestep帯、no-quant 3 replicas、candidate 2 noise × Q quant repeatsを
+Strictと共通にします。Qは新標準の既定1、CLIで2も選べます。standardでは重複warmupを共有方式へ変更しました。短いPrefix検算、
+一律mul・場所別mulの候補、dropout OFF／任意のON確認、TE込み・部位別集計の測定量は変更しません。
+warmup共有で短縮できるのは従来のwarmup 2回分とモデルの再読み込みです。共有化だけではLocalのforward/backwardは減りません。
+これとは別に、丸め反復を2→1へ変更すると候補のforward/backwardが半分になります。
+no-quant参照は残るため、診断全体が半分になるわけではありません。時間見積もりは両方の変更を反映します。
+共有経路の合成CPU検証と、実データを使ったGPUでの数値一致・短縮時間の確認は区別します。
 
 `strict`は独立Snapshot A/B、長いPrefix、bounded edge再測定を使うreference modeです。コード、
 CUDA、PyTorch、bitsandbytesの変更後、リリース前、またはStandardの結果が疑わしい場合に使います。
@@ -312,9 +582,31 @@ d = sqrt(1 + norm_ratio^2 - 2 * norm_ratio * gradient_cosine)
 
 NaN、Inf、極端なgradient explosion、optimizer stateの非finiteがなかった候補です。
 これは最低限の安全条件であり、画質保証ではありません。
-1件でも非finiteなgradient probeが出たmulは、その候補全体を数値比較から外して
+従来の一律mul診断では、1件でも非finiteなgradient probeが出たmulは、その候補全体を数値比較から外して
 `Hard unsafe`として残します。他の有限なmulはbootstrapとHTML生成を継続するため、
 1候補の異常だけで診断全体を失敗させません。原因と非finite件数はsummary／候補カードへ保存します。
+
+**現行の`canonical-v2`:** この候補単位の除外を、場所別mul・部位別の標準診断にも適用します。
+初期の標準v2では1件の非finiteでrun全体を停止していましたが、現在は量子化候補のLocal
+loss・勾配ノルム・raw MSE・部位別勾配集計にNaN/Inf等が出た場合、**その配分×dropout条件全体**を
+「計測不能」として、正常な条件の集計とレポート作成を続けます。OFFとONは別判定なので、
+ONだけで異常が出ても正常なOFFの値は残ります。異常が出た一律mulはOFFのBody代表選出からも外します。
+
+予定した画像・noise・反復の測定記録は残し、異常probeには無効理由を付けます。
+異常条件は全7部位のグラフ・予測誤差比較で欠測にし、表に理由と件数を表示します。
+健全な条件の式・重み付け・測定対象は変更しません。共通warmupのA→Bも維持します。
+AI用JSONには条件別の状態と`eligible_for_comparison`を保存し、異常条件の正常だった観測も
+比較対象外と明示します。補助の従来画像詳細ページは候補全体の除外に未対応なため、異常条件がある場合は案内リンクを表示しません。
+
+通常学習のstepスキップは不正な勾配で重みを更新しない処理です。一方、診断で失敗probeだけを
+捨てると、条件ごとの評価対象が変わり、苦手な場面を落としたBody／Tailが有利に見えるおそれがあります。
+そのため、正常probeだけの再集計・ゼロ埋め・自動再試行・loss scaleの自動変更は行いません。
+全条件から同じprobeを除く集計も、この標準診断には含めません。
+
+量子化OFFの共通参照が非finiteなら比較の基準が成立しないため停止します。一律mulに有効候補が
+一つも残らない場合も、従来の判定と同じく停止します。入力／dropoutの対応不一致、勾配の構造不一致、
+読み書きの失敗等、数値異常以外のエラーも握りつぶしません。「計測不能」はこの診断条件での判定であり、
+そのデータセットで通常学習できない、または画質が悪いと断定するものではありません。
 
 ### Fidelity retained
 
@@ -363,7 +655,7 @@ cd /d D:\work\sd-scripts
 python -m dq_profile ^
   --dq-profile-name="example_dataset" ^
   --dq-profile-output-dir="D:\outputs\dq_diagnostics" ^
-  --dq-profile-preset="canonical-v1" ^
+  --dq-profile-preset="canonical-v2" ^
   --dq-profile-mode=standard ^
   --dq-profile-open-report ^
   --pretrained_model_name_or_path="D:\models\sdxl_base.safetensors" ^
@@ -374,7 +666,7 @@ python -m dq_profile ^
 現在の長い通常学習コマンドを再利用する場合は、先頭の
 `accelerate launch ... sdxl_train_network.py`を`python -m dq_profile`へ置き換えます。
 ただし、過去commandに`AdamW8bit`、`native_accum`、異なるdimなどが含まれると
-`canonical-v1`との衝突で停止します。最小構成を使い、presetへ固定値の指定を任せる方法が
+選択したpresetとの衝突で停止します。最小構成を使い、presetへ固定値の指定を任せる方法が
 もっとも安全です。
 
 ### 6.2 診断入口のCLI一覧
@@ -386,8 +678,13 @@ python -m dq_profile ^
 | `--output_name` | 任意 | dataset TOMLのstem | 診断名のfallback。パス区切りを含まない名前 |
 | `--dq-profile-name` | 任意 | `output_name` | datasetごとの親フォルダ名 |
 | `--dq-profile-output-dir` | 任意 | repositoryの`..\lora_output\dq_dataset_profiler` | 診断runを格納する基底ディレクトリ |
-| `--dq-profile-preset` | 任意 | `canonical-v1` | versioned互換性・計測契約。現在の対応presetは1つ |
-| `--dq-profile-mode` | 任意 | `standard` | `standard`: 最大52画像・snapshot 1回の日常診断、`strict`: 独立snapshot A/B・長いreference QA＋bounded edge再測定 |
+| `--dq-profile-preset` | 任意 | `canonical-v2` | TE込み・追加配分の新標準。`canonical-v1` は再現用 |
+| `--dq-profile-dropout-on` | 任意 | false | 同じ配分のdropout ON計測を追加 |
+| `--dq-profile-quant-repeats` | 任意 | v2は`1`、v1は`2` | 確率的丸めの測定反復数。`1`または`2`。拡散ノイズやdropoutマスクの数とは別 |
+| `--dq-profile-uniform-only` | 任意 | false | 追加配分を省き、一律5点のみ測定 |
+| `--dq-profile-data-diagnostics` | 任意 | v2は`warmup`、v1は`off` | 初期評価・画像別raw MSEの記録 |
+| `--dq-profile-no-te-quantized` | 任意 | false | v1でのみ許可。旧UNetのみの測定 |
+| `--dq-profile-mode` | 任意 | `standard` | `standard`: 最大52画像・warmupを1回で共有する日常診断、`strict`: 独立snapshot A/B・長いreference QA（v1のみbounded edge再測定） |
 | `--dq-profile-preflight` | 任意 | false | パス、source、CLI契約、fingerprintまで作りGPUを起動しない |
 | `--dq-profile-dry-run` | 任意 | false | `execution_plan.json`と解決済みCore commandを書き、GPUを起動しない |
 | `--dq-profile-open-report` | 任意 | false | Windowsで正常完了した場合に`report.html`を開く |
@@ -416,7 +713,7 @@ python -m dq_profile ^
 通常利用で直接呼ぶと、Snapshot A/B、prefix gate、edge extension、成果物の昇格を手動管理する
 必要があるため、公開CLIとして使用しません。
 
-### 6.3 `canonical-v1`が固定する学習設定
+### 6.3 presetが固定する学習設定
 
 次の値は、省略すればpresetが自動挿入します。同じ値を明示した場合は
 `matched_preset`、異なる値を明示した場合はGPU開始前に`rejected`となります。
@@ -473,7 +770,7 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | DQ | `dq_delta_stat` | `rms` |
 | DQ | `dq_delta_mode` | `stoch` |
 | DQ | `dq_delta_begin_after_lr_warmup` | enabled |
-| DQ | `dq_delta_scope` | `unet` |
+| DQ | `dq_delta_scope` | v2は`both`、互換v1は`unet`。v2へ旧unetを入力した場合は理由を記録してbothへ統一 |
 | DQ | `dq_delta_log` | enabled |
 | DQ | `dq_delta_log_detail` | `basic` |
 | DQ backend | `dq_delta_use_triton` | enabled |
@@ -488,11 +785,11 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 | 項目 | 固定値・動作 |
 |---|---|
 | 製品scope | Local Body／Tail Safety/Fidelity。最終画質Utilityではない |
-| probe画像数 | Standard／Strictとも`min(dataset実画像数, 32)`。最低8画像 |
+| probe画像数 | Standard／Strictとも`min(dataset実画像数, 52)`。最低8画像 |
 | timestep bins | `4` |
 | no-quant replicas | noise 3回 |
 | candidate replicas | noise 2回 × stochastic quant 2回 |
-| Local dropout | off (`structural_dropout_off`) |
+| Local dropout | 基本はoff (`structural_dropout_off`)。v2はCLI指定で対応付きON確認を追加 |
 | Prefix dropout | on。通常学習に近いprefix再現性検査 |
 | update branch | 製品Localでは0。128-step Trajectoryは研究専用で実行しない |
 | Guardian ablation | `common_only` |
@@ -503,17 +800,21 @@ TOMLの`[general]`またはdataset sectionで`batch_size`、`enable_bucket`、`b
 
 ### 6.5 execution modeごとのQA・候補探索契約
 
+以下のgrid・edge extension・GPU process数は旧`canonical-v1`の候補探索です。
+新`canonical-v2`では両modeとも一律5点を使い、edge extensionは行いません。
+その後にBody基準の追加配分を同じLocal workerで計測します。snapshot／prefixのQA深度は下表のままです。
+
 | 項目 | `standard` | `strict` |
 |---|---|---|
 | 用途 | 日常の正式dataset診断 | コード／CUDA／PyTorch／bitsandbytes変更後、リリース前、再現性調査 |
-| 独立snapshot | 1回。Prefix processとの境界一致を検査 | A/Bの2回 |
+| snapshotの検査 | 1回のwarmup状態を共有し、Prefix後の復元一致を検査 | 独立A/Bの2回とPrefix境界の一致 |
 | Prefix | 8A／8B／16@8 | 64A／64B／128@64 |
 | state checkpoints | `0, 1, 4, 8` | `0, 1, 32, 64` |
 | Prefix branch updates | 64 | 512 |
-| Local画像上限 | 32 | 32 |
+| Local画像上限 | 52 | 52 |
 | 最初のgrid | `2.70, 3.15, 3.45, 3.75, 4.05` | `2.70, 3.15, 3.45` |
 | edge extension | なし。端点傾向は未解決として表示 | 最大2 round、拡張gridを再測定してparity検査 |
-| GPU process数 | 3 | 4～6 |
+| GPU process数 | 1（warmup・Prefix・Local共通） | 4～6 |
 | QA表示 | `Standard smoke` | `Strict reference` |
 | confidence上限 | 通常 | 通常 |
 
@@ -564,7 +865,7 @@ source groupがmodeの画像上限を超える場合もpreflightでは拒否し�
 診断入口は各明示指定を次の4種類に分類し、`resolved_args.json`へ保存します。
 
 - `consumed`: model、dataset、output名など診断要求に使用する。
-- `matched_preset`: `canonical-v1`と一致するため許可する。
+- `matched_preset`: 選択presetと一致するため許可する。
 - `overridden_with_reason`: 理由を記録して診断値へ置換する。
 - `rejected`: GPU開始前にエラーにする。
 
@@ -599,6 +900,8 @@ source groupがmodeの画像上限を超える場合もpreflightでは拒否し�
 - `resolved_args.json`
 - `protocol_fingerprint.json`
 - `execution_plan.json`: GPU process数、warmup、Prefix、Local probe数、非保証の参考時間
+- `shared_warmup.json`（元記録は`01_core_local_raw/`内）: Standardの共有・復元fingerprintとreplay hash。独立warmupのparityは未実施と明記
+- `01_core_local_raw/shared_prefix/`: Standardが同じprocess内で実行したPrefixのgate・軌跡・ソース記録（Strictは従来の`00d_prefix/`）
 - `dataset_config_snapshot.toml`
 - `source_manifest.json`と`candidate_definitions.json`
 - `status.json`
@@ -608,6 +911,18 @@ source groupがmodeの画像上限を超える場合もpreflightでは拒否し�
   `no_quant_timestep_profile.csv`: no-quant短期勾配の規模と偏り
 - `dataset_character_vector.json`: 合成点を作らないdataset体質の5 channel
 - 実行ログ
+
+標準v2のLocal probeに数値異常が出た場合、Local workerの出力先に
+`spatial_failure.json`（直近に記録した異常）と`spatial_failure_連番.json`を残します。
+詳細の採取は配分×OFF/ONごとの最初の異常です。失敗した配分、OFF/ON、画像識別子、時刻帯、noise・量子化反復、
+loss、勾配ノルム、loss scale、非finite勾配を持つパラメータを確認できます。
+JSONの非finite数値は`null`とし、`nonfinite_values`に`nan`／`inf`等の種別を記録します。
+診断を完了できた場合は、無効probeも`spatial_observations.jsonl`に状態付きで残し、
+`spatial_contract.json`に`failure_policy=exclude-condition-per-regime-v1`と条件別の理由・件数を保存します。
+共通参照の異常等で途中停止した場合に限り、途中までの記録を`spatial_observations.partial.jsonl`、件数と停止理由を
+`spatial_progress.partial.json`へ保存します。これらは**調査用の未完了データ**であり、
+正式なレポート入力や再開用checkpointではありません。失敗詳細には実パス等を含み得るため、
+匿名の共有用JSONとは区別してください。保存先への書き込み自体が失敗した場合はログへ記録します。
 
 ## 8. 実測比較例
 

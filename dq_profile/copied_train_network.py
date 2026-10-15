@@ -3440,7 +3440,8 @@ class NetworkTrainer:
         if bool(getattr(args, "dq_profile_enabled", False)):
             from dq_profile.trainer_runtime import DiagnosticProfileRuntime
 
-            dq_profile_runtime = DiagnosticProfileRuntime(args=args, trainer=self)
+            runtime_class = getattr(args, "_dq_profile_runtime_class", DiagnosticProfileRuntime)
+            dq_profile_runtime = runtime_class(args=args, trainer=self)
             if getattr(args, "dq_profile_data_diagnostics", "off") != "off":
                 from dq_profile.diagnostic_eval import DatasetDiagnostics
                 # The local train_dataset_group was deleted after metadata setup;
@@ -3469,6 +3470,10 @@ class NetworkTrainer:
                 if initial_step > 0:
                     initial_step -= 1
                     continue
+                if dq_profile_runtime is not None and global_step < dq_delta_begin_step:
+                    budget_callback = getattr(args, "_dq_profile_budget_callback", None)
+                    if budget_callback is not None:
+                        budget_callback("warmup")
                 if (
                     dq_profile_runtime is not None
                     and dq_delta_begin_step is not None
@@ -3708,6 +3713,9 @@ class NetworkTrainer:
                     )
 
                     accelerator.backward(loss)
+                    after_backward = getattr(args, "_dq_profile_after_backward", None)
+                    if after_backward is not None:
+                        after_backward(accelerator.unwrap_model(network), loss)
                     loss_scalar = loss.detach().item()
                     skip_step = False
                     if check_gradients_and_skip_update(network, epoch, step, loss_scalar):
@@ -3727,6 +3735,9 @@ class NetworkTrainer:
                                 accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                         optimizer.step()
+                        after_update = getattr(args, "_dq_profile_after_update", None)
+                        if after_update is not None:
+                            after_update(accelerator.unwrap_model(network), optimizer)
                         lr_scheduler.step()
                         self._apply_te_lr_after_if_ready(optimizer, lr_scheduler, global_step + 1)
                         optimizer.zero_grad(set_to_none=True)

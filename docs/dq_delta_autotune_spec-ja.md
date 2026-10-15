@@ -3,7 +3,40 @@
 本ドキュメントは、`--dq_delta_step / --dq_delta_bits` のフェイク量子化に対して、
 「ログ追加」と「range_mul のフィードバック制御（自動調律）」を導入するための仕様です。
 
+**場所別の固定mul指定とは別の運用です。** `--dq_delta_range_mul_attn2`、
+`--dq_delta_range_mul_te`、`--dq_delta_range_mul_te1`、`--dq_delta_range_mul_te2`は
+`--dq_delta_auto_range_mul`と併用できません。固定配分を比較するときは自動調整を外します。
+`--dq_delta_log`による観測は併用できます。`--dq_delta_scope unet`のままTEにも固定mulを
+指定した場合、TEのログも採るには`--dq_delta_log_scope both`を明示してください。
+使い分けとCLI例は[量子化ガイド](dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)を参照してください。
+
 ## 目的
+
+### 最新仕様：bothでもUNetの統計で自動判定する
+
+**通常のUNet＋TE学習では、`--dq_delta_scope both`にしても、mulの自動判定に使うのはUNetの値です。**
+`--dq_delta_auto_scope`を省略した場合の既定動作で、`unet`指定時と同じ判定対象・制御則を使います。
+ClipRateのRaw／EMA、および`clip_rate_low_auto`の誤差判定もUNetが対象です。TEのログを追加しても、
+その値を自動判定へ混ぜません。
+
+判定対象を明示的に変える場合のみ`--dq_delta_auto_scope {unet,te,both}`を使います。
+`--dq_delta_auto_scope both`はUNet＋TEの統合統計を選ぶ追加の選択肢で、既定の運用ではありません。
+TE専用学習または`dq_delta_scope=te`ではTEが既定です。明示した`auto_scope`は既定値より優先します。
+
+`--dq_delta_log_scope`はログを取る範囲、`--dq_delta_auto_scope`は調整の判定に使う範囲です。
+`--dq_delta_scope both --dq_delta_log_scope both --dq_delta_auto_scope unet`なら、両方を記録しながらUNet統計で調整します。
+調整する値はTEにも適用する**共通mul**であり、部位ごとに独立した自動調整ではありません。
+AutoStepの間隔・EMA・調整アルゴリズムは変更していません。対象選択はCPU検証済みで、GPU実学習での受入は未実施です。
+
+### この既定値にした経緯（2026-10-11）
+
+以前の実装では自動判定の対象も`dq_delta_scope`に連動し、`both`に変更するとUNet＋TEの統合統計へ切り替わっていました。
+一方、今回の判断の基準となった従来の自動調整運用は`unet`で、`both`による自動調整の利用実績を維持する要件はありませんでした。
+そこで、旧`both`実装との互換性よりも、**今後`both`へ移行しても従来のUNet基準の自動調整を保つこと**を優先しました。
+量子化・ログをTE込みにする選択と、自動判定の基準を変える選択を分けた変更です。
+ここでいう「同じ」は判定対象と制御則を指し、ログ収集範囲の拡張を含む別runの重みの完全一致を保証するものではありません。
+
+### 狙い
 
 - dq_delta の当たり外れ要因（特に clip 過多/過少）をログで可視化する
 - `range_mul` を自動調整して、clip_rate を目標レンジに保つ
@@ -15,13 +48,28 @@
 - `--dq_delta_bits` / `--dq_delta_bits_sched` を中心に設計（`--dq_delta_step` はログのみ）
 - `--dq_quantize_z`（z 量子化）にも対応
 
+### 場所別固定mulとの併用
+
+現行仕様では、場所別mulの直接指定または固定policyと`--dq_delta_auto_range_mul`の併用はエラーです。
+どちらかを黙って無視したり、固定値を自動調整で上書きしたりしません。
+`--dq_delta_auto_scope`は判定対象の選択だけなので、この引数を付けるだけでは自動調整は有効になりません。
+
+場所別固定mulは、診断で比較した配分を学習でも保つための設定です。例えばその他UNet 2.70、attn2・TE 4.05に
+自動調整を足すと、「2.70だけを動かす」「配分の比率を保って全体を動かす」「各部位を別々に動かす」のどれかを
+新たに定義する必要があります。これらは別の学習条件で、現在の固定配分の診断結果から効果を保証できません。
+現段階では、固定配分と共通mulの自動調整を別の運用として扱います。
+
+将来必要になった場合の検討候補は、**attn2・TEを固定し、その他UNetだけを自動調整する方式**です（未採用・未実装）。
+この場合は判定統計もその他UNetだけに分け、固定した高側mulを超えない上限や、配分の保存・再開・ログを定義する必要があります。
+現行の`--dq_delta_auto_scope unet`はattn2を含む全UNetの統計なので、この候補方式の代わりにはなりません。
+
 ## 追加ログ仕様
 
 ### 有効化オプション
 
 - `--dq_delta_log` : dq_delta ログを有効化（デフォルト無効）
 - `--dq_delta_log_every <int>` : ログ間隔（optimizer step 単位、デフォルト 100）
-- `--dq_delta_log_scope {unet,te,both}` : 計測対象（未指定時は `dq_delta_scope` を継承）
+- `--dq_delta_log_scope {unet,te,both}` : ログ対象（未指定時は `dq_delta_scope` を継承）。`unet`指定のままTEも量子化されていても、TEのログは自動で増えない。
 - `--dq_delta_log_mode {summary,per_module}` : 出力粒度（デフォルト summary）
 - `--dq_delta_log_detail {basic,full}` : summaryログの詳細度（デフォルト basic）。`basic` は常用向けに `ZeroRate`, `AbsMax`, `Range`, `ScaleMin/Mean/Max` を省略し、`full` は従来相当の詳細診断列を出力する。`per_module` は詳細診断扱い。
 - `--dq_delta_log_file <path>` : 省略時は `--output_dir/dq_delta_logs+<output_name>.txt`
@@ -248,6 +296,7 @@ LogStep 以外の列は空欄（NA）で、追加統計は計算しません。
 ### 有効化オプション
 
 - `--dq_delta_auto_range_mul` : range_mul の自動調整を有効化（デフォルト無効）
+- `--dq_delta_auto_scope {unet,te,both}` : 制御用統計の対象。通常はUNetが既定、TE専用時はTE。明示bothで従来の統合統計による調整。ログ対象は変えない。
 - `--dq_delta_auto_preset {default,clip_rate_high,clip_rate_high_narrow,clip_rate_mid,clip_rate_low,clip_rate_low_auto}` : auto range_mul のプリセット（指定時は clip_low/high のみ上書き。`clip_rate_low_auto` は途中でbandを切替）
 - `--dq_delta_auto_every <int>` : 調整間隔（optimizer step 単位、デフォルト 50）
 - `--dq_delta_auto_clip_low <float>` : clip_rate 下限（デフォルト 0.0005 = 0.05%）
@@ -308,7 +357,13 @@ low_bad =
 
 `--dq_quantize_z` や `--dq_delta_mode det` を使う場合、`ZeroRate` や `QErrPerClip` の分布が変わるため、同じ閾値は保守的な警告として扱う。特に z 量子化では `QErrPerClip` が高めに出ることがあり、`clip_rate_low_auto` が `mid` へ逃がす挙動は安全側に働く可能性がある。
 
-`QErrPerClip` は autoログ側の診断列として出力される。`dq_delta_logs` 側には `QuantErrRatioEMA` と `ClipRateEMA` を残すため、必要なら後段ツールで同等の比率を再計算できる。
+`QErrPerClip` は autoログ側の診断列として出力される。通常ログの`QuantErrRatioEMA`はログ対象の合算値であり、
+制御対象や更新間隔が違う場合があるため、`ClipRateEMA`で割って制御用の値として扱ってはいけない。
+2026-10-11以降のautoログ（minimal/full_schema）は末尾に`AutoQuantErrRatioRaw`と`AutoQuantErrRatioEMA`を追加する。
+前者はauto対象の誤差比率で、誤差を収集したstepだけ記録する。後者は`clip_rate_low_auto`の判定に使ったEMAで、他presetでは空欄。
+以前のログに`QErrPerClip`・`ClipRateEMA`・`QErrPerClipClipFloor`が揃う場合、
+`QErrPerClip × max(ClipRateEMA, floor)`から判定用の誤差EMAを復元できる（CSV丸め差あり）。
+学習設定の実行時記録には解決後のログ対象・auto対象も保存し、レポートで区別する。
 
 ### 発動条件（重要）
 

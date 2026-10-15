@@ -19,9 +19,41 @@ python -m dq_profile `
   --dataset_config="D:\datasets\example\dataset.toml"
 ```
 
-The complete public CLI, fixed `canonical-v1` contract, stage descriptions,
+The complete public CLI, versioned `canonical-v2` contract, stage descriptions,
 and runtime estimates are documented in
 [`docs/dq_dataset_profiler-ja.md`](../docs/dq_dataset_profiler-ja.md).
+
+The [standard diagnostic specification](../docs/dq_dataset_profiler-ja.md#spatial-diagnostic-spec)
+documents the **attn2/TE high-mul allocation** (formerly candidate A), the rationale from
+training and image evaluations, fixed UNet+TE quantization in the standard protocol,
+optional dropout-ON confirmation, and component-aware reports. TE-inclusive Local
+measurement, automatic extra candidates, optional matched dropout ON, and integrated
+reports are implemented. CPU toy-LoRA and offline UI checks cover the new path;
+full-SDXL GPU acceptance of the complete new protocol remains pending.
+
+## Using a measured allocation in ordinary training
+
+The report prints direct training CLI arguments; no diagnostic JSON is required.
+For example, append the following fixed 8-bit RMS delta settings to an SDXL
+`networks.lora` training command (join the lines for your shell):
+
+```text
+--dq_delta_bits 8 --dq_delta_stat rms --dq_delta_granularity channel --dq_delta_mode stoch
+--dq_delta_begin_after_lr_warmup --dq_delta_scope both
+--dq_delta_range_mul 2.70 --dq_delta_range_mul_attn2 3.75 --dq_delta_range_mul_te 3.75
+```
+
+`--dq_delta_range_mul_te1` and `--dq_delta_range_mul_te2` override the common TE
+value individually. Unspecified parts inherit `--dq_delta_range_mul`.
+The example is a comparison candidate, not a universal quality recommendation.
+Remove automatic mul tuning and bit scheduling when using these overrides;
+z quantization and a policy JSON cannot be combined with them either.
+Existing `--dq_delta_scope unet` training commands still apply explicit TE mul;
+use `--dq_delta_log_scope both` if the logs should include TE as well.
+See the [training CLI guide](../docs/dq_delta_mechanism-ja.md#場所別の固定mulをcliで指定する)
+for target requirements, resume checks, and compatibility limits.
+
+## Research protocols
 
 The older staged custom-dataset runners remain research/reproduction tools;
 they are not the ordinary product entry.
@@ -34,7 +66,7 @@ verdict.
 
 ## Dataset diagnostics
 
-Add `--dq-profile-data-diagnostics=local` for image/folder/tag reports without extra GPU forwards, or `warmup` for paired initial-state evaluation. The default is `off` until full-SDXL mode parity is validated. Production now uses the 52-image `local-body-tail-v2` contract in every mode.
+Add `--dq-profile-data-diagnostics=local` for image/folder/tag reports without extra GPU forwards, or `warmup` for paired initial-state evaluation. The new `canonical-v2` default is `warmup`; legacy `canonical-v1` defaults to `off`. Production now uses the 52-image `local-body-tail-v2` contract in every mode.
 
 See [dataset diagnostics guide](../docs/dq_dataset_diagnostics-ja.md) for report controls, group-map reuse, timings, CPU rebuilding, and validation limits.
 
@@ -71,13 +103,18 @@ as if they were one package version:
 - the current practical-report model uses schema
   `2.4.3-practical-report-beta`.
 
-The public execution modes share the same `canonical-v1` training preset and
+The public execution modes default to `canonical-v2`, with explicit UNet+TE scope, and
 `local-body-tail-v2` measurement contract:
 
 - `standard`: daily-use 8A/8B/16@8 prefix smoke and one fixed five-point
   Local scan (`2.70, 3.15, 3.45, 3.75, 4.05`), without edge remeasurement;
-- `strict`: 64A/64B/128@64 reference parity, a three-point core, and up to
-  two bounded edge-extension remeasurements.
+- `strict`: 64A/64B/128@64 reference parity and the same five-point Local scan.
+
+Both append the deduplicated Body-based low-2.70/3.15 allocations and the fixed
+2.70/3.75 reference (at most eight unique conditions). Use `--dq-profile-uniform-only`
+to omit these additions and `--dq-profile-dropout-on` to add matched ON confirmation.
+Legacy `--dq-profile-preset=canonical-v1` retains the old Strict edge-extension behavior.
+TE-off reproduction requires that legacy preset plus `--dq-profile-no-te-quantized`.
 
 Both modes retain up to 52 images, four timestep bins, three no-quant noise
 replicas, and two candidate-noise by two stochastic-quant repeats. The mode,

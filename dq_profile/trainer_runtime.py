@@ -393,6 +393,28 @@ class DiagnosticProfileRuntime:
         self._stats_sequence = 1_000_000
         self._warnings: list[str] = []
 
+    def _configure_candidate_quantization(self, network, candidate, range_mul, shadow):
+        _set_fake_quant(network, self.args,
+            enabled=bool((candidate.quantized and not shadow) or shadow), range_mul=range_mul)
+        grid = getattr(self.args, "dq_profile_policy_grid_resolved", {})
+        if grid and candidate.quantized:
+            if shadow:
+                raise ValueError("Explicit policy grids are supported by Local measurement, not shadow estimation")
+            from library.dq_mul_policy import MulPolicy, digest
+            declaration = grid[f"{float(range_mul):.12g}"]
+            expanded = MulPolicy.from_dict(declaration).apply(network)
+            policies = getattr(self, "_fixed_policy_records", {})
+            policies[candidate.name] = {"declaration": declaration, "assignments_sha256": digest(expanded), "modules": expanded}
+            if candidate.name not in getattr(self, "_fixed_policy_written", set()):
+                self._fixed_policy_records = policies
+                self.artifacts.root.mkdir(parents=True, exist_ok=True)
+                from dq_profile.research_budget import write_json
+                write_json(self.artifacts.root / "fixed_policy_assignments.json", {"policies": policies, "policy_grid_source_sha256": getattr(self.args, "dq_profile_policy_grid_sha256", None), "provisional": True, "not_image_quality": True})
+                self._fixed_policy_written = set(policies)
+
+    def _extra_quantization_metrics(self, exported):
+        return {}
+
     def _next_stats_step(self) -> int:
         self._stats_sequence += 1
         return self._stats_sequence
@@ -690,6 +712,9 @@ class DiagnosticProfileRuntime:
         hard_safety: bool = False,
         diagnostic_forward_only: bool = False,
     ) -> tuple[dict[str, Any], ExactGradient, list[dict[str, Any]]]:
+        budget_callback = getattr(self.args, "_dq_profile_budget_callback", None)
+        if budget_callback is not None and not diagnostic_forward_only:
+            budget_callback("diagnostic_update" if update else "diagnostic")
         observer = getattr(self.trainer, "_dataset_diagnostics", None)
         if observer is not None:
             observer.active = phase == "v2_tail_probe" or diagnostic_forward_only
@@ -717,12 +742,7 @@ class DiagnosticProfileRuntime:
         )
         if hasattr(unwrapped, "set_dq_profile_context"):
             unwrapped.set_dq_profile_context(self.quant_context)
-        _set_fake_quant(
-            unwrapped,
-            self.args,
-            enabled=bool((candidate.quantized and not shadow) or shadow),
-            range_mul=range_mul,
-        )
+        self._configure_candidate_quantization(unwrapped, candidate, range_mul, shadow)
 
         stats_step = self._next_stats_step()
         if hasattr(unwrapped, "set_dq_stats_state"):
@@ -821,12 +841,25 @@ class DiagnosticProfileRuntime:
             if safety_reason is not None:
                 skip = True
             lr_before = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
+            clip_input_norm = None
+            clip_output_norm = None
+            clipped_gradient_hash = None
+            amp_step_skipped = False
             if update and not skip:
                 if accelerator.sync_gradients:
                     self.trainer.all_reduce_network(accelerator, network)
                     if self.args.max_grad_norm != 0.0:
-                        accelerator.clip_grad_norm_(unwrapped.get_trainable_params(), self.args.max_grad_norm)
+                        clip_input_norm = accelerator.clip_grad_norm_(unwrapped.get_trainable_params(), self.args.max_grad_norm)
+                        if hard_safety:
+                            # Accelerate has unscaled these gradients before
+                            # clipping. Record what the optimizer actually sees.
+                            clipped = ExactGradient.capture(unwrapped.named_parameters(), scale=1.0)
+                            clip_output_norm = clipped.norm
+                            clipped_gradient_hash = exact_gradient_fingerprint(clipped)
+                            if not math.isfinite(clip_output_norm):
+                                raise FloatingPointError("Nonfinite clipped gradient before optimizer update")
                 optimizer.step()
+                amp_step_skipped = bool(getattr(accelerator, "optimizer_step_was_skipped", False))
                 lr_scheduler.step()
                 self.trainer._apply_te_lr_after_if_ready(optimizer, lr_scheduler, absolute_step + 1)
                 if self.args.round_lora_step is not None and self.args.round_lora_step > 0:
@@ -846,7 +879,7 @@ class DiagnosticProfileRuntime:
                 if post_step_reason is not None:
                     safety_reason = post_step_reason
             common_skip_matched = None if forced_skip is None else safety_reason is None
-            optimizer_step_performed = bool(update and not skip)
+            optimizer_step_performed = bool(update and not skip and not amp_step_skipped)
             optimizer.zero_grad(set_to_none=True)
             rng_digest_after = rng_fingerprint()
             row = {
@@ -861,6 +894,11 @@ class DiagnosticProfileRuntime:
                 "lr_before": lr_before,
                 "lr_after": [float(group.get("lr", 0.0)) for group in optimizer.param_groups],
                 "native_would_skip": native_would_skip,
+                "native_guardian_checked": bool(update and grad_norm_guardian is not None),
+                "amp_step_skipped": amp_step_skipped if update and not skip else None,
+                "clip_input_norm": None if clip_input_norm is None else float(clip_input_norm),
+                "clip_output_norm": clip_output_norm,
+                "clipped_gradient_hash": clipped_gradient_hash,
                 "common_skip_matched": common_skip_matched,
                 "forced_safety_abort": safety_reason is not None,
                 "invalid_reason": safety_reason,
@@ -874,6 +912,7 @@ class DiagnosticProfileRuntime:
                 "rng_digest_after": rng_digest_after,
                 **profile_trace,
                 **dq_metrics,
+                **self._extra_quantization_metrics(exported),
             }
             return row, exact_gradient, shadow_rows
         finally:
@@ -2026,6 +2065,8 @@ class DiagnosticProfileRuntime:
         training_model: Any,
         on_step_start: Any,
         dq_delta_begin_step: int,
+        _prepared_boundary: Optional[tuple[TrainingSnapshot, ReplaySequence, dict[str, Any]]] = None,
+        _end_training: bool = True,
     ) -> dict[str, Any]:
         if int(global_step) != int(dq_delta_begin_step):
             raise RuntimeError(
@@ -2047,7 +2088,9 @@ class DiagnosticProfileRuntime:
                 "The requested normal-training preset clip_rate_low_auto is not a v1 candidate. "
                 "The profiler uses clip_rate_low; early branches do not evaluate the low-auto escape condition."
             )
-        snapshot = TrainingSnapshot.capture(
+        if _prepared_boundary is not None and self.profile_protocol != "v2-prefix-smoke":
+            raise ValueError("prepared shared boundary is only valid for internal Prefix validation")
+        snapshot = _prepared_boundary[0] if _prepared_boundary is not None else TrainingSnapshot.capture(
             network=unwrapped,
             optimizer=optimizer,
             scheduler=lr_scheduler,
@@ -2097,7 +2140,7 @@ class DiagnosticProfileRuntime:
             if self.profile_protocol.startswith("v24-")
             else ()
         )
-        sequence, capture_metadata = self._capture_batches(
+        sequence, capture_metadata = _prepared_boundary[1:] if _prepared_boundary is not None else self._capture_batches(
             first_batch=first_batch,
             epoch_iterator=epoch_iterator,
             train_dataloader=train_dataloader,
@@ -2122,14 +2165,33 @@ class DiagnosticProfileRuntime:
             trainer=self.trainer,
             guardian=grad_norm_guardian,
         )
-        self._materialize_replay(
-            sequence,
-            accelerator=accelerator,
-            vae=vae,
-            vae_dtype=vae_dtype,
-            weight_dtype=weight_dtype,
-            noise_scheduler=noise_scheduler,
-        )
+        if _prepared_boundary is None:
+            self._materialize_replay(
+                sequence,
+                accelerator=accelerator,
+                vae=vae,
+                vae_dtype=vae_dtype,
+                weight_dtype=weight_dtype,
+                noise_scheduler=noise_scheduler,
+            )
+        if bool(getattr(self.args, "dq_profile_shared_warmup", False)):
+            from dq_profile.shared_warmup import run_shared_prefix
+            self._shared_warmup_record = run_shared_prefix(
+                runtime=self, snapshot=snapshot, sequence=sequence,
+                boundary_context={
+                    "accelerator": accelerator, "network": network, "optimizer": optimizer,
+                    "lr_scheduler": lr_scheduler, "grad_norm_guardian": grad_norm_guardian,
+                    "global_step": global_step, "epoch": epoch, "data_step": data_step,
+                    "first_batch": first_batch, "epoch_iterator": epoch_iterator,
+                    "train_dataloader": train_dataloader, "current_epoch": current_epoch,
+                    "current_step": current_step, "num_train_epochs": num_train_epochs,
+                    "vae": vae, "vae_dtype": vae_dtype, "weight_dtype": weight_dtype,
+                    "noise_scheduler": noise_scheduler, "unet": unet, "text_encoders": text_encoders,
+                    "tokenizers": tokenizers, "train_unet": train_unet,
+                    "train_text_encoder": train_text_encoder, "training_model": training_model,
+                    "on_step_start": on_step_start, "dq_delta_begin_step": dq_delta_begin_step,
+                },
+            )
         bin_count = int(self.args.dq_profile_timestep_bins)
         diffusion_steps = int(noise_scheduler.config.num_train_timesteps)
         if self.profile_protocol == "v2-prefix-smoke":
@@ -2322,6 +2384,8 @@ class DiagnosticProfileRuntime:
             nonfinite_probe_rows: list[dict[str, Any]] = []
             for probe_row in probe_rows:
                 fields: list[str] = []
+                if probe_row.get("forced_safety_abort"):
+                    fields.append("forced_safety_abort")
                 for field in (
                     "loss",
                     "gradient_norm",
@@ -2573,6 +2637,9 @@ class DiagnosticProfileRuntime:
                 }
             )
             v2_result["calibration_gate"] = calibration_gate
+        shared_record = getattr(self, "_shared_warmup_record", None)
+        if shared_record is not None:
+            source_manifest["shared_warmup"] = shared_record
         source_manifest_hash = canonical_sha256(source_manifest)
         preflight = _finite_json(getattr(self.args, "dq_profile_preflight", {}))
         current_controls = _current_control_contract(
@@ -2601,6 +2668,7 @@ class DiagnosticProfileRuntime:
         v2_summary = {
             "enabled": self.profile_protocol != "v1",
             "profile_protocol": self.profile_protocol,
+            "shared_warmup": getattr(self, "_shared_warmup_record", None),
             "diagnostic_target": (
                 "numerical_gradient_acceptance_by_fixed_range_mul"
                 if self.profile_protocol
@@ -2867,5 +2935,6 @@ class DiagnosticProfileRuntime:
             observer.finish(self.artifacts.root / "data_diagnostics")
         summary_hash = canonical_sha256(summary)
         self.artifacts.mark_complete(summary_hash)
-        accelerator.end_training()
+        if _end_training:
+            accelerator.end_training()
         return summary
