@@ -8,6 +8,17 @@ from datetime import datetime, timezone
 from pathlib import PureWindowsPath
 
 
+def settings_summary(run):
+    key = run.get("settings", {}).get("settings_id")
+    source = run["settings_sources"].get(key, {})
+    origin = source.get("source")
+    if origin is None and key == "resolved" and isinstance(source.get("resolved"), dict):
+        origin = "resolved"  # Previously registered runs omitted this label.
+    values = dict(source.get("values", {}))
+    values["optimizer"] = values.get("optimizer_type") or values.get("optimizer")
+    return origin, values
+
+
 def _basename(value):
     return PureWindowsPath(value.strip().rstrip("/\\")).name if isinstance(value, str) else ""
 

@@ -78,7 +78,7 @@
 |---|---|
 | [library/training_run.py](../library/training_run.py) | runフォルダを確保し、run ID・索引・状態を管理する。 |
 | [library/training_settings.py](../library/training_settings.py) | 要求・実効設定とGitリビジョン・依存環境の照合情報をrunに保存。 |
-| [library/training_run_weights.py](../library/training_run_weights.py) | 重みを保存し、役割・保存時点・世代整理の結果を索引に登録する。 |
+| [library/training_run_weights.py](../library/training_run_weights.py) | 実効保存間隔とrunの保存先を解決し、保存した重みの役割・epoch到達位置・世代整理の結果を索引に登録する。 |
 | [library/lora_run_schema.py](../library/lora_run_schema.py) | 6種類のCSVの列、型、変換規則を定義する。 |
 | [library/training_diagnostics.py](../library/training_diagnostics.py) | 各観測をrunのCSVに書き出す。 |
 | [library/training_run_output.py](../library/training_run_output.py) | 学習ループからrunの作成・観測・出力確定を呼び出す。 |
@@ -139,7 +139,7 @@
 | [tools/lora_ledger_core/notes.py](../tools/lora_ledger_core/notes.py) | runや重みごとの手動メモを保存する。 |
 | [tools/lora_ledger_core/exporting.py](../tools/lora_ledger_core/exporting.py) | 選択した指標・評価をCSV等の一式として書き出す。 |
 | [tools/lora_ledger_core/history_transfer.py](../tools/lora_ledger_core/history_transfer.py) | 旧台帳の履歴を引き継ぎ、保存済みexportを参照する。 |
-| [tools/lora_ledger_core/presentation.py](../tools/lora_ledger_core/presentation.py) | 記録から表示用のdataset名・時刻を組み立てる。 |
+| [tools/lora_ledger_core/presentation.py](../tools/lora_ledger_core/presentation.py) | 記録から表示用のdataset名・時刻、設定の出典とoptimizer名を組み立てる。 |
 | [tools/lora_ledger_core/gui.py](../tools/lora_ledger_core/gui.py) | 研究台帳のQtメイン画面。 |
 | [tools/lora_ledger_core/dialogs.py](../tools/lora_ledger_core/dialogs.py) | 台帳のrun登録・画像比較の取込に使うダイアログと、取り消し可能なバックグラウンド処理を提供する。 |
 
@@ -182,7 +182,7 @@
 | ファイル | 役割 |
 |---|---|
 | [tests/migration/test_training_run.py](../tests/migration/test_training_run.py) | runフォルダの同時作成、索引の更新、失敗時の保護。 |
-| [tests/migration/test_training_run_weights.py](../tests/migration/test_training_run_weights.py) | 重みの登録・世代整理・保存名、sampleの保存先。 |
+| [tests/migration/test_training_run_weights.py](../tests/migration/test_training_run_weights.py) | 重みの登録・世代整理・保存名、sampleの保存先、実効保存間隔でのstateの保持。 |
 | [tests/migration/test_training_settings_provenance.py](../tests/migration/test_training_settings_provenance.py) | clone・worktreeで設定に使うGitリビジョンを取得。 |
 | [tests/migration/test_run_control_output.py](../tests/migration/test_run_control_output.py) | run controlのメタデータと本家の共有sample出力先。 |
 | [tests/migration/test_run_output.py](../tests/migration/test_run_output.py) | 学習から設定とログへの接続、棄却時・無効時の出力。 |

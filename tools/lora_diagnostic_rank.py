@@ -9,6 +9,39 @@ from tools.lora_run_metrics import rank_fields
 from tools.lora_diagnostic_numbers import safe_int, safe_float
 
 
+def _energy_bucket():
+    return {"energy_sum": 0.0, "missing_energy": False, "sat_weighted_sum": 0.0,
+            "sat_weighted_energy": 0.0, "sat_values": [], "missing_weighted_sat": False,
+            "param_count_sum": 0, "missing_params": False}
+
+
+def _observe_bucket(info, energy, sat, param_count, eps):
+    if energy is None:
+        info["missing_energy"] = True
+    else:
+        info["energy_sum"] += energy
+    if param_count is None or param_count <= 0:
+        info["missing_params"] = True
+    else:
+        info["param_count_sum"] += int(param_count)
+    if energy is None or (energy > eps and sat is None):
+        info["missing_weighted_sat"] = True
+    if sat is not None:
+        if energy is not None and energy > eps:
+            info["sat_weighted_sum"] += sat * energy
+            info["sat_weighted_energy"] += energy
+        else:
+            info["sat_values"].append(sat)
+
+
+def _weighted_sat(info, eps):
+    if info["missing_weighted_sat"]:
+        return None
+    if info["sat_weighted_energy"] > eps:
+        return info["sat_weighted_sum"] / info["sat_weighted_energy"]
+    return statistics.mean(info["sat_values"]) if info["sat_values"] else None
+
+
 def _summarize(rows, names, module_param_counts):
     rank_lr_keys = [
         "UnetLRMin",
@@ -87,31 +120,28 @@ def _summarize(rows, names, module_param_counts):
         for bucket in group_buckets.values():
             groups_out: Dict[str, Dict[str, Any]] = {}
             total_energy = sum(info["energy_sum"] for info in bucket["groups"].values())
-            shares_complete = not any(info["missing_params"] for info in bucket["groups"].values())
+            energy_complete = not any(info["missing_energy"] for info in bucket["groups"].values())
+            shares_complete = energy_complete and not any(info["missing_params"] for info in bucket["groups"].values())
             total_energy_per_param = 0.0
             for info in bucket["groups"].values():
                 param_count = info.get("param_count_sum")
-                if not info["missing_params"] and param_count and param_count > 0:
+                if not info["missing_energy"] and not info["missing_params"] and param_count and param_count > 0:
                     total_energy_per_param += info["energy_sum"] / param_count
             for label, info in bucket["groups"].items():
                 labels.add(label)
-                sat_wmean = None
-                if info["sat_weighted_energy"] > eps:
-                    sat_wmean = info["sat_weighted_sum"] / info["sat_weighted_energy"]
-                elif info["sat_values"]:
-                    sat_wmean = statistics.mean(info["sat_values"])
+                sat_wmean = _weighted_sat(info, eps)
                 energy_share = None
-                if total_energy > eps:
+                if energy_complete and total_energy > eps:
                     energy_share = info["energy_sum"] / total_energy
                 energy_per_param = None
                 energy_share_per_param = None
                 param_count = info.get("param_count_sum")
-                if not info["missing_params"] and param_count and param_count > 0:
+                if not info["missing_energy"] and not info["missing_params"] and param_count and param_count > 0:
                     energy_per_param = info["energy_sum"] / param_count
                     if shares_complete and total_energy_per_param > eps:
                         energy_share_per_param = energy_per_param / total_energy_per_param
                 groups_out[label] = {
-                    "RankEnergySum": info["energy_sum"],
+                    "RankEnergySum": None if info["missing_energy"] else info["energy_sum"],
                     "RankEnergyShare": energy_share,
                     "RankEnergyPerParam": energy_per_param,
                     "RankEnergySharePerParam": energy_share_per_param,
@@ -207,26 +237,8 @@ def _summarize(rows, names, module_param_counts):
                 if grouped_bucket.get(lr_key) is None and lr_value is not None:
                     grouped_bucket[lr_key] = lr_value
             if label not in grouped_bucket["groups"]:
-                grouped_bucket["groups"][label] = {
-                    "energy_sum": 0.0,
-                    "sat_weighted_sum": 0.0,
-                    "sat_weighted_energy": 0.0,
-                    "sat_values": [],
-                    "param_count_sum": 0, "missing_params": False,
-                }
-            info = grouped_bucket["groups"][label]
-            if energy is not None:
-                info["energy_sum"] += energy
-            if module_param_count is not None and module_param_count > 0:
-                info["param_count_sum"] += int(module_param_count)
-            else:
-                info["missing_params"] = True
-            if sat is not None:
-                if energy is not None and energy > eps:
-                    info["sat_weighted_sum"] += sat * energy
-                    info["sat_weighted_energy"] += energy
-                else:
-                    info["sat_values"].append(sat)
+                grouped_bucket["groups"][label] = _energy_bucket()
+            _observe_bucket(grouped_bucket["groups"][label], energy, sat, module_param_count, eps)
 
         if train_step == last_step:
             final_step_modules.append(
@@ -275,13 +287,7 @@ def _summarize(rows, names, module_param_counts):
         cell_buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for path_label in heatmap_path_labels:
             for role_label in heatmap_role_labels:
-                cell_buckets[(path_label, role_label)] = {
-                    "energy_sum": 0.0,
-                    "sat_weighted_sum": 0.0,
-                    "sat_weighted_energy": 0.0,
-                    "sat_values": [],
-                    "param_count_sum": 0, "missing_params": False,
-                }
+                cell_buckets[(path_label, role_label)] = _energy_bucket()
 
         final_epoch = None
         final_scope = None
@@ -298,20 +304,10 @@ def _summarize(rows, names, module_param_counts):
             energy = item.get("RankEnergy")
             sat = item.get("RankSat")
             param_count = item.get("ParamCount")
-            if energy is not None:
-                info["energy_sum"] += energy
-            if param_count is not None and param_count > 0:
-                info["param_count_sum"] += int(param_count)
-            else:
-                info["missing_params"] = True
-            if sat is not None:
-                if energy is not None and energy > eps:
-                    info["sat_weighted_sum"] += sat * energy
-                    info["sat_weighted_energy"] += energy
-                else:
-                    info["sat_values"].append(sat)
+            _observe_bucket(info, energy, sat, param_count, eps)
 
-        shares_complete = not any(info["missing_params"] for info in cell_buckets.values())
+        shares_complete = (all(item["RankEnergy"] is not None for item in final_modules)
+                           and not any(info["missing_params"] for info in cell_buckets.values()))
         total_energy_per_param = 0.0
         for info in cell_buckets.values():
             if not info["missing_params"] and info["param_count_sum"] > 0:
@@ -331,10 +327,7 @@ def _summarize(rows, names, module_param_counts):
                             if shares_complete and total_energy_per_param > eps:
                                 value = energy_per_param / total_energy_per_param
                     elif metric_key == "RankSatWMean":
-                        if info["sat_weighted_energy"] > eps:
-                            value = info["sat_weighted_sum"] / info["sat_weighted_energy"]
-                        elif info["sat_values"]:
-                            value = statistics.mean(info["sat_values"])
+                        value = _weighted_sat(info, eps)
                     if value is not None:
                         max_value = max(max_value, value)
                     cells.append(
@@ -342,7 +335,7 @@ def _summarize(rows, names, module_param_counts):
                             "path": path_label,
                             "role": role_label,
                             "value": value,
-                            "RankEnergySum": info["energy_sum"],
+                            "RankEnergySum": None if info["missing_energy"] else info["energy_sum"],
                             "ParamCount": None if info["missing_params"] else info["param_count_sum"] or None,
                         }
                     )

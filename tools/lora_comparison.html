@@ -54,7 +54,7 @@ const state={runs:[],selected:[],chart:'loss_ma',mode:'overlay',axis:'native',ra
 let renders=[],busy=false,dragDepth=0,resizeTimer,pinned=false,displayIndex=0,rangeDraft=null;
 const titles={grad_norm:'勾配ノルム・閾値',loss_ma:'Loss・移動平均',thresh_off:'ThreshOff',scale:'GradScaler Scale',cosine:'勾配 Cosine',cosine_by_epoch:'勾配の整列度（epoch）',dq_bits:'DQ Bits',dq_range_mul:'DQ RangeMul',dq_clip:'DQ ClipRate',dq_qerr_ratio:'DQ 量子化誤差比',dq_qerr_rms:'DQ 量子化誤差 RMS',dq_zero_rate:'DQ ZeroRate',dq_absmax:'DQ AbsMax',dq_range:'DQ Range',dq_qerr_per_clip:'DQ QErrPerClip',dq_low_auto_bad:'DQ Auto Bad / Streak',dq_error_part_ratio:'DQ Clip / Round 誤差比',dq_error_part_share:'DQ Clip / Round 構成比',rank_dim:'RankDim',rank_sat:'Rank 飽和度・Top1',rank_energy:'Rank 重み量',rank_lr:'学習率の記録',rank_group_path_energy_share:'Down / Mid / Up：重み構成比',rank_group_path_energy_share_per_param:'Down / Mid / Up：パラメータ当たり構成比',rank_group_path_sat:'Down / Mid / Up：RankSat',rank_group_role_energy_share:'役割別：重み構成比',rank_group_role_energy_share_per_param:'役割別：パラメータ当たり構成比',rank_group_role_sat:'役割別：RankSat',group_loss_step_ema:'Group Loss EMA（step）',group_loss_epoch_ema:'Group Loss EMA（epoch）',group_scale_applied_epoch:'Group Scale（epoch）',group_ratio_epoch:'Group Ratio（epoch）',group_ratio_ema_epoch:'Group Ratio EMA（epoch）',lora_trend_unet:'UNet 情報密度推移',lora_trend_te1:'TE1 情報密度推移',lora_trend_te2:'TE2 情報密度推移',dq_direct_ratio:'DQ Direct 誤差比',dq_direct_rms:'DQ Direct 誤差 RMS',dq_guard_direct_ratio:'DQ Guard 誤差比・上限',dq_guard_gain:'DQ Guard Gain',dq_guard_cadence:'DQ Guard サンプリング間隔',heat_energy_share_per_param:'最終重み構成比ヒートマップ',heat_rank_sat_wmean:'最終RankSatヒートマップ'};
 const groups={grad:'Loss・勾配',dq:'DQ',dq_auto:'DQ 自動mul調整の監視',promote:'Promoteの採点と採用',rank:'Rank',group_loss:'Group Loss',lora_trend:'情報密度推移',heatmap:'最終ヒートマップ'};
-const discrete=new Set(['thresh_off','scale','dq_bits','dq_range_mul','rank_dim','dq_low_auto_bad','dq_guard_gain','dq_guard_cadence','rank_lr','group_scale_applied_epoch']);
+const discrete=new Set(['thresh_off','scale','dq_bits','dq_range_mul','rank_dim','dq_low_auto_bad','dq_auto_mul','dq_low_auto_streak','dq_guard_gain','dq_guard_cadence','rank_lr','group_scale_applied_epoch']);
 const dash=['','7 3','2 3','10 3 2 3','12 3','4 2 1 2'];
 function el(tag,attrs={},content){const n=document.createElement(tag);for(const [k,v] of Object.entries(attrs)){if(k==='class')n.className=v;else n.setAttribute(k,v)}if(content!==undefined)n.textContent=content;return n}
 function svgEl(tag,attrs={},content){const n=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v]of Object.entries(attrs))n.setAttribute(k,v);if(content!==undefined)n.textContent=content;return n}
@@ -78,8 +78,10 @@ function dqContext(report){
 }
 function chartContract(report,raw,section){
  const declared=obj(raw.comparison_condition);
- const signature={clock:axisKind(raw.x_label), ...declared};
- let confirmed=Boolean(signature.clock);
+ const legacyHold=discrete.has(raw.id)||/^dq_auto_(mul|bad)_/.test(raw.id);
+ const interpolation=raw.interpolation??(legacyHold?'previous':'linear');
+ const signature={clock:axisKind(raw.x_label), ...declared, interpolation};
+ let confirmed=Boolean(signature.clock) && ['linear','previous'].includes(interpolation);
  if(section==='dq'||section==='dq_auto'){
   const config=obj(report.training_settings?.resolved?.dq);
   signature.scope=declared.scope??null;
@@ -96,7 +98,7 @@ function chartContract(report,raw,section){
   signature.rank_dims=[...new Set(array(report.rank?.rows).map(row=>row.RankDim).filter(finite))].sort((a,b)=>a-b);
   confirmed=confirmed&&Boolean(signature.expected_modules)&&signature.rank_dims.length>0;
  }
- return {signature:stableSetting(signature),confirmed,scope:text(declared.scope),
+ return {signature:stableSetting(signature),confirmed,discrete:interpolation==='previous',scope:text(declared.scope),
          metric:text(declared.definition_version),origin:text(declared.source)};
 }
 function normalizeReport(report,name,fingerprint){
@@ -123,7 +125,7 @@ function normalizeReport(report,name,fingerprint){
    ss.push({name:duplicate?label+' ['+(duplicate+1)+']':label,points});
   }
   if(!ss.length){dropped++;continue}
-  charts.push({id,kind:'line',section:id.startsWith('rank_')?'rank':section,title:text(raw.title||titles[id]||id),originalTitle:text(raw.title),subtitle:text(raw.subtitle),xLabel:text(raw.x_label||'x'),...contract,series:ss,markers:array(raw.markers).filter(m=>finite(m?.x)).map(m=>({x:m.x,label:text(m.label)})),fixedMin:finite(raw.y_min_fixed)?raw.y_min_fixed:null,fixedMax:finite(raw.y_max_fixed)?raw.y_max_fixed:null,minFloor:finite(raw.y_min_floor)?raw.y_min_floor:null,maxCeil:finite(raw.y_max_ceil)?raw.y_max_ceil:null,tickStep:finite(raw.y_tick_step)&&raw.y_tick_step>0?raw.y_tick_step:null,tickPrecision:Number.isInteger(raw.y_tick_precision)&&raw.y_tick_precision>=0?Math.min(15,raw.y_tick_precision):null,tickInteger:raw.y_tick_integer===true,tickNiceInteger:raw.y_tick_nice_integer===true,discrete:discrete.has(id)||/^dq_auto_(mul|bad)_/.test(id)});used.add(id);
+  charts.push({id,kind:'line',section:id.startsWith('rank_')?'rank':section,title:text(raw.title||titles[id]||id),originalTitle:text(raw.title),subtitle:text(raw.subtitle),xLabel:text(raw.x_label||'x'),...contract,series:ss,markers:array(raw.markers).filter(m=>finite(m?.x)).map(m=>({x:m.x,label:text(m.label)})),fixedMin:finite(raw.y_min_fixed)?raw.y_min_fixed:null,fixedMax:finite(raw.y_max_fixed)?raw.y_max_fixed:null,minFloor:finite(raw.y_min_floor)?raw.y_min_floor:null,maxCeil:finite(raw.y_max_ceil)?raw.y_max_ceil:null,tickStep:finite(raw.y_tick_step)&&raw.y_tick_step>0?raw.y_tick_step:null,tickPrecision:Number.isInteger(raw.y_tick_precision)&&raw.y_tick_precision>=0?Math.min(15,raw.y_tick_precision):null,tickInteger:raw.y_tick_integer===true,tickNiceInteger:raw.y_tick_nice_integer===true});used.add(id);
  }
  for(const [key,raw]of Object.entries(obj(report.rank?.final_heatmaps))){
   const rows=array(raw?.rows).map(r=>({label:text(r?.label),cells:array(r?.cells).map(c=>({role:text(c?.role),value:finite(c?.value)?c.value:null}))}));

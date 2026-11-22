@@ -43,6 +43,15 @@ const upload = (name,data) => ({name, mimeType:'application/json',buffer:Buffer.
     }
     await page.goto(pathToFileURL(viewer).href);
     const first=report(crypto.randomUUID(),'gen1'), other=report(crypto.randomUUID(),'gen2');
+    const discreteIds = ['dq_auto_mul', 'dq_low_auto_streak'];
+    for (const run of [first, other]) {
+      run.charts.dq_auto = discreteIds.map(id => ({
+        ...makeChart(id, {scope:'unet', definition_version:1, source:'controller'}),
+        ...(run === other ? {interpolation:'previous'} : {}),
+        x: run === first ? [50,100,110,120] : [75,115],
+        series: [{name:'value', y: run === first ? [3,5,null,8] : [5,8]}]
+      }));
+    }
     other.training_settings.requested.seed=4;
     other.charts.dq[0].comparison_condition.definition_version=2;
     await add([upload('01.json',first),upload('02.json',other)]);
@@ -58,6 +67,12 @@ const upload = (name,data) => ({name, mimeType:'application/json',buffer:Buffer.
     assert((await page.locator('#notices').textContent()).includes('測定条件'));
     await page.selectOption('#mode','difference');
     assert((await page.locator('#notices').textContent()).includes('測定条件'));
+    for (const id of discreteIds) {
+      await page.locator(`[data-chart-id="${id}"]`).click();
+      const cells = await page.locator('#stats-body tr td').allTextContents();
+      assert.equal(Number(cells[2]), 1); // step 115 falls inside a missing interval
+      assert.equal(Number(cells[3]), 2); // step 75 uses the last observed multiplier/count
+    }
     await page.locator('[data-chart-id="heat_rank_sat_wmean"]').click();
     assert(await page.locator('#plots').textContent());
     await add([upload('duplicate.json',first)]);

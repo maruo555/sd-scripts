@@ -22,14 +22,17 @@ def bundle_rows(bundle, kind):
         return list(csv.DictReader(stream))
 
 
-def test_saved_comparison_review_and_bundle_link_cases_strength_history(tmp_path):
+@pytest.mark.parametrize("partial_final", [False, True])
+def test_saved_comparison_review_and_bundle_link_cases_strength_history(tmp_path, partial_final):
     root = tmp_path / "out"
     ledger = open_output_ledger(root / "ledger", create=True)
-    runs = [source(root, 5), source(root, 7)]
+    first_epoch = 6 if partial_final else 5
+    runs = [source(root, first_epoch), source(root, 7)]
     paths = [weight(r,"final.safetensors") for r in runs]
-    # These checkpoints represent the completed epochs whose traces are being compared.
-    for run, n in zip(runs,(5,7)):
-        run.update_index(lambda data: data["weights"][0].update(epoch=n,attempt_step=n*10))
+    for run, epoch in zip(runs, (first_epoch, 7)):
+        complete = run is runs[1] or not partial_final
+        run.update_index(lambda data: data["weights"][0].update(
+            epoch=epoch, attempt_step=epoch*10, epoch_complete=complete, batch_index=0))
     assert len(apply_scan(ledger,scan(ledger,full=True))["applied"]) == 2
     folder = tmp_path / "comparison"
     m = comparison(folder)
@@ -60,7 +63,10 @@ def test_saved_comparison_review_and_bundle_link_cases_strength_history(tmp_path
     rows=bundle_rows(bundle,"features")
     filtered = [r for r in rows if r["metric_id"]=="loss.tail_median"]
     assert {r["window_id"] for r in filtered}=={"observed_run","checkpoint_local","common_interval"}
-    assert {float(r["value"]) for r in filtered if r["window_id"]=="common_interval"}=={5.0}
+    common = [r for r in filtered if r["window_id"] == "common_interval"]
+    assert len(common) == 2 and {float(r["value"]) for r in common} == {5.0}
+    if partial_final:
+        assert all("epoch 6 excluded" in r["range_note"] for r in common)
     assert json.loads((bundle/"reviews.jsonl").read_text(encoding="utf-8"))["review_id"]==saved["review_id"]
     old=hashlib.sha256((bundle/"export_manifest.json").read_bytes()).hexdigest()
     again=export_bundle(ledger,[runs[0].run_id])

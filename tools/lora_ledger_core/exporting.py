@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .storage import (now, digest, atomic_json, new_id, LedgerError, Cancelled, latest_annotations,
                       same_stat, file_stat, sha256_file)
-from .presentation import dataset_info, run_time, time_text
+from .presentation import settings_summary, dataset_info, run_time, time_text
 from .features import RunFeatures, DEFINITIONS
 from .output_root import output_root
 from tools.lora_run_reader import discover_run_indexes
@@ -49,8 +49,7 @@ def listing_rows(ledger, run_ids=None):
         for review, annotation in impressions or [(None, {})]:
             artifact_id = annotation.get("artifact_id")
             artifact = next((a for a in run["artifacts"] if a["artifact_id"] == artifact_id), None)
-            source = run["settings_sources"].get(run.get("settings", {}).get("settings_id"), {})
-            values = source.get("values", {})
+            origin, values = settings_summary(run)
             rows.append({"run_id": run["run_id"], "学習名": run["display_name"],
                          "データセット": dataset["display_name"],
                          "データセット名の出典": dataset["name_source"],
@@ -65,7 +64,7 @@ def listing_rows(ledger, run_ids=None):
                          "悪いところ": annotation.get("bad_points", ""),
                          "任意メモ": annotation.get("free_note", ""),
                          "optimizer": values.get("optimizer"), "rank": values.get("network_dim"),
-                         "学習率": values.get("learning_rate"), "設定出典": source.get("source"),
+                         "学習率": values.get("learning_rate"), "設定出典": origin,
                          "対応状態": run.get("association"), "旧名": run.get("aliases", []),
                          "review_id": review["review_id"] if review else None,
                          "評価日時": review.get("evaluated_at") if review else None})
@@ -286,6 +285,7 @@ def export_bundle(ledger, run_ids=None, progress=None, cancel=None):
                     issues.append({"run_id": run_id, "artifact_id": aid, "reason": "登録時の重みと一致しません"})
                     continue
                 weight_inputs.append((rpath, dict(observed)))
+                moment["epoch_complete"] = indexed.get("epoch_complete")
                 by_artifact[(run_id,aid)] = moment
                 for row in data.summarize(moment):
                     features.append({**row,"run_id":run_id,"subject_id":aid,"window_id":"checkpoint_local"})

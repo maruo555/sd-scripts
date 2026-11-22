@@ -217,7 +217,7 @@ def _validate_ranges(v):
 def _guard_training(args, features):
     if not features:
         return
-    for key in ("resume", "cache_text_encoder_outputs", "cache_text_encoder_outputs_to_disk", "train_inpainting"):
+    for key in ("deepspeed", "resume", "cache_text_encoder_outputs", "cache_text_encoder_outputs_to_disk", "train_inpainting"):
         if getattr(args, key, None):
             raise ValueError(f"--{key} is unsupported with: {', '.join(sorted(features))}")
     initial_step = getattr(args, "initial_step", None)

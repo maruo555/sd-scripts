@@ -56,3 +56,29 @@ def test_shared_samples_and_omitted_checkpoint_stems(tmp_path):
     assert sample_args(a, r1).output_dir == str(tmp_path) and sample_args(a, r1).output_name == r1.run_id
     assert w.output_dir == str(r1.directory)
     assert a.output_name is None and weight_args(a, None) is a and sample_args(a, None) is a
+
+
+@pytest.mark.parametrize("initial_interval", [None, 1])
+def test_all_off_epoch_state_retention(tmp_path, initial_interval):
+    from types import SimpleNamespace
+    from library.checkpoint_io import save_and_remove_state_on_epoch_end
+    from library.maruo_training_config import resolve_training_config
+    from library.training_run_weights import resolve_epoch_save_args
+    from sdxl_train_network import parse_training_args, setup_parser
+
+    argv = ["--network_module", "networks.lora", "--output_dir", str(tmp_path),
+            "--save_n_epoch_ratio", "3", "--max_train_epochs", "6", "--save_state",
+            "--save_last_n_epochs_state", "1"]
+    if initial_interval:
+        argv.extend(["--save_every_n_epochs", str(initial_interval)])
+    args = parse_training_args(setup_parser(), argv)
+    config = resolve_training_config(args)
+    assert not config.training_features and not config.observation_features
+    run = TrainingRun.create(tmp_path, None, 1)
+    saving = resolve_epoch_save_args(args, run, args.max_train_epochs)
+    assert args.save_every_n_epochs == saving.save_every_n_epochs == 2
+    accelerator = SimpleNamespace(save_state=lambda path: Path(path).mkdir())
+    second = Path(save_and_remove_state_on_epoch_end(saving, accelerator, 2))
+    assert second.is_dir() and second.parent == run.directory
+    fourth = Path(save_and_remove_state_on_epoch_end(saving, accelerator, 4))
+    assert fourth.is_dir() and not second.exists()

@@ -14,6 +14,8 @@ SDXL LoRAの独自機能を使った学習で、どの処理が重みを変え�
 
 ## 対象と1試行の順序
 
+学習挙動を変える独自機能は通常のAccelerateで使用します。DeepSpeedはbackward内で更新するため、CLI・TOMLやAccelerateの起動設定でDeepSpeedを有効にした場合、独自学習との併用は開始時にエラーになります。独自学習をすべてOFFにした場合は本家のDeepSpeed経路を使用できます。公開されている独自学習引数は、CLI・TOMLのどちらで指定しても、実効のネットワークモジュールが `networks.lora` であることが必要です。
+
 学習の入口は `sdxl_train_network.py --network_module networks.lora` です。独自機能で学習の挙動を変える構成は、1プロセス、勾配蓄積1、datasetのbatch size 1・実効 `network_multiplier=1.0` で、新しいrunとして開始します。datasetで同じ画像を何回学習するかは `num_repeats` で設定できます。TE出力のキャッシュ、inpainting学習、subsetの `diff_output_preservation`、optimizer途中状態からの `--resume` は、この構成の対象外です。常用例の `--cache_latents` は使用できます。本家の学習にrankやgroup lossなどの観測だけを加えた場合は、本家の `--resume` で再開でき、再開後の観測は新しいrunに記録します。既存LoRAを `--network_weights` で読み込む操作は、その重みを初期値とする新規学習です。
 
 1. **forward前**に、完了済みの試行数から、その試行で使うDQのbits、開始条件、統計を取る部位を決めます。

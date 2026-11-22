@@ -25,7 +25,7 @@ from accelerate.utils import set_seed
 from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
-from library.training_run_weights import WeightMoment, publish_weight, record_weight, remove_weight, weight_args
+from library.training_run_weights import WeightMoment, publish_weight, record_weight, remove_weight, resolve_epoch_save_args
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd
 
 import library.accelerator_setup as accelerator_setup
@@ -1252,6 +1252,8 @@ class NetworkTrainer:
         # acceleratorを準備する
         logger.info("preparing accelerator")
         accelerator = accelerator_setup.prepare_accelerator(args)
+        if maruo_config is not None and maruo_config.changes_training and accelerator.state.deepspeed_plugin is not None:
+            raise ValueError("DeepSpeed from the Accelerate configuration is unsupported with custom SDXL training")
         is_main_process = accelerator.is_main_process
         if maruo_config is not None:
             from library.training_run_output import RunOutput, reserve_run
@@ -1261,7 +1263,6 @@ class NetworkTrainer:
                 self.run_output = RunOutput(self.training_run, requested_args)
                 logger.info("SDXL LoRA run: %s", self.training_run.directory)
         output = self.run_output
-        save_args = weight_args(args, self.training_run)
 
         # mixed precisionに対応した型を用意しておき適宜castする
         weight_dtype, save_dtype = accelerator_setup.prepare_dtype(args)
@@ -1615,8 +1616,7 @@ class NetworkTrainer:
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-        if (args.save_n_epoch_ratio is not None) and (args.save_n_epoch_ratio > 0):
-            args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
+        save_args = resolve_epoch_save_args(args, self.training_run, num_train_epochs)
 
         # 学習する
         # TODO: find a way to handle total batch size when there are multiple datasets
@@ -1956,7 +1956,9 @@ class NetworkTrainer:
         else:
             score_bank = None
 
+        actual_batch_index = None
         for epoch in range(epoch_to_start, num_train_epochs):
+            actual_batch_index = None
             if averaging is not None:
                 self._promote_bank = averaging.bank if averaging.eligible(epoch + 1, num_train_epochs) else None
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
@@ -2296,6 +2298,8 @@ class NetworkTrainer:
             run_controller.record_state(state_dir, step=global_step)
 
         if is_main_process:
+            final_epoch_complete = (actual_batch_index + 1 == len(train_dataloader)
+                                    if actual_batch_index is not None else None)
             ckpt_name = checkpoint_io.get_last_ckpt_name(save_args, "." + args.save_model_as)
             self._save_model(
                 args=save_args,
@@ -2306,7 +2310,8 @@ class NetworkTrainer:
                 steps=global_step,
                 epoch_no=num_train_epochs,
                 force_sync_upload=True,
-                moment=WeightMoment("final", num_train_epochs, global_step, None, "after_epoch_decision"),
+                moment=WeightMoment("final", num_train_epochs, global_step, actual_batch_index,
+                                    "after_epoch_decision", final_epoch_complete),
             )
 
             if averaging is not None and averaging.final_raw is not None:
@@ -2321,7 +2326,8 @@ class NetworkTrainer:
                 save_final_raw(raw_path, averaging.final_raw, save_dtype, raw_metadata)
                 if self.training_run is not None:
                     record_weight(self.training_run, raw_path,
-                                  WeightMoment("final_raw", num_train_epochs, global_step, None, "before_epoch_decision"))
+                                  WeightMoment("final_raw", num_train_epochs, global_step, actual_batch_index,
+                                               "before_epoch_decision", final_epoch_complete))
             logger.info("model saved.")
 
         logs_complete = output is not None and output.finish("completed")

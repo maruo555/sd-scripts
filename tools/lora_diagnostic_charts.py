@@ -898,6 +898,7 @@ def report_charts(data, trend=None):
         chart = _chart(key,title,"Attempt step",dq["events"],"attempt_step",fields,
                        condition={"scope":dq["auto_scope"],"definition_version":dq["definition"],"source":"controller"})
         if chart["series"]:
+            chart["interpolation"] = "previous" if key in {"dq_auto_mul", "dq_low_auto_streak"} else "linear"
             charts["dq_auto"].append(chart)
     chart = _chart("promote_proxy_loss","固定bankのproxy loss","Epoch",data["promote"]["rows"],"epoch",
                    [("raw_proxy_loss","raw"),("selected_proxy_loss","候補")])

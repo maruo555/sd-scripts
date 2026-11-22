@@ -13,6 +13,7 @@ class WeightMoment:
     attempt_step: int
     batch_index: int | None
     phase: str
+    epoch_complete: bool | None = None
 
 
 def weight_args(args, run):
@@ -22,6 +23,13 @@ def weight_args(args, run):
     local.output_dir = str(run.directory)
     local.output_name = None if run.output_name_omitted else run.base_name
     return local
+
+
+def resolve_epoch_save_args(args, run, num_train_epochs):
+    """Resolve the cadence before redirecting checkpoint writes to the run."""
+    if args.save_n_epoch_ratio is not None and args.save_n_epoch_ratio > 0:
+        args.save_every_n_epochs = max(1, num_train_epochs // args.save_n_epoch_ratio)
+    return weight_args(args, run)
 
 
 def sample_args(args, run):

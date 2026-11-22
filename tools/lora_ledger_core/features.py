@@ -6,13 +6,14 @@ import math
 from statistics import median
 
 from library.lora_run_schema import HEADERS
+from tools.lora_run_metrics import rank_energy_total
 from tools.lora_run_reader import promote_windows, unique_auto_events
 from tools.lora_report_publication import hash_prefix, read_published_report
 
 from .storage import Cancelled, Conflict, digest
 
 
-DEFINITION_VERSION = "ledger-2"
+DEFINITION_VERSION = "ledger-3"
 INITIAL_METRICS = {
     "loss.tail_median", "loss.tail_delta", "grad_scale.tail_median",
     "dq_error_ratio.tail_median", "dq_error_ratio.tail_delta", "dq_error_rms.tail_median",
@@ -26,6 +27,7 @@ DEFINITIONS = {
     "version": DEFINITION_VERSION, "initial_metric_ids": sorted(INITIAL_METRICS),
     "epoch": "one-based recorded epoch, gradient uses within-epoch batch_index",
     "window": "median within epoch, then equal-epoch median; previous=[0.6,0.8), tail=[0.8,1]",
+    "common_interval": "complete epochs or matching measured partial cutoffs; unknown final extent excluded",
     "minimum_epochs": 5, "tail_delta": "tail minus previous; neither may be missing",
     "rank": "complete module set. P95 of finite module observations, unweighted; energy requires all finite",
     "auto": "unique measured checks; decision, application and escape have independent missingness",
@@ -66,6 +68,15 @@ class Series:
     stream: str
     metric: str
     dimension: str
+
+
+def _partial_epoch(cutoff):
+    return cutoff is not None and (cutoff.get("role") == "step" or
+                       (cutoff.get("role") in {"final", "final_raw"} and cutoff.get("epoch_complete") is not True))
+
+
+def _unknown_final(cutoff):
+    return cutoff.get("role") in {"final", "final_raw"} and cutoff.get("epoch_complete") is None
 
 
 class RunFeatures:
@@ -204,8 +215,7 @@ class RunFeatures:
                 dim = _dimension(scope=scope, module_ranks_sha256=digest(dims) if all(type(x) is int for x in dims.values()) else None)
                 for column in ("rank_sat", "rank_top1"):
                     self.add(kind, column + "_p95", dim, epoch, step, quantile((r[column] for r in records), .95))
-                energies = [number(r["rank_energy"]) for r in records]
-                self.add(kind, "rank_energy", dim, epoch, step, sum(energies) if None not in energies else None)
+                self.add(kind, "rank_energy", dim, epoch, step, rank_energy_total(records))
 
     def _dq(self, rows):
         config = self.resolved.get("dq", {})
@@ -265,9 +275,12 @@ class RunFeatures:
                 if type(last) is not int or epoch > last:
                     continue
                 if epoch == last:
-                    if series.stream == "promote" and cutoff.get("phase") != "after_epoch_decision":
-                        continue
-                    if cutoff.get("role") == "step":
+                    if series.stream == "promote":
+                        if cutoff.get("phase") != "after_epoch_decision":
+                            continue
+                    elif _partial_epoch(cutoff):
+                        if _unknown_final(cutoff):
+                            continue
                         limit = cutoff.get("batch_index" if series.stream == "gradient" else "attempt_step")
                         if type(limit) is not int or type(point) is not int or point > limit:
                             continue
@@ -280,8 +293,12 @@ class RunFeatures:
             groups = self.groups(series, cutoff)
             rows.extend(self._summaries(series, groups, internal))
         for row in rows:
-            row["cutoff"] = {k: cutoff.get(k) for k in ("role", "epoch", "attempt_step", "batch_index", "phase")} if cutoff else None
-            if cutoff and cutoff.get("role") == "step":
+            row["cutoff"] = {k: cutoff.get(k) for k in ("role", "epoch", "attempt_step", "batch_index", "phase", "epoch_complete")} if cutoff else None
+            if row["source_kind"] == "promote":
+                continue
+            if cutoff and _unknown_final(cutoff):
+                row["range_note"] = f"epoch {cutoff.get('epoch')} excluded: final position unknown"
+            elif _partial_epoch(cutoff):
                 clock = "batch_index" if row["source_kind"] == "gradient" else "attempt_step"
                 if cutoff.get(clock) is None:
                     row["range_note"] = f"missing checkpoint {clock}; through prior complete epoch"
@@ -320,20 +337,40 @@ class RunFeatures:
             left = self.groups(series, left_cutoff)
             right = other.groups(series, right_cutoff)
             allowed = left.keys() & right.keys()
+            exclusions = {}
             for a, b in ((left_cutoff, right_cutoff), (right_cutoff, left_cutoff)):
-                if a and a.get("role") == "step" and a.get("epoch") in allowed:
+                if not _partial_epoch(a):
+                    continue
+                epoch = a.get("epoch")
+                if type(epoch) is not int:
+                    continue
+                if _unknown_final(a):
+                    other_end = b.get("epoch") if b else None
+                    if type(other_end) is not int or epoch <= other_end:
+                        exclusions[epoch] = "final position unknown"
+                    allowed.discard(epoch)
+                    continue
+                if epoch in allowed:
                     key = "batch_index" if series.stream == "gradient" else "attempt_step"
-                    epoch = a["epoch"]
-                    if (not b or b.get("role") != "step" or epoch != b.get("epoch") or type(a.get(key)) is not int
+                    if (not _partial_epoch(b) or epoch != b.get("epoch") or type(a.get(key)) is not int
+                            or a.get("batch_index") != b.get("batch_index")
                             or a.get(key) != b.get(key)):
+                        exclusions[epoch] = "observed partial intervals differ"
                         allowed = allowed - {epoch}
                         continue
+                    if series.stream == "promote":
+                        continue  # Both decisions occurred at matching cutoffs.
                     def bounds(owner):
                         points = [p for e, p, _ in owner.series[series] if e == epoch and type(p) is int and p <= a[key]]
                         return (min(points), max(points)) if points else None
                     if bounds(self) is None or bounds(self) != bounds(other):
+                        exclusions[epoch] = "observed partial intervals differ"
                         allowed = allowed - {epoch}
             a = self._summaries(series, {e: left[e] for e in allowed})
             b = other._summaries(series, {e: right[e] for e in allowed})
+            if exclusions:
+                note = "; ".join(f"epoch {e} excluded: {why}" for e, why in sorted(exclusions.items()))
+                for row in a + b:
+                    row["range_note"] = note
             pairs.extend(zip(a, b))
         return pairs

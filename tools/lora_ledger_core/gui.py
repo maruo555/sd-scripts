@@ -18,7 +18,7 @@ from .scanner import scan, verify
 from .output_root import open_output_ledger
 from .history_transfer import list_saved_exports
 from .notes import save_note
-from .presentation import dataset_info, dataset_tooltip, automatic_dataset, run_time, time_text
+from .presentation import settings_summary, dataset_info, dataset_tooltip, automatic_dataset, run_time, time_text
 from .exporting import export_csv, export_bundle, listing_rows
 from .dialogs import (button, task, show_error, ScanDialog, ComparisonDialog)
 
@@ -558,13 +558,13 @@ class LedgerWindow(QMainWindow):
         self.active_target = None
         self.purpose_kind.setCurrentIndex(max(0, self.purpose_kind.findData(run.get("purpose", "unknown"))))
         self.training_status.setCurrentIndex(max(0, self.training_status.findData(run.get("training_status", "unknown"))))
-        source = run["settings_sources"].get(run.get("settings", {}).get("settings_id"), {})
-        values = source.get("values", {})
-        summary = [("設定の出典", {"metadata": "checkpointのメタ情報（部分記録）", "record": "学習設定ファイル"}.get(source.get("source"), "記録なし")),
+        origin, values = settings_summary(run)
+        summary = [("設定の出典", {"metadata": "checkpointのメタ情報（部分記録）", "record": "学習設定ファイル",
+                               "resolved": "runの実効学習設定"}.get(origin, "記録なし")),
                    ("メタ情報の旧名", " / ".join(run.get("aliases", []))),
                    ("対応", ASSOCIATIONS.get(run["association"], run["association"]))]
         for key, label in (("learning_rate", "学習率"), ("network_dim", "rank"), ("network_alpha", "alpha"),
-                           ("optimizer", "optimizer"), ("optimizer_type", "optimizer_type"),
+                           ("optimizer", "optimizer"),
                            ("seed", "seed"), ("sd_model_name", "base model"),
                            ("network_module", "network module"), ("network_args", "network args")):
             value = values.get(key)

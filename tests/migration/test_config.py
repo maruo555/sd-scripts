@@ -209,3 +209,35 @@ def test_unwired_features_block_standard_entry(parser):
         with pytest.raises(ValueError, match="rank_log"):
             SdxlNetworkTrainer().train(args)
         upstream.assert_not_called()
+
+
+@pytest.mark.parametrize("source", ["cli", "toml"])
+def test_deepspeed_all_off_allowed_custom_update_rejected(parser, tmp_path, source):
+    def resolve(enabled):
+        values = {"network_module": "networks.lora", "deepspeed": True}
+        if enabled:
+            values["grad_norm_mode"] = "gamble"
+        argv = ["--network_module", "networks.lora", "--deepspeed"]
+        if enabled:
+            argv += ["--grad_norm_mode", "gamble"]
+        if source == "toml":
+            argv = ["--config_file", config_file(tmp_path, values)]
+        return config.resolve_training_config(parse_training_args(parser, argv))
+    assert not resolve(False).changes_training
+    with pytest.raises(ValueError, match="deepspeed"):
+        resolve(True)
+
+
+@pytest.mark.parametrize("source", ["cli", "toml", "mixed"])
+def test_foreign_module_rejects_explicit_custom_settings(parser, tmp_path, source):
+    values = {"network_module": "networks.oft", "dq_delta_bits": 8}
+    if source == "cli":
+        argv = ["--network_module", "networks.oft", "--dq_delta_bits", "8"]
+    else:
+        if source == "mixed":
+            del values["network_module"]
+        argv = ["--config_file", config_file(tmp_path, values)]
+        if source == "mixed":
+            argv.extend(["--network_module", "networks.oft"])
+    with pytest.raises(ValueError, match="dq_delta_bits"):
+        parse_training_args(parser, argv)

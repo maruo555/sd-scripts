@@ -182,3 +182,58 @@ def test_published_diagnostic_fallback_requires_missing_csv_matching_pair_and_fu
     assert not any(r["kind"]=="diagnostic" for r in ledger.get_run(run.run_id)["source_refs"])
     with pytest.raises(Conflict):
         data.verify_inputs()
+
+
+@pytest.mark.parametrize("role", ["final", "final_raw"])
+@pytest.mark.parametrize("right_role", ["final", "epoch"])
+def test_common_interval_ends_before_unmatched_final_epoch(tmp_path, role, right_role):
+    sides = []
+    for name, count in [("lhs", 11), ("rhs", 12)]:
+        run = source(tmp_path/name, 6)
+        write(run, "gradient", [dict(epoch=i//2+1, batch_index=i%2, loss=999 if i==11 else i//2+1)
+                                for i in range(count)])
+        sides.append(RunFeatures.load(RunReader(run.directory)))
+    left = dict(role=role, epoch=6, attempt_step=11, batch_index=0, epoch_complete=False)
+    right = dict(role=right_role, epoch=6, attempt_step=12, batch_index=1, epoch_complete=True)
+    def compare(a, b):
+        return next(pair for pair in sides[0].compare(sides[1], a, b) if pair[0]["metric_id"]=="loss.tail_median")
+    for row in compare(left, right):
+        assert row["epochs"] == list(range(1, 6)) and row["value"] == 5 and row["n_valid"] == 10
+        assert "epoch 6 excluded" in row["range_note"]
+    legacy = dict(left, epoch_complete=None, batch_index=None)
+    assert all("final position unknown" in row["range_note"] for row in compare(legacy, right))
+    matching = dict(left, role="final")
+    assert all(row["n_valid"] == 11 and row["value"] == 5.5 for row in compare(left, matching))
+
+
+@pytest.mark.parametrize("cell,energy", [("", None), ("NaN", None), ("invalid", None), ("0", 0.), ("2", 2.)])
+def test_rank_energy_completeness_in_report_heatmap_and_ledger(tmp_path, cell, energy):
+    from tools.lora_diagnostic_rank import analyze_rank
+
+    run = source(tmp_path)
+    names = ["lora_unet_input_blocks_1_to_q", "lora_unet_output_blocks_1_to_k"]
+    rows = [dict(epoch=e, attempt_step=e, scope="unet", module=name, rank_dim=4,
+                 rank_energy=1., rank_sat=.8, rank_top1=.7) for e in range(1, 6) for name in names]
+    path = write(run, "rank", rows, expected_modules_by_scope={"unet": names})
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        records = list(csv.DictReader(stream))
+    for row in records:
+        if row["module"] == names[1]:
+            row["rank_energy"] = cell
+    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, HEADERS["rank"])
+        writer.writeheader()
+        writer.writerows(records)
+    reader = RunReader(run.directory)
+    report = analyze_rank(reader, reader.stream("rank").rows, dict.fromkeys(names, 4))
+    metric = value(RunFeatures.load(reader).summarize(), "rank_energy.tail_median")
+    total = None if energy is None else 1 + energy
+    share = None if total is None else 1 / total
+    assert report["summary"]["final_rank_energy_sum"] == metric["value"] == total
+    assert metric["n_missing"] == (5 if energy is None else 0)
+    groups = report["grouped"]["path"]["rows"][0]["groups"]
+    assert groups["up"]["RankEnergySum"] == energy and groups["down"]["RankEnergyShare"] == share
+    heatmap = report["final_heatmaps"]["energy_share_per_param"]
+    assert next(c for row in heatmap["rows"] for c in row["cells"]
+                if c["role"]=="to_q" and c["path"]=="down")["value"] == share
+    assert report["rows"][0]["RankSatP95"] == .8

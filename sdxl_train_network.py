@@ -273,11 +273,11 @@ def parse_training_args(parser, argv=None):
             maruo_config.reject_retired(token.partition("=")[0], "command line")
 
     args = parser.parse_args(argv)
-    custom_cli = maruo_config.OPTIONS.keys() & vars(args).keys()
     args_util.verify_command_line_training_args(args)
     args = args_util.read_config_from_file(args, parser, argv=argv)
-    if custom_cli and args.network_module != "networks.lora":
-        raise ValueError(f"{sorted(custom_cli)}: custom SDXL options require --network_module networks.lora")
+    custom_options = maruo_config.OPTIONS.keys() & vars(args).keys()
+    if custom_options and args.network_module != "networks.lora":
+        raise ValueError(f"{sorted(custom_options)}: custom SDXL options require --network_module networks.lora")
     return args
 
 

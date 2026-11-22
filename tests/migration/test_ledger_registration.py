@@ -162,3 +162,22 @@ def test_cli_arm_and_cancel(tmp_path, capsys):
     ledger = open_output_ledger(folder)
     assert apply_scan(ledger, scan(ledger), cancel=lambda: True)["cancelled"]
     assert len(ledger.list_runs()) == 1
+
+
+def test_listing_optimizer_and_provenance_after_scan(tmp_path):
+    from tools.lora_ledger_core.exporting import listing_rows
+    from tools.lora_ledger_core.presentation import settings_summary
+
+    ledger = open_output_ledger(tmp_path/"ledger", create=True)
+    run = TrainingRun.create(tmp_path, "example", 1)
+    values = {"optimizer_type": "AdamW8bitFast", "network_dim": 4, "learning_rate": .001}
+    save_settings(run, {}, resolved={"args": values})
+    apply(ledger)
+    row, = listing_rows(ledger)
+    assert (row["optimizer"], row["設定出典"], row["rank"]) == ("AdamW8bitFast", "resolved", 4)
+    saved = ledger.get_run(run.run_id)
+    del saved["settings_sources"]["resolved"]["source"]
+    assert settings_summary(saved)[0] == "resolved"
+    legacy = {"settings": {"settings_id": "old"}, "settings_sources": {
+        "old": {"source": "metadata", "values": {"optimizer": "AdamW"}}}}
+    assert settings_summary(legacy) == ("metadata", {"optimizer": "AdamW"})

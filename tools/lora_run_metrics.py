@@ -88,18 +88,25 @@ def _finite(value):
     return isinstance(value, (int, float)) and math.isfinite(value)
 
 
+def rank_energy_total(records):
+    values = [row.get("rank_energy") for row in records]
+    return sum(values) if values and all(_finite(v) for v in values) else None
+
+
 def rank_fields(records, completeness_issues):
     """Six legacy diagnostic summaries; records and issues come from rank_observations()."""
     rows = [] if completeness_issues else records
-    energies = [r["rank_energy"] for r in rows if _finite(r.get("rank_energy"))]
-    total = sum(energies) if energies else None
+    total = rank_energy_total(rows)
     def values(field):
         all_values = [row for row in rows if _finite(row.get(field))]
         positive = [r for r in all_values if _finite(r.get("rank_energy")) and r["rank_energy"] > 1e-12]
         return [r[field] for r in positive or all_values]
     sat = values("rank_sat")
     pairs = [r["rank_sat"] * r["rank_energy"] for r in rows if _finite(r.get("rank_sat")) and _finite(r.get("rank_energy"))]
-    return dict(RankSatWMean=sum(pairs) / total if pairs and total > 1e-12 else 0.0 if pairs else None,
+    weighted_sat = None
+    if total is not None and len(pairs) == len(rows):
+        weighted_sat = sum(pairs) / total if total > 1e-12 else 0.0
+    return dict(RankSatWMean=weighted_sat,
                 RankSatP50=quantile(sat, 0.5), RankSatP95=quantile(sat, 0.95), RankSatMax=max(sat, default=None),
                 RankTop1P95=quantile(values("rank_top1"), 0.95), RankEnergySum=total)
 

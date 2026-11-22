@@ -160,7 +160,7 @@ def _propose(reader, root, root_id, previous, full, cancel, issues):
     if resolved is None:
         run.update(settings_sources={}, settings={})
     else:
-        run["settings_sources"] = {"resolved": {"resolved": resolved, "values": resolved.get("args", {})}}
+        run["settings_sources"] = {"resolved": {"source": "resolved", "resolved": resolved, "values": resolved.get("args", {})}}
         run["settings"] = {"settings_id": "resolved", "values": resolved.get("args", {})}
     refresh_dataset(run)
     run["artifacts"] = _weights(reader, root, root_id, run["artifacts"], resolved, full, cancel, issues)
