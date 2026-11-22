@@ -1,4 +1,4 @@
-"""Durable attempt receipts shared by the GUI, comparison CLI and generator worker."""
+"""Track comparison results and control running generator processes."""
 import json
 import os
 from pathlib import Path
@@ -37,14 +37,8 @@ def is_running(record):
         return False
 
 
-def find_result(receipt_path,comparison_id,attempt_id):
-    receipt_path=Path(receipt_path)
-    if not receipt_path.is_file():
-        return None
-    receipt=json.loads(receipt_path.read_text(encoding="utf-8"))
-    if (receipt["comparison_id"],receipt["attempt_id"])!=(comparison_id,attempt_id):
-        raise ValueError("queue receipt does not match the running comparison")
-    folder=Path(receipt["directory"])
+def find_result(directory, comparison_id, attempt_id):
+    folder = Path(directory)
     if (folder/"metadata.json").is_file():
         meta,_,_=read_comparison(folder)
         if (meta["comparison_id"],meta["attempt_id"])!=(comparison_id,attempt_id):
@@ -56,7 +50,7 @@ def find_result(receipt_path,comparison_id,attempt_id):
     for file in (folder/"worker/generator-process.json", folder/"worker/worker-process.json"):
         if file.is_file() and is_running(json.loads(file.read_text(encoding="utf-8"))):
             return "running",None
-    return ("running",None) if is_running(receipt["process"]) else None
+    return None
 
 
 def run_generator(command,cwd,control_dir,cancel_file):

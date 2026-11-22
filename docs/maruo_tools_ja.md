@@ -104,12 +104,15 @@ GUIを初めて使うときは、このリポジトリの仮想環境に `& $pyt
 3. **Run report** で生成します。計画だけを確かめる場合は **Dry run** にチェックを付けます。比較ごとに「日時・実行名・試行IDの先頭」を含む新しいフォルダが出力ルートにできます。生成済みの比較は **Open report** で開けます。
 4. まとめて実行するときは **Add to queue** → **Run queue** を使います。**Stop after current** は現在の比較が終わってから停止し、失敗・中止・部分完了の項目は **Retry selected** で待機に戻し、**Run queue** で新しい試行として実行できます。
 
+比較結果は **Output root** の下に保存され、**Open report** で開けます。キューの保存先は `.tmp/queue/queue_state.json` です。GUIはこのファイルに記録した出力先と実行IDを使って、再起動後もキュー項目と比較結果を照合します。
+
 ### 同じ設定をCUIで再利用する
 
-GUIで **Run report** を押したときの設定は `.tmp/lora_report_gui_last.json` に保存されます。再利用したい比較は次のGUI実行の前に別名で残します。例の `study.json` は新しいファイル名に置き換えられます。
+GUIは Model、Output root、Generation、Common args を `.tmp/lora_report_gui_last.json` に記憶します。Prompt file、LoRA条件、seed は比較ごとに指定します。比較をそのままCUIで再実行するときは、**Run report** が作成した比較フォルダの `config.json` を使います。
 
 ```powershell
-Copy-Item .\.tmp\lora_report_gui_last.json .\study.json
+$reportDir = Read-Host "GUIで作成した比較フォルダのパス"
+Copy-Item (Join-Path $reportDir "config.json") .\study.json
 & $python sdxl_lora_report_cui.py --config .\study.json --dry-run
 & $python sdxl_lora_report_cui.py --config .\study.json
 ```

@@ -9,6 +9,7 @@ import psutil
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QProcess, QTimer, Qt, QUrl
@@ -45,7 +46,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tools.lora_report_plan import freeze_comparison, sanitize_id
+from tools.lora_report_plan import attempt_directory, freeze_comparison, sanitize_id
 from tools.lora_report_queue import atomic_json, find_result, is_running, process_identity
 
 from library.generation_lora_strengths import (
@@ -348,7 +349,7 @@ class MainWindow(QMainWindow):
         self._updating_tree = False
         self._build_ui()
         self._set_defaults()
-        self.restore_last_generation_settings()
+        self.restore_last_settings()
         self.active_attempt = None
         self.load_queue()
         self.reconcile_timer = QTimer(self)
@@ -627,21 +628,56 @@ class MainWindow(QMainWindow):
         self.precision_combo.setCurrentText("bf16")
         self.attention_combo.setCurrentText("sdpa")
 
-    def restore_last_generation_settings(self):
+    def generation_settings(self):
+        return {
+            "width": self.width_spin.value(),
+            "height": self.height_spin.value(),
+            "steps": self.steps_spin.value(),
+            "sampler": self.sampler_combo.currentText().strip(),
+            "scale": self.scale_spin.value(),
+            "batch_size": self.batch_spin.value(),
+        }
+
+    def save_last_settings(self):
+        settings = {
+            "model": self.model_edit.text(),
+            "output_root": self.output_edit.text(),
+            "generation": self.generation_settings(),
+            "common_args": {
+                "precision": self.precision_combo.currentText(),
+                "attention": self.attention_combo.currentText(),
+                "extra_args": self.extra_args_edit.text(),
+            },
+        }
+        try:
+            atomic_json(GUI_CONFIG_PATH, settings)
+        except OSError as exc:
+            self.log(f"Could not save GUI settings: {exc}")
+
+    def restore_last_settings(self):
         if not GUI_CONFIG_PATH.exists():
             return
         try:
             with GUI_CONFIG_PATH.open("r", encoding="utf-8") as f:
-                config = json.load(f)
-        except Exception as exc:
-            self.log(f"Could not restore last settings: {exc}")
+                settings = json.load(f)
+            if not isinstance(settings, dict):
+                raise ValueError("Expected a settings object")
+            if "output_root" in settings:
+                self.output_edit.setText(str(settings["output_root"]))
+            self.model_edit.setText(str(settings.get("model", "")))
+            self.apply_generation_settings(settings.get("generation", {}))
+            common = settings.get("common_args", {})
+            if "precision" in common:
+                self.precision_combo.setCurrentText(common["precision"])
+            if "attention" in common:
+                self.attention_combo.setCurrentText(common["attention"])
+            self.extra_args_edit.setText(common.get("extra_args", ""))
+        except (OSError, ValueError, AttributeError, TypeError) as exc:
+            self.log(f"Could not restore GUI settings: {exc}")
             return
+        self.log(f"Restored GUI settings from {GUI_CONFIG_PATH}")
 
-        gen_config = config.get("sdxl_gen_img", {})
-        model = gen_config.get("ckpt")
-        if model:
-            self.model_edit.setText(str(model))
-
+    def apply_generation_settings(self, gen_config):
         self._set_spin_value(self.width_spin, gen_config.get("width"))
         self._set_spin_value(self.height_spin, gen_config.get("height"))
         self._set_spin_value(self.steps_spin, gen_config.get("steps"))
@@ -651,9 +687,6 @@ class MainWindow(QMainWindow):
         sampler = gen_config.get("sampler")
         if sampler:
             self.sampler_combo.setCurrentText(str(sampler))
-
-        self.restore_common_args(gen_config.get("common_args", []))
-        self.log(f"Restored generation settings from {GUI_CONFIG_PATH}")
 
     def _set_spin_value(self, spin, value):
         if value is None:
@@ -1082,12 +1115,7 @@ class MainWindow(QMainWindow):
             "prompt_file": prompt_file,
             "sdxl_gen_img": {
                 "ckpt": model,
-                "width": self.width_spin.value(),
-                "height": self.height_spin.value(),
-                "steps": self.steps_spin.value(),
-                "sampler": self.sampler_combo.currentText().strip(),
-                "scale": self.scale_spin.value(),
-                "batch_size": self.batch_spin.value(),
+                **self.generation_settings(),
                 "images_per_prompt": 1,
                 "common_args": self.common_args(),
             },
@@ -1095,10 +1123,6 @@ class MainWindow(QMainWindow):
             "include_baseline": self.baseline_check.isChecked(),
             "loras": loras,
         }
-
-    def write_gui_config(self, config: dict) -> Path:
-        atomic_json(GUI_CONFIG_PATH, config)
-        return GUI_CONFIG_PATH
 
     def load_queue(self):
         if QUEUE_STATE_PATH.exists():
@@ -1115,14 +1139,17 @@ class MainWindow(QMainWindow):
         atomic_json(QUEUE_STATE_PATH, {"items": self.queue})
 
     def reconcile_queue(self):
-        changed = False
+        resolved = []
         for index, item in enumerate(self.queue):
             if item["status"] != "Running" or (self.process is not None and self.running_queue_index == index):
                 continue
             if self.resolve_attempt(item, orphan=True):
-                changed = True
-        if changed:
+                resolved.append(item)
+        if resolved:
             self.save_queue()
+            for item in resolved:
+                if item.get("attempt"):
+                    self.clear_cancel_request(item["attempt"])
             self.refresh_queue_tree()
             self.update_queue_buttons()
 
@@ -1132,7 +1159,7 @@ class MainWindow(QMainWindow):
             item["status"] = "Waiting" if orphan else "Failed"
             return True
         try:
-            result = find_result(attempt["receipt"], attempt["comparison_id"], attempt["id"])
+            result = find_result(attempt["directory"], attempt["comparison_id"], attempt["id"])
         except (OSError, KeyError, ValueError, TypeError) as exc:
             self.log(f"Could not verify comparison: {exc}")
             item["status"] = "Failed"
@@ -1144,7 +1171,7 @@ class MainWindow(QMainWindow):
             item["status"] = {"done": "Done", "dry_run": "Dry run", "partial": "Partial",
                               "cancelled": "Canceled", "failed": "Failed"}[outcome]
             item["report_path"] = str(path)
-        elif Path(attempt["cancel"]).is_file():
+        elif self.cancel_path(attempt).is_file():
             item["status"] = "Canceled"
         else:
             item["status"] = "Waiting" if orphan else "Failed"
@@ -1183,6 +1210,7 @@ class MainWindow(QMainWindow):
         self.queue.append(item)
         self.save_queue()
         self.refresh_queue_tree()
+        self.save_last_settings()
         self.log(f"Queued: {config.get('run_name', 'lora_report')}")
 
     def queue_summary(self, config: dict) -> dict:
@@ -1223,20 +1251,26 @@ class MainWindow(QMainWindow):
         self.start_next_queue_item()
 
     def start_next_queue_item(self):
-        next_index = None
         for index, item in enumerate(self.queue):
-            if item.get("status") == "Waiting":
-                next_index = index
-                break
-        if next_index is None:
+            if item["status"] != "Waiting":
+                continue
+            try:
+                item["attempt"] = self.new_attempt(item["config"])
+            except (KeyError, ValueError) as exc:
+                item["status"] = "Failed"
+                item["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                self.log(f"Invalid queued comparison: {exc}")
+                self.save_queue()
+                self.refresh_queue_tree()
+                continue
+            self.running_queue_index = index
+            break
+        else:
             self.running_queue_index = None
             self.update_queue_buttons()
             self.log("Queue finished.")
             return
 
-        self.running_queue_index = next_index
-        item = self.queue[next_index]
-        item["attempt"] = self.new_attempt(item["config"])
         item["status"] = "Running"
         item["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         item["finished_at"] = ""
@@ -1246,23 +1280,31 @@ class MainWindow(QMainWindow):
         self.refresh_queue_tree()
         options = item.get("options", {})
         self.start_process_for_config(
-            self.queue_config_path(item),
+            item["config"],
             "queue",
             dry_run=bool(options.get("dry_run")), attempt=item["attempt"],
         )
 
-    def queue_config_path(self, item: dict) -> Path:
-        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-        path = QUEUE_DIR / f"{item['id']}.json"
-        atomic_json(path, item["config"])
-        return path
-
     @staticmethod
     def new_attempt(config):
         attempt_id = str(uuid.uuid4())
-        directory = QUEUE_DIR / "attempts" / attempt_id
-        return {"id": attempt_id, "comparison_id": config["_comparison_plan"]["comparison_id"],
-                "receipt": str(directory / "receipt.json"), "cancel": str(directory / "cancel.json")}
+        started_at = datetime.now()
+        return {
+            "id": attempt_id,
+            "comparison_id": config["_comparison_plan"]["comparison_id"],
+            "started_at": started_at.isoformat(),
+            "directory": str(attempt_directory(config, attempt_id, started_at)),
+        }
+
+    @staticmethod
+    def cancel_path(attempt):
+        return QUEUE_DIR / f"cancel-{uuid.UUID(attempt['id'])}.json"
+
+    def clear_cancel_request(self, attempt):
+        try:
+            self.cancel_path(attempt).unlink(missing_ok=True)
+        except OSError as exc:
+            self.log(f"Could not clear cancellation request: {exc}")
 
     def stop_after_current(self):
         self.stop_after_current_requested = True
@@ -1272,7 +1314,7 @@ class MainWindow(QMainWindow):
     def cancel_running(self):
         for item in self.queue:
             if item["status"] == "Running" and item.get("attempt"):
-                atomic_json(item["attempt"]["cancel"], {"attempt_id": item["attempt"]["id"]})
+                atomic_json(self.cancel_path(item["attempt"]), {"attempt_id": item["attempt"]["id"]})
                 self.log("Cancellation requested. Waiting for the worker and generator to stop.")
 
     def remove_selected_queue_items(self):
@@ -1315,13 +1357,7 @@ class MainWindow(QMainWindow):
 
         gen_config = config.get("sdxl_gen_img", {})
         self.model_edit.setText(str(gen_config.get("ckpt") or ""))
-        self._set_spin_value(self.width_spin, gen_config.get("width"))
-        self._set_spin_value(self.height_spin, gen_config.get("height"))
-        self._set_spin_value(self.steps_spin, gen_config.get("steps"))
-        self._set_spin_value(self.scale_spin, gen_config.get("scale"))
-        self._set_spin_value(self.batch_spin, gen_config.get("batch_size"))
-        if gen_config.get("sampler"):
-            self.sampler_combo.setCurrentText(str(gen_config.get("sampler")))
+        self.apply_generation_settings(gen_config)
         self.restore_common_args(gen_config.get("common_args", []))
 
         seed_config = config.get("seeds", {})
@@ -1379,7 +1415,7 @@ class MainWindow(QMainWindow):
             return
         try:
             config = freeze_comparison(self.build_config(), SCRIPT_DIR)
-            config_path = self.write_gui_config(config)
+            attempt = self.new_attempt(config)
         except Exception as exc:
             QMessageBox.warning(self, "Invalid settings", str(exc))
             return
@@ -1387,16 +1423,18 @@ class MainWindow(QMainWindow):
         self.current_report = None
         self.open_report_button.setEnabled(False)
         self.log_edit.clear()
+        self.save_last_settings()
         self.start_process_for_config(
-            config_path,
+            config,
             "single",
-            dry_run=self.dry_run_check.isChecked(), attempt=self.new_attempt(config),
+            dry_run=self.dry_run_check.isChecked(), attempt=attempt,
         )
 
-    def start_process_for_config(self, config_path: Path, mode: str, dry_run: bool, attempt: dict):
-        args = [str(SCRIPT_DIR / "sdxl_lora_report_cui.py"), "--config", str(config_path)]
+    def start_process_for_config(self, config: dict, mode: str, dry_run: bool, attempt: dict):
+        args = [str(SCRIPT_DIR / "sdxl_lora_report_cui.py"), "--config", "-"]
         self.active_attempt = attempt
-        args.extend(["--attempt-id", attempt["id"], "--receipt", attempt["receipt"], "--cancel-file", attempt["cancel"]])
+        args.extend(["--attempt-id", attempt["id"], "--started-at", attempt["started_at"],
+                     "--cancel-file", str(self.cancel_path(attempt))])
         if dry_run:
             args.append("--dry-run")
 
@@ -1404,7 +1442,7 @@ class MainWindow(QMainWindow):
         self.process.setWorkingDirectory(str(SCRIPT_DIR))
         self.process.setProgram(sys.executable)
         self.process.setArguments(args)
-        self.process.started.connect(self.record_running_process)
+        self.process.started.connect(lambda: self.send_running_config(config))
         self.process.errorOccurred.connect(self.process_error)
         self.process.setProcessChannelMode(QProcess.MergedChannels)
         self.process.readyReadStandardOutput.connect(self.read_process_output)
@@ -1414,7 +1452,7 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.update_queue_buttons()
-        self.log(f"Config: {config_path}")
+        self.log(f"Comparison output: {attempt['directory']}")
         self.process.start()
 
     def read_process_output(self):
@@ -1422,15 +1460,23 @@ class MainWindow(QMainWindow):
             return
         text = bytes(self.process.readAllStandardOutput()).decode(errors="replace")
         self.log(text.rstrip())
-    def record_running_process(self):
+
+    def send_running_config(self, config):
         pid = int(self.process.processId())
         if pid:
             try:
                 self.active_attempt["process"] = process_identity(pid)
             except (OSError, psutil.Error):
-                return
+                pass
+        try:
             if self.process_mode == "queue":
                 self.save_queue()
+            payload = json.dumps(config, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            self.process.write(payload)
+        except (OSError, ValueError) as exc:
+            self.log(f"Could not submit comparison: {exc}")
+        finally:
+            self.process.closeWriteChannel()
 
     def process_error(self, error):
         if error == QProcess.FailedToStart:
@@ -1458,13 +1504,15 @@ class MainWindow(QMainWindow):
         if mode == "queue":
             self.save_queue()
             self.refresh_queue_tree()
+        if item["status"] != "Running":
+            self.clear_cancel_request(item["attempt"])
         self.update_queue_buttons()
         if mode == "queue" and not self.stop_after_current_requested and item["status"] != "Running":
             self.start_next_queue_item()
 
     def stop_report(self):
         if self.active_attempt:
-            atomic_json(self.active_attempt["cancel"], {"attempt_id": self.active_attempt["id"]})
+            atomic_json(self.cancel_path(self.active_attempt), {"attempt_id": self.active_attempt["id"]})
             self.log("Cancellation requested. Waiting for the worker and generator to stop.")
 
     def closeEvent(self, event):
@@ -1472,6 +1520,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Comparison running", "Stop the current comparison or wait for it to finish before closing.")
             event.ignore()
             return
+        self.save_last_settings()
         super().closeEvent(event)
 
     def open_report(self):

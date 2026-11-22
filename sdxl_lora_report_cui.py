@@ -8,11 +8,11 @@ import os
 import subprocess
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from tools.lora_report_plan import make_attempt, order_jobs_for_generation
 from tools.lora_report_result import comparison_jobs
-from tools.lora_report_queue import atomic_json, process_identity
 
 
 def write_json(path, record):
@@ -52,10 +52,17 @@ def worker_result(directory,config,jobs,attempt_id,dry_run,cancel_file=None):
 
 
 def run(args):
-    config_path=Path(args.config).resolve()
-    original=config_path.read_bytes()
+    if args.config == "-":
+        original = sys.stdin.buffer.read()
+        config_dir = Path.cwd()
+    else:
+        config_path = Path(args.config).resolve()
+        original = config_path.read_bytes()
+        config_dir = config_path.parent
     attempt_id=str(uuid.UUID(args.attempt_id)) if args.attempt_id else str(uuid.uuid4())
-    directory,config,jobs=make_attempt(json.loads(original.decode("utf-8-sig")),config_path.parent,attempt_id)
+    directory, config, jobs = make_attempt(
+        json.loads(original.decode("utf-8-sig")), config_dir, attempt_id, getattr(args, "started_at", None)
+    )
     frozen=config["_comparison_plan"]
     # Validate restored queue data and its relative targets before giving the worker any paths.
     preview=dict(kind="lora_image_comparison",schema_version=1,comparison_id=frozen["comparison_id"],attempt_id=attempt_id,
@@ -63,9 +70,6 @@ def run(args):
                  jobs=[dict(j,status="dry_run",returncode=None) for j in jobs])
     comparison_jobs(preview,directory)
     directory.mkdir(parents=True,exist_ok=False)
-    if getattr(args, "receipt", None):
-        atomic_json(args.receipt, {"comparison_id": frozen["comparison_id"], "attempt_id": attempt_id,
-                                   "directory": str(directory), "process": process_identity(os.getpid())})
     (directory/"config.json").write_bytes(original)
     (directory/"prompts.txt").write_bytes(base64.b64decode(frozen["prompt_file_base64"],validate=True))
     write_json(directory/"prompts.parsed.json",{"source":config["prompt_file"], "prompts":frozen["prompts"]})
@@ -97,7 +101,7 @@ def main():
     parser.add_argument("--config",required=True)
     parser.add_argument("--dry-run",action="store_true",help="Build the exact generation plan without launching the generator")
     parser.add_argument("--attempt-id",help=argparse.SUPPRESS)
-    parser.add_argument("--receipt",help=argparse.SUPPRESS)
+    parser.add_argument("--started-at", type=datetime.fromisoformat, help=argparse.SUPPRESS)
     parser.add_argument("--cancel-file",help=argparse.SUPPRESS)
     args=parser.parse_args()
     try:

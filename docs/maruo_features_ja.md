@@ -175,12 +175,13 @@ LoRA 1本の生成例です。次の3値はTE1、TE2、UNetの順です。UNet�
 ```powershell
 & .\venv\Scripts\python.exe sdxl_gen_img.py --ckpt $modelPath --network_module networks.lora_lbw --network_weights (Join-Path $runDir "example_r4.safetensors") --network_mul 0.8 0.25 0.5 --network_lbw XLMLT1 --from_file prompts.txt --outdir ..\generated --bf16 --sdpa
 & .\venv\Scripts\python.exe sdxl_lora_report_gui.py
-Copy-Item .\.tmp\lora_report_gui_last.json .\study.json
+$reportDir = Read-Host "GUIで作成した比較フォルダのパス"
+Copy-Item (Join-Path $reportDir "config.json") .\study.json
 & .\venv\Scripts\python.exe sdxl_lora_report_cui.py --config study.json --dry-run
 & .\venv\Scripts\python.exe sdxl_lora_report_cui.py --config study.json
 ```
 
-GUIでモデル・LoRA・prompt・seedを決めて「Run report」を押すと、今回の設定が `.tmp/lora_report_gui_last.json` に保存されます。上の例はこの設定を `study.json` にコピーしてCUIで使います。`--dry-run` は条件とjobを組み立てます。画像生成は同じコマンドから `--dry-run` を外して開始します。N本のLoRAならN値までが各slotの共通強度、2N値が各slotのTE共通とUNet、3N値がTE1・TE2・UNetです。prompt内の `--am 0.4,0.3,0.7` はその行だけ上書きします。部位分割指定とmerge／precalcの組合せは対象外です。GUI初期設定と手書きJSONの省略時既定は異なるため、比較では保存した設定を共用します。
+GUIでモデル・LoRA・prompt・seedを決めて「Run report」を押すと、その比較フォルダに `config.json` が保存されます。上の例はこの設定を `study.json` にコピーしてCUIで使います。`--dry-run` は条件とjobを組み立てます。画像生成は同じコマンドから `--dry-run` を外して開始します。N本のLoRAならN値までが各slotの共通強度、2N値が各slotのTE共通とUNet、3N値がTE1・TE2・UNetです。prompt内の `--am 0.4,0.3,0.7` はその行だけ上書きします。部位分割指定とmerge／precalcの組合せは対象外です。GUI初期設定と手書きJSONの省略時既定は異なるため、比較では保存した設定を共用します。
 
 1. 比較フォルダの `report.html` で生成できた画像を確認します。blindで採点するときは `blind_report.html` または `blind_report_detailed.html` を先に開きます。
 2. 詳細blindでは開示後に「集計CSVを保存」で採点を書き出せます。未採点・同順位・画像欠落の扱いが区別されます。比較フォルダには `metadata.json` と対応する画像を一緒に保管します。

@@ -2,6 +2,7 @@
 import base64
 import copy
 import csv
+from datetime import datetime
 import json
 import os
 import random
@@ -423,15 +424,17 @@ def freeze_comparison(config, config_dir):
     return config
 
 
-def make_attempt(config,config_dir,attempt_id):
-    import datetime as dt
+def attempt_directory(config, attempt_id, started_at):
+    name = sanitize_id(config.get("run_name"), "lora_report")
+    timestamp = started_at.strftime("%Y%m%d_%H%M%S_%f")
+    return Path(config["output_root"]) / f"{timestamp}_{name}_{uuid.UUID(attempt_id).hex[:8]}"
+
+
+def make_attempt(config, config_dir, attempt_id, started_at=None):
     config=freeze_comparison(config,config_dir)
     frozen=config["_comparison_plan"]
     uid=uuid.UUID(frozen["comparison_id"])
-    attempt=uuid.UUID(attempt_id)
-    name=sanitize_id(config.get("run_name"),"lora_report")
-    timestamp=dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    directory=Path(config["output_root"])/(timestamp+"_"+name+"_"+attempt.hex[:8])
+    directory = attempt_directory(config, attempt_id, started_at or datetime.now())
     conditions=frozen["conditions"]
     slots=build_lora_slots(conditions)
     jobs=[]
