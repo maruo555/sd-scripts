@@ -2,6 +2,7 @@ import argparse
 from dataclasses import (
     asdict,
     dataclass,
+    field,
 )
 import functools
 import random
@@ -80,6 +81,7 @@ class BaseSubsetParams:
     validation_seed: int = 0
     validation_split: float = 0.0
     resize_interpolation: Optional[str] = None
+    group: Optional[str] = field(default=None, kw_only=True)
 
 
 @dataclass
@@ -274,27 +276,39 @@ class ConfigSanitizer:
         "dataset_repeats": "num_repeats",
     }
 
-    def __init__(self, support_dreambooth: bool, support_finetuning: bool, support_controlnet: bool, support_dropout: bool) -> None:
+    def __init__(
+        self,
+        support_dreambooth: bool,
+        support_finetuning: bool,
+        support_controlnet: bool,
+        support_dropout: bool,
+        *,
+        support_subset_group: bool = False,
+    ) -> None:
         assert support_dreambooth or support_finetuning or support_controlnet, (
             "Neither DreamBooth mode nor fine tuning mode nor controlnet mode specified. Please specify one mode or more."
             + " / DreamBooth モードか fine tuning モードか controlnet モードのどれも指定されていません。1つ以上指定してください。"
         )
 
+        subset_schema = self.SUBSET_ASCENDABLE_SCHEMA
+        if support_subset_group:
+            subset_schema = {**subset_schema, "group": str}
+
         self.db_subset_schema = self.__merge_dict(
-            self.SUBSET_ASCENDABLE_SCHEMA,
+            subset_schema,
             self.DB_SUBSET_DISTINCT_SCHEMA,
             self.DB_SUBSET_ASCENDABLE_SCHEMA,
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
         )
 
         self.ft_subset_schema = self.__merge_dict(
-            self.SUBSET_ASCENDABLE_SCHEMA,
+            subset_schema,
             self.FT_SUBSET_DISTINCT_SCHEMA,
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
         )
 
         self.cn_subset_schema = self.__merge_dict(
-            self.SUBSET_ASCENDABLE_SCHEMA,
+            subset_schema,
             self.CN_SUBSET_DISTINCT_SCHEMA,
             self.CN_SUBSET_ASCENDABLE_SCHEMA,
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
@@ -302,7 +316,7 @@ class ConfigSanitizer:
 
         self.db_dataset_schema = self.__merge_dict(
             self.DATASET_ASCENDABLE_SCHEMA,
-            self.SUBSET_ASCENDABLE_SCHEMA,
+            subset_schema,
             self.DB_SUBSET_ASCENDABLE_SCHEMA,
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
             {"subsets": [self.db_subset_schema]},
@@ -310,14 +324,14 @@ class ConfigSanitizer:
 
         self.ft_dataset_schema = self.__merge_dict(
             self.DATASET_ASCENDABLE_SCHEMA,
-            self.SUBSET_ASCENDABLE_SCHEMA,
+            subset_schema,
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
             {"subsets": [self.ft_subset_schema]},
         )
 
         self.cn_dataset_schema = self.__merge_dict(
             self.DATASET_ASCENDABLE_SCHEMA,
-            self.SUBSET_ASCENDABLE_SCHEMA,
+            subset_schema,
             self.CN_SUBSET_ASCENDABLE_SCHEMA,
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
             {"subsets": [self.cn_subset_schema]},
@@ -356,7 +370,7 @@ class ConfigSanitizer:
 
         self.general_schema = self.__merge_dict(
             self.DATASET_ASCENDABLE_SCHEMA,
-            self.SUBSET_ASCENDABLE_SCHEMA,
+            subset_schema,
             self.DB_SUBSET_ASCENDABLE_SCHEMA if support_dreambooth else {},
             self.CN_SUBSET_ASCENDABLE_SCHEMA if support_controlnet else {},
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
@@ -480,6 +494,29 @@ class BlueprintGenerator:
                 return value
 
         return default_value
+
+def validate_custom_training_datasets(blueprint: DatasetGroupBlueprint) -> None:
+    """Check effective dataset settings before loading models for training-altering SDXL options."""
+    for index, dataset in enumerate(blueprint.datasets):
+        sources = [getattr(subset.params, "metadata_file", None) or subset.params.image_dir for subset in dataset.subsets]
+        if dataset.params.network_multiplier != 1.0:
+            raise ValueError(
+                f"datasets[{index}] {sources}: network_multiplier={dataset.params.network_multiplier}. "
+                "Custom SDXL training requires network_multiplier=1.0."
+            )
+        if dataset.params.batch_size != 1:
+            raise ValueError(
+                f"datasets[{index}] {sources}: batch_size={dataset.params.batch_size}. "
+                "Custom SDXL training requires batch_size=1."
+            )
+        for subset_index, subset in enumerate(dataset.subsets):
+            preservation = (subset.params.custom_attributes or {}).get("diff_output_preservation")
+            if preservation:
+                raise ValueError(
+                    f"datasets[{index}].subsets[{subset_index}] {sources[subset_index]}: "
+                    f"diff_output_preservation={preservation!r} is unsupported with custom SDXL training."
+                )
+
 
 def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlueprint) -> Tuple[DatasetGroup, Optional[DatasetGroup]]:
     datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []

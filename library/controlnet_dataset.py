@@ -87,6 +87,7 @@ class ControlNetDataset(BaseDataset):
                 resize_interpolation=subset.resize_interpolation,
                 enable_multiline_caption=subset.enable_multiline_caption,
                 multiline_caption_separator=subset.multiline_caption_separator,
+                group=subset.group,
             )
             db_subsets.append(db_subset)
 

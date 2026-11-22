@@ -1,0 +1,2 @@
+# Optional Triton kernels for Windows x64 with PyTorch 2.9.x (tested with torch 2.9.1+cu130).
+triton-windows==3.5.1.post24

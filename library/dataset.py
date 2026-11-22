@@ -490,6 +490,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         self.image_data: Dict[str, ImageInfo] = {}
         self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
+        self.record_promote_labels = False
         self.dataset_index: Optional[int] = None  # index in the DatasetGroup, set by the group
 
         # True if any image has multiple caption candidates (enable_multiline_caption with separator lines).
@@ -1170,11 +1171,14 @@ class BaseDataset(torch.utils.data.Dataset):
         masks = []
         masked_images = []
         subset_indices = []
+        class_tokens = [] if self.record_promote_labels else None
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
             subset_indices.append((self.dataset_index, self.get_subset_index(subset)))
+            if class_tokens is not None:
+                class_tokens.append(getattr(subset, "class_tokens", None))
 
             custom_attributes.append(subset.custom_attributes)
 
@@ -1422,6 +1426,8 @@ class BaseDataset(torch.utils.data.Dataset):
         example["image_keys"] = bucket[image_index : image_index + bucket_batch_size]
         # (index of the dataset in the group, index of the subset in the dataset), the same order as `ss_datasets` in the metadata
         example["subset_indices"] = subset_indices
+        if class_tokens is not None:
+            example["class_tokens"] = class_tokens
         return example
 
     @staticmethod

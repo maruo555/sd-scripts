@@ -25,6 +25,7 @@ from accelerate.utils import set_seed
 from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+from library.training_run_weights import WeightMoment, publish_weight, record_weight, remove_weight, weight_args
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd
 
 import library.accelerator_setup as accelerator_setup
@@ -68,6 +69,8 @@ class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
+        self.training_run = None
+        self.run_output = None
         self.run_controller = run_control.RunController(None)  # disabled until train() creates the real one
 
     # TODO 他のスクリプトと共通化する
@@ -329,6 +332,34 @@ class NetworkTrainer:
             )
         return network
 
+    def load_initial_network_weights(self, args, network):
+        return network.load_weights(args.network_weights)
+
+    @staticmethod
+    def get_network_text_encoder_lr(args, network):
+        rates = args.text_encoder_lr
+        if hasattr(network, "prepare_optimizer_params_with_multiple_te_lrs") or rates is None or isinstance(rates, (float, int)):
+            return rates
+        return rates[0] if len(rates) else None
+
+    def prepare_network_optimizer_params(self, args, network, text_encoder_lr):
+        support_multiple_lrs = hasattr(network, "prepare_optimizer_params_with_multiple_te_lrs")
+        try:
+            if support_multiple_lrs:
+                results = network.prepare_optimizer_params_with_multiple_te_lrs(text_encoder_lr, args.unet_lr, args.learning_rate)
+            else:
+                results = network.prepare_optimizer_params(text_encoder_lr, args.unet_lr, args.learning_rate)
+            if type(results) is tuple:
+                trainable_params = results[0]
+                lr_descriptions = results[1]
+            else:
+                trainable_params = results
+                lr_descriptions = None
+        except TypeError:
+            trainable_params = network.prepare_optimizer_params(text_encoder_lr, args.unet_lr)
+            lr_descriptions = None
+        return trainable_params, lr_descriptions
+
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
         pass
 
@@ -464,6 +495,8 @@ class NetworkTrainer:
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
                 target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
 
+        if is_train and getattr(self, "_promote_capture", None) is not None:
+            self._promote_capture["noisy_latents"] = noisy_latents
         return noise_pred, target, timesteps, None
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler) -> torch.FloatTensor:
@@ -505,6 +538,70 @@ class NetworkTrainer:
         pass
 
     # endregion
+
+    def _batch_text_conditions(
+        self, args, accelerator, batch, text_encoders, text_encoding_strategy, tokenize_strategy,
+        weight_dtype, *, is_train, train_text_encoder, weighted_tokens=None, capture=None,
+    ):
+        text_encoder_conds = []
+        text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
+        if text_encoder_outputs_list is not None:
+            text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
+
+        if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
+            # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
+            with torch.set_grad_enabled(is_train and train_text_encoder), accelerator.autocast():
+                # Get the text embedding for conditioning
+                if args.weighted_captions:
+                    if weighted_tokens is None:
+                        input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                        if capture is not None:
+                            capture["weighted_tokens"] = (input_ids_list, weights_list)
+                    else:
+                        input_ids_list, weights_list = weighted_tokens
+                    encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
+                        tokenize_strategy,
+                        self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                        input_ids_list,
+                        weights_list,
+                    )
+                else:
+                    input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
+                    encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                        tokenize_strategy,
+                        self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                        input_ids,
+                    )
+                if args.full_fp16:
+                    encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
+
+            # if text_encoder_conds is not cached, use encoded_text_encoder_conds
+            if len(text_encoder_conds) == 0:
+                text_encoder_conds = encoded_text_encoder_conds
+            else:
+                # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
+                for i in range(len(encoded_text_encoder_conds)):
+                    if encoded_text_encoder_conds[i] is not None:
+                        text_encoder_conds[i] = encoded_text_encoder_conds[i]
+
+        return text_encoder_conds
+
+    def _prediction_loss(self, args, batch, prediction, target, timesteps, weighting, huber_c, noise_scheduler, *, record):
+        loss = loss_util.conditional_loss(prediction.float(), target.float(), args.loss_type, "none", huber_c)
+        if weighting is not None:
+            loss = loss * weighting
+        if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+            loss = apply_masked_loss(loss, batch)
+        loss = loss.mean(dim=list(range(1, loss.ndim)))  # mean over all dims except batch
+        if record:
+            self.run_controller.record_sample_losses(batch, timesteps, loss)  # before loss_weights and post_process_loss
+
+        loss_weights = batch["loss_weights"]  # 各sampleごとのweight
+        loss = loss * loss_weights
+
+        loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
+
+        return loss.mean()
 
     def process_batch(
         self,
@@ -559,41 +656,11 @@ class NetworkTrainer:
                 )
                 batch["masked_latents"] = self.shift_scale_latents(args, masked_latents)
 
-        text_encoder_conds = []
-        text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
-        if text_encoder_outputs_list is not None:
-            text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
-
-        if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
-            # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
-            with torch.set_grad_enabled(is_train and train_text_encoder), accelerator.autocast():
-                # Get the text embedding for conditioning
-                if args.weighted_captions:
-                    input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
-                    encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
-                        tokenize_strategy,
-                        self.get_models_for_text_encoding(args, accelerator, text_encoders),
-                        input_ids_list,
-                        weights_list,
-                    )
-                else:
-                    input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
-                    encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
-                        tokenize_strategy,
-                        self.get_models_for_text_encoding(args, accelerator, text_encoders),
-                        input_ids,
-                    )
-                if args.full_fp16:
-                    encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
-
-            # if text_encoder_conds is not cached, use encoded_text_encoder_conds
-            if len(text_encoder_conds) == 0:
-                text_encoder_conds = encoded_text_encoder_conds
-            else:
-                # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
-                for i in range(len(encoded_text_encoder_conds)):
-                    if encoded_text_encoder_conds[i] is not None:
-                        text_encoder_conds[i] = encoded_text_encoder_conds[i]
+        capture = getattr(self, "_promote_capture", None) if is_train else None
+        text_encoder_conds = self._batch_text_conditions(
+            args, accelerator, batch, text_encoders, text_encoding_strategy, tokenize_strategy, weight_dtype,
+            is_train=is_train, train_text_encoder=train_text_encoder, capture=capture,
+        )
 
         # sample noise, call unet, get target
         noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
@@ -611,21 +678,17 @@ class NetworkTrainer:
         )
 
         huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-        loss = loss_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
-        if weighting is not None:
-            loss = loss * weighting
-        if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-            loss = apply_masked_loss(loss, batch)
-        loss = loss.mean(dim=list(range(1, loss.ndim)))  # mean over all dims except batch
-        if is_train:
-            self.run_controller.record_sample_losses(batch, timesteps, loss)  # before loss_weights and post_process_loss
+        # A detached device view of just the sampled timesteps also serves group-only logging.
+        config = getattr(self, "maruo_config", None)
+        if is_train and config is not None and "group_loss_log" in config.observation_features:
+            self.group_loss_timesteps = timesteps.detach()
+        if capture is not None:
+            from library.promote_bank import BankItem
 
-        loss_weights = batch["loss_weights"]  # 各sampleごとのweight
-        loss = loss * loss_weights
-
-        loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
-
-        return loss.mean()
+            self._promote_bank.add(BankItem.capture(
+                batch, capture["noisy_latents"], target, timesteps, huber_c, weighting, capture.get("weighted_tokens"),
+            ))
+        return self._prediction_loss(args, batch, noise_pred, target, timesteps, weighting, huber_c, noise_scheduler, record=is_train)
 
     def cast_text_encoder(self, args):
         return True  # default for other than HunyuanImage
@@ -1014,6 +1077,7 @@ class NetworkTrainer:
         steps: int,
         epoch_no: int,
         force_sync_upload: bool = False,
+        moment: WeightMoment | None = None,
     ):
         os.makedirs(args.output_dir, exist_ok=True)
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
@@ -1027,21 +1091,57 @@ class NetworkTrainer:
         sai_metadata = self.get_sai_model_spec(args)
         metadata_to_save.update(sai_metadata)
 
-        unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+        if self.training_run is None:
+            unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+        else:
+            metadata_to_save = dict(metadata_to_save, ss_run_id=self.training_run.run_id, ss_session_id=self.training_run.session_id)
+            ckpt_file = publish_weight(self.training_run, ckpt_name, moment,
+                                       lambda path: unwrapped_nw.save_weights(path, save_dtype, metadata_to_save))
         self.run_controller.record_checkpoint(ckpt_file, step=steps)
         if args.huggingface_repo_id is not None:
             huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
         return ckpt_file
 
     def _remove_model(self, *, args: argparse.Namespace, accelerator: Accelerator, old_ckpt_name: str):
+        if self.training_run is not None:
+            remove_weight(self.training_run, old_ckpt_name)
+            return
         old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
         if os.path.exists(old_ckpt_file):
             accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
             os.remove(old_ckpt_file)
 
+    def _step_optimizer(self, args, accelerator, network, optimizer, lr_scheduler, *, skip_update):
+        """Finish a backward pass without advancing optimizer state on Guardian rejection."""
+        if not skip_update:
+            if accelerator.sync_gradients:
+                self.all_reduce_network(accelerator, network)
+                if args.max_grad_norm != 0.0:
+                    params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                if hasattr(network, "update_grad_norms"):
+                    network.update_grad_norms()
+                if hasattr(network, "update_norms"):
+                    network.update_norms()
+            optimizer.step()
+            lr_scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+
     def train(self, args):
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
+        maruo_config = getattr(self, "maruo_config", None)
+        averaging = None
+        self._promote_bank = None
+        if maruo_config is not None and "averaging" in maruo_config.training_features:
+            from library.avg_training import EpochAveraging
+
+            averaging = EpochAveraging(maruo_config.values)
+        startup_clock = time.perf_counter() if maruo_config is not None else None
+        if maruo_config is not None:
+            from library.training_settings import snapshot
+
+            requested_args = snapshot(vars(args))
         args_util.verify_training_args(args)
         accelerator_setup.prepare_dataset_args(args, True)
         deepspeed_utils.prepare_deepspeed_args(args)
@@ -1065,7 +1165,9 @@ class NetworkTrainer:
 
         # データセットを準備する
         if args.dataset_class is None:
-            blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, args.masked_loss, True))
+            blueprint_generator = BlueprintGenerator(
+                ConfigSanitizer(True, True, args.masked_loss, True, support_subset_group=maruo_config is not None)
+            )
             if use_user_config:
                 logger.info(f"Loading dataset config from {args.dataset_config}")
                 user_config = config_util.load_user_config(args.dataset_config)
@@ -1104,11 +1206,18 @@ class NetworkTrainer:
                     }
 
             blueprint = blueprint_generator.generate(user_config, args)
+            if maruo_config is not None and maruo_config.changes_training:
+                config_util.validate_custom_training_datasets(blueprint.dataset_group)
             train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
         else:
             # use arbitrary dataset class
             train_dataset_group = dataset_util.load_arbitrary_dataset(args)
             val_dataset_group = None  # placeholder until validation dataset supported for arbitrary
+
+        if averaging is not None and averaging.bank is not None:
+            for dataset in getattr(train_dataset_group, "datasets", []):
+                # ControlNet's image metadata is assembled by its DreamBooth delegate.
+                getattr(dataset, "dreambooth_dataset_delegate", dataset).record_promote_labels = True
 
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
@@ -1144,6 +1253,15 @@ class NetworkTrainer:
         logger.info("preparing accelerator")
         accelerator = accelerator_setup.prepare_accelerator(args)
         is_main_process = accelerator.is_main_process
+        if maruo_config is not None:
+            from library.training_run_output import RunOutput, reserve_run
+
+            self.training_run = reserve_run(args, accelerator, session_id, training_started_at)
+            if is_main_process:
+                self.run_output = RunOutput(self.training_run, requested_args)
+                logger.info("SDXL LoRA run: %s", self.training_run.directory)
+        output = self.run_output
+        save_args = weight_args(args, self.training_run)
 
         # mixed precisionに対応した型を用意しておき適宜castする
         weight_dtype, save_dtype = accelerator_setup.prepare_dtype(args)
@@ -1238,8 +1356,7 @@ class NetworkTrainer:
         network.apply_to(text_encoder, unet, train_text_encoder, train_unet)
 
         if args.network_weights is not None:
-            # FIXME consider alpha of weights: this assumes that the alpha is not changed
-            info = network.load_weights(args.network_weights)
+            info = self.load_initial_network_weights(args, network)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
         if args.gradient_checkpointing:
@@ -1258,30 +1375,8 @@ class NetworkTrainer:
         # 学習に必要なクラスを準備する
         accelerator.print("prepare optimizer, data loader etc.")
 
-        # make backward compatibility for text_encoder_lr
-        support_multiple_lrs = hasattr(network, "prepare_optimizer_params_with_multiple_te_lrs")
-        if support_multiple_lrs:
-            text_encoder_lr = args.text_encoder_lr
-        else:
-            # toml backward compatibility
-            if args.text_encoder_lr is None or isinstance(args.text_encoder_lr, float) or isinstance(args.text_encoder_lr, int):
-                text_encoder_lr = args.text_encoder_lr
-            else:
-                text_encoder_lr = None if len(args.text_encoder_lr) == 0 else args.text_encoder_lr[0]
-        try:
-            if support_multiple_lrs:
-                results = network.prepare_optimizer_params_with_multiple_te_lrs(text_encoder_lr, args.unet_lr, args.learning_rate)
-            else:
-                results = network.prepare_optimizer_params(text_encoder_lr, args.unet_lr, args.learning_rate)
-            if type(results) is tuple:
-                trainable_params = results[0]
-                lr_descriptions = results[1]
-            else:
-                trainable_params = results
-                lr_descriptions = None
-        except TypeError as e:
-            trainable_params = network.prepare_optimizer_params(text_encoder_lr, args.unet_lr)
-            lr_descriptions = None
+        text_encoder_lr = self.get_network_text_encoder_lr(args, network)
+        trainable_params, lr_descriptions = self.prepare_network_optimizer_params(args, network, text_encoder_lr)
 
         # if len(trainable_params) == 0:
         #     accelerator.print("no trainable parameters found / 学習可能なパラメータが見つかりませんでした")
@@ -1294,6 +1389,11 @@ class NetworkTrainer:
         #         accelerator.print(f"trainable_params: {k} = {v}")
 
         optimizer_name, optimizer_args, optimizer = optimizer_util.get_optimizer(args, trainable_params)
+        created_groups = None
+        if output is not None:
+            from library.training_settings import optimizer_groups
+
+            created_groups = optimizer_groups(optimizer, lr_descriptions)
         optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
 
         # prepare dataloader
@@ -1335,6 +1435,15 @@ class NetworkTrainer:
 
         # データセット側にも学習ステップを送信
         train_dataset_group.set_max_train_steps(args.max_train_steps)
+
+        self.dq_training = None
+        if maruo_config is not None and "dq" in maruo_config.training_features:
+            from library.dq_training import DQTraining
+
+            self.dq_training = DQTraining(
+                maruo_config, network, total_steps=args.max_train_steps,
+                lr_warmup_steps=args.lr_warmup_steps, num_processes=accelerator.num_processes,
+            )
 
         # lr schedulerを用意する
         lr_scheduler = optimizer_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
@@ -1547,7 +1656,8 @@ class NetworkTrainer:
         )
 
         # observation of the training from outside. no-op unless --run_control is specified
-        self.run_controller = run_control.create_run_controller(args, is_main_process)
+        from library.training_run_control import create_run_controller
+        self.run_controller = create_run_controller(save_args, is_main_process, maruo_config)
         if self.run_controller.enabled:
             manifest = run_control.build_manifest(
                 args,
@@ -1560,6 +1670,8 @@ class NetworkTrainer:
                     "num_processes": accelerator.num_processes,
                 },
             )
+            if self.training_run is not None:
+                manifest["outputs"].update(output_dir=save_args.output_dir, output_name=save_args.output_name)
             self.run_controller.start(manifest, max_train_steps=args.max_train_steps, num_train_epochs=num_train_epochs)
         run_controller = self.run_controller
         if accelerator.num_processes > 1:
@@ -1614,6 +1726,10 @@ class NetworkTrainer:
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
+        if output is not None:
+            output.configure(args=args, config=maruo_config, dq=self.dq_training, network=accelerator.unwrap_model(network),
+                             optimizer=optimizer, descriptions=lr_descriptions, dataset=train_dataset_group, metadata=self._metadata,
+                             epochs=num_train_epochs, diffusion_steps=noise_scheduler.config.num_train_timesteps, averaging=averaging, created_groups=created_groups)
         logging_util.init_trackers(accelerator, args, "network_train")
 
         loss_recorder = logging_util.LossRecorder()
@@ -1672,6 +1788,12 @@ class NetworkTrainer:
         progress_bar = tqdm(
             range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
         )
+
+        guardian = None
+        if maruo_config is not None and "guardian" in maruo_config.training_features:
+            from library.grad_norm_guardian import GradNormGuardian
+
+            guardian = GradNormGuardian(maruo_config.values["grad_norm_mode"], network.parameters())
 
         validation_steps = (
             min(args.max_validation_steps, len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
@@ -1754,20 +1876,21 @@ class NetworkTrainer:
             return result
 
         def command_save(command: dict) -> dict:
-            ckpt_name = checkpoint_io.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
+            ckpt_name = checkpoint_io.get_step_ckpt_name(save_args, "." + args.save_model_as, global_step)
             ckpt_file = self._save_model(
-                args=args,
+                args=save_args,
                 accelerator=accelerator,
                 save_dtype=save_dtype,
                 ckpt_name=ckpt_name,
                 unwrapped_nw=accelerator.unwrap_model(network),
                 steps=global_step,
                 epoch_no=epoch,
+                moment=WeightMoment("step", epoch + 1, global_step, actual_batch_index, "step_complete"),
             )
             return {"path": os.path.abspath(ckpt_file)}
 
         def command_save_state(command: dict) -> dict:
-            state_dir = checkpoint_io.save_state_stepwise(args, accelerator, global_step)
+            state_dir = checkpoint_io.save_state_stepwise(save_args, accelerator, global_step)
             run_controller.record_state(state_dir, step=global_step)
             return {"path": os.path.abspath(state_dir)}
 
@@ -1822,7 +1945,20 @@ class NetworkTrainer:
             "resume": command_resume,
         }
 
+        if averaging is not None and averaging.bank is not None:
+            from functools import partial
+
+            score_bank = partial(
+                self.score_promote_bank, args=args, accelerator=accelerator, unet=unet, text_encoders=text_encoders,
+                noise_scheduler=noise_scheduler, weight_dtype=weight_dtype,
+                text_encoding_strategy=text_encoding_strategy, tokenize_strategy=tokenize_strategy,
+            )
+        else:
+            score_bank = None
+
         for epoch in range(epoch_to_start, num_train_epochs):
+            if averaging is not None:
+                self._promote_bank = averaging.bank if averaging.eligible(epoch + 1, num_train_epochs) else None
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
             current_epoch.value = epoch + 1
             run_controller.on_epoch_start(epoch=epoch + 1)
@@ -1833,16 +1969,25 @@ class NetworkTrainer:
 
             # TRAINING
             skipped_dataloader = None
+            batch_offset = max(0, initial_step - 1)
             if initial_step > 0:
                 skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step - 1)
                 initial_step = 1
 
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
+                actual_batch_index = batch_offset + step
                 current_step.value = global_step
                 if initial_step > 0:
                     initial_step -= 1
                     continue
+                if startup_clock is not None:
+                    logging_util.start_step_progress(
+                        progress_bar, time.perf_counter() - startup_clock, main_process=accelerator.is_main_process
+                    )
+                    startup_clock = None
                 run_controller.on_batch_fetched(batch, global_step=global_step)
+                if output is not None and output.group is not None:
+                    output.group.validate_batch(batch)
 
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
@@ -1850,6 +1995,8 @@ class NetworkTrainer:
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
+                    if self.dq_training is not None:
+                        self.dq_training.begin_attempt(global_step)
                     loss = self.forward_backward(
                         args,
                         accelerator,
@@ -1867,20 +2014,14 @@ class NetworkTrainer:
                         train_unet,
                     )
 
-                    if accelerator.sync_gradients:
-                        self.all_reduce_network(accelerator, network)  # sync DDP grad manually
-                        if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-
-                        if hasattr(network, "update_grad_norms"):
-                            network.update_grad_norms()
-                        if hasattr(network, "update_norms"):
-                            network.update_norms()
-
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    grad_observation = guardian.observe() if guardian is not None else None
+                    observed_loss = None
+                    if output is not None and (grad_observation is not None or output.group is not None):
+                        observed_loss = loss.detach().item()
+                        if grad_observation is not None:
+                            output.gradient(epoch + 1, actual_batch_index, grad_observation, observed_loss, accelerator.scaler)
+                    skip_update = grad_observation is not None and grad_observation.skipped
+                    self._step_optimizer(args, accelerator, network, optimizer, lr_scheduler, skip_update=skip_update)
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -1893,9 +2034,9 @@ class NetworkTrainer:
                     if hasattr(network, "weight_norms"):
                         weight_norms = network.weight_norms()
                         mean_norm = weight_norms.mean().item() if weight_norms is not None else None
-                        grad_norms = network.grad_norms()
+                        grad_norms = None if skip_update else network.grad_norms()
                         mean_grad_norm = grad_norms.mean().item() if grad_norms is not None else None
-                        combined_weight_norms = network.combined_weight_norms()
+                        combined_weight_norms = None if skip_update else network.combined_weight_norms()
                         mean_combined_norm = combined_weight_norms.mean().item() if combined_weight_norms is not None else None
                         maximum_norm = weight_norms.max().item() if weight_norms is not None else None
                         keys_scaled = None
@@ -1910,6 +2051,12 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+                    if output is not None and output.group is not None:
+                        output.group_step(batch, self.group_loss_timesteps, observed_loss, epoch + 1, global_step, skip_update)
+                    if self.dq_training is not None:
+                        self.dq_training.finish_attempt(global_step, epoch=epoch + 1, guardian_skipped=skip_update)
+                    if output is not None:
+                        output.dq_and_rank(self.dq_training, lr_scheduler, epoch + 1, global_step, skip_update)
 
                     optimizer_eval_fn()
                     with run_controller.watch_samples(step=global_step):
@@ -1922,25 +2069,26 @@ class NetworkTrainer:
                     if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
-                            ckpt_name = checkpoint_io.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
+                            ckpt_name = checkpoint_io.get_step_ckpt_name(save_args, "." + args.save_model_as, global_step)
                             self._save_model(
-                                args=args,
+                                args=save_args,
                                 accelerator=accelerator,
                                 save_dtype=save_dtype,
                                 ckpt_name=ckpt_name,
                                 unwrapped_nw=accelerator.unwrap_model(network),
                                 steps=global_step,
                                 epoch_no=epoch,
+                                moment=WeightMoment("step", epoch + 1, global_step, actual_batch_index, "step_complete"),
                             )
 
                             if args.save_state:
-                                state_dir = checkpoint_io.save_and_remove_state_stepwise(args, accelerator, global_step)
+                                state_dir = checkpoint_io.save_and_remove_state_stepwise(save_args, accelerator, global_step)
                                 run_controller.record_state(state_dir, step=global_step)
 
                             remove_step_no = checkpoint_io.get_remove_step_no(args, global_step)
                             if remove_step_no is not None:
-                                remove_ckpt_name = checkpoint_io.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
-                                self._remove_model(args=args, accelerator=accelerator, old_ckpt_name=remove_ckpt_name)
+                                remove_ckpt_name = checkpoint_io.get_step_ckpt_name(save_args, "." + args.save_model_as, remove_step_no)
+                                self._remove_model(args=save_args, accelerator=accelerator, old_ckpt_name=remove_ckpt_name)
 
                     run_controller.process_commands(command_handlers, step=global_step)
                     if run_controller.paused:
@@ -1949,10 +2097,12 @@ class NetworkTrainer:
                         progress_bar.unpause()
                     optimizer_train_fn()
 
-                current_loss = loss.detach().item()
+                current_loss = observed_loss if observed_loss is not None else loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                if guardian is not None:
+                    logs["skipped"] = guardian.skipped_steps
                 progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 step_logs = None
@@ -1971,7 +2121,8 @@ class NetworkTrainer:
                         mean_combined_norm,
                     )
                     if is_tracking:
-                        self.step_logging(accelerator, step_logs, global_step, epoch + 1)
+                        tracker_logs = step_logs if guardian is None else {**step_logs, "train/skipped_steps": guardian.skipped_steps}
+                        self.step_logging(accelerator, tracker_logs, global_step, epoch + 1)
 
                 # VALIDATION PER STEP: global_step is already incremented
                 # for example, if validate_every_n_steps=100, validate at step 100, 200, 300, ...
@@ -2077,24 +2228,25 @@ class NetworkTrainer:
             if args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if is_main_process and saving:
-                    ckpt_name = checkpoint_io.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
+                    ckpt_name = checkpoint_io.get_epoch_ckpt_name(save_args, "." + args.save_model_as, epoch + 1)
                     self._save_model(
-                        args=args,
+                        args=save_args,
                         accelerator=accelerator,
                         save_dtype=save_dtype,
                         ckpt_name=ckpt_name,
                         unwrapped_nw=accelerator.unwrap_model(network),
                         steps=global_step,
                         epoch_no=epoch + 1,
+                        moment=WeightMoment("epoch", epoch + 1, global_step, None, "before_epoch_decision"),
                     )
 
                     remove_epoch_no = checkpoint_io.get_remove_epoch_no(args, epoch + 1)
                     if remove_epoch_no is not None:
-                        remove_ckpt_name = checkpoint_io.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
-                        self._remove_model(args=args, accelerator=accelerator, old_ckpt_name=remove_ckpt_name)
+                        remove_ckpt_name = checkpoint_io.get_epoch_ckpt_name(save_args, "." + args.save_model_as, remove_epoch_no)
+                        self._remove_model(args=save_args, accelerator=accelerator, old_ckpt_name=remove_ckpt_name)
 
                     if args.save_state:
-                        state_dir = checkpoint_io.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
+                        state_dir = checkpoint_io.save_and_remove_state_on_epoch_end(save_args, accelerator, epoch + 1)
                         run_controller.record_state(state_dir, step=global_step)
 
             with run_controller.watch_samples(step=global_step):
@@ -2103,6 +2255,20 @@ class NetworkTrainer:
                 )
             progress_bar.unpause()
             optimizer_train_fn()
+            if averaging is not None:
+                rows = averaging.finish_epoch(
+                    epoch + 1, num_train_epochs, accelerator.unwrap_model(network), optimizer, score_bank,
+                    accelerator.device, noise_scheduler.config.num_train_timesteps,
+                )
+                if rows:
+                    if output is not None:
+                        output.writer.append("promote", rows)
+                    decision = rows[0]
+                    logger.info("promote epoch %s: %s, raw=%s, %s=%s, streak=%s, applied=%s",
+                                epoch+1, decision["status"], decision["raw_proxy_loss"], decision["selected_candidate_mode"],
+                                decision["selected_proxy_loss"], decision["win_streak"], decision["promote_applied"])
+            if output is not None:
+                output.writer.end_epoch(global_step)
             run_controller.on_epoch_end(global_step=global_step, average_loss=loss_recorder.moving_average)
 
             # end of epoch
@@ -2110,6 +2276,8 @@ class NetworkTrainer:
         if run_controller.stop_requested:
             # stopped by a command. the model and the state were saved by the command with the name of the step
             accelerator.end_training()
+            if output is not None:
+                output.finish("stopped")
             run_controller.finish("stopped")
             logger.info(f"training is stopped by a command at step {global_step}")
             return
@@ -2124,13 +2292,13 @@ class NetworkTrainer:
         optimizer_eval_fn()
 
         if is_main_process and (args.save_state or args.save_state_on_train_end):
-            state_dir = checkpoint_io.save_state_on_train_end(args, accelerator)
+            state_dir = checkpoint_io.save_state_on_train_end(save_args, accelerator)
             run_controller.record_state(state_dir, step=global_step)
 
         if is_main_process:
-            ckpt_name = checkpoint_io.get_last_ckpt_name(args, "." + args.save_model_as)
+            ckpt_name = checkpoint_io.get_last_ckpt_name(save_args, "." + args.save_model_as)
             self._save_model(
-                args=args,
+                args=save_args,
                 accelerator=accelerator,
                 save_dtype=save_dtype,
                 ckpt_name=ckpt_name,
@@ -2138,11 +2306,30 @@ class NetworkTrainer:
                 steps=global_step,
                 epoch_no=num_train_epochs,
                 force_sync_upload=True,
+                moment=WeightMoment("final", num_train_epochs, global_step, None, "after_epoch_decision"),
             )
 
+            if averaging is not None and averaging.final_raw is not None:
+                from library.avg_training import save_final_raw
+
+                raw_name = checkpoint_io.get_last_ckpt_name(save_args, "_final_raw.safetensors")
+                metadata = self._minimum_metadata if args.no_metadata else self._metadata
+                raw_metadata = dict(metadata, ss_steps=str(global_step), ss_epoch=str(num_train_epochs))
+                raw_path = os.path.join(save_args.output_dir, raw_name)
+                if self.training_run is not None:
+                    raw_metadata.update(ss_run_id=self.training_run.run_id, ss_session_id=self.training_run.session_id)
+                save_final_raw(raw_path, averaging.final_raw, save_dtype, raw_metadata)
+                if self.training_run is not None:
+                    record_weight(self.training_run, raw_path,
+                                  WeightMoment("final_raw", num_train_epochs, global_step, None, "before_epoch_decision"))
             logger.info("model saved.")
 
+        logs_complete = output is not None and output.finish("completed")
         run_controller.finish()
+        if logs_complete and "report_after_training" in maruo_config.observation_features:
+            from library.training_run_report import report_after_training
+
+            report_after_training(output.run)
 
 
 def setup_parser() -> argparse.ArgumentParser:

@@ -1,0 +1,2 @@
+# Optional Qt frontend for image comparisons and the research ledger.
+PySide6==6.11.1

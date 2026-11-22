@@ -66,7 +66,7 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdamWBnb, AdamW8bitFast, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, "
         "Lion8bit, PagedLion8bit, Lion, SGDNesterov, SGDNesterov8bit, "
         "DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, "
         "AdaFactor. "
@@ -1218,7 +1218,7 @@ def add_sd_saving_arguments(parser: argparse.ArgumentParser):
     )
 
 
-def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentParser):
+def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentParser, *, argv=None):
     if not args.config_file:
         return args
 
@@ -1279,7 +1279,7 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
             ignore_nesting_dict[key] = value
 
     config_args = argparse.Namespace(**ignore_nesting_dict)
-    args = parser.parse_args(namespace=config_args)
+    args = parser.parse_args(argv, namespace=config_args)
     args.config_file = os.path.splitext(args.config_file)[0]
 
     return args

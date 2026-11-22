@@ -1,4 +1,6 @@
 import argparse
+from contextlib import nullcontext
+import sys
 from typing import List, Optional, Union
 
 import torch
@@ -10,7 +12,9 @@ init_ipex()
 from library import sdxl_model_util, sdxl_train_util, strategy_base, strategy_sd, strategy_sdxl
 import library.args as args_util
 import library.model_io as model_io
+from library import maruo_training_config as maruo_config
 from library.dataset import DatasetGroup, MinimalDataset
+from library.training_run_weights import sample_args
 import train_network
 from library.utils import setup_logging
 
@@ -25,6 +29,76 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         super().__init__()
         self.vae_scale_factor = sdxl_model_util.VAE_SCALE_FACTOR
         self.is_sdxl = True
+
+    def train(self, args):
+        self.maruo_config = maruo_config.resolve_training_config(args)
+        maruo_config.require_wired_features(self.maruo_config)
+        self.training_run = self.run_output = None
+        try:
+            return super().train(args)
+        except BaseException:
+            if self.run_output is not None and not self.run_output.finished:
+                try:
+                    self.run_output.finish("failed")
+                except Exception:
+                    logger.exception("Could not finalize failed run %s", self.training_run.directory)
+            raise
+
+    def create_network(self, args, network_module, vae, text_encoder, unet, net_kwargs):
+        config = getattr(self, "maruo_config", None)
+        self._initial_lora_weights = None
+        if config is None or not config.changes_training or not (config.values["te_mlp_fc_only"] or args.network_weights):
+            return super().create_network(args, network_module, vae, text_encoder, unet, net_kwargs)
+        network, self._initial_lora_weights = network_module.create_sdxl_training_network(
+            args, text_encoder, unet, net_kwargs, te_mlp_fc_only=config.values["te_mlp_fc_only"]
+        )
+        return network
+
+    def load_initial_network_weights(self, args, network):
+        weights = self._initial_lora_weights
+        if weights is None:
+            return super().load_initial_network_weights(args, network)
+        from library.te_training import load_initial_weights
+
+        self._initial_lora_weights = None
+        return load_initial_weights(network, weights, args)
+
+    def prepare_network_optimizer_params(self, args, network, text_encoder_lr):
+        config = getattr(self, "maruo_config", None)
+        if config is not None and config.text_encoder_lrs is not None:
+            return network.prepare_sdxl_optimizer_params(config.text_encoder_lrs, args.unet_lr, args.learning_rate)
+        return super().prepare_network_optimizer_params(args, network, text_encoder_lr)
+
+    def forward_backward(self, *args, **kwargs):
+        bank = getattr(self, "_promote_bank", None)
+        if bank is None or not bank.wants_item():
+            return super().forward_backward(*args, **kwargs)
+        self._promote_capture = {}
+        try:
+            return super().forward_backward(*args, **kwargs)
+        finally:
+            self._promote_capture = None
+
+    @torch.no_grad()
+    def score_promote_bank(
+        self, items, args, accelerator, unet, text_encoders, noise_scheduler, weight_dtype,
+        text_encoding_strategy, tokenize_strategy,
+    ):
+        total = 0.0
+        count = 0
+        for item in items:
+            batch, noisy, target, timesteps, huber_c, weighting, tokens = item.materialize(accelerator.device, weight_dtype)
+            conditions = self._batch_text_conditions(
+                args, accelerator, batch, text_encoders, text_encoding_strategy, tokenize_strategy, weight_dtype,
+                is_train=False, train_text_encoder=True, weighted_tokens=tokens,
+            )
+            with accelerator.autocast():
+                prediction = self.call_unet(args, accelerator, unet, noisy, timesteps, conditions, batch, weight_dtype)
+            loss = self._prediction_loss(args, batch, prediction, target, timesteps, weighting, huber_c, noise_scheduler, record=False)
+            size = batch["loss_weights"].shape[0]
+            total += loss.item() * size
+            count += size
+        return total / count
 
     def assert_extra_args(
         self,
@@ -67,7 +141,18 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
+        config = getattr(self, "maruo_config", None)
+        if config is not None:
+            unet.timestep_freq_shift = int(config.values["downscale_freq_shift"])
+            unet.set_strict_fp16_norms(config.values["fp16_safe_norms_mode"] == "strict")
+
         return sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, [text_encoder1, text_encoder2], vae, unet
+
+    def update_metadata(self, metadata, args):
+        super().update_metadata(metadata, args)
+        config = getattr(self, "maruo_config", None)
+        if config is not None:
+            metadata["ss_fp16_safe_norms_mode"] = config.values["fp16_safe_norms_mode"]
 
     def get_tokenize_strategy(self, args):
         return strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
@@ -163,21 +248,43 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         return noise_pred
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
-        sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
+        from library.sampling import should_sample_images
+        from library.training_run_control import preserve_python_rng
+
+        config = getattr(self, "maruo_config", None)
+        isolate_rng = self.training_run is not None and config is not None and config.changes_training
+        with preserve_python_rng() if isolate_rng and should_sample_images(args, epoch, global_step) else nullcontext():
+            sdxl_train_util.sample_images(accelerator, sample_args(args, self.training_run), epoch, global_step, device,
+                                         vae, tokenizer, text_encoder, unet)
 
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
     sdxl_train_util.add_sdxl_training_arguments(parser)
+    maruo_config.add_training_arguments(parser)
     return parser
+
+
+def parse_training_args(parser, argv=None):
+    """Use the upstream TOML/CLI merge, retaining the ordinary parser for other trainers."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    for token in argv:
+        if token.startswith("--"):
+            maruo_config.reject_retired(token.partition("=")[0], "command line")
+
+    args = parser.parse_args(argv)
+    custom_cli = maruo_config.OPTIONS.keys() & vars(args).keys()
+    args_util.verify_command_line_training_args(args)
+    args = args_util.read_config_from_file(args, parser, argv=argv)
+    if custom_cli and args.network_module != "networks.lora":
+        raise ValueError(f"{sorted(custom_cli)}: custom SDXL options require --network_module networks.lora")
+    return args
 
 
 if __name__ == "__main__":
     parser = setup_parser()
 
-    args = parser.parse_args()
-    args_util.verify_command_line_training_args(args)
-    args = args_util.read_config_from_file(args, parser)
+    args = parse_training_args(parser)
 
     trainer = SdxlNetworkTrainer()
     trainer.train(args)

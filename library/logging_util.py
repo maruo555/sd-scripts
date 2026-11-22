@@ -26,6 +26,18 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def start_step_progress(progress_bar, initialization_seconds: float, *, main_process: bool):
+    """Start the displayed rate at the first real training batch."""
+    if main_process:
+        logger.info(
+            "startup time before first training step: %.2f sec / 学習開始前の初期化時間: %.2f 秒",
+            initialization_seconds,
+            initialization_seconds,
+        )
+    if not progress_bar.disable:
+        progress_bar.reset()
+
+
 def init_trackers(accelerator: Accelerator, args: argparse.Namespace, default_tracker_name: str):
     """
     Initialize experiment trackers with tracker specific behaviors

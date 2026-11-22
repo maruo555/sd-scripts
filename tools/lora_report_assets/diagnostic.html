@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+@@IDENTITY@@
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LoRA Diagnostic Report</title>
+<style>
+:root {
+  --bg: #f4f6fb;
+  --card: #ffffff;
+  --text: #0f172a;
+  --muted: #64748b;
+  --line: #d7deea;
+  --good: #15803d;
+  --good-bg: #dcfce7;
+  --warn: #b45309;
+  --warn-bg: #ffedd5;
+  --bad: #b91c1c;
+  --bad-bg: #fee2e2;
+  --info: #0f766e;
+  --info-bg: #ccfbf1;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: linear-gradient(160deg, #eef2ff 0%, #f8fafc 45%, #f5f5f4 100%);
+  color: var(--text);
+  font-family: "Segoe UI", "Noto Sans JP", "Hiragino Kaku Gothic ProN", sans-serif;
+}
+.container {
+  max-width: 1520px;
+  margin: 0 auto;
+  padding: 22px;
+}
+h1, h2 {
+  margin: 0;
+}
+.sub {
+  color: var(--muted);
+  margin-top: 8px;
+}
+.panel {
+  margin-top: 16px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 14px 16px;
+}
+.grid {
+  display: grid;
+  gap: 12px;
+}
+.grid.cards {
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+.card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  background: #fbfdff;
+}
+.card .title {
+  color: var(--muted);
+  font-size: 12px;
+}
+.card .value {
+  margin-top: 4px;
+  font-size: 24px;
+  font-weight: 700;
+}
+.card .caption {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.overall {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 20px;
+  font-weight: 700;
+}
+.score {
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 15px;
+}
+.score.good { background: var(--good-bg); color: var(--good); }
+.score.warn { background: var(--warn-bg); color: var(--warn); }
+.score.bad { background: var(--bad-bg); color: var(--bad); }
+.score.info { background: var(--info-bg); color: var(--info); }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+  font-size: 13px;
+}
+th, td {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  color: #334155;
+  font-weight: 600;
+  background: #f8fafc;
+}
+th.num, td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.muted { color: var(--muted); }
+.badge {
+  border-radius: 999px;
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.badge.good { color: var(--good); background: var(--good-bg); }
+.badge.warn { color: var(--warn); background: var(--warn-bg); }
+.badge.bad { color: var(--bad); background: var(--bad-bg); }
+.badge.info { color: var(--info); background: var(--info-bg); }
+.chart-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+}
+.chart-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 8px;
+}
+.chart-title {
+  font-size: 13px;
+  color: #0f172a;
+  margin: 2px 2px 4px;
+}
+.chart-subtitle {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 2px 8px;
+}
+.chart-canvas {
+  width: 100%;
+  height: 240px;
+  display: block;
+}
+.series-legend {
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+.series-row {
+  display: grid;
+  grid-template-columns: 14px 1fr 88px 88px 88px;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  padding: 3px 0;
+}
+.series-row.header {
+  color: var(--muted);
+  font-weight: 600;
+  padding-top: 1px;
+}
+.series-chip {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid #ffffff;
+  box-shadow: 0 0 0 1px #cbd5e1 inset;
+}
+.series-row .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.heatmap-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  margin-top: 16px;
+}
+.heatmap-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 10px;
+}
+.heatmap-table {
+  margin-top: 0;
+}
+.heatmap-table th,
+.heatmap-table td {
+  text-align: center;
+  vertical-align: middle;
+}
+.heatmap-table th.num,
+.heatmap-table td.num {
+  text-align: center;
+}
+.heatmap-cell {
+  font-weight: 600;
+}
+.file-list {
+  line-height: 1.8;
+  font-size: 13px;
+}
+
+.grid.cards { margin-top: 12px; }
+.help { margin: 8px 0 14px; font-size: 13px; }
+summary { cursor: pointer; color: #334155; line-height: 1.7; }
+summary:focus-visible { outline: 2px solid #2563eb; outline-offset: 3px; }
+.help p { line-height: 1.7; }
+.axis-note { color: var(--muted); font-size: 12px; margin: 6px 0 12px; }
+.constant-values { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 12px; }
+.constant-value { background: #f1f5f9; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+.constant-charts { grid-column: 1 / -1; min-width: 0; }
+.constant-charts .chart-grid { margin-top: 10px; }
+.chart-card[hidden] { display: none; }
+.dq-scope-control { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+.dq-scope-control select { padding: 8px 12px; border: 1px solid #b6c8df; border-radius: 6px; color: #173354; background: white; }
+.table-scroll { overflow-x: auto; }
+.wide-table table { min-width: 640px; }
+.badge { white-space: nowrap; }
+.series-legend { overflow-x: auto; }
+.series-row { min-width: 400px; }
+h1, .sub { overflow-wrap: anywhere; }
+.input-status { line-height: 1.7; overflow-wrap: anywhere; }
+.analysis-errors { border-left: 4px solid var(--warn); background: var(--warn-bg); padding: 12px 16px; margin-top: 16px; }
+.analysis-errors p { margin: 6px 0 0; }
+.single-values { padding: 10px; line-height: 1.8; font-variant-numeric: tabular-nums; }
+.chart-grid, .heatmap-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); }
+
+@media (max-width: 700px) {
+  .container { padding: 12px; }
+  .chart-canvas { height: 210px; }
+}
+</style>
+</head>
+<body>
+  <div class="container">
+    @@BODY_HTML@@
+  </div>
+
+<script>
+const reportData = @@REPORT_JSON@@;
+
+function withAlpha(hex, alpha) {
+  const clean = hex.replace('#', '');
+  const r = parseInt(clean.slice(0, 2), 16);
+  const g = parseInt(clean.slice(2, 4), 16);
+  const b = parseInt(clean.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function finite(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function reduceMarkers(markers, maxCount = 14) {
+  if (!Array.isArray(markers) || markers.length <= maxCount) return markers || [];
+  const step = Math.ceil(markers.length / maxCount);
+  const out = [];
+  for (let i = 0; i < markers.length; i += step) {
+    out.push(markers[i]);
+  }
+  const last = markers[markers.length - 1];
+  if (out[out.length - 1] !== last) out.push(last);
+  return out;
+}
+
+function decimalsFromStep(step) {
+  if (!finite(step) || step <= 0) return 4;
+  const txt = String(step);
+  if (!txt.includes('.')) return 0;
+  return Math.min(6, txt.split('.')[1].length);
+}
+
+function buildNiceIntegerStep(minVal, maxVal, targetTicks = 6) {
+  const range = Math.max(1e-9, maxVal - minVal);
+  const rough = range / Math.max(2, targetTicks);
+  const base = Math.pow(10, Math.floor(Math.log10(rough)));
+  const scaled = rough / base;
+  let nice = 1;
+  if (scaled > 5) {
+    nice = 10;
+  } else if (scaled > 2) {
+    nice = 5;
+  } else if (scaled > 1) {
+    nice = 2;
+  }
+  return Math.max(1, Math.round(nice * base));
+}
+
+function buildYAxisTicks(bounds, chart) {
+  let minVal = bounds.yMin;
+  let maxVal = bounds.yMax;
+  if (finite(chart.y_min_fixed)) {
+    minVal = chart.y_min_fixed;
+  }
+  if (finite(chart.y_max_fixed)) {
+    maxVal = chart.y_max_fixed;
+  }
+  if (finite(chart.y_min_floor)) {
+    minVal = Math.min(minVal, chart.y_min_floor);
+  }
+  if (finite(chart.y_max_ceil)) {
+    maxVal = Math.max(maxVal, chart.y_max_ceil);
+  }
+  if (!(maxVal > minVal)) {
+    const pad = Math.abs(maxVal || 1) * 0.05 + 1e-6;
+    minVal -= pad;
+    maxVal += pad;
+  }
+
+  let step = null;
+  let ticks = [];
+  if (finite(chart.y_tick_step) && chart.y_tick_step > 0) {
+    step = chart.y_tick_step;
+    let start = Math.floor(minVal / step) * step;
+    let end = Math.ceil(maxVal / step) * step;
+    let count = Math.round((end - start) / step) + 1;
+    if (count > 24) {
+      const mul = Math.ceil(count / 24);
+      step *= mul;
+      start = Math.floor(minVal / step) * step;
+      end = Math.ceil(maxVal / step) * step;
+      count = Math.round((end - start) / step) + 1;
+    }
+    for (let i = 0; i < count; i += 1) {
+      ticks.push(start + i * step);
+    }
+    minVal = start;
+    maxVal = end;
+  } else if (chart.y_tick_nice_integer) {
+    step = buildNiceIntegerStep(minVal, maxVal, 6);
+    const start = Math.floor(minVal / step) * step;
+    const end = Math.ceil(maxVal / step) * step;
+    const count = Math.round((end - start) / step) + 1;
+    for (let i = 0; i < count; i += 1) {
+      ticks.push(start + i * step);
+    }
+    minVal = start;
+    maxVal = end;
+  } else {
+    const tickCount = 5;
+    for (let i = 0; i <= tickCount; i += 1) {
+      ticks.push(minVal + ((maxVal - minVal) * i) / tickCount);
+    }
+    step = (maxVal - minVal) / tickCount;
+  }
+  return { min: minVal, max: maxVal, ticks, step };
+}
+
+function formatTickValue(value, chart, step) {
+  if (chart.y_tick_integer || chart.y_tick_nice_integer) {
+    return Math.round(value).toString();
+  }
+  const precision = finite(chart.y_tick_precision) ? chart.y_tick_precision : decimalsFromStep(step);
+  return Number(value).toFixed(Math.max(0, precision));
+}
+
+function layoutInlineLegend(ctx, series, width, marginLeft, marginRight, maxRows) {
+  const rows = Math.max(1, maxRows || 2);
+  const rowHeight = 14;
+  const entries = [];
+  let x = marginLeft;
+  let row = 0;
+  const rightLimit = Math.max(marginLeft + 20, width - marginRight);
+  ctx.font = '11px sans-serif';
+  (series || []).forEach((seriesItem) => {
+    const name = seriesItem.name || 'series';
+    const itemWidth = 14 + ctx.measureText(name).width + 12;
+    if (x + itemWidth > rightLimit && row + 1 < rows) {
+      row += 1;
+      x = marginLeft;
+    }
+    entries.push({ series: seriesItem, x, y: 12 + row * rowHeight });
+    x += itemWidth;
+  });
+  return { entries, height: rowHeight * (row + 1) + 4 };
+}
+
+function computeBounds(chart) {
+  let xMin = Infinity;
+  let xMax = -Infinity;
+  let yMin = Infinity;
+  let yMax = -Infinity;
+  let hasData = false;
+
+  (chart.series || []).forEach((series) => {
+    const xVals = Array.isArray(series.x) && series.x.length ? series.x : (Array.isArray(chart.x) ? chart.x : []);
+    const yVals = Array.isArray(series.y) ? series.y : [];
+    const n = Math.min(xVals.length, yVals.length);
+    for (let i = 0; i < n; i += 1) {
+      const x = xVals[i];
+      const y = yVals[i];
+      if (!finite(x) || !finite(y)) continue;
+      hasData = true;
+      if (x < xMin) xMin = x;
+      if (x > xMax) xMax = x;
+      if (y < yMin) yMin = y;
+      if (y > yMax) yMax = y;
+    }
+  });
+
+  if (!hasData) return null;
+  if (Math.abs(yMax - yMin) < 1e-12) {
+    const pad = Math.abs(yMax || 1) * 0.05 + 1e-6;
+    yMin -= pad;
+    yMax += pad;
+  } else {
+    const pad = (yMax - yMin) * 0.10;
+    yMin -= pad;
+    yMax += pad;
+  }
+  if (xMin === xMax) {
+    xMin -= 1;
+    xMax += 1;
+  }
+  return { xMin, xMax, yMin, yMax };
+}
+
+function drawChart(canvas, chart) {
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(320, Math.floor(canvas.clientWidth));
+  const height = Math.max(180, Math.floor(canvas.clientHeight));
+  const pxW = Math.floor(width * ratio);
+  const pxH = Math.floor(height * ratio);
+  if (canvas.width !== pxW || canvas.height !== pxH) {
+    canvas.width = pxW;
+    canvas.height = pxH;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const bounds = computeBounds(chart);
+  if (!bounds) {
+    ctx.fillStyle = '#64748b';
+    ctx.font = '13px sans-serif';
+    ctx.fillText('有効な描画データがありません', 12, 28);
+    return;
+  }
+
+  let legendLayout = null;
+  let inlineLegendHeight = 0;
+  if (!chart.no_inline_legend) {
+    legendLayout = layoutInlineLegend(
+      ctx,
+      chart.series || [],
+      width,
+      58,
+      14,
+      finite(chart.legend_max_rows) ? chart.legend_max_rows : 2
+    );
+    inlineLegendHeight = legendLayout.height;
+  }
+
+  const margin = { top: 18 + inlineLegendHeight, right: 14, bottom: 34, left: 58 };
+  const chartW = Math.max(10, width - margin.left - margin.right);
+  const chartH = Math.max(10, height - margin.top - margin.bottom);
+  const yAxis = buildYAxisTicks(bounds, chart);
+  const yRange = Math.max(1e-12, yAxis.max - yAxis.min);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.strokeStyle = '#e2e8f0';
+  ctx.lineWidth = 1;
+  yAxis.ticks.forEach((tick) => {
+    const y = margin.top + chartH - ((tick - yAxis.min) / yRange) * chartH;
+    ctx.beginPath();
+    ctx.moveTo(margin.left, y);
+    ctx.lineTo(margin.left + chartW, y);
+    ctx.stroke();
+  });
+
+  const markers = reduceMarkers(chart.markers, 12);
+  ctx.setLineDash([4, 4]);
+  ctx.strokeStyle = '#cbd5e1';
+  markers.forEach((marker) => {
+    if (!finite(marker.x)) return;
+    const t = (marker.x - bounds.xMin) / (bounds.xMax - bounds.xMin);
+    const x = margin.left + t * chartW;
+    if (x < margin.left || x > margin.left + chartW) return;
+    ctx.beginPath();
+    ctx.moveTo(x, margin.top);
+    ctx.lineTo(x, margin.top + chartH);
+    ctx.stroke();
+    ctx.save();
+    ctx.fillStyle = '#64748b';
+    ctx.font = '10px sans-serif';
+    ctx.fillText(marker.label || '', x + 2, margin.top + 10);
+    ctx.restore();
+  });
+  ctx.setLineDash([]);
+
+  (chart.series || []).forEach((series) => {
+    const xVals = (Array.isArray(series.x) && series.x.length) ? series.x : (chart.x || []);
+    const yVals = series.y || [];
+    const n = Math.min(xVals.length, yVals.length);
+    ctx.strokeStyle = series.color || '#2563eb';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    let moved = false;
+    for (let i = 0; i < n; i += 1) {
+      const x = xVals[i];
+      const y = yVals[i];
+      if (!finite(x) || !finite(y)) {
+        moved = false;
+        continue;
+      }
+      const px = margin.left + ((x - bounds.xMin) / (bounds.xMax - bounds.xMin)) * chartW;
+      const py = margin.top + chartH - ((y - yAxis.min) / yRange) * chartH;
+      if (!moved) {
+        ctx.moveTo(px, py);
+        moved = true;
+      } else {
+        ctx.lineTo(px, py);
+      }
+    }
+    ctx.stroke();
+    for (let i = 0; i < n; i += 1) {
+      if (!finite(xVals[i]) || !finite(yVals[i])) continue;
+      const before = i > 0 && finite(xVals[i - 1]) && finite(yVals[i - 1]);
+      const after = i + 1 < n && finite(xVals[i + 1]) && finite(yVals[i + 1]);
+      if (before || after) continue;
+      const px = margin.left + ((xVals[i] - bounds.xMin) / (bounds.xMax - bounds.xMin)) * chartW;
+      const py = margin.top + chartH - ((yVals[i] - yAxis.min) / yRange) * chartH;
+      ctx.fillStyle = series.color || '#2563eb';
+      ctx.beginPath();
+      ctx.arc(px, py, 2.5, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  });
+
+  ctx.strokeStyle = '#94a3b8';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(margin.left, margin.top);
+  ctx.lineTo(margin.left, margin.top + chartH);
+  ctx.lineTo(margin.left + chartW, margin.top + chartH);
+  ctx.stroke();
+
+  ctx.fillStyle = '#475569';
+  ctx.font = '11px sans-serif';
+  yAxis.ticks.forEach((tick) => {
+    const y = margin.top + chartH - ((tick - yAxis.min) / yRange) * chartH;
+    ctx.fillText(formatTickValue(tick, chart, yAxis.step), 6, y + 4);
+  });
+  ctx.fillText(Math.round(bounds.xMin).toString(), margin.left, margin.top + chartH + 18);
+  const xMid = (bounds.xMin + bounds.xMax) / 2;
+  const midText = Math.round(xMid).toString();
+  const midW = ctx.measureText(midText).width;
+  ctx.fillText(midText, margin.left + chartW / 2 - midW / 2, margin.top + chartH + 18);
+  const maxText = Math.round(bounds.xMax).toString();
+  const maxW = ctx.measureText(maxText).width;
+  ctx.fillText(maxText, margin.left + chartW - maxW, margin.top + chartH + 18);
+
+  if (!chart.no_inline_legend && legendLayout) {
+    legendLayout.entries.forEach((entry) => {
+      const series = entry.series || {};
+      const color = series.color || '#2563eb';
+      const name = series.name || 'series';
+      ctx.fillStyle = color;
+      ctx.fillRect(entry.x, entry.y - 8, 10, 10);
+      ctx.fillStyle = '#334155';
+      ctx.font = '11px sans-serif';
+      ctx.fillText(name, entry.x + 14, entry.y);
+    });
+  }
+}
+
+function appendSeriesLegend(parent, chart) {
+  const rows = Array.isArray(chart.legend_rows) ? chart.legend_rows : [];
+  if (!rows.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'series-legend';
+
+  const header = document.createElement('div');
+  header.className = 'series-row header';
+  header.innerHTML = '<div></div><div>ブロック</div><div class="num">開始密度</div><div class="num">終了密度</div><div class="num">差分</div>';
+  wrap.appendChild(header);
+
+  rows.forEach((row) => {
+    const el = document.createElement('div');
+    el.className = 'series-row';
+    const startVal = finite(row.start_density) ? Number(row.start_density).toFixed(4) : '-';
+    const endVal = finite(row.end_density) ? Number(row.end_density).toFixed(4) : '-';
+    const deltaVal = finite(row.delta_density) ? Number(row.delta_density).toFixed(4) : '-';
+    const chip = document.createElement('div');
+    chip.className = 'series-chip';
+    chip.style.backgroundColor = row.color || '#2563eb';
+    el.appendChild(chip);
+    for (const [i, value] of [row.name || '-', startVal, endVal, deltaVal].entries()) {
+      const cell = document.createElement('div');
+      if (i > 0) cell.className = 'num';
+      cell.textContent = value;
+      el.appendChild(cell);
+    }
+    wrap.appendChild(el);
+  });
+  parent.appendChild(wrap);
+}
+
+function mountCharts(containerId, charts) {
+  const container = document.getElementById(containerId);
+  if (!container || !Array.isArray(charts) || !charts.length) return;
+  const states = [];
+  const collapsedCharts = charts.filter(chart => chart.display_mode === 'constant');
+  let collapsedGrid = null;
+  let disclosure = null;
+  if (collapsedCharts.length) {
+    disclosure = document.createElement('details');
+    disclosure.className = 'constant-charts';
+    const summary = document.createElement('summary');
+    summary.textContent = `一定値のグラフを表示（${collapsedCharts.length}件）`;
+    disclosure.appendChild(summary);
+    collapsedGrid = document.createElement('div');
+    collapsedGrid.className = 'chart-grid';
+    disclosure.appendChild(collapsedGrid);
+  }
+  charts.forEach((chart, idx) => {
+    const card = document.createElement('div');
+    card.className = 'chart-card';
+    card.dataset.chartId = chart.id || '';
+    if (chart.dq_scope) card.dataset.dqScope = chart.dq_scope;
+    const title = document.createElement('div');
+    title.className = 'chart-title';
+    title.textContent = chart.title || `Chart ${idx + 1}`;
+    card.appendChild(title);
+    if (chart.subtitle) {
+      const subtitle = document.createElement('div');
+      subtitle.className = 'chart-subtitle';
+      subtitle.textContent = chart.subtitle;
+      card.appendChild(subtitle);
+    }
+    if (chart.display_mode === 'single') {
+      const values = document.createElement('div');
+      values.className = 'single-values';
+      (chart.display_values || []).forEach(item => {
+        const row = document.createElement('div');
+        row.textContent = `${item.name}：${item.value}（観測1点・${chart.x_label || 'x'} ${item.x}${item.missing ? '・一部欠測' : ''}）`;
+        values.appendChild(row);
+      });
+      card.appendChild(values);
+    } else {
+      const canvas = document.createElement('canvas');
+      canvas.className = 'chart-canvas';
+      card.appendChild(canvas);
+      appendSeriesLegend(card, chart);
+      states.push({ canvas, chart });
+    }
+    (chart.display_mode === 'constant' ? collapsedGrid : container).appendChild(card);
+  });
+  if (disclosure) container.appendChild(disclosure);
+  const renderAll = () => {
+    states.forEach(state => {
+      if (!state.canvas.closest('details:not([open])') && state.canvas.getClientRects().length) drawChart(state.canvas, state.chart);
+    });
+  };
+  if (disclosure) disclosure.addEventListener('toggle', renderAll);
+  const scopeSelect = containerId === 'charts-dq' ? document.getElementById('dq-scope-view') : null;
+  const applyScope = () => {
+    const selected = scopeSelect ? scopeSelect.value : 'all';
+    container.querySelectorAll('[data-dq-scope]').forEach(card => {
+      card.hidden = selected === 'split' ? card.dataset.dqScope === 'combined' : selected !== 'all' && card.dataset.dqScope !== selected;
+    });
+    renderAll();
+  };
+  if (scopeSelect) scopeSelect.addEventListener('change', applyScope);
+  applyScope();
+  window.addEventListener('resize', renderAll);
+}
+
+Object.entries(reportData.charts || {}).forEach(([section, charts]) => mountCharts(`charts-${section}`, charts));
+
+</script>
+</body>
+</html>

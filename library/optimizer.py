@@ -97,6 +97,22 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         optimizer_class = lion_pytorch.Lion
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+    elif optimizer_type == "adamw8bitfast":
+        try:
+            from library.adamw8bit_fast import AdamW8bitFast
+        except ImportError as exc:
+            raise ImportError("AdamW8bitFast requires bitsandbytes") from exc
+        optimizer_class = AdamW8bitFast
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "adamwbnb":
+        try:
+            from library.adamw_bnb import AdamWBnb
+        except ImportError as exc:
+            raise ImportError("AdamWBnb requires bitsandbytes") from exc
+        optimizer_class = AdamWBnb
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
     elif optimizer_type.endswith("8bit".lower()):
         try:
             import bitsandbytes as bnb

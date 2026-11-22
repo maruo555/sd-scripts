@@ -1,5 +1,9 @@
 import itertools
 import json
+from library.generation_lora_strengths import (
+    LoraComponentStrengths, apply_generation_strengths, parse_prompt_strengths, resolve_flat_strengths,
+    resolve_prompt_override, validate_component_strength_compatibility,
+)
 from typing import Any, List, NamedTuple, Optional, Tuple, Union, Callable
 import glob
 import importlib
@@ -1340,101 +1344,7 @@ def preprocess_mask(mask):
 # if the second fragment is a number or two numbers, repeat the variants in the range
 # if the third fragment is a string, use it as a separator
 
-RE_DYNAMIC_PROMPT = re.compile(r"\{((e|E)\$\$)?(([\d\-]+)\$\$)?(([^\|\}]+?)\$\$)?(.+?((\|).+?)*?)\}")
-
-
-def handle_dynamic_prompt_variants(prompt, repeat_count):
-    founds = list(RE_DYNAMIC_PROMPT.finditer(prompt))
-    if not founds:
-        return [prompt]
-
-    # make each replacement for each variant
-    enumerating = False
-    replacers = []
-    for found in founds:
-        # if "e$$" is found, enumerate all variants
-        found_enumerating = found.group(2) is not None
-        enumerating = enumerating or found_enumerating
-
-        separator = ", " if found.group(6) is None else found.group(6)
-        variants = found.group(7).split("|")
-
-        # parse count range
-        count_range = found.group(4)
-        if count_range is None:
-            count_range = [1, 1]
-        else:
-            count_range = count_range.split("-")
-            if len(count_range) == 1:
-                count_range = [int(count_range[0]), int(count_range[0])]
-            elif len(count_range) == 2:
-                count_range = [int(count_range[0]), int(count_range[1])]
-            else:
-                logger.warning(f"invalid count range: {count_range}")
-                count_range = [1, 1]
-            if count_range[0] > count_range[1]:
-                count_range = [count_range[1], count_range[0]]
-            if count_range[0] < 0:
-                count_range[0] = 0
-            if count_range[1] > len(variants):
-                count_range[1] = len(variants)
-
-        if found_enumerating:
-            # make function to enumerate all combinations
-            def make_replacer_enum(vari, cr, sep):
-                def replacer():
-                    values = []
-                    for count in range(cr[0], cr[1] + 1):
-                        for comb in itertools.combinations(vari, count):
-                            values.append(sep.join(comb))
-                    return values
-
-                return replacer
-
-            replacers.append(make_replacer_enum(variants, count_range, separator))
-        else:
-            # make function to choose random combinations
-            def make_replacer_single(vari, cr, sep):
-                def replacer():
-                    count = random.randint(cr[0], cr[1])
-                    comb = random.sample(vari, count)
-                    return [sep.join(comb)]
-
-                return replacer
-
-            replacers.append(make_replacer_single(variants, count_range, separator))
-
-    # make each prompt
-    if not enumerating:
-        # if not enumerating, repeat the prompt, replace each variant randomly
-        prompts = []
-        for _ in range(repeat_count):
-            current = prompt
-            for found, replacer in zip(founds, replacers):
-                current = current.replace(found.group(0), replacer()[0], 1)
-            prompts.append(current)
-    else:
-        # if enumerating, iterate all combinations for previous prompts
-        prompts = [prompt]
-
-        for found, replacer in zip(founds, replacers):
-            if found.group(2) is not None:
-                # make all combinations for existing prompts
-                new_prompts = []
-                for current in prompts:
-                    replecements = replacer()
-                    for replecement in replecements:
-                        new_prompts.append(current.replace(found.group(0), replecement, 1))
-                prompts = new_prompts
-
-        for found, replacer in zip(founds, replacers):
-            # make random selection for existing prompts
-            if found.group(2) is None:
-                for i in range(len(prompts)):
-                    prompts[i] = prompts[i].replace(found.group(0), replacer()[0], 1)
-
-    return prompts
-
+from library.generation_dynamic_prompt import RE_DYNAMIC_PROMPT, handle_dynamic_prompt_variants
 
 # endregion
 
@@ -1471,7 +1381,7 @@ class BatchDataExt(NamedTuple):
     scale: float
     negative_scale: float
     strength: float
-    network_muls: Tuple[float]
+    network_muls: Tuple[LoraComponentStrengths, ...]
     num_sub_prompts: int
 
 
@@ -1671,10 +1581,17 @@ def main(args):
     text_encoder2.eval()
     unet.eval()
 
+    default_strengths = resolve_flat_strengths(args.network_mul, len(args.network_module or ()))
+    merge_requested = bool(args.network_merge or args.network_merge_n_models)
+    validate_component_strength_compatibility(default_strengths, network_merge=merge_requested, network_pre_calc=args.network_pre_calc)
+    if args.network_lbw and not args.network_module:
+        raise ValueError("--network_lbw requires --network_module")
+    network_default_muls = []
+    dynamic_slots = []
+    merged_slots = []
     # networkを組み込む
     if args.network_module:
         networks = []
-        network_default_muls = []
         network_pre_calc = args.network_pre_calc
 
         # merge関連の引数を統合する
@@ -1690,7 +1607,7 @@ def main(args):
             logger.info(f"import network module: {network_module}")
             imported_module = importlib.import_module(network_module)
 
-            network_mul = 1.0 if args.network_mul is None or len(args.network_mul) <= i else args.network_mul[i]
+            network_mul = default_strengths[i].unet
 
             net_kwargs = {}
             if args.network_args and i < len(args.network_args):
@@ -1721,6 +1638,17 @@ def main(args):
             if network is None:
                 return
 
+            lbw = args.network_lbw[min(i, len(args.network_lbw) - 1)] if args.network_lbw else None
+            if lbw is not None:
+                setter = getattr(network, "set_lbw_weights", None)
+                if not callable(setter):
+                    raise ValueError(f"slot {i + 1}: {network_module} does not support --network_lbw")
+                setter(lbw)
+            if default_strengths[i].is_component_split:
+                try:
+                    apply_generation_strengths(network, default_strengths[i])
+                except ValueError as error:
+                    raise ValueError(f"slot {i + 1}: {error}") from error
             mergeable = network.is_mergeable()
             if network_merge and not mergeable:
                 logger.warning("network is not mergiable. ignore merge option.")
@@ -1740,9 +1668,11 @@ def main(args):
                     network.backup_weights()
 
                 networks.append(network)
-                network_default_muls.append(network_mul)
+                network_default_muls.append(default_strengths[i])
+                dynamic_slots.append((i + 1, lbw))
             else:
                 network.merge_to([text_encoder1, text_encoder2], unet, weights_sd, dtype, device)
+                merged_slots.append({"slot":i + 1, "module":network_module, "strength":network_mul, "lbw":lbw})
 
     else:
         networks = []
@@ -2319,8 +2249,11 @@ def main(args):
             if networks:
                 # 追加ネットワークの処理
                 shared = {}
-                for n, m in zip(networks, network_muls if network_muls else network_default_muls):
-                    n.set_multiplier(m)
+                for n, m, (slot, _) in zip(networks, network_muls, dynamic_slots):
+                    try:
+                        apply_generation_strengths(n, m)
+                    except ValueError as error:
+                        raise ValueError(f"slot {slot}: {error}") from error
                     if regional_network:
                         n.set_current_generation(batch_size, num_sub_prompts, width, height, shared)
 
@@ -2363,7 +2296,7 @@ def main(args):
             # save image
             highres_prefix = ("0" if highres_1st else "1") if highres_fix else ""
             ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
-            for i, (image, prompt, negative_prompts, seed, clip_prompt, raw_prompt) in enumerate(
+            for i, (image, prompt, negative_prompt, seed, clip_prompt, raw_prompt) in enumerate(
                 zip(images, prompts, negative_prompts, seeds, clip_prompts, raw_prompts)
             ):
                 if highres_fix:
@@ -2388,6 +2321,14 @@ def main(args):
                 metadata.add_text("original-width-negative", str(original_width_negative))
                 metadata.add_text("crop-top", str(crop_top))
                 metadata.add_text("crop-left", str(crop_left))
+
+                if network_muls:
+                    metadata.add_text("network-strength-mode", json.dumps([m.value_count for m in network_muls]))
+                    for component in ("te1", "te2", "unet"):
+                        metadata.add_text(f"network-{component}-strength", json.dumps([getattr(m, component) for m in network_muls]))
+                    metadata.add_text("network-dynamic-slots", json.dumps([{"slot":slot, "lbw":lbw} for slot,lbw in dynamic_slots]))
+                if merged_slots:
+                    metadata.add_text("network-merged-slots", json.dumps(merged_slots))
 
                 if args.use_original_file_name and init_images is not None:
                     if type(init_images) is list:
@@ -2464,7 +2405,7 @@ def main(args):
                     strength = 0.8 if args.strength is None else args.strength
                     negative_prompt = ""
                     clip_prompt = None
-                    network_muls = None
+                    network_muls = tuple(network_default_muls)
 
                     # Deep Shrink
                     ds_depth_1 = None  # means no override
@@ -2580,12 +2521,11 @@ def main(args):
                                 logger.info(f"clip prompt: {clip_prompt}")
                                 continue
 
-                            m = re.match(r"am ([\d\.\-,]+)", parg, re.IGNORECASE)
-                            if m:  # network multiplies
-                                network_muls = [float(v) for v in m.group(1).split(",")]
-                                while len(network_muls) < len(networks):
-                                    network_muls.append(network_muls[-1])
-                                logger.info(f"network mul: {network_muls}")
+                            if re.match(r"^am(?:\s|$)", parg, re.IGNORECASE):
+                                raw = parse_prompt_strengths(parg[2:].strip())
+                                network_muls = resolve_prompt_override(raw, total_slots=len(default_strengths),
+                                    dynamic_slots=len(networks), merge=merge_requested, pre_calc=args.network_pre_calc)
+                                logger.info(f"network strengths: {network_muls}")
                                 continue
 
                             # Deep Shrink
@@ -2818,7 +2758,7 @@ def main(args):
                         scale,
                         negative_scale,
                         strength,
-                        tuple(network_muls) if network_muls else None,
+                        network_muls,
                         num_sub_prompts,
                     ),
                 )
@@ -3010,6 +2950,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--network_weights", type=str, default=None, nargs="*", help="additional network weights to load / 追加ネットワークの重み"
     )
+    parser.add_argument("--network_lbw", nargs="+", help="SDXL LoRA block weights per slot: preset or twelve comma-separated values")
     parser.add_argument(
         "--network_mul", type=float, default=None, nargs="*", help="additional network multiplier / 追加ネットワークの効果の倍率"
     )

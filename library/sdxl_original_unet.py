@@ -30,6 +30,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
+from library import sdxl_training_options
 from library.utils import setup_logging
 
 setup_logging()
@@ -289,7 +290,12 @@ def resize_like(x, target, mode="bicubic", align_corners=False):
 
 
 class GroupNorm32(nn.GroupNorm):
+    strict_fp16_norms = False
+
     def forward(self, x):
+        if self.strict_fp16_norms and x.dtype == torch.float16:
+            # Keep the original affine parameters and autocast behavior for ResNet norms.
+            return super().forward(x.float()).to(x.dtype)
         if self.weight.dtype != torch.float32:
             return super().forward(x)
         return super().forward(x.float()).type(x.dtype)
@@ -389,6 +395,8 @@ class Downsample2D(nn.Module):
 
 
 class CrossAttention(nn.Module):
+    strict_fp16_norms = False
+
     def __init__(
         self,
         query_dim: int,
@@ -474,7 +482,7 @@ class CrossAttention(nn.Module):
             beta=0,
             alpha=self.scale,
         )
-        attention_probs = attention_scores.softmax(dim=-1)
+        attention_probs = sdxl_training_options.attention_softmax(attention_scores, self.strict_fp16_norms)
 
         # cast back to the original dtype
         attention_probs = attention_probs.to(value.dtype)
@@ -601,6 +609,8 @@ class FeedForward(nn.Module):
 
 
 class BasicTransformerBlock(nn.Module):
+    strict_fp16_norms = False
+
     def __init__(
         self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False
     ):
@@ -643,16 +653,17 @@ class BasicTransformerBlock(nn.Module):
 
     def forward_body(self, hidden_states, context=None, timestep=None):
         # 1. Self-Attention
-        norm_hidden_states = self.norm1(hidden_states)
+        norm_hidden_states = sdxl_training_options.layer_norm(hidden_states, self.norm1, self.strict_fp16_norms)
 
         hidden_states = self.attn1(norm_hidden_states) + hidden_states
 
         # 2. Cross-Attention
-        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = sdxl_training_options.layer_norm(hidden_states, self.norm2, self.strict_fp16_norms)
         hidden_states = self.attn2(norm_hidden_states, context=context) + hidden_states
 
         # 3. Feed-forward
-        hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
+        norm_hidden_states = sdxl_training_options.layer_norm(hidden_states, self.norm3, self.strict_fp16_norms)
+        hidden_states = self.ff(norm_hidden_states) + hidden_states
 
         return hidden_states
 
@@ -676,6 +687,8 @@ class BasicTransformerBlock(nn.Module):
 
 
 class Transformer2DModel(nn.Module):
+    strict_fp16_norms = False
+
     def __init__(
         self,
         num_attention_heads: int = 16,
@@ -735,7 +748,7 @@ class Transformer2DModel(nn.Module):
         batch, _, height, weight = hidden_states.shape
         residual = hidden_states
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = sdxl_training_options.spatial_group_norm(hidden_states, self.norm, self.strict_fp16_norms)
         if not self.use_linear_projection:
             hidden_states = self.proj_in(hidden_states)
             inner_dim = hidden_states.shape[1]
@@ -831,6 +844,7 @@ class SdxlUNet2DConditionModel(nn.Module):
         self.in_channels = in_channels
         self.out_channels = OUT_CHANNELS
         self.model_channels = MODEL_CHANNELS
+        self.timestep_freq_shift = 0
         self.time_embed_dim = TIME_EMBED_DIM
         self.adm_in_channels = ADM_IN_CHANNELS
 
@@ -1072,14 +1086,21 @@ class SdxlUNet2DConditionModel(nn.Module):
 
     # endregion
 
+    def set_strict_fp16_norms(self, enabled: bool):
+        for module in self.modules():
+            if isinstance(module, (GroupNorm32, Transformer2DModel, BasicTransformerBlock, CrossAttention)):
+                module.strict_fp16_norms = enabled
+
+    def _diffusion_timestep_embedding(self, timesteps, dtype):
+        embedding = get_timestep_embedding(timesteps, self.model_channels, downscale_freq_shift=self.timestep_freq_shift)
+        return embedding.to(dtype)
+
     def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
         # broadcast timesteps to batch dimension
         timesteps = timesteps.expand(x.shape[0])
 
         hs = []
-        t_emb = get_timestep_embedding(timesteps, self.model_channels, downscale_freq_shift=0)  # , repeat_only=False)
-        t_emb = t_emb.to(x.dtype)
-        emb = self.time_embed(t_emb)
+        emb = self.time_embed(self._diffusion_timestep_embedding(timesteps, x.dtype))
 
         assert x.shape[0] == y.shape[0], f"batch size mismatch: {x.shape[0]} != {y.shape[0]}"
         assert x.dtype == y.dtype, f"dtype mismatch: {x.dtype} != {y.dtype}"
@@ -1167,9 +1188,7 @@ class InferSdxlUNet2DConditionModel:
         timesteps = timesteps.expand(x.shape[0])
 
         hs = []
-        t_emb = get_timestep_embedding(timesteps, _self.model_channels, downscale_freq_shift=0)  # , repeat_only=False)
-        t_emb = t_emb.to(x.dtype)
-        emb = _self.time_embed(t_emb)
+        emb = _self.time_embed(_self._diffusion_timestep_embedding(timesteps, x.dtype))
 
         assert x.shape[0] == y.shape[0], f"batch size mismatch: {x.shape[0]} != {y.shape[0]}"
         assert x.dtype == y.dtype, f"dtype mismatch: {x.dtype} != {y.dtype}"

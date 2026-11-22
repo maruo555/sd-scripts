@@ -48,8 +48,10 @@ class BaseSubset:
         resize_interpolation: Optional[str] = None,
         enable_multiline_caption: bool = False,
         multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
+        group: Optional[str] = None,
     ) -> None:
         self.image_dir = image_dir
+        self.group = (group or "").strip() or None
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
         self.num_repeats = num_repeats
         self.shuffle_caption = shuffle_caption
@@ -120,6 +122,7 @@ class DreamBoothSubset(BaseSubset):
         resize_interpolation: Optional[str] = None,
         enable_multiline_caption: bool = False,
         multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
+        group: Optional[str] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -150,6 +153,7 @@ class DreamBoothSubset(BaseSubset):
             resize_interpolation=resize_interpolation,
             enable_multiline_caption=enable_multiline_caption,
             multiline_caption_separator=multiline_caption_separator,
+            group=group,
         )
 
         self.is_reg = is_reg
@@ -195,6 +199,7 @@ class FineTuningSubset(BaseSubset):
         resize_interpolation: Optional[str] = None,
         enable_multiline_caption: bool = False,
         multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
+        group: Optional[str] = None,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -225,6 +230,7 @@ class FineTuningSubset(BaseSubset):
             resize_interpolation=resize_interpolation,
             enable_multiline_caption=enable_multiline_caption,
             multiline_caption_separator=multiline_caption_separator,
+            group=group,
         )
 
         self.metadata_file = metadata_file
@@ -266,6 +272,7 @@ class ControlNetSubset(BaseSubset):
         resize_interpolation: Optional[str] = None,
         enable_multiline_caption: bool = False,
         multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR,
+        group: Optional[str] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -296,6 +303,7 @@ class ControlNetSubset(BaseSubset):
             resize_interpolation=resize_interpolation,
             enable_multiline_caption=enable_multiline_caption,
             multiline_caption_separator=multiline_caption_separator,
+            group=group,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
