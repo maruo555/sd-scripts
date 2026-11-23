@@ -1,6 +1,6 @@
 # 独自改造ファイル一覧
 
-本家 sd-scripts 0.13.0（`8c088eb`）を基準に、初回移植の149件と、その後の整理を反映した現在のファイル構成を示す。移植元と設計判断は[選択移植の記録](migration/MIGRATION_PLAN.md)にまとめた。
+初回移植は本家 sd-scripts 0.13.0（`8c088eb`）を基に149件を反映した。以下は本家 0.13.1（`88ff6b5`）との差分で、現在の独自改造ファイルを示す。移植元と設計判断は[選択移植の記録](migration/MIGRATION_PLAN.md)にまとめた。
 
 | 本家からの差分 | 現在の件数 |
 |---|---:|
@@ -262,6 +262,6 @@
 照合にはリポジトリのルートで次のコマンドを使う。本家を更新した場合は、比較先をその本家コミットに替え、新たに取り込んだ本家ファイルと独自ファイルを区別する。
 
 ```powershell
-git diff --name-status --find-renames 8c088eb --
+git diff --name-status --find-renames 88ff6b5 --
 git ls-files --others --exclude-standard
 ```
