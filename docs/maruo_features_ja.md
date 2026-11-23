@@ -8,9 +8,11 @@
 
 **値**は実際に渡す値、**指定**は値を取らないフラグを付けること、**-** はその引数を省略することを表します。省略時はCLIの既定値または読み込んだ設定が適用されます。`--no-avg_reset_stats` の「指定」は、平均重みの採用時にoptimizerの統計をリセットしない指定です。
 
-全例とも `sdxl_train_network.py` を使用します。`--num_cpu_threads_per_process` は起動側の `accelerate launch` に渡します。表中の「モデル」は `noobaiXLNAIXL_epsilonPred075.safetensors` のパス、「入力TOML」は手元のデータ設定ファイルのパス、「出力名」は各学習につける名前です。
+全例とも `sdxl_train_network.py` を使用します。`--num_cpu_threads_per_process` は起動側の `accelerate launch` に渡します。表中の「モデル」は `noobaiXLNAIXL_epsilonPred075.safetensors` のパス、「入力TOML」は手元のデータ設定ファイルのパス、「出力名」は各学習につける名前です。bucketの有効化と最小・最大解像度は、入力TOMLに同じ項目があればそちらの値を使います。
 
-| グループ | CLI引数 | 独自機能なし | DQのみなし | DQ mul固定 | DQ A方式 | DQ mul自動 |
+※ 全例で `AdamW8bitFast` を使います。「独自機能なし」で使う独自処理は、標準の `AdamW8bit` のGPU同期待ちをまとめる高速化だけです。パラメーターの更新計算は同じです。[optimizerの仕組み](maruo_training_features_ja.md#optimizer)
+
+| グループ | CLI引数 | 独自機能なし※ | DQのみなし | DQ mul固定 | DQ A方式 | DQ mul自動 |
 |---|---|:---:|:---:|:---:|:---:|:---:|
 | **[起動・入力](sdxl_train_network.md)** | `--num_cpu_threads_per_process` | `8` | `8` | `8` | `8` | `8` |
 |  | `--pretrained_model_name_or_path` | モデル | モデル | モデル | モデル | モデル |
@@ -79,7 +81,7 @@
 
 ## 差し替えるときの目安
 
-「独自機能なし」はTE別学習率・Guardian・promote・DQなどを省いた比較用の構成です。optimizerには全列で独自の `AdamW8bitFast` を使います。「DQのみなし」で他の3列と学習条件を揃える場合は、`--fp16_safe_norms_mode strict` を追加します。
+「DQのみなし」で他の3列と学習条件を揃える場合は、`--fp16_safe_norms_mode strict` を追加します。
 
 <a id="fixed-mul-note"></a>
 

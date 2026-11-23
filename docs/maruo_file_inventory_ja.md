@@ -4,12 +4,12 @@
 
 | 本家からの差分 | 現在の件数 |
 |---|---:|
-| 変更した本家ソース／日本語README | 12件／1件 |
+| 変更した本家ソース／日本語README／Git設定 | 12件／1件／1件 |
 | 追加した実行用ソース・画面 | 69件 |
 | 追加したテスト・検証コード | 55件 |
 | 追加した文書（本一覧・テスト手順を含む） | 7件 |
 | 追加したテスト用固定データ・依存環境・ライセンス | 6件 |
-| **合計** | **150件** |
+| **合計** | **151件** |
 
 - [変更した本家ファイル](#upstream-changes)
 - [追加した実行用ソース・画面](#runtime-files)
@@ -36,6 +36,7 @@
 | [library/sdxl_original_unet.py](../library/sdxl_original_unet.py) | strict時のnorm・attentionの演算精度と、拡散時刻埋め込みのfreq shiftを適用。 |
 | [library/logging_util.py](../library/logging_util.py) | 学習ループが計測した初期化時間を表示し、最初の学習バッチで進捗バーの速度計測をリセットする。 |
 | [README-ja.md](../README-ja.md) | 本家の日本語READMEから、独自機能の利用ガイドとファイル一覧へ案内する。 |
+| [.gitignore](../.gitignore) | ツールがリポジトリ直下の `.tmp/` に保存する一時ファイルをGitの追跡対象から除く。 |
 
 <a id="runtime-files"></a>
 

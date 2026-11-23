@@ -114,7 +114,7 @@ DQの開始時期を決めるLR warmupと、自動倍率を決めるための観
 | `--dq_delta_log_detail` | `basic` | `basic` | 通常ログの詳細レベル。 |
 | `--rank_log` | フラグ | OFF | 同期試行番号が100の倍数でGuardianを通過したとき、**UNet**のLoRAモジュール単位のrank統計を `rank.csv` に書く。 |
 | `--rank_log_mode` | `per_module` | `per_module` | `--rank_log` の集計形式。学習対象のUNetモジュールを個別に識別する。 |
-| `--group_loss_log` | フラグ | OFF | datasetの実画像・subset・groupとlossを `group_loss.csv` に対応付ける。datasetのbatch size 1が必要。 |
+| `--group_loss_log` | フラグ | OFF | 勾配同期時の最後のバッチについて、subset・groupとlossを `group_loss.csv` に記録する。datasetのbatch size 1が必要。[記録条件](maruo_training_features_ja.md#logging) |
 | `--report_after_training` | フラグ | OFF | 学習・最終保存・ログ確定後、当該runでepoch推移付きの診断レポートを作る。 |
 
 `gradient.csv` はGuardian、`promote.csv` はpromoteが有効にします。観測・棄却・optimizer更新は別々に数えるため、進捗バーの `skipped` はGuardianの棄却回数として読みます。学習開始前の初期化時間は自動表示され、進捗の速度計時は初回バッチから始まります。[ログの記録条件](maruo_training_features_ja.md#logging)・[重みの役割と保存先](maruo_training_features_ja.md#run-output)

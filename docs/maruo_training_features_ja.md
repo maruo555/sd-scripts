@@ -125,10 +125,10 @@ Triton指定があるだけで、すべての層が融合カーネルを通っ�
 |`dq.csv`|指定間隔の同期試行で集めたdelta統計。両側を記録する場合は部位ごとに1行|同じ `attempt_step` の `scope`、`bits`、clip率と誤差|
 |`dq_auto.csv`|自動倍率の初期化または判定1回|観測scope、倍率の前後、warmup、判定理由|
 |`rank.csv`|100同期試行ごと、Guardianを通過した回のUNet LoRA 1モジュール|有効rank／設定rankの `rank_sat`、最も強い成分のエネルギー割合 `rank_top1`、総エネルギー `rank_energy`|
-|`group_loss.csv`|通過した実バッチのうち有限の学習loss 1件|groupとsubset、`timestep`、`bucket_reso`、loss、groupごとのEMAと観測数|
+|`group_loss.csv`|勾配を同期した回の最後のバッチのloss。Guardianが棄却した回とlossが非有限の回は省く|groupとsubset、`timestep`、`bucket_reso`、loss、groupごとのEMAと観測数|
 |`promote.csv`|1 epochの候補判断または平均窓の内訳|採点・採用の件数を数えるときは `decision` 行を使用|
 
-group lossは `--group_loss_log` を指定し、dataset TOMLの `[[datasets.subsets]]` に `group = "standing"` のように名前を付けます。複数のsubsetで同じ名前を使えば、そのグループ内でEMA（直前の値の重みは0.98）と観測数を共有します。`group` は `[general]` → `[[datasets]]` → `[[datasets.subsets]]` の順で内側の指定を優先します。継承元にも指定がない場合、または内側で空白名を指定した場合は `__ungrouped__` にまとまります。rankのTE1・TE2 LR列は実optimizerグループから得た学習率で、rank観測自体の対象はUNetです。run間で推移を並べるときの手順は[診断レポート](maruo_tools_ja.md#report)と[診断比較](maruo_tools_ja.md#viewer)にあります。
+group lossは `--group_loss_log` を指定し、dataset TOMLの `[[datasets.subsets]]` に `group = "standing"` のように名前を付けます。勾配蓄積が1なら各バッチが記録対象です。蓄積が2なら、2バッチごとに最後の1バッチのgroupとlossを記録します。グループごとの観測数とEMA（直前の値の重みは0.98）は、記録した行だけで更新し、同名のgroupを持つsubset間で共有します。`group` は `[general]` → `[[datasets]]` → `[[datasets.subsets]]` の順で内側の指定を優先します。継承元にも指定がない場合、または内側で空白名を指定した場合は `__ungrouped__` にまとまります。rankのTE1・TE2 LR列は実optimizerグループから得た学習率で、rank観測自体の対象はUNetです。run間で推移を並べるときの手順は[診断レポート](maruo_tools_ja.md#report)と[診断比較](maruo_tools_ja.md#viewer)にあります。
 
 <a id="run-output"></a>
 
