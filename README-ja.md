@@ -162,7 +162,7 @@ SDXL LoRA向けの独自機能については、目的に合わせて次の資�
 - 改造の全体を見渡し、引数名・既定値から調べる → [独自CLIリファレンス](./docs/maruo_cli_ja.md)
 - 学習中に何が起きるか、複数の機能がどう作用するかを知る → [機能グループ別の解説](./docs/maruo_training_features_ja.md)
 - 学習結果を診断し、画像を比較して評価を残す → [ツールの操作ガイド](./docs/maruo_tools_ja.md)
-- DQなし・固定倍率・自動倍率の起動例を見る → [学習設定の使用例](./docs/maruo_features_ja.md)
+- DQなし・固定倍率・自動倍率の5例を比較する → [SDXL LoRA 学習のおすすめ設定](./docs/maruo_features_ja.md)
 - 本家から変更・追加したファイルを調べる → [独自改造ファイル一覧](./docs/maruo_file_inventory_ja.md)
 
 ### 学習ドキュメント（英語および日本語）
