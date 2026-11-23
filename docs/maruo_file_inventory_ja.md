@@ -1,15 +1,15 @@
 # 独自改造ファイル一覧
 
-本家 sd-scripts 0.13.0（`8c088eb`）を基準とした**初回移植の公開対象**を記録する。表に載せたのは本家から変更・追加したファイル。各リンクからリポジトリ内の実物を開ける。移植元と設計判断は[選択移植の記録](migration/MIGRATION_PLAN.md)にまとめた。
+本家 sd-scripts 0.13.0（`8c088eb`）を基準に、初回移植の149件と、その後の整理を反映した現在のファイル構成を示す。移植元と設計判断は[選択移植の記録](migration/MIGRATION_PLAN.md)にまとめた。
 
-| 本家からの差分 | 初回の構成 |
+| 本家からの差分 | 現在の件数 |
 |---|---:|
 | 変更した本家ソース／日本語README | 12件／1件 |
-| 追加した実行用ソース・画面 | 68件 |
+| 追加した実行用ソース・画面 | 69件 |
 | 追加したテスト・検証コード | 55件 |
 | 追加した文書（本一覧・テスト手順を含む） | 7件 |
 | 追加したテスト用固定データ・依存環境・ライセンス | 6件 |
-| **合計** | **149件** |
+| **合計** | **150件** |
 
 - [変更した本家ファイル](#upstream-changes)
 - [追加した実行用ソース・画面](#runtime-files)
@@ -23,8 +23,8 @@
 
 | ファイル | 役割 |
 |---|---|
-| [train_network.py](../train_network.py) | 学習ループに勾配更新の採否、観測、epoch末の保存・平均、run controlとの接続点を追加。 |
-| [sdxl_train_network.py](../sdxl_train_network.py) | SDXLで独自CLIを解決し、TE設定・学習ループ・観測を適用。 |
+| [train_network.py](../train_network.py) | 共通の学習ループで重み更新・サンプル生成・保存の順序を決め、SDXLでは各段階で独自処理を呼ぶ。 |
+| [sdxl_train_network.py](../sdxl_train_network.py) | SDXLの独自CLIを読み、TE設定を適用する。標準LoRAの学習開始時に独自機能を扱うセッションを作る。 |
 | [networks/lora.py](../networks/lora.py) | LoRAの対象層とLR、重みの読込・生成、DQのforwardへの接続。 |
 | [sdxl_gen_img.py](../sdxl_gen_img.py) | 生成時のTE1・TE2・UNet別強度、LBW、動的プロンプトを接続。 |
 | [library/args.py](../library/args.py) | 独自optimizerの引数案内と、設定ファイルを読み込んだ後の引数の再解析。 |
@@ -43,13 +43,14 @@
 
 ### 実行用ソース・画面の内訳
 
-学習・生成・診断・研究台帳で実行または読み込む68件。Python 64件、Windowsの起動バッチ1件、画面・テンプレートのHTML 3件。
+学習・生成・診断・研究台帳で実行または読み込む69件。Python 65件、Windowsの起動バッチ1件、画面・テンプレートのHTML 3件。
 
-### 学習設定・更新の制御・LoRA平均（11件）
+### 学習設定・更新の制御・LoRA平均（12件）
 
 | ファイル | 役割 |
 |---|---|
 | [library/maruo_training_config.py](../library/maruo_training_config.py) | 独自CLIとTOMLの既定値・優先順・組合せを解決する。 |
+| [library/sdxl_lora_training.py](../library/sdxl_lora_training.py) | SDXL LoRAの学習1回分の状態を持ち、勾配の計算後にGuardian、更新の試行後にDQの集計、epoch末の定期保存後にpromoteを呼ぶ。重みとログをその回のrunに結び付ける。 |
 | [library/sdxl_training_options.py](../library/sdxl_training_options.py) | strict有効時、fp16入力のLayerNorm・空間GroupNorm・attentionのsoftmaxをfp32で計算し、元の型に戻す。 |
 | [library/te_training.py](../library/te_training.py) | TE1・TE2の各MLPからfc1・fc2を選び、旧LoRAを初期重みとして読み込む際にキーと倍率を照合する。 |
 | [library/adamw8bit_fast.py](../library/adamw8bit_fast.py) | bitsandbytesの更新処理の同期をまとめ、標準経路への切替も扱う。 |
@@ -78,7 +79,7 @@
 |---|---|
 | [library/training_run.py](../library/training_run.py) | runフォルダを確保し、run ID・索引・状態を管理する。 |
 | [library/training_settings.py](../library/training_settings.py) | 要求・実効設定とGitリビジョン・依存環境の照合情報をrunに保存。 |
-| [library/training_run_weights.py](../library/training_run_weights.py) | 実効保存間隔とrunの保存先を解決し、保存した重みの役割・epoch到達位置・世代整理の結果を索引に登録する。 |
+| [library/training_run_weights.py](../library/training_run_weights.py) | runの保存先を解決し、保存した重みの役割・epoch到達位置・世代整理の結果を索引に登録する。実効保存間隔は共通trainerが解決する。 |
 | [library/lora_run_schema.py](../library/lora_run_schema.py) | 6種類のCSVの列、型、変換規則を定義する。 |
 | [library/training_diagnostics.py](../library/training_diagnostics.py) | 各観測をrunのCSVに書き出す。 |
 | [library/training_run_output.py](../library/training_run_output.py) | 学習ループからrunの作成・観測・出力確定を呼び出す。 |
@@ -172,7 +173,7 @@
 | [tests/migration/test_avg_window.py](../tests/migration/test_avg_window.py) | 平均窓への追加・破棄・元重みとの独立。 |
 | [tests/migration/test_promote_bank.py](../tests/migration/test_promote_bank.py) | promote採点用のサンプル選択・両TE・乱数状態。 |
 | [tests/migration/test_epoch_averaging.py](../tests/migration/test_epoch_averaging.py) | epoch末のraw・平均重みの保存順、promote/reset、失敗処理。 |
-| [tests/migration/test_epoch_boundary_observations.py](../tests/migration/test_epoch_boundary_observations.py) | epoch最終試行での観測・保存・promoteの順序。 |
+| [tests/migration/test_epoch_boundary_observations.py](../tests/migration/test_epoch_boundary_observations.py) | 小さなモデルで共通ループとSDXLを実行し、更新の棄却、勾配蓄積時の観測、保存とpromoteの順序、停止・失敗時のrun状態を検査。 |
 | [tests/migration/test_rank_group_observers.py](../tests/migration/test_rank_group_observers.py) | 更新後のrankと重み付きgroup lossの観測。 |
 | [tests/migration/test_console_progress.py](../tests/migration/test_console_progress.py) | 初期化時間を学習速度から除く進捗表示。 |
 | [tests/migration/test_sample_python_rng.py](../tests/migration/test_sample_python_rng.py) | 学習中のサンプル生成前後でPythonの乱数状態を保つ。 |
@@ -255,7 +256,7 @@
 
 ## 更新方法
 
-初回移植の比較基準を残し、対象ファイルの追加・削除・移動・役割変更と同じ変更で、この一覧、リンク、件数を更新する。パスはリポジトリのルートを起点に記載する。初回後に構成が変わったら日付と増減を追記する。
+初回移植の比較基準を残し、対象ファイルの追加・削除・移動・役割変更と同じ変更で、この一覧、リンク、件数を更新する。パスはリポジトリのルートを起点に記載する。追加したファイルは役割に合う表に1行で掲載し、章の内訳と冒頭の集計を合わせる。
 
 照合にはリポジトリのルートで次のコマンドを使う。本家を更新した場合は、比較先をその本家コミットに替え、新たに取り込んだ本家ファイルと独自ファイルを区別する。
 

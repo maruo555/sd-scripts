@@ -8,6 +8,7 @@ from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from library.sdxl_lora_training import SdxlLoraTraining
 from library import run_control, sampling, sdxl_train_util
 from library.training_run import TrainingRun
 from library.training_run_weights import WeightMoment, weight_args
@@ -33,7 +34,8 @@ def test_controller_metadata_and_shared_sample_paths(tmp_path, monkeypatch):
     for _ in range(2):
         run = TrainingRun.create(tmp_path, args.output_name, 7)
         trainer = SdxlNetworkTrainer()
-        trainer.training_run = run
+        trainer.training_session = SdxlLoraTraining(args, SimpleNamespace(training_features=set()))
+        trainer.training_session.run = run
         trainer._metadata = {"ss_session_id":"7", "ss_training_started_at":"100000.0"}
         trainer._minimum_metadata = {}
         monkeypatch.setattr(trainer, "get_sai_model_spec", lambda args: {})

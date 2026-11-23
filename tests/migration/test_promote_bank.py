@@ -6,6 +6,7 @@ import json
 import pytest
 import torch
 
+from library.sdxl_lora_training import SdxlLoraTraining
 from library.promote_bank import BankItem, PromoteBank
 from sdxl_train_network import SdxlNetworkTrainer
 
@@ -113,9 +114,10 @@ def test_bank_collection_keeps_training_loss_grad_and_rng(monkeypatch, weighted)
     def run(collect):
         torch.manual_seed(7)
         trainer=SdxlNetworkTrainer()
-        trainer.maruo_config = SimpleNamespace(observation_features={"group_loss_log"})
+        session = SdxlLoraTraining(args, SimpleNamespace(training_features=set(), observation_features={"group_loss_log"}))
+        trainer.training_session = session
         bank=PromoteBank(1)
-        trainer._promote_bank=bank if collect else None
+        session.bank=bank if collect else None
         monkeypatch.setattr(trainer,"shift_scale_latents",lambda args,x:x)
         w=torch.nn.Parameter(torch.tensor(0.25))
         v=torch.nn.Parameter(torch.tensor(0.5))
@@ -137,11 +139,11 @@ def test_bank_collection_keeps_training_loss_grad_and_rng(monkeypatch, weighted)
         batch.update(latents=torch.ones(1,1,2,2),captions=["a"],loss_weights=torch.tensor([0.75]))
         loss=trainer.forward_backward(args,accelerator,batch,[w,v],None,None,None,None,None,
                                       torch.float32,strategy,tok,True,True)
-        assert trainer.group_loss_timesteps.tolist() == [20]
+        assert session.group_timesteps.tolist() == [20]
         assert len(observed)==1
         assert len(token_calls)==int(weighted)
         if collect:
-            assert len(bank.pool)==1 and trainer._promote_capture is None
+            assert len(bank.pool)==1 and session.capture is None
             assert (bank.pool[0].weighted_tokens is not None) == weighted
         return loss.detach(), w.grad, v.grad, torch.rand(5), observed[0]
 

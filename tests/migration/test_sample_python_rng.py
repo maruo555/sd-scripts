@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from library.sdxl_lora_training import SdxlLoraTraining
 from library import sdxl_train_util
 from library.training_run import TrainingRun
 from sdxl_train_network import SdxlNetworkTrainer
@@ -14,8 +15,9 @@ def test_custom_sample_rng_boundary(tmp_path, monkeypatch, custom, schedule, rai
     args=Namespace(output_dir=str(tmp_path), output_name=None, sample_at_first=False, sample_every_n_steps=schedule,
                    sample_every_n_epochs=None)
     trainer=SdxlNetworkTrainer()
-    trainer.training_run=TrainingRun.create(tmp_path,None,12)
-    trainer.maruo_config=SimpleNamespace(changes_training=custom)
+    trainer.maruo_config = SimpleNamespace(changes_training=custom, training_features=set())
+    trainer.training_session = SdxlLoraTraining(args, trainer.maruo_config)
+    trainer.training_session.run = TrainingRun.create(tmp_path, None, 12)
     def generate(*args):
         random.random()
         if raises:

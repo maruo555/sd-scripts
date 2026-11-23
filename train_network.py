@@ -25,7 +25,7 @@ from accelerate.utils import set_seed
 from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
-from library.training_run_weights import WeightMoment, publish_weight, record_weight, remove_weight, resolve_epoch_save_args
+from library.training_run_weights import WeightMoment
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd
 
 import library.accelerator_setup as accelerator_setup
@@ -69,8 +69,7 @@ class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
-        self.training_run = None
-        self.run_output = None
+        self.training_session = None
         self.run_controller = run_control.RunController(None)  # disabled until train() creates the real one
 
     # TODO 他のスクリプトと共通化する
@@ -495,8 +494,8 @@ class NetworkTrainer:
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
                 target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
 
-        if is_train and getattr(self, "_promote_capture", None) is not None:
-            self._promote_capture["noisy_latents"] = noisy_latents
+        if is_train and self.training_session is not None and self.training_session.capture is not None:
+            self.training_session.capture.noisy_latents = noisy_latents
         return noise_pred, target, timesteps, None
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler) -> torch.FloatTensor:
@@ -556,7 +555,7 @@ class NetworkTrainer:
                     if weighted_tokens is None:
                         input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
                         if capture is not None:
-                            capture["weighted_tokens"] = (input_ids_list, weights_list)
+                            capture.weighted_tokens = (input_ids_list, weights_list)
                     else:
                         input_ids_list, weights_list = weighted_tokens
                     encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
@@ -656,7 +655,8 @@ class NetworkTrainer:
                 )
                 batch["masked_latents"] = self.shift_scale_latents(args, masked_latents)
 
-        capture = getattr(self, "_promote_capture", None) if is_train else None
+        session = self.training_session if is_train else None
+        capture = session.capture if session is not None else None
         text_encoder_conds = self._batch_text_conditions(
             args, accelerator, batch, text_encoders, text_encoding_strategy, tokenize_strategy, weight_dtype,
             is_train=is_train, train_text_encoder=train_text_encoder, capture=capture,
@@ -678,16 +678,8 @@ class NetworkTrainer:
         )
 
         huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-        # A detached device view of just the sampled timesteps also serves group-only logging.
-        config = getattr(self, "maruo_config", None)
-        if is_train and config is not None and "group_loss_log" in config.observation_features:
-            self.group_loss_timesteps = timesteps.detach()
-        if capture is not None:
-            from library.promote_bank import BankItem
-
-            self._promote_bank.add(BankItem.capture(
-                batch, capture["noisy_latents"], target, timesteps, huber_c, weighting, capture.get("weighted_tokens"),
-            ))
+        if session is not None:
+            session.observe_target(batch, target, timesteps, huber_c, weighting)
         return self._prediction_loss(args, batch, noise_pred, target, timesteps, weighting, huber_c, noise_scheduler, record=is_train)
 
     def cast_text_encoder(self, args):
@@ -1066,6 +1058,11 @@ class NetworkTrainer:
             }
             log_fn(accelerator, logs, global_step, epoch + 1)
 
+    def checkpoint_args(self, args, num_train_epochs):
+        if args.save_n_epoch_ratio is not None and args.save_n_epoch_ratio > 0:
+            args.save_every_n_epochs = max(1, num_train_epochs // args.save_n_epoch_ratio)
+        return self.training_session.checkpoint_args(args) if self.training_session is not None else args
+
     def _save_model(
         self,
         *,
@@ -1091,20 +1088,18 @@ class NetworkTrainer:
         sai_metadata = self.get_sai_model_spec(args)
         metadata_to_save.update(sai_metadata)
 
-        if self.training_run is None:
+        if self.training_session is None:
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
         else:
-            metadata_to_save = dict(metadata_to_save, ss_run_id=self.training_run.run_id, ss_session_id=self.training_run.session_id)
-            ckpt_file = publish_weight(self.training_run, ckpt_name, moment,
-                                       lambda path: unwrapped_nw.save_weights(path, save_dtype, metadata_to_save))
+            ckpt_file = self.training_session.save_weight(ckpt_name, moment, unwrapped_nw, save_dtype, metadata_to_save)
         self.run_controller.record_checkpoint(ckpt_file, step=steps)
         if args.huggingface_repo_id is not None:
             huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
         return ckpt_file
 
     def _remove_model(self, *, args: argparse.Namespace, accelerator: Accelerator, old_ckpt_name: str):
-        if self.training_run is not None:
-            remove_weight(self.training_run, old_ckpt_name)
+        if self.training_session is not None:
+            self.training_session.remove_weight(old_ckpt_name)
             return
         old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
         if os.path.exists(old_ckpt_file):
@@ -1130,18 +1125,8 @@ class NetworkTrainer:
     def train(self, args):
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
-        maruo_config = getattr(self, "maruo_config", None)
-        averaging = None
-        self._promote_bank = None
-        if maruo_config is not None and "averaging" in maruo_config.training_features:
-            from library.avg_training import EpochAveraging
-
-            averaging = EpochAveraging(maruo_config.values)
-        startup_clock = time.perf_counter() if maruo_config is not None else None
-        if maruo_config is not None:
-            from library.training_settings import snapshot
-
-            requested_args = snapshot(vars(args))
+        # SDXLの入口が学習1回分のセッションを渡す。以下の session の呼び先は library/sdxl_lora_training.py。
+        session = self.training_session
         args_util.verify_training_args(args)
         accelerator_setup.prepare_dataset_args(args, True)
         deepspeed_utils.prepare_deepspeed_args(args)
@@ -1166,7 +1151,7 @@ class NetworkTrainer:
         # データセットを準備する
         if args.dataset_class is None:
             blueprint_generator = BlueprintGenerator(
-                ConfigSanitizer(True, True, args.masked_loss, True, support_subset_group=maruo_config is not None)
+                ConfigSanitizer(True, True, args.masked_loss, True, support_subset_group=session is not None)
             )
             if use_user_config:
                 logger.info(f"Loading dataset config from {args.dataset_config}")
@@ -1206,18 +1191,16 @@ class NetworkTrainer:
                     }
 
             blueprint = blueprint_generator.generate(user_config, args)
-            if maruo_config is not None and maruo_config.changes_training:
-                config_util.validate_custom_training_datasets(blueprint.dataset_group)
+            if session is not None:
+                session.validate_dataset(blueprint.dataset_group)
             train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
         else:
             # use arbitrary dataset class
             train_dataset_group = dataset_util.load_arbitrary_dataset(args)
             val_dataset_group = None  # placeholder until validation dataset supported for arbitrary
 
-        if averaging is not None and averaging.bank is not None:
-            for dataset in getattr(train_dataset_group, "datasets", []):
-                # ControlNet's image metadata is assembled by its DreamBooth delegate.
-                getattr(dataset, "dreambooth_dataset_delegate", dataset).record_promote_labels = True
+        if session is not None:
+            session.prepare_dataset(train_dataset_group)
 
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
@@ -1252,17 +1235,9 @@ class NetworkTrainer:
         # acceleratorを準備する
         logger.info("preparing accelerator")
         accelerator = accelerator_setup.prepare_accelerator(args)
-        if maruo_config is not None and maruo_config.changes_training and accelerator.state.deepspeed_plugin is not None:
-            raise ValueError("DeepSpeed from the Accelerate configuration is unsupported with custom SDXL training")
         is_main_process = accelerator.is_main_process
-        if maruo_config is not None:
-            from library.training_run_output import RunOutput, reserve_run
-
-            self.training_run = reserve_run(args, accelerator, session_id, training_started_at)
-            if is_main_process:
-                self.run_output = RunOutput(self.training_run, requested_args)
-                logger.info("SDXL LoRA run: %s", self.training_run.directory)
-        output = self.run_output
+        if session is not None:
+            session.open_run(args, accelerator, session_id, training_started_at)
 
         # mixed precisionに対応した型を用意しておき適宜castする
         weight_dtype, save_dtype = accelerator_setup.prepare_dtype(args)
@@ -1390,11 +1365,8 @@ class NetworkTrainer:
         #         accelerator.print(f"trainable_params: {k} = {v}")
 
         optimizer_name, optimizer_args, optimizer = optimizer_util.get_optimizer(args, trainable_params)
-        created_groups = None
-        if output is not None:
-            from library.training_settings import optimizer_groups
-
-            created_groups = optimizer_groups(optimizer, lr_descriptions)
+        if session is not None:
+            session.optimizer_created(optimizer, lr_descriptions)
         optimizer_train_fn, optimizer_eval_fn = optimizer_util.get_optimizer_train_eval_fn(optimizer, args)
 
         # prepare dataloader
@@ -1437,14 +1409,8 @@ class NetworkTrainer:
         # データセット側にも学習ステップを送信
         train_dataset_group.set_max_train_steps(args.max_train_steps)
 
-        self.dq_training = None
-        if maruo_config is not None and "dq" in maruo_config.training_features:
-            from library.dq_training import DQTraining
-
-            self.dq_training = DQTraining(
-                maruo_config, network, total_steps=args.max_train_steps,
-                lr_warmup_steps=args.lr_warmup_steps, num_processes=accelerator.num_processes,
-            )
+        if session is not None:
+            session.prepare_network(args, network, accelerator.num_processes)
 
         # lr schedulerを用意する
         lr_scheduler = optimizer_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
@@ -1616,7 +1582,7 @@ class NetworkTrainer:
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-        save_args = resolve_epoch_save_args(args, self.training_run, num_train_epochs)
+        save_args = self.checkpoint_args(args, num_train_epochs)
 
         # 学習する
         # TODO: find a way to handle total batch size when there are multiple datasets
@@ -1656,8 +1622,8 @@ class NetworkTrainer:
         )
 
         # observation of the training from outside. no-op unless --run_control is specified
-        from library.training_run_control import create_run_controller
-        self.run_controller = create_run_controller(save_args, is_main_process, maruo_config)
+        self.run_controller = (session.controller(save_args, is_main_process) if session is not None
+                               else run_control.create_run_controller(args, is_main_process))
         if self.run_controller.enabled:
             manifest = run_control.build_manifest(
                 args,
@@ -1670,7 +1636,7 @@ class NetworkTrainer:
                     "num_processes": accelerator.num_processes,
                 },
             )
-            if self.training_run is not None:
+            if session is not None:
                 manifest["outputs"].update(output_dir=save_args.output_dir, output_name=save_args.output_name)
             self.run_controller.start(manifest, max_train_steps=args.max_train_steps, num_train_epochs=num_train_epochs)
         run_controller = self.run_controller
@@ -1726,10 +1692,13 @@ class NetworkTrainer:
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
-        if output is not None:
-            output.configure(args=args, config=maruo_config, dq=self.dq_training, network=accelerator.unwrap_model(network),
-                             optimizer=optimizer, descriptions=lr_descriptions, dataset=train_dataset_group, metadata=self._metadata,
-                             epochs=num_train_epochs, diffusion_steps=noise_scheduler.config.num_train_timesteps, averaging=averaging, created_groups=created_groups)
+        if session is not None:
+            session.prepare_loop(
+                args=args, trainer=self, accelerator=accelerator, network=network, optimizer=optimizer,
+                descriptions=lr_descriptions, dataset=train_dataset_group, epochs=num_train_epochs,
+                unet=unet, text_encoders=text_encoders, noise_scheduler=noise_scheduler, weight_dtype=weight_dtype,
+                text_encoding_strategy=text_encoding_strategy, tokenize_strategy=tokenize_strategy,
+            )
         logging_util.init_trackers(accelerator, args, "network_train")
 
         loss_recorder = logging_util.LossRecorder()
@@ -1788,12 +1757,6 @@ class NetworkTrainer:
         progress_bar = tqdm(
             range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
         )
-
-        guardian = None
-        if maruo_config is not None and "guardian" in maruo_config.training_features:
-            from library.grad_norm_guardian import GradNormGuardian
-
-            guardian = GradNormGuardian(maruo_config.values["grad_norm_mode"], network.parameters())
 
         validation_steps = (
             min(args.max_validation_steps, len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
@@ -1945,22 +1908,11 @@ class NetworkTrainer:
             "resume": command_resume,
         }
 
-        if averaging is not None and averaging.bank is not None:
-            from functools import partial
-
-            score_bank = partial(
-                self.score_promote_bank, args=args, accelerator=accelerator, unet=unet, text_encoders=text_encoders,
-                noise_scheduler=noise_scheduler, weight_dtype=weight_dtype,
-                text_encoding_strategy=text_encoding_strategy, tokenize_strategy=tokenize_strategy,
-            )
-        else:
-            score_bank = None
-
         actual_batch_index = None
         for epoch in range(epoch_to_start, num_train_epochs):
             actual_batch_index = None
-            if averaging is not None:
-                self._promote_bank = averaging.bank if averaging.eligible(epoch + 1, num_train_epochs) else None
+            if session is not None:
+                session.start_epoch(epoch + 1, num_train_epochs)
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
             current_epoch.value = epoch + 1
             run_controller.on_epoch_start(epoch=epoch + 1)
@@ -1982,14 +1934,11 @@ class NetworkTrainer:
                 if initial_step > 0:
                     initial_step -= 1
                     continue
-                if startup_clock is not None:
-                    logging_util.start_step_progress(
-                        progress_bar, time.perf_counter() - startup_clock, main_process=accelerator.is_main_process
-                    )
-                    startup_clock = None
+                if session is not None:
+                    session.start_progress(progress_bar, accelerator.is_main_process)
                 run_controller.on_batch_fetched(batch, global_step=global_step)
-                if output is not None and output.group is not None:
-                    output.group.validate_batch(batch)
+                if session is not None:
+                    session.validate_batch(batch)
 
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
@@ -1997,8 +1946,9 @@ class NetworkTrainer:
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
-                    if self.dq_training is not None:
-                        self.dq_training.begin_attempt(global_step)
+                    if session is not None:
+                        # DQが有効なら、ここで今回の量子化条件を決めてからLoRAの出力を計算する。
+                        session.before_forward(global_step)
                     loss = self.forward_backward(
                         args,
                         accelerator,
@@ -2016,13 +1966,10 @@ class NetworkTrainer:
                         train_unet,
                     )
 
-                    grad_observation = guardian.observe() if guardian is not None else None
-                    observed_loss = None
-                    if output is not None and (grad_observation is not None or output.group is not None):
-                        observed_loss = loss.detach().item()
-                        if grad_observation is not None:
-                            output.gradient(epoch + 1, actual_batch_index, grad_observation, observed_loss, accelerator.scaler)
-                    skip_update = grad_observation is not None and grad_observation.skipped
+                    skip_update, observed_loss = False, None
+                    if session is not None:
+                        # 計算した勾配をGuardianに確認し、その判定を直後のoptimizer更新に渡す。
+                        skip_update, observed_loss = session.after_backward(loss, epoch + 1, actual_batch_index, accelerator)
                     self._step_optimizer(args, accelerator, network, optimizer, lr_scheduler, skip_update=skip_update)
 
                 if args.scale_weight_norms:
@@ -2053,12 +2000,9 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
-                    if output is not None and output.group is not None:
-                        output.group_step(batch, self.group_loss_timesteps, observed_loss, epoch + 1, global_step, skip_update)
-                    if self.dq_training is not None:
-                        self.dq_training.finish_attempt(global_step, epoch=epoch + 1, guardian_skipped=skip_update)
-                    if output is not None:
-                        output.dq_and_rank(self.dq_training, lr_scheduler, epoch + 1, global_step, skip_update)
+                    if session is not None:
+                        # global_stepにはGuardianが更新を見送った回も含む。集計側にはステップ番号と採否を一緒に渡す。
+                        session.after_sync_step(batch, observed_loss, epoch + 1, global_step, lr_scheduler, skip_update)
 
                     optimizer_eval_fn()
                     with run_controller.watch_samples(step=global_step):
@@ -2103,8 +2047,9 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                if guardian is not None:
-                    logs["skipped"] = guardian.skipped_steps
+                skipped_steps = session.skipped_steps if session is not None else None
+                if skipped_steps is not None:
+                    logs["skipped"] = skipped_steps
                 progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 step_logs = None
@@ -2123,7 +2068,7 @@ class NetworkTrainer:
                         mean_combined_norm,
                     )
                     if is_tracking:
-                        tracker_logs = step_logs if guardian is None else {**step_logs, "train/skipped_steps": guardian.skipped_steps}
+                        tracker_logs = step_logs if skipped_steps is None else {**step_logs, "train/skipped_steps": skipped_steps}
                         self.step_logging(accelerator, tracker_logs, global_step, epoch + 1)
 
                 # VALIDATION PER STEP: global_step is already incremented
@@ -2257,20 +2202,10 @@ class NetworkTrainer:
                 )
             progress_bar.unpause()
             optimizer_train_fn()
-            if averaging is not None:
-                rows = averaging.finish_epoch(
-                    epoch + 1, num_train_epochs, accelerator.unwrap_model(network), optimizer, score_bank,
-                    accelerator.device, noise_scheduler.config.num_train_timesteps,
-                )
-                if rows:
-                    if output is not None:
-                        output.writer.append("promote", rows)
-                    decision = rows[0]
-                    logger.info("promote epoch %s: %s, raw=%s, %s=%s, streak=%s, applied=%s",
-                                epoch+1, decision["status"], decision["raw_proxy_loss"], decision["selected_candidate_mode"],
-                                decision["selected_proxy_loss"], decision["win_streak"], decision["promote_applied"])
-            if output is not None:
-                output.writer.end_epoch(global_step)
+            if session is not None:
+                # 定期重みとサンプルには採点前の重みを使うため、promoteの判定はこの位置で行う。
+                session.after_epoch_save(epoch + 1, num_train_epochs, network, optimizer, accelerator,
+                                         noise_scheduler.config.num_train_timesteps, global_step)
             run_controller.on_epoch_end(global_step=global_step, average_loss=loss_recorder.moving_average)
 
             # end of epoch
@@ -2278,8 +2213,8 @@ class NetworkTrainer:
         if run_controller.stop_requested:
             # stopped by a command. the model and the state were saved by the command with the name of the step
             accelerator.end_training()
-            if output is not None:
-                output.finish("stopped")
+            if session is not None:
+                session.finish("stopped")
             run_controller.finish("stopped")
             logger.info(f"training is stopped by a command at step {global_step}")
             return
@@ -2301,6 +2236,8 @@ class NetworkTrainer:
             final_epoch_complete = (actual_batch_index + 1 == len(train_dataloader)
                                     if actual_batch_index is not None else None)
             ckpt_name = checkpoint_io.get_last_ckpt_name(save_args, "." + args.save_model_as)
+            final_moment = WeightMoment("final", num_train_epochs, global_step, actual_batch_index,
+                                        "after_epoch_decision", final_epoch_complete)
             self._save_model(
                 args=save_args,
                 accelerator=accelerator,
@@ -2310,32 +2247,18 @@ class NetworkTrainer:
                 steps=global_step,
                 epoch_no=num_train_epochs,
                 force_sync_upload=True,
-                moment=WeightMoment("final", num_train_epochs, global_step, actual_batch_index,
-                                    "after_epoch_decision", final_epoch_complete),
+                moment=final_moment,
             )
 
-            if averaging is not None and averaging.final_raw is not None:
-                from library.avg_training import save_final_raw
-
-                raw_name = checkpoint_io.get_last_ckpt_name(save_args, "_final_raw.safetensors")
+            if session is not None:
                 metadata = self._minimum_metadata if args.no_metadata else self._metadata
-                raw_metadata = dict(metadata, ss_steps=str(global_step), ss_epoch=str(num_train_epochs))
-                raw_path = os.path.join(save_args.output_dir, raw_name)
-                if self.training_run is not None:
-                    raw_metadata.update(ss_run_id=self.training_run.run_id, ss_session_id=self.training_run.session_id)
-                save_final_raw(raw_path, averaging.final_raw, save_dtype, raw_metadata)
-                if self.training_run is not None:
-                    record_weight(self.training_run, raw_path,
-                                  WeightMoment("final_raw", num_train_epochs, global_step, actual_batch_index,
-                                               "before_epoch_decision", final_epoch_complete))
+                session.save_final_raw(save_args, save_dtype, metadata, final_moment)
             logger.info("model saved.")
 
-        logs_complete = output is not None and output.finish("completed")
+        logs_complete = session is not None and session.finish("completed")
         run_controller.finish()
-        if logs_complete and "report_after_training" in maruo_config.observation_features:
-            from library.training_run_report import report_after_training
-
-            report_after_training(output.run)
+        if logs_complete:
+            session.report_after_completion()
 
 
 def setup_parser() -> argparse.ArgumentParser:

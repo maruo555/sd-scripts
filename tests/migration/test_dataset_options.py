@@ -152,6 +152,5 @@ def test_observation_or_standard_learning_delegates_dataset_settings(monkeypatch
         raise UpstreamDatasetReached
 
     monkeypatch.setattr(config_util, "generate_dataset_group_by_blueprint", check_native_dataset)
-    # Test the dataset consumer even at revisions where a later observation feature is not wired yet.
     with pytest.raises(UpstreamDatasetReached):
-        train_network.NetworkTrainer.train(trainer, args)
+        trainer.train(args)

@@ -1,6 +1,5 @@
-"""The hundredth attempt is the last batch of E2; replay both Guardian branches on CPU."""
+"""Exercise CPU trainer boundaries and replay a controlled epoch-end promote decision."""
 from argparse import Namespace
-import inspect
 from math import isclose
 from types import SimpleNamespace as NS
 
@@ -8,6 +7,7 @@ import pytest
 from safetensors.torch import load_file, save_file
 import torch
 
+from library.sdxl_lora_training import SdxlLoraTraining
 from library.avg_training import EpochAveraging
 from library.dq_training import DQTraining
 from library.grad_norm_guardian import GradNormGuardian
@@ -39,20 +39,6 @@ def _network():
     return net
 
 
-def test_live_trainer_orders_observation_checkpoint_and_decision():
-    # This test ties the controlled boundary below to the real trainer's actual branch ordering.
-    source = inspect.getsource(NetworkTrainer.train)
-    start = source.index("grad_observation = guardian.observe()")
-    sequence = ("output.gradient(", "self._step_optimizer(", "apply_max_norm_regularization(",
-                "global_step += 1", "output.group_step(", "self.dq_training.finish_attempt(",
-                "output.dq_and_rank(", "with run_controller.watch_samples(", "run_controller.process_commands(",
-                "if run_controller.stop_requested:", "checkpoint_io.get_epoch_ckpt_name(", "self._save_model(",
-                "with run_controller.watch_samples(", "averaging.finish_epoch(", 'output.writer.append("promote"',
-                "run_controller.on_epoch_end(")
-    for event in sequence:
-        start = source.index(event, start) + len(event)
-
-
 @pytest.mark.parametrize("reject", [False, True])
 def test_epoch_100_boundary(tmp_path, reject):
     args = Namespace(network_module="networks.lora", optimizer_type="AdamW8bit", output_dir=str(tmp_path),
@@ -72,11 +58,14 @@ def test_epoch_100_boundary(tmp_path, reject):
     dq = DQTraining(config, net, total_steps=150, lr_warmup_steps=0, num_processes=1)
     average = EpochAveraging(config.values)
     train = NetworkTrainer()
-    train.training_run = run
+    session = SdxlLoraTraining(args, config)
+    train.training_session = session
+    session.run, session.output = run, output
+    session.guardian, session.dq, session.averaging = guardian, dq, average
     train.all_reduce_network = lambda *unused: None
     train.get_sai_model_spec = lambda unused: {}
     train._metadata, train._minimum_metadata = {}, {}
-    accel = NS(sync_gradients=True, print=lambda *unused: None)
+    accel = NS(sync_gradients=True, device=torch.device("cpu"), unwrap_model=lambda m: m, scaler=None, print=lambda *unused: None)
     dataset = NS(datasets=[NS(batch_size=1, subsets=[NS(group="swatch")], image_data={})])
     batch = {"loss_weights":torch.ones(1), "subset_indices":[(0,0)], "image_keys":["swatch"]}
     output.configure(args=args, config=config, dq=dq, network=net, optimizer=opt, descriptions=["unet"],
@@ -88,16 +77,14 @@ def test_epoch_100_boundary(tmp_path, reject):
     average.finish_epoch(1, 3, net, opt, None, torch.device("cpu"), 1000)
     with torch.no_grad():
         adapter.lora_up.weight.copy_(torch.eye(2) * 2)
-    dq.begin_attempt(99)
+    session.before_forward(99)
     adapter.delta_quantizer(torch.ones(2,2))
     adapter.lora_up.weight.grad = torch.eye(2) * (200_001 if reject else 1)
-    observation = guardian.observe()
-    assert observation.skipped == reject
-    output.gradient(2, 49, observation, 0.5, None)
-    train._step_optimizer(args, accel, net, opt, scheduler, skip_update=observation.skipped)
-    output.group_step(batch, torch.tensor([512]), 0.5, 2, 100, reject)
-    dq.finish_attempt(100, epoch=2, guardian_skipped=reject)
-    output.dq_and_rank(dq, scheduler, 2, 100, reject)
+    skipped, loss_value = session.after_backward(torch.tensor(.5), 2, 49, accel)
+    assert skipped == reject
+    train._step_optimizer(args, accel, net, opt, scheduler, skip_update=skipped)
+    session.group_timesteps = torch.tensor([512])
+    session.after_sync_step(batch, loss_value, 2, 100, scheduler, skipped)
 
     diagonal = 2.0 if reject else 1.75
     expected = torch.eye(2) * diagonal
@@ -109,18 +96,17 @@ def test_epoch_100_boundary(tmp_path, reject):
     def score(_):
         adapter.delta_quantizer(torch.ones(2,2))
         return adapter.lora_up.weight.trace().item()
-    rows = average.finish_epoch(2, 3, net, opt, score, torch.device("cpu"), 1000)
-    assert before[:3] == (output.writer.counts, output.group.history, dq.last_result)
+    session.score = score
+    session.after_epoch_save(2, 3, net, opt, accel, 1000, 100)
+    assert all(output.writer.counts[key] == count for key, count in before[0].items() if key != "promote")
+    assert before[1:3] == (output.group.history, dq.last_result)
     assert torch.equal(before[3], torch.get_rng_state())
-    assert rows[0]["promote_applied"] and rows[0]["raw_proxy_loss"] == 2 * diagonal
-    output.writer.append("promote", rows)
     assert torch.equal(adapter.lora_up.weight, (expected + torch.eye(2)*.25) / 2)
     # E3 starts from the adopted weight; the skipped attempt is never replayed.
-    dq.begin_attempt(100)
-    output.group_step(batch, torch.tensor([0]), .125, 3, 101, False)
-    dq.finish_attempt(101, epoch=3, guardian_skipped=False)
-    output.dq_and_rank(dq, scheduler, 3, 101, False)
-    output.finish("completed")
+    session.before_forward(100)
+    session.group_timesteps = torch.tensor([0])
+    session.after_sync_step(batch, .125, 3, 101, scheduler, False)
+    session.finish("completed")
     reader = RunReader(run.directory)
     assert reader.stream("gradient").rows[0]["batch_index"] == 49
     assert [r["attempt_step"] for r in reader.stream("group_loss").rows] == ([101] if reject else [100,101])
@@ -129,4 +115,154 @@ def test_epoch_100_boundary(tmp_path, reject):
     if rank:
         assert isclose(rank[0]["rank_energy"], 2 * diagonal ** 2, rel_tol=2e-5)
     assert [r["attempt_step"] for r in reader.stream("dq").rows] == ([] if reject else [100])
-    assert reader.stream("promote").rows[0]["status"] == "scored"
+    decision = reader.stream("promote").rows[0]
+    assert decision["status"] == "scored"
+    assert decision["promote_applied"] and decision["raw_proxy_loss"] == 2 * diagonal
+
+
+def _tiny_trainer(tmp_path, monkeypatch, mode):
+    from accelerate import Accelerator
+    from accelerate.state import AcceleratorState, GradientState, PartialState
+    from library import dataset, strategy_base
+    from sdxl_train_network import SdxlNetworkTrainer, setup_parser as sdxl_parser
+    import train_network
+
+    sdxl = mode != "common"
+    guardian = mode == "sdxl-guardian"
+    accumulation = 2 if mode == "sdxl-observation" else 1
+
+    class TinyDataset(dataset.MinimalDataset):
+        def __len__(self):
+            return accumulation
+
+        def __getitem__(self, index):
+            return {"loss_weights": torch.ones(1), "subset_indices": [(0, 0)]}
+
+    class Model(torch.nn.Sequential):
+        @property
+        def device(self):
+            return next(self.parameters()).device
+
+    # LoRA discovers this target by its class name, as it does on a real UNet.
+    class Transformer2DModel(torch.nn.Sequential):
+        pass
+
+    trainer = SdxlNetworkTrainer() if sdxl else NetworkTrainer()
+    parser = sdxl_parser() if sdxl else train_network.setup_parser()
+    args = parser.parse_args([
+        "--network_module", "networks.lora", "--network_dim", "1", "--network_train_unet_only",
+        "--dataset_class", "test.TinyDataset", "--output_dir", str(tmp_path), "--output_name", "test",
+        "--max_train_epochs", "3", "--save_every_n_epochs", "1", "--save_model_as", "safetensors",
+        "--max_data_loader_n_workers", "0", "--seed", "12",
+        "--gradient_accumulation_steps", str(accumulation),
+        *(["--grad_norm_mode", "stable_no_threshoff", "--scale_weight_norms", "100"] if guardian else []),
+        *(["--group_loss_log"] if accumulation == 2 else []),
+    ])
+    # Give this CPU trainer its own Accelerate state even when a previous test initialized CUDA.
+    # monkeypatch restores each class's original shared-state descriptor after the run.
+    for state in (PartialState, AcceleratorState, GradientState):
+        monkeypatch.setattr(state, "_shared_state", {})
+    for strategy in (strategy_base.TokenizeStrategy, strategy_base.LatentsCachingStrategy,
+                     strategy_base.TextEncodingStrategy, strategy_base.TextEncoderOutputsCachingStrategy):
+        monkeypatch.setattr(strategy, "_strategy", None)
+    monkeypatch.setattr(dataset, "load_arbitrary_dataset", lambda args: TinyDataset((64, 64), 1))
+    monkeypatch.setattr(
+        train_network.accelerator_setup, "prepare_accelerator",
+        lambda args: Accelerator(cpu=True, gradient_accumulation_steps=args.gradient_accumulation_steps),
+    )
+    monkeypatch.setattr(trainer, "get_tokenize_strategy", lambda args: NS(tokenizer=None, tokenizer1=None, tokenizer2=None))
+    unet = Model(Transformer2DModel(torch.nn.Linear(2, 2)))
+    encoders = [Model(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)) for _ in range(2 if sdxl else 1)]
+    monkeypatch.setattr(trainer, "load_target_model", lambda *args: ("test", encoders, torch.nn.Identity(), unet))
+
+    batches = []
+
+    def backward(args, accelerator, batch, text_encoders, unet, network, *unused):
+        loss = unet(torch.ones(1, 2)).sum()
+        accelerator.backward(loss)
+        if accumulation == 2:
+            trainer.training_session.observe_target(batch, None, torch.tensor([len(batches)]), None, None)
+        if len(batches) == 1 and accumulation == 1:
+            next(p for p in network.parameters() if p.grad is not None).grad.fill_(300_000)
+        batches.append(loss.item())
+        return loss
+
+    monkeypatch.setattr(trainer, "forward_backward", backward)
+    return trainer, args, batches
+
+
+@pytest.mark.parametrize("mode", ["common", "sdxl-guardian", "sdxl-observation"])
+def test_real_trainer_update_and_save_order(tmp_path, monkeypatch, mode):
+    trainer, args, batches = _tiny_trainer(tmp_path, monkeypatch, mode)
+    sdxl = mode != "common"
+    guardian = mode == "sdxl-guardian"
+    epoch_files_at_decision = []
+    if sdxl:
+        finish_epoch = SdxlLoraTraining.after_epoch_save
+        sample_images = trainer.sample_images
+        sampled_epochs = set()
+
+        def track_sample(accelerator, args, epoch, *rest):
+            sample_images(accelerator, args, epoch, *rest)
+            if epoch is not None and epoch > 0:  # Only the end-of-epoch call.
+                sampled_epochs.add(epoch)
+
+        monkeypatch.setattr(trainer, "sample_images", track_sample)
+
+        def check_epoch(session, epoch, *args):
+            assert epoch in sampled_epochs, f"Epoch {epoch} sample hook must finish before the promote decision"
+            epoch_files_at_decision.append((session.run.directory / f"test-{epoch:06}.safetensors").is_file())
+            return finish_epoch(session, epoch, *args)
+
+        monkeypatch.setattr(SdxlLoraTraining, "after_epoch_save", check_epoch)
+
+    trainer.train(args)
+    assert len(batches) == 3 * args.gradient_accumulation_steps
+    if sdxl:
+        directory, = tmp_path.iterdir()
+        assert epoch_files_at_decision == [True, True, False]
+        reader = RunReader(directory)
+        if guardian:
+            assert len(reader.stream("gradient").rows) == 3
+        else:
+            rows = reader.stream("group_loss").rows
+            assert [row["attempt_step"] for row in rows] == [1, 2, 3]
+            assert [row["timestep"] for row in rows] == [1, 3, 5]
+    else:
+        directory = tmp_path
+        assert all(item.is_file() for item in directory.iterdir())
+    first, second, last = [load_file(str(directory / name)) for name in
+                           ("test-000001.safetensors", "test-000002.safetensors", "test.safetensors")]
+    assert all(torch.equal(first[k], second[k]) for k in first) == guardian
+    assert any(not torch.equal(last[k], second[k]) for k in last)
+
+
+@pytest.mark.parametrize("interrupt", ["stop", "failure"])
+def test_interrupted_trainer_finalizes_run_before_epoch_decision(tmp_path, monkeypatch, interrupt):
+    from library import run_control
+    import json
+
+    trainer, args, batches = _tiny_trainer(tmp_path, monkeypatch, "sdxl-guardian")
+    args.report_after_training = True
+
+    def interrupt_at_sync(controller, handlers, *, step):
+        assert step == 1
+        if interrupt == "failure":
+            raise RuntimeError("simulated interruption")
+        handlers["stop"]({"save": True, "save_state": False})
+
+    monkeypatch.setattr(run_control.RunController, "process_commands", interrupt_at_sync)
+    if interrupt == "failure":
+        with pytest.raises(RuntimeError, match="simulated interruption"):
+            trainer.train(args)
+    else:
+        trainer.train(args)
+
+    assert len(batches) == 1 and trainer.training_session is None
+    directory, = tmp_path.iterdir()
+    index = json.loads((directory / "run.json").read_text(encoding="utf-8"))
+    assert index["status"] == ("failed" if interrupt == "failure" else "stopped")
+    assert not (directory / "diagnostic_report").exists()
+    assert [weight["role"] for weight in index["weights"]] == (["step"] if interrupt == "stop" else [])
+    for weight in index["weights"]:
+        assert weight["attempt_step"] == 1 and (directory / weight["path"]).is_file()

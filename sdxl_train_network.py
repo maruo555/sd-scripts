@@ -14,6 +14,7 @@ import library.args as args_util
 import library.model_io as model_io
 from library import maruo_training_config as maruo_config
 from library.dataset import DatasetGroup, MinimalDataset
+from library.sdxl_lora_training import ForwardInputs, SdxlLoraTraining
 from library.training_run_weights import sample_args
 import train_network
 from library.utils import setup_logging
@@ -33,16 +34,19 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
     def train(self, args):
         self.maruo_config = maruo_config.resolve_training_config(args)
         maruo_config.require_wired_features(self.maruo_config)
-        self.training_run = self.run_output = None
+        session = SdxlLoraTraining(args, self.maruo_config) if self.maruo_config is not None else None
+        self.training_session = session
         try:
             return super().train(args)
         except BaseException:
-            if self.run_output is not None and not self.run_output.finished:
+            if session is not None and session.output is not None and not session.output.finished:
                 try:
-                    self.run_output.finish("failed")
+                    session.finish("failed")
                 except Exception:
-                    logger.exception("Could not finalize failed run %s", self.training_run.directory)
+                    logger.exception("Could not finalize failed run %s", session.run.directory)
             raise
+        finally:
+            self.training_session = None
 
     def create_network(self, args, network_module, vae, text_encoder, unet, net_kwargs):
         config = getattr(self, "maruo_config", None)
@@ -70,14 +74,14 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         return super().prepare_network_optimizer_params(args, network, text_encoder_lr)
 
     def forward_backward(self, *args, **kwargs):
-        bank = getattr(self, "_promote_bank", None)
-        if bank is None or not bank.wants_item():
+        session = self.training_session
+        if session is None or session.bank is None or not session.bank.wants_item():
             return super().forward_backward(*args, **kwargs)
-        self._promote_capture = {}
+        session.capture = ForwardInputs()
         try:
             return super().forward_backward(*args, **kwargs)
         finally:
-            self._promote_capture = None
+            session.capture = None
 
     @torch.no_grad()
     def score_promote_bank(
@@ -252,9 +256,10 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         from library.training_run_control import preserve_python_rng
 
         config = getattr(self, "maruo_config", None)
-        isolate_rng = self.training_run is not None and config is not None and config.changes_training
+        run = self.training_session.run if self.training_session is not None else None
+        isolate_rng = run is not None and config is not None and config.changes_training
         with preserve_python_rng() if isolate_rng and should_sample_images(args, epoch, global_step) else nullcontext():
-            sdxl_train_util.sample_images(accelerator, sample_args(args, self.training_run), epoch, global_step, device,
+            sdxl_train_util.sample_images(accelerator, sample_args(args, run), epoch, global_step, device,
                                          vae, tokenizer, text_encoder, unet)
 
 
